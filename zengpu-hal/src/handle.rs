@@ -8,41 +8,41 @@
 use core::marker::PhantomData;
 
 /// A generational key into a [`SlotMap`]. `Copy`, backend-free, and carries a
-/// phantom marker so a `BufferHandle` can't be used where a `TextureHandle` is
-/// expected.
-pub struct Handle<T> {
+/// phantom marker `K` so a `BufferHandle` can't be used where a `TextureHandle`
+/// is expected.
+pub struct Handle<K> {
     idx: u32,
     generation: u32,
-    _marker: PhantomData<fn() -> T>,
+    _marker: PhantomData<fn() -> K>,
 }
 
-// Manual impls: deriving would add a `T: Trait` bound we don't want (the marker
-// `T` is never actually stored).
-impl<T> Clone for Handle<T> {
+// Manual impls: deriving would add a `K: Trait` bound we don't want (the marker
+// `K` is never actually stored).
+impl<K> Clone for Handle<K> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for Handle<T> {}
-impl<T> PartialEq for Handle<T> {
+impl<K> Copy for Handle<K> {}
+impl<K> PartialEq for Handle<K> {
     fn eq(&self, other: &Self) -> bool {
         self.idx == other.idx && self.generation == other.generation
     }
 }
-impl<T> Eq for Handle<T> {}
-impl<T> core::hash::Hash for Handle<T> {
+impl<K> Eq for Handle<K> {}
+impl<K> core::hash::Hash for Handle<K> {
     fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.idx.hash(state);
         self.generation.hash(state);
     }
 }
-impl<T> core::fmt::Debug for Handle<T> {
+impl<K> core::fmt::Debug for Handle<K> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Handle({}, gen {})", self.idx, self.generation)
     }
 }
 
-impl<T> Handle<T> {
+impl<K> Handle<K> {
     /// The slot index. Doubles as the **bindless index** for resources placed in
     /// a descriptor table (plan D4).
     pub const fn index(self) -> u32 {
@@ -55,29 +55,35 @@ impl<T> Handle<T> {
     }
 }
 
-struct Slot<T> {
+struct Slot<V> {
     generation: u32,
-    value: Option<T>,
+    value: Option<V>,
 }
 
-/// A generational-index slotmap. Insertion reuses freed slots (bumping their
-/// generation); a handle from a freed slot is detected as stale and rejected.
-pub struct SlotMap<T> {
-    slots: Vec<Slot<T>>,
+/// A generational-index slotmap: keys are typed [`Handle<K>`], values are `V`.
+/// Insertion reuses freed slots (bumping their generation); a handle from a
+/// freed slot is detected as stale and rejected.
+///
+/// The key tag `K` and the stored value `V` are separate, so a backend can store
+/// its own buffer struct under a public [`Handle<crate::marker::Buffer>`].
+pub struct SlotMap<K, V> {
+    slots: Vec<Slot<V>>,
     free: Vec<u32>,
+    _tag: PhantomData<fn() -> K>,
 }
 
-impl<T> SlotMap<T> {
+impl<K, V> SlotMap<K, V> {
     /// An empty slotmap.
     pub fn new() -> Self {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            _tag: PhantomData,
         }
     }
 
     /// Insert a value, returning a fresh handle to it.
-    pub fn insert(&mut self, value: T) -> Handle<T> {
+    pub fn insert(&mut self, value: V) -> Handle<K> {
         if let Some(idx) = self.free.pop() {
             let slot = &mut self.slots[idx as usize];
             slot.value = Some(value);
@@ -101,7 +107,7 @@ impl<T> SlotMap<T> {
     }
 
     /// Borrow the value for `handle`, or `None` if the handle is stale.
-    pub fn get(&self, handle: Handle<T>) -> Option<&T> {
+    pub fn get(&self, handle: Handle<K>) -> Option<&V> {
         self.slots
             .get(handle.idx as usize)
             .filter(|slot| slot.generation == handle.generation)
@@ -109,7 +115,7 @@ impl<T> SlotMap<T> {
     }
 
     /// Mutably borrow the value for `handle`, or `None` if the handle is stale.
-    pub fn get_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
+    pub fn get_mut(&mut self, handle: Handle<K>) -> Option<&mut V> {
         self.slots
             .get_mut(handle.idx as usize)
             .filter(|slot| slot.generation == handle.generation)
@@ -119,7 +125,7 @@ impl<T> SlotMap<T> {
     /// Remove and return the value for `handle`. Bumps the slot's generation so
     /// any remaining copy of `handle` becomes stale. A stale handle removes
     /// nothing.
-    pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
+    pub fn remove(&mut self, handle: Handle<K>) -> Option<V> {
         let slot = self.slots.get_mut(handle.idx as usize)?;
         if slot.generation != handle.generation {
             return None;
@@ -133,7 +139,7 @@ impl<T> SlotMap<T> {
     }
 
     /// Whether `handle` still refers to a live value.
-    pub fn contains(&self, handle: Handle<T>) -> bool {
+    pub fn contains(&self, handle: Handle<K>) -> bool {
         self.get(handle).is_some()
     }
 
@@ -154,7 +160,7 @@ impl<T> SlotMap<T> {
     }
 }
 
-impl<T> Default for SlotMap<T> {
+impl<K, V> Default for SlotMap<K, V> {
     fn default() -> Self {
         Self::new()
     }
@@ -197,9 +203,12 @@ pub type TargetHandle = Handle<marker::RenderTarget>;
 mod tests {
     use super::*;
 
+    // Any tag works for the tests; reuse the buffer marker.
+    type Map = SlotMap<marker::Buffer, i32>;
+
     #[test]
     fn insert_get_remove() {
-        let mut map: SlotMap<i32> = SlotMap::new();
+        let mut map = Map::new();
         assert!(map.is_empty());
         let h = map.insert(42);
         assert_eq!(map.get(h), Some(&42));
@@ -212,7 +221,7 @@ mod tests {
 
     #[test]
     fn stale_handle_after_remove_is_rejected() {
-        let mut map: SlotMap<i32> = SlotMap::new();
+        let mut map = Map::new();
         let h = map.insert(10);
         assert_eq!(map.remove(h), Some(10));
         // Generation bumped → the old handle is now stale.
@@ -230,8 +239,8 @@ mod tests {
 
     #[test]
     fn out_of_range_handle_is_safe() {
-        let real: SlotMap<i32> = SlotMap::new();
-        let mut other: SlotMap<i32> = SlotMap::new();
+        let real = Map::new();
+        let mut other = Map::new();
         let foreign = other.insert(1); // index 0 in a different map
         // `real` has no slot 0 — must not panic, must return None.
         assert_eq!(real.get(foreign), None);
@@ -239,7 +248,7 @@ mod tests {
 
     #[test]
     fn generation_at_tracks_slot() {
-        let mut map: SlotMap<i32> = SlotMap::new();
+        let mut map = Map::new();
         let h = map.insert(1);
         assert_eq!(map.generation_at(h.index()), Some(0));
         map.remove(h);
