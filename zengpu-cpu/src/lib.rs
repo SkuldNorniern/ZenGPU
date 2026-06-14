@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage,
     DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSurface,
-    HalCapabilities, Result, SlotMap, UsageError, WindowHandles, marker,
+    HalCapabilities, Result, SamplerDesc, SamplerHandle, SlotMap, TextureDesc, TextureHandle,
+    UsageError, WindowHandles, marker,
 };
 
 struct CpuBuffer {
@@ -115,6 +116,28 @@ impl GpuDevice for CpuDevice {
     fn destroy_buffer(&self, buffer: BufferHandle) {
         self.buffers.lock().unwrap().remove(buffer);
     }
+
+    fn create_texture(&self, _desc: TextureDesc) -> Result<TextureHandle> {
+        Err(GpuError::Backend(
+            "CPU backend does not support textures".to_string(),
+        ))
+    }
+
+    fn upload_texture_data(&self, _texture: TextureHandle, _data: &[u8]) -> Result<()> {
+        Err(GpuError::Backend(
+            "CPU backend does not support textures".to_string(),
+        ))
+    }
+
+    fn destroy_texture(&self, _texture: TextureHandle) {}
+
+    fn create_sampler(&self, _desc: SamplerDesc) -> Result<SamplerHandle> {
+        Err(GpuError::Backend(
+            "CPU backend does not support samplers".to_string(),
+        ))
+    }
+
+    fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 }
 
 /// A CPU adapter — wraps the single CPU entry in the HAL adapter chain.
