@@ -1,11 +1,20 @@
-# ZenGPU workspace — native-first GPU runtime (graphics + general compute).
-# Crates are added as they gain real content (no empty placeholders — plan D8).
+# ZenGPU — native-first GPU runtime (graphics + general compute).
+# Root is the `zengpu` crate and the workspace root; member crates are added as
+# they gain real content (no empty placeholders — plan D8).
+[package]
+name = "zengpu"
+description = "A native-first GPU runtime for Rust — graphics and general compute under one device."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "README.md"
+
 [workspace]
 resolver = "2"
-members = [
-    "zengpu",
-    "zengpu-hal",
-]
+members = ["zengpu-hal"]
 
 [workspace.package]
 version = "0.0.1"
@@ -17,3 +26,9 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
+
+[lib]
+name = "zengpu"
+
+[dependencies]
+zengpu-hal.workspace = true

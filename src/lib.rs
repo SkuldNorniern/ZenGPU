@@ -1,6 +1,6 @@
 //! ZenGPU — a native-first GPU runtime for Rust (graphics + general compute).
 //!
-//! This is the umbrella crate; it re-exports the stable public API from the
+//! This is the main crate; it re-exports the stable public API from the
 //! internal crates. See the project plan for the architecture and the numbered
 //! decision record.
 //!
