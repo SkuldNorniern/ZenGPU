@@ -124,6 +124,44 @@ impl core::ops::BitOrAssign for Features {
     }
 }
 
+/// Bitflags over `u32`, combined with `|`. Validated like [`BufferUsage`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TextureUsage(u32);
+
+impl TextureUsage {
+    pub const SAMPLED: Self = Self(1 << 0);
+    pub const STORAGE: Self = Self(1 << 1);
+    pub const RENDER_TARGET: Self = Self(1 << 2);
+    pub const DEPTH_STENCIL: Self = Self(1 << 3);
+    pub const TRANSFER_SRC: Self = Self(1 << 4);
+    pub const TRANSFER_DST: Self = Self(1 << 5);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::ops::BitOr for TextureUsage {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+impl core::ops::BitOrAssign for TextureUsage {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
@@ -178,6 +216,45 @@ pub enum Format {
 impl Format {
     pub const fn is_depth_stencil(self) -> bool {
         matches!(self, Format::Depth32Float | Format::Depth24PlusStencil8)
+    }
+}
+
+/// Axis-aligned rectangle, in pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rect {
+    pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min_depth: f32,
+    pub max_depth: f32,
+}
+
+impl Viewport {
+    /// Covers `(0, 0)..(width, height)`, depth `0.0..1.0`.
+    pub const fn new(width: f32, height: f32) -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }
     }
 }
 
