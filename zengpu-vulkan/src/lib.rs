@@ -12,6 +12,7 @@ pub use device::VulkanDevice;
 pub use instance::VulkanInstance;
 pub use swapchain::VulkanSwapchain;
 pub use swapchain_2d::{
-    CircleInstance, Frame2d, GradientInstance, RectInstance, Vulkan2dSurface,
+    CircleInstance, Frame2d, GradientInstance, IMAGE_SLOTS, ImageInstance, RectInstance,
+    Vulkan2dSurface,
 };
 pub use swapchain_textured::{BINDLESS_CAPACITY, VulkanTexturedSwapchain};
