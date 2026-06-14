@@ -10,8 +10,8 @@ use std::sync::Mutex;
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage,
-    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities,
-    Result, SlotMap, UsageError, marker,
+    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSurface,
+    HalCapabilities, Result, SlotMap, UsageError, WindowHandles, marker,
 };
 
 struct CpuBuffer {
@@ -163,6 +163,12 @@ impl GpuInstance for CpuInstance {
 
     fn request_adapter(&self, _req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
         Some(Box::new(CpuAdapter::new()))
+    }
+
+    fn create_surface(&self, _handles: &WindowHandles) -> Result<Box<dyn GpuSurface>> {
+        Err(GpuError::Backend(
+            "CPU backend does not support presentable surfaces".to_string(),
+        ))
     }
 }
 

@@ -8,6 +8,7 @@
 use crate::device::GpuDevice;
 use crate::error::Result;
 use crate::request::{AdapterRequest, DeviceRequest, HalCapabilities};
+use crate::surface::{GpuSurface, WindowHandles};
 use crate::types::BackendPreference;
 
 /// Physical device class reported by the driver.
@@ -54,8 +55,8 @@ pub trait GpuAdapter: Send + Sync {
     fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>>;
 }
 
-/// Entry-point for a backend: enumerates physical adapters and selects the best
-/// one for a given request.
+/// Entry-point for a backend: enumerates physical adapters, selects the best
+/// one for a given request, and creates presentable surfaces.
 ///
 /// `Send + Sync` — the instance can be created once and shared across threads.
 pub trait GpuInstance: Send + Sync {
@@ -66,6 +67,11 @@ pub trait GpuInstance: Send + Sync {
     /// then power preference, then enumeration order. Returns `None` when no
     /// adapter satisfies the request.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
+
+    /// Create a presentable surface from platform window handles (plan G2).
+    /// The window must outlive the surface.  Returns [`GpuError::Backend`] if
+    /// the backend does not support the platform (e.g. X11 handles on Windows).
+    fn create_surface(&self, handles: &WindowHandles) -> Result<Box<dyn GpuSurface>>;
 }
 
 #[cfg(test)]
