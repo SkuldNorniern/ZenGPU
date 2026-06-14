@@ -1,0 +1,16 @@
+[package]
+name = "zengpu-conformance"
+description = "ZenGPU conformance harness — validates backend correctness against the CPU oracle (plan D7 / M1.5)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
+
+[dev-dependencies]
+zengpu-cpu = { path = "../zengpu-cpu" }
+zengpu-vulkan = { path = "../zengpu-vulkan" }
