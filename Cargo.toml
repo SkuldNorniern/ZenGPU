@@ -27,9 +27,16 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
 zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
+inline-spirv = { version = "0.2", features = ["glsl"] }
 
 [lib]
 name = "zengpu"
 
 [dependencies]
 zengpu-hal.workspace = true
+
+[dev-dependencies]
+zengpu-vulkan.workspace = true
+inline-spirv.workspace = true
+winit = "0.30"
+ash = "0.38"
