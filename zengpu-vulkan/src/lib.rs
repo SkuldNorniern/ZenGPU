@@ -1,9 +1,9 @@
 //! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+ (plan D15).
 
-mod adapter;
-mod device;
-mod instance;
-mod swapchain;
+pub mod adapter;
+pub mod device;
+pub mod instance;
+pub mod swapchain;
 
 pub use adapter::VulkanAdapter;
 pub use device::VulkanDevice;
