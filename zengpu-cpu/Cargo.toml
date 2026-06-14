@@ -1,0 +1,12 @@
+[package]
+name = "zengpu-cpu"
+description = "ZenGPU CPU reference backend — the conformance oracle (plan D7), not a product fallback."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
