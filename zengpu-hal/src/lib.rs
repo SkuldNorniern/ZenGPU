@@ -17,9 +17,11 @@ mod command;
 mod desc;
 mod error;
 mod handle;
+mod request;
 mod types;
 
 pub use command::{Bindings, Scalar};
+pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
 
 pub use desc::{
     AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,
