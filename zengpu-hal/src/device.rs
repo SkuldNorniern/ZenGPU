@@ -3,9 +3,9 @@
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn GpuDevice>` and
 //! selected at runtime.
 
-use crate::desc::BufferDesc;
+use crate::desc::{BufferDesc, SamplerDesc, TextureDesc};
 use crate::error::Result;
-use crate::handle::BufferHandle;
+use crate::handle::{BufferHandle, SamplerHandle, TextureHandle};
 use crate::request::HalCapabilities;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker threads can allocate
@@ -27,4 +27,17 @@ pub trait GpuDevice: Send + Sync {
 
     /// A stale handle is a no-op.
     fn destroy_buffer(&self, buffer: BufferHandle);
+
+    fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle>;
+
+    /// Uploads pixel data to a texture. `data` must be tightly packed in the creation format (RGBA8
+    /// is 4 bytes per pixel). Blocks until the upload completes.
+    fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
+
+    /// Nothing may still reference the image, as with `destroy_buffer`. A stale handle is a no-op.
+    fn destroy_texture(&self, texture: TextureHandle);
+
+    fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle>;
+
+    fn destroy_sampler(&self, sampler: SamplerHandle);
 }
