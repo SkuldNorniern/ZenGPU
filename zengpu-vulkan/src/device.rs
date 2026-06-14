@@ -255,14 +255,14 @@ impl VulkanDevice {
         submit_result
     }
 
-    /// Raw image view for `handle` — used by [`crate::swapchain_textured`] to
-    /// bind a texture into the bindless descriptor set.
-    pub(crate) fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
+    /// Raw `vk::ImageView` for a HAL texture handle. For user-side pipelines that
+    /// need to bind textures into descriptor sets (e.g. bindless arrays).
+    pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
         self.textures.lock().unwrap().get(handle).map(|t| t.view)
     }
 
-    /// Raw sampler for `handle` — used by [`crate::swapchain_textured`].
-    pub(crate) fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
+    /// Raw `vk::Sampler` for a HAL sampler handle.
+    pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
         self.samplers.lock().unwrap().get(handle).map(|s| *s)
     }
 }

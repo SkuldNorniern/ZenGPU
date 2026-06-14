@@ -403,6 +403,76 @@ impl DeviceContext {
                 .get_physical_device_memory_properties(self.inner.physical)
         }
     }
+
+    /// Submit a one-shot command buffer — records work via `f`, then waits for
+    /// completion. Useful for staging uploads and layout transitions in user-side
+    /// surfaces that build on top of [`Swapchain`].
+    pub fn one_shot_submit<F>(&self, record: F) -> Result<()>
+    where
+        F: FnOnce(&ash::Device, vk::CommandBuffer) -> Result<()>,
+    {
+        let dev = &self.inner.device;
+        let pool = unsafe {
+            dev.create_command_pool(
+                &vk::CommandPoolCreateInfo {
+                    queue_family_index: self.inner.queue_family,
+                    flags: vk::CommandPoolCreateFlags::TRANSIENT,
+                    ..Default::default()
+                },
+                None,
+            )
+            .map_err(|e| GpuError::Backend(format!("one_shot create_command_pool: {e}")))?
+        };
+        let cmd = unsafe {
+            match dev.allocate_command_buffers(&vk::CommandBufferAllocateInfo {
+                command_pool: pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            }) {
+                Ok(v) => v[0],
+                Err(e) => {
+                    dev.destroy_command_pool(pool, None);
+                    return Err(GpuError::Backend(format!("one_shot allocate_command_buffers: {e}")));
+                }
+            }
+        };
+        if let Err(e) = unsafe {
+            dev.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo {
+                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                    ..Default::default()
+                },
+            )
+        } {
+            unsafe { dev.destroy_command_pool(pool, None) };
+            return Err(GpuError::Backend(format!("one_shot begin_command_buffer: {e}")));
+        }
+        let result = record(dev, cmd);
+        unsafe { let _ = dev.end_command_buffer(cmd); }
+        if let Err(e) = result {
+            unsafe { dev.destroy_command_pool(pool, None) };
+            return Err(e);
+        }
+        let submit_result = unsafe {
+            dev.queue_submit(
+                self.inner.queue,
+                &[vk::SubmitInfo {
+                    command_buffer_count: 1,
+                    p_command_buffers: &cmd,
+                    ..Default::default()
+                }],
+                vk::Fence::null(),
+            )
+            .map_err(|e| GpuError::Backend(format!("one_shot queue_submit: {e}")))
+        };
+        unsafe {
+            let _ = dev.device_wait_idle();
+            dev.destroy_command_pool(pool, None);
+        }
+        submit_result
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

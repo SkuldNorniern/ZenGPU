@@ -5,16 +5,14 @@ pub mod device;
 pub mod instance;
 pub mod swapchain;
 pub mod swapchain_2d;
-pub mod swapchain_textured;
-pub mod swapchain_triangle;
 
+pub use ash;
+pub use ash::vk;
 pub use adapter::VulkanAdapter;
 pub use device::VulkanDevice;
 pub use instance::VulkanInstance;
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
-pub use swapchain_triangle::VulkanSwapchain;
 pub use swapchain_2d::{
     CircleInstance, DrawRef, Frame2d, GradientInstance, IMAGE_SLOTS, ImageInstance, RectInstance,
     TextInstance, Vulkan2dSurface,
 };
-pub use swapchain_textured::{BINDLESS_CAPACITY, VulkanTexturedSwapchain};
