@@ -24,5 +24,5 @@ pub use handle::{
 };
 pub use types::{
     BackendPreference, BufferUsage, DType, Features, Format, MemoryUsage, PowerPreference,
-    PresentMode,
+    PresentMode, Rect, TextureUsage, Viewport,
 };

@@ -140,6 +140,51 @@ impl core::ops::BitOrAssign for Features {
     }
 }
 
+/// How a texture may be used. As with [`BufferUsage`], the validation layer
+/// checks that a texture carries the usage an operation needs.
+///
+/// A set of flags over a `u32`; compose with `|`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct TextureUsage(u32);
+
+impl TextureUsage {
+    pub const SAMPLED: Self = Self(1 << 0);
+    pub const STORAGE: Self = Self(1 << 1);
+    pub const RENDER_TARGET: Self = Self(1 << 2);
+    pub const DEPTH_STENCIL: Self = Self(1 << 3);
+    pub const TRANSFER_SRC: Self = Self(1 << 4);
+    pub const TRANSFER_DST: Self = Self(1 << 5);
+
+    /// The empty set.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+    /// The raw bits.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+    /// Whether `self` contains every flag in `other`.
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+    /// Whether no flags are set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::ops::BitOr for TextureUsage {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+impl core::ops::BitOrAssign for TextureUsage {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
 /// Numeric element type for device arrays (plan §13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
@@ -198,6 +243,48 @@ impl Format {
     /// Whether this format is a depth and/or stencil format.
     pub const fn is_depth_stencil(self) -> bool {
         matches!(self, Format::Depth32Float | Format::Depth24PlusStencil8)
+    }
+}
+
+/// An axis-aligned rectangle in pixels. Used for scissor/damage (plan §15).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Rect {
+    /// A rectangle from position and size.
+    pub const fn new(x: f32, y: f32, width: f32, height: f32) -> Self {
+        Self { x, y, width, height }
+    }
+}
+
+/// A rendering viewport, including the depth range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min_depth: f32,
+    pub max_depth: f32,
+}
+
+impl Viewport {
+    /// A viewport covering `(0, 0)..(width, height)` with a `0.0..1.0` depth
+    /// range.
+    pub const fn new(width: f32, height: f32) -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        }
     }
 }
 
