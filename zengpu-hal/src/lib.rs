@@ -7,10 +7,13 @@
 
 #![forbid(unsafe_code)]
 
+mod command;
 mod desc;
 mod error;
 mod handle;
 mod types;
+
+pub use command::{Bindings, Scalar};
 
 pub use desc::{
     AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,
