@@ -297,7 +297,7 @@ impl GpuSurface for VulkanSwapchain {
 }
 
 #[cfg(target_os = "windows")]
-fn create_platform_surface(
+pub(crate) fn create_platform_surface(
     shared: &VulkanShared,
     handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
@@ -328,7 +328,7 @@ fn create_platform_surface(
 }
 
 #[cfg(not(target_os = "windows"))]
-fn create_platform_surface(
+pub(crate) fn create_platform_surface(
     _shared: &VulkanShared,
     _handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
