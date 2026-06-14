@@ -5,9 +5,9 @@
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn
 //! GpuDevice>` and selected at runtime.
 
-use crate::desc::BufferDesc;
+use crate::desc::{BufferDesc, SamplerDesc, TextureDesc};
 use crate::error::Result;
-use crate::handle::BufferHandle;
+use crate::handle::{BufferHandle, SamplerHandle, TextureHandle};
 use crate::request::HalCapabilities;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
@@ -32,4 +32,26 @@ pub trait GpuDevice: Send + Sync {
 
     /// Destroy `buffer`, invalidating its handle. A stale handle is a no-op.
     fn destroy_buffer(&self, buffer: BufferHandle);
+
+    // ── Texture API (plan G3) ─────────────────────────────────────────────────
+
+    /// Allocate a GPU-resident texture. Data must be uploaded separately via
+    /// [`Self::upload_texture_data`].
+    fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle>;
+
+    /// Upload `data` to the texture.  `data` must be tightly packed pixels in
+    /// the format specified at creation (RGBA8 = 4 bytes per pixel).  Blocks
+    /// until the upload is complete (G3 scope; async path is plan D6).
+    fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
+
+    /// Destroy a texture, invalidating its handle. A stale handle is a no-op.
+    /// The caller must ensure no surface / pipeline is still referencing the
+    /// underlying image (the same contract as `destroy_buffer`).
+    fn destroy_texture(&self, texture: TextureHandle);
+
+    /// Create a texture sampler.
+    fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle>;
+
+    /// Destroy a sampler, invalidating its handle.
+    fn destroy_sampler(&self, sampler: SamplerHandle);
 }
