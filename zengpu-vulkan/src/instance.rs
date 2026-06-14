@@ -5,11 +5,13 @@ use std::sync::Arc;
 use ash::{Entry, Instance, vk};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuDevice, GpuError,
-    GpuInstance, GpuSurface, PowerPreference, SurfaceConfig, WindowHandles,
+    GpuInstance, GpuSurface, PowerPreference, SamplerHandle, SurfaceConfig, TextureHandle,
+    WindowHandles,
 };
 
 use crate::adapter::VulkanAdapter;
 use crate::swapchain::VulkanSwapchain;
+use crate::swapchain_textured::VulkanTexturedSwapchain;
 
 /// Shared ownership of the Vulkan loader and `VkInstance`.
 pub(crate) struct VulkanShared {
@@ -84,6 +86,36 @@ impl VulkanInstance {
     /// Instance with surface extensions enabled — required for presenting to windows.
     pub fn new_with_surface() -> zengpu_hal::Result<Self> {
         Self::create(true)
+    }
+
+    /// Create a surface that renders a fullscreen quad sampling from a bindless
+    /// texture array.  `texture` and `sampler` are registered at slot 0; all
+    /// other slots are pre-filled with a 1×1 white placeholder.
+    ///
+    /// The underlying texture and sampler must remain alive for the lifetime of
+    /// the returned surface.
+    pub fn create_textured_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &crate::device::VulkanDevice,
+        config: SurfaceConfig,
+        texture: TextureHandle,
+        sampler: SamplerHandle,
+    ) -> zengpu_hal::Result<Box<dyn GpuSurface>> {
+        if !self.has_surface {
+            return Err(GpuError::Backend(
+                "create_textured_surface requires VulkanInstance::new_with_surface()".to_string(),
+            ));
+        }
+        let sc = VulkanTexturedSwapchain::new(
+            Arc::clone(&self.shared),
+            device,
+            handles,
+            config,
+            texture,
+            sampler,
+        )?;
+        Ok(Box::new(sc))
     }
 
     /// Return the first available adapter as a concrete [`VulkanAdapter`], or
