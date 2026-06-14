@@ -11,6 +11,7 @@ use zengpu_hal::{
 
 use crate::adapter::VulkanAdapter;
 use crate::swapchain::VulkanSwapchain;
+use crate::swapchain_2d::Vulkan2dSurface;
 use crate::swapchain_textured::VulkanTexturedSwapchain;
 
 /// Shared ownership of the Vulkan loader and `VkInstance`.
@@ -116,6 +117,23 @@ impl VulkanInstance {
             sampler,
         )?;
         Ok(Box::new(sc))
+    }
+
+    /// Create a surface that paints batches of instanced solid-colour
+    /// rectangles (aurea's 2D path, G4 / Rung 1).  Call
+    /// [`Vulkan2dSurface::present`] each frame with the clear colour and rects.
+    pub fn create_2d_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &crate::device::VulkanDevice,
+        config: SurfaceConfig,
+    ) -> zengpu_hal::Result<Vulkan2dSurface> {
+        if !self.has_surface {
+            return Err(GpuError::Backend(
+                "create_2d_surface requires VulkanInstance::new_with_surface()".to_string(),
+            ));
+        }
+        Vulkan2dSurface::new(Arc::clone(&self.shared), device, handles, config)
     }
 
     /// Return the first available adapter as a concrete [`VulkanAdapter`], or
