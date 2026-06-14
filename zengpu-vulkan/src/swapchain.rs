@@ -340,14 +340,79 @@ pub(crate) fn create_platform_surface(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+pub(crate) fn create_platform_surface(
+    shared: &VulkanShared,
+    handles: &zengpu_hal::WindowHandles,
+) -> Result<vk::SurfaceKHR> {
+    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
+    match (handles.window, handles.display) {
+        (RawWindowHandle::Xcb(window), RawDisplayHandle::Xcb(display)) => {
+            let connection = display.connection.ok_or_else(|| {
+                GpuError::Backend("XCB display handle has no connection".to_string())
+            })?;
+            let loader = khr::xcb_surface::Instance::new(&shared.entry, &shared.instance);
+            let create_info = vk::XcbSurfaceCreateInfoKHR {
+                connection: connection.as_ptr(),
+                window: window.window.get(),
+                ..Default::default()
+            };
+            unsafe {
+                loader
+                    .create_xcb_surface(&create_info, None)
+                    .map_err(|e| GpuError::Backend(format!("vkCreateXcbSurfaceKHR: {e}")))
+            }
+        }
+        (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) => {
+            let loader = khr::wayland_surface::Instance::new(&shared.entry, &shared.instance);
+            let create_info = vk::WaylandSurfaceCreateInfoKHR {
+                display: display.display.as_ptr(),
+                surface: window.surface.as_ptr(),
+                ..Default::default()
+            };
+            unsafe {
+                loader
+                    .create_wayland_surface(&create_info, None)
+                    .map_err(|e| GpuError::Backend(format!("vkCreateWaylandSurfaceKHR: {e}")))
+            }
+        }
+        _ => Err(GpuError::Backend(
+            "expected matching XCB or Wayland window/display handles on Linux".to_string(),
+        )),
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn create_platform_surface(
+    shared: &VulkanShared,
+    handles: &zengpu_hal::WindowHandles,
+) -> Result<vk::SurfaceKHR> {
+    use raw_window_handle::RawWindowHandle;
+
+    let RawWindowHandle::AppKit(appkit) = handles.window else {
+        return Err(GpuError::Backend(
+            "expected AppKit window handle on macOS".to_string(),
+        ));
+    };
+    let loader = ash::mvk::macos_surface::Instance::new(&shared.entry, &shared.instance);
+    let create_info = vk::MacOSSurfaceCreateInfoMVK {
+        p_view: appkit.ns_view.as_ptr(),
+        ..Default::default()
+    };
+    unsafe {
+        loader
+            .create_mac_os_surface(&create_info, None)
+            .map_err(|e| GpuError::Backend(format!("vkCreateMacOSSurfaceMVK: {e}")))
+    }
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub(crate) fn create_platform_surface(
     _shared: &VulkanShared,
     _handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
-    Err(GpuError::Backend(
-        "surface creation not yet implemented for this platform".to_string(),
-    ))
+    Err(GpuError::Backend("unsupported surface platform".to_string()))
 }
 
 fn create_swapchain(

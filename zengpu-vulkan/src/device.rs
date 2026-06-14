@@ -73,6 +73,22 @@ impl VulkanDevice {
         _req: DeviceRequest,
         extra_extensions: &[*const i8],
     ) -> Result<Self> {
+        let mut extensions = extra_extensions.to_vec();
+        let supports_portability = unsafe {
+            shared
+                .instance
+                .enumerate_device_extension_properties(physical)
+        }
+        .is_ok_and(|available| {
+            available.iter().any(|extension| unsafe {
+                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr())
+                    == ash::khr::portability_subset::NAME
+            })
+        });
+        if supports_portability {
+            extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+
         let queue_family = compute_queue_family(&shared.instance, physical)
             .ok_or_else(|| GpuError::Backend("no compute queue family".to_string()))?;
 
@@ -96,11 +112,11 @@ impl VulkanDevice {
         let device_create_info = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
-            enabled_extension_count: extra_extensions.len() as u32,
-            pp_enabled_extension_names: if extra_extensions.is_empty() {
+            enabled_extension_count: extensions.len() as u32,
+            pp_enabled_extension_names: if extensions.is_empty() {
                 std::ptr::null()
             } else {
-                extra_extensions.as_ptr()
+                extensions.as_ptr()
             },
             p_enabled_features: &features,
             ..Default::default()

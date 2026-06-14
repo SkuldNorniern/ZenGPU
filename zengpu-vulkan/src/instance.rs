@@ -46,17 +46,60 @@ impl VulkanInstance {
         };
 
         let mut ext_names: Vec<*const i8> = Vec::new();
+        #[cfg(target_os = "macos")]
+        let mut flags = vk::InstanceCreateFlags::empty();
+        #[cfg(not(target_os = "macos"))]
+        let flags = vk::InstanceCreateFlags::empty();
         if surface_extensions {
-            ext_names.push(ash::khr::surface::NAME.as_ptr());
+            let available = unsafe { entry.enumerate_instance_extension_properties(None) }
+                .map_err(|e| GpuError::Backend(format!("enumerate instance extensions: {e}")))?;
+            let supports = |name: &std::ffi::CStr| {
+                available.iter().any(|extension| unsafe {
+                    std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
+                })
+            };
+            let mut require = |name: &'static std::ffi::CStr| -> zengpu_hal::Result<()> {
+                if !supports(name) {
+                    return Err(GpuError::Backend(format!(
+                        "required Vulkan instance extension is unavailable: {}",
+                        name.to_string_lossy()
+                    )));
+                }
+                ext_names.push(name.as_ptr());
+                Ok(())
+            };
+
+            require(ash::khr::surface::NAME)?;
             #[cfg(target_os = "windows")]
-            ext_names.push(ash::khr::win32_surface::NAME.as_ptr());
+            require(ash::khr::win32_surface::NAME)?;
             #[cfg(target_os = "linux")]
-            ext_names.push(ash::khr::xlib_surface::NAME.as_ptr());
+            {
+                if supports(ash::khr::xcb_surface::NAME) {
+                    ext_names.push(ash::khr::xcb_surface::NAME.as_ptr());
+                }
+                if supports(ash::khr::wayland_surface::NAME) {
+                    ext_names.push(ash::khr::wayland_surface::NAME.as_ptr());
+                }
+                if !supports(ash::khr::xcb_surface::NAME)
+                    && !supports(ash::khr::wayland_surface::NAME)
+                {
+                    return Err(GpuError::Backend(
+                        "Vulkan loader supports neither XCB nor Wayland surfaces".to_string(),
+                    ));
+                }
+            }
             #[cfg(target_os = "macos")]
-            ext_names.push(ash::mvk::macos_surface::NAME.as_ptr());
+            {
+                require(ash::mvk::macos_surface::NAME)?;
+                if supports(ash::khr::portability_enumeration::NAME) {
+                    ext_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+                    flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
+                }
+            }
         }
 
         let create_info = vk::InstanceCreateInfo {
+            flags,
             p_application_info: &app_info,
             enabled_extension_count: ext_names.len() as u32,
             pp_enabled_extension_names: if ext_names.is_empty() {
