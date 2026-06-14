@@ -252,13 +252,12 @@ impl VulkanDevice {
         submit_result
     }
 
-    /// Returns the raw image view for `handle`, for bindless binding in
-    /// [`crate::swapchain_textured`].
-    pub(crate) fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
+    /// Returns the raw `vk::ImageView` for a texture handle, for user-side descriptor sets.
+    pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
         self.textures.lock().unwrap().get(handle).map(|t| t.view)
     }
 
-    pub(crate) fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
+    pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
         self.samplers.lock().unwrap().get(handle).map(|s| *s)
     }
 }
