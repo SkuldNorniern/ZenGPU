@@ -82,6 +82,35 @@ impl VulkanInstance {
     pub fn new_with_surface() -> zengpu_hal::Result<Self> {
         Self::create(true)
     }
+
+    /// First adapter as a concrete [`VulkanAdapter`], or `None`.
+    ///
+    /// Use over [`GpuInstance::enumerate_adapters`] for [`VulkanAdapter::open_with_surface`], which
+    /// is not on the trait object.
+    pub fn request_vulkan_adapter(&self) -> Option<VulkanAdapter> {
+        let physicals = unsafe {
+            self.shared.instance.enumerate_physical_devices().unwrap_or_default()
+        };
+        physicals.into_iter().next().map(|phys| {
+            let props = unsafe { self.shared.instance.get_physical_device_properties(phys) };
+            let name = unsafe {
+                std::ffi::CStr::from_ptr(props.device_name.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            VulkanAdapter::new(
+                Arc::clone(&self.shared),
+                phys,
+                AdapterInfo {
+                    name,
+                    vendor: props.vendor_id,
+                    device: props.device_id,
+                    device_type: vk_device_type(props.device_type),
+                    backend: BackendPreference::Vulkan,
+                },
+            )
+        })
+    }
 }
 
 fn vk_device_type(t: vk::PhysicalDeviceType) -> DeviceType {
