@@ -158,6 +158,20 @@ impl<K, V> SlotMap<K, V> {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Remove and yield all live values in slot order.  After draining, the
+    /// map is empty and all previously valid handles are stale.  Useful for
+    /// deterministic cleanup in `Drop` implementations.
+    pub fn drain(&mut self) -> impl Iterator<Item = V> + '_ {
+        // Reset free list to cover every slot so len() == 0 after draining.
+        self.free.clear();
+        self.free.extend(0..self.slots.len() as u32);
+        self.slots.iter_mut().filter_map(|slot| {
+            let value = slot.value.take()?;
+            slot.generation = slot.generation.wrapping_add(1);
+            Some(value)
+        })
+    }
 }
 
 impl<K, V> Default for SlotMap<K, V> {
@@ -254,5 +268,17 @@ mod tests {
         map.remove(h);
         assert_eq!(map.generation_at(h.index()), Some(1)); // bumped on free
         assert_eq!(map.generation_at(999), None); // out of range
+    }
+
+    #[test]
+    fn drain_removes_all_and_invalidates_handles() {
+        let mut map = Map::new();
+        let h0 = map.insert(10);
+        let h1 = map.insert(20);
+        map.remove(h0); // h0 slot is free before drain
+        let drained: Vec<_> = map.drain().collect();
+        assert_eq!(drained, vec![20]); // only h1 was live
+        assert!(map.is_empty());
+        assert_eq!(map.get(h1), None); // h1 is now stale
     }
 }
