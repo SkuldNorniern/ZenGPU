@@ -9,7 +9,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use ash::vk;
+use zengpu_vulkan::{ash, vk};
 use inline_spirv::inline_spirv;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;

@@ -39,4 +39,3 @@ zengpu-hal.workspace = true
 zengpu-vulkan.workspace = true
 inline-spirv.workspace = true
 winit = "0.30"
-ash = "0.38"
