@@ -15,12 +15,14 @@
 
 mod command;
 mod desc;
+mod device;
 mod error;
 mod handle;
 mod request;
 mod types;
 
 pub use command::{Bindings, Scalar};
+pub use device::GpuDevice;
 pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
 
 pub use desc::{
