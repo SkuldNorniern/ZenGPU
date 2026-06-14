@@ -10,7 +10,7 @@ use zengpu_hal::{
 };
 
 use crate::adapter::VulkanAdapter;
-use crate::swapchain::VulkanSwapchain;
+use crate::swapchain_triangle::VulkanSwapchain;
 use crate::swapchain_2d::Vulkan2dSurface;
 use crate::swapchain_textured::VulkanTexturedSwapchain;
 
