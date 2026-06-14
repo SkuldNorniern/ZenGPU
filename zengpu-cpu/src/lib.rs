@@ -9,8 +9,9 @@
 use std::sync::Mutex;
 
 use zengpu_hal::{
-    BufferDesc, BufferHandle, BufferUsage, GpuDevice, GpuError, HalCapabilities, Result, SlotMap,
-    UsageError, marker,
+    AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage,
+    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities,
+    Result, SlotMap, UsageError, marker,
 };
 
 struct CpuBuffer {
@@ -112,6 +113,59 @@ impl GpuDevice for CpuDevice {
     }
 }
 
+/// A CPU adapter — wraps the single CPU entry in the HAL adapter chain.
+pub struct CpuAdapter {
+    info: AdapterInfo,
+}
+
+impl CpuAdapter {
+    pub fn new() -> Self {
+        Self {
+            info: AdapterInfo {
+                name: "ZenGPU CPU Reference".to_string(),
+                vendor: 0,
+                device: 0,
+                device_type: DeviceType::Cpu,
+                backend: BackendPreference::Cpu,
+            },
+        }
+    }
+}
+
+impl Default for CpuAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GpuAdapter for CpuAdapter {
+    fn info(&self) -> &AdapterInfo {
+        &self.info
+    }
+
+    fn capabilities(&self) -> HalCapabilities {
+        HalCapabilities::compute_only()
+    }
+
+    fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
+        Ok(Box::new(CpuDevice::new()))
+    }
+}
+
+/// Instance for the CPU backend — always available, always returns the single
+/// CPU adapter regardless of the adapter request.
+pub struct CpuInstance;
+
+impl GpuInstance for CpuInstance {
+    fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>> {
+        vec![Box::new(CpuAdapter::new())]
+    }
+
+    fn request_adapter(&self, _req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
+        Some(Box::new(CpuAdapter::new()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +246,33 @@ mod tests {
         let h = dev.create_buffer(rw_desc(2)).unwrap();
         dev.write_buffer(h, 0, &[9, 8]).unwrap();
         assert_eq!(dev.read_buffer(h, 0, 2).unwrap(), vec![9, 8]);
+    }
+
+    #[test]
+    fn adapter_opens_cpu_device() {
+        let adapter = CpuAdapter::new();
+        assert_eq!(adapter.info().name, "ZenGPU CPU Reference");
+        assert!(!adapter.capabilities().graphics);
+        assert!(adapter.capabilities().compute);
+        let dev = adapter.open(DeviceRequest::default()).unwrap();
+        let h = dev.create_buffer(rw_desc(4)).unwrap();
+        dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn instance_enumerates_one_adapter() {
+        let inst = CpuInstance;
+        let adapters = inst.enumerate_adapters();
+        assert_eq!(adapters.len(), 1);
+        assert_eq!(adapters[0].info().name, "ZenGPU CPU Reference");
+    }
+
+    #[test]
+    fn instance_request_adapter_always_returns_cpu() {
+        let inst = CpuInstance;
+        let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
+        let dev = adapter.open(DeviceRequest::default()).unwrap();
+        assert!(dev.capabilities().compute);
     }
 }
