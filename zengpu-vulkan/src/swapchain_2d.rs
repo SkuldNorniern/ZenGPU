@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use ash::{khr, vk};
 use inline_spirv::inline_spirv;
-use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
+use zengpu_hal::{GpuError, PresentMode, Result, SamplerHandle, SurfaceError, TextureHandle};
 
 use crate::device::VulkanDeviceInner;
 use crate::instance::VulkanShared;
@@ -70,15 +70,31 @@ pub struct GradientInstance {
     pub color1: [f32; 4],
 }
 
+/// One textured image quad. `rect` is the dest `[x, y, w, h]` in physical
+/// pixels; `uv` is the source region `[u0, v0, u1, v1]` (normalised); `tint` is
+/// a straight-RGBA multiply; `slot` selects the bindless texture (read CPU-side
+/// for the per-draw push constant — the GPU ignores the `slot`/`_pad` tail).
+/// 64-byte `#[repr(C)]`.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ImageInstance {
+    pub rect: [f32; 4],
+    pub uv: [f32; 4],
+    pub tint: [f32; 4],
+    pub slot: u32,
+    pub _pad: [u32; 3],
+}
+
 /// One frame's 2D primitives to draw. Within a primitive kind the order is
 /// back-to-front (painter's algorithm); across kinds the draw order is fixed
-/// (rects, gradients, circles), so cross-kind z-order is not yet preserved —
-/// true interleaving is a scene-graph concern. Borrows the instance slices.
+/// (rects, gradients, images, circles), so cross-kind z-order is not yet
+/// preserved — true interleaving is a scene-graph concern. Borrows the slices.
 #[derive(Default, Clone, Copy)]
 pub struct Frame2d<'a> {
     pub clear: Option<[f32; 4]>,
     pub rects: &'a [RectInstance],
     pub gradients: &'a [GradientInstance],
+    pub images: &'a [ImageInstance],
     pub circles: &'a [CircleInstance],
 }
 
@@ -87,6 +103,11 @@ const INSTANCE_SIZE: usize = std::mem::size_of::<RectInstance>();
 const _: () = assert!(std::mem::size_of::<CircleInstance>() == INSTANCE_SIZE);
 const GRADIENT_SIZE: usize = std::mem::size_of::<GradientInstance>();
 const _: () = assert!(GRADIENT_SIZE == 80);
+const IMAGE_SIZE: usize = std::mem::size_of::<ImageInstance>();
+const _: () = assert!(IMAGE_SIZE == 64);
+
+/// Bindless texture-array capacity (must match the image fragment shader).
+pub const IMAGE_SLOTS: u32 = 64;
 
 // ── Compiled shaders ──────────────────────────────────────────────────────────
 
@@ -224,6 +245,50 @@ const GRADIENT_FRAG_SPV: &[u32] = inline_spirv!(
             t = length(v_px - v_a.xy) / max(v_a.z, 1e-6);
         }
         o_color = mix(v_c0, v_c1, clamp(t, 0.0, 1.0));
+    }
+    "#,
+    frag,
+    vulkan1_0
+);
+
+// Image: textured quad sampling a bindless slot (uniform per draw via push
+// constant). `viewport` (vertex) and `slot` (fragment) share one push block.
+const IMAGE_VERT_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec4 i_rect;   // dest x, y, w, h (px)
+    layout(location = 1) in vec4 i_uv;     // u0, v0, u1, v1
+    layout(location = 2) in vec4 i_tint;
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
+    layout(location = 0) out vec2 v_uv;
+    layout(location = 1) out vec4 v_tint;
+    void main() {
+        vec2 corners[6] = vec2[](
+            vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+            vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)
+        );
+        vec2 corner = corners[gl_VertexIndex];
+        vec2 px = i_rect.xy + corner * i_rect.zw;
+        v_uv = mix(i_uv.xy, i_uv.zw, corner);
+        v_tint = i_tint;
+        vec2 ndc = (px / pc.viewport) * 2.0 - 1.0;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+    }
+    "#,
+    vert,
+    vulkan1_0
+);
+
+const IMAGE_FRAG_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(set = 0, binding = 0) uniform sampler2D textures[64];
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
+    layout(location = 0) in vec2 v_uv;
+    layout(location = 1) in vec4 v_tint;
+    layout(location = 0) out vec4 o_color;
+    void main() {
+        o_color = texture(textures[pc.slot], v_uv) * v_tint;
     }
     "#,
     frag,
@@ -410,6 +475,13 @@ pub struct Vulkan2dSurface {
     rect_pipeline: vk::Pipeline,
     circle_pipeline: vk::Pipeline,
     gradient_pipeline: vk::Pipeline,
+    // Images use a separate layout (bindless texture set + vertex/fragment push).
+    image_pipeline_layout: vk::PipelineLayout,
+    image_pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_set: vk::DescriptorSet,
+    placeholder: Placeholder,
     cmd_pool: vk::CommandPool,
     /// One command buffer per frame-in-flight (re-recorded each present).
     cmd_buffers: Vec<vk::CommandBuffer>,
@@ -417,6 +489,7 @@ pub struct Vulkan2dSurface {
     rect_buffers: Vec<Mutex<InstanceBuffer>>,
     circle_buffers: Vec<Mutex<InstanceBuffer>>,
     gradient_buffers: Vec<Mutex<InstanceBuffer>>,
+    image_buffers: Vec<Mutex<InstanceBuffer>>,
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
@@ -503,18 +576,38 @@ impl Vulkan2dSurface {
             5,
         )?;
 
+        // Bindless image path: descriptor set (64 slots), placeholder fill,
+        // and a dedicated pipeline/layout.
+        let (descriptor_pool, descriptor_set_layout, descriptor_set) =
+            create_bindless_descriptors(&inner.device)?;
+        let placeholder = create_placeholder(device)?;
+        fill_bindless_slots(&inner.device, descriptor_set, placeholder.view, placeholder.sampler);
+        let image_pipeline_layout =
+            create_image_pipeline_layout(&inner.device, descriptor_set_layout)?;
+        let image_pipeline = create_pipeline(
+            &inner.device,
+            image_pipeline_layout,
+            render_pass,
+            IMAGE_VERT_SPV,
+            IMAGE_FRAG_SPV,
+            IMAGE_SIZE as u32,
+            3,
+        )?;
+
         let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
         let cmd_buffers = allocate_cmd_buffers(&inner.device, cmd_pool, MAX_FRAMES_IN_FLIGHT)?;
 
         let mut rect_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut circle_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut gradient_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut image_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
             circle_buffers
                 .push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
             gradient_buffers
                 .push(Mutex::new(InstanceBuffer::new(&inner, GRADIENT_SIZE, INITIAL_RECTS)?));
+            image_buffers.push(Mutex::new(InstanceBuffer::new(&inner, IMAGE_SIZE, INITIAL_RECTS)?));
         }
 
         let (image_available, render_finished, in_flight) =
@@ -530,11 +623,18 @@ impl Vulkan2dSurface {
             rect_pipeline,
             circle_pipeline,
             gradient_pipeline,
+            image_pipeline_layout,
+            image_pipeline,
+            descriptor_pool,
+            descriptor_set_layout,
+            descriptor_set,
+            placeholder,
             cmd_pool,
             cmd_buffers,
             rect_buffers,
             circle_buffers,
             gradient_buffers,
+            image_buffers,
             image_available,
             render_finished,
             in_flight,
@@ -567,6 +667,40 @@ impl Vulkan2dSurface {
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         let mut res = self.resources.lock().unwrap();
         self.recreate(&mut res, width, height)
+    }
+
+    /// Bindless slot capacity for image textures.
+    pub fn image_slot_capacity(&self) -> u32 {
+        IMAGE_SLOTS
+    }
+
+    /// Bind `texture`/`sampler` (live handles in `device`) into bindless `slot`
+    /// (`< image_slot_capacity()`). Waits for the device to idle first so no
+    /// in-flight frame references the old descriptor — cache misses are rare, so
+    /// this is acceptable (UPDATE_AFTER_BIND is a later optimisation).
+    pub fn set_image_slot(
+        &self,
+        device: &crate::device::VulkanDevice,
+        slot: u32,
+        texture: TextureHandle,
+        sampler: SamplerHandle,
+    ) -> Result<()> {
+        if slot >= IMAGE_SLOTS {
+            return Err(GpuError::Backend(format!(
+                "image slot {slot} out of range (capacity {IMAGE_SLOTS})"
+            )));
+        }
+        let view = device
+            .texture_view(texture)
+            .ok_or_else(|| GpuError::Backend("set_image_slot: stale TextureHandle".to_string()))?;
+        let samp = device
+            .sampler_vk(sampler)
+            .ok_or_else(|| GpuError::Backend("set_image_slot: stale SamplerHandle".to_string()))?;
+        unsafe {
+            let _ = self.inner.device.device_wait_idle();
+        }
+        update_bindless_slot(&self.inner.device, self.descriptor_set, slot, view, samp);
+        Ok(())
     }
 
     /// Draw `frame`'s primitives (clear, then rects, then circles) and present.
@@ -631,6 +765,12 @@ impl Vulkan2dSurface {
             ib.upload_bytes(frame.gradients);
             ib.buffer
         };
+        let image_buf = {
+            let mut ib = self.image_buffers[current].lock().unwrap();
+            ib.ensure_capacity(&self.inner, frame.images.len())?;
+            ib.upload_bytes(frame.images);
+            ib.buffer
+        };
 
         let cmd = self.cmd_buffers[current];
         self.record(
@@ -638,7 +778,7 @@ impl Vulkan2dSurface {
             res.framebuffers[image_index as usize],
             res.extent,
             &frame,
-            [rect_buf, gradient_buf, circle_buf],
+            [rect_buf, gradient_buf, image_buf, circle_buf],
         )?;
 
         let wait_semaphores = [self.image_available[current]];
@@ -727,7 +867,7 @@ impl Vulkan2dSurface {
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
         frame: &Frame2d,
-        bufs: [vk::Buffer; 3], // [rect, gradient, circle]
+        bufs: [vk::Buffer; 4], // [rect, gradient, image, circle]
     ) -> Result<()> {
         let dev = &self.inner.device;
         unsafe {
@@ -780,9 +920,9 @@ impl Vulkan2dSurface {
                 std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
             );
 
-            let [rect_buf, gradient_buf, circle_buf] = bufs;
-            // Fixed per-kind order: rects (backgrounds/panels), then gradient
-            // fills, then circles on top. See Frame2d note on cross-kind z-order.
+            let [rect_buf, gradient_buf, image_buf, circle_buf] = bufs;
+            // Fixed per-kind order: rects (backgrounds/panels), gradient fills,
+            // images, then circles on top. See Frame2d note on cross-kind z-order.
             if !frame.rects.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rect_pipeline);
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
@@ -792,6 +932,37 @@ impl Vulkan2dSurface {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gradient_pipeline);
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[gradient_buf], &[0]);
                 dev.cmd_draw(cmd, 6, frame.gradients.len() as u32, 0, 0);
+            }
+            if !frame.images.is_empty() {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.image_pipeline);
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.image_pipeline_layout,
+                    0,
+                    &[self.descriptor_set],
+                    &[],
+                );
+                // Viewport push (vertex, offset 0) for the image layout.
+                dev.cmd_push_constants(
+                    cmd,
+                    self.image_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
+                );
+                dev.cmd_bind_vertex_buffers(cmd, 0, &[image_buf], &[0]);
+                // Per-image draw: slot is a uniform-per-draw fragment push.
+                for (i, img) in frame.images.iter().enumerate() {
+                    dev.cmd_push_constants(
+                        cmd,
+                        self.image_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        8,
+                        &img.slot.to_ne_bytes(),
+                    );
+                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
+                }
             }
             if !frame.circles.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.circle_pipeline);
@@ -817,6 +988,7 @@ impl Drop for Vulkan2dSurface {
             .iter()
             .chain(&self.circle_buffers)
             .chain(&self.gradient_buffers)
+            .chain(&self.image_buffers)
         {
             ib.lock().unwrap().destroy(&self.inner);
         }
@@ -833,7 +1005,12 @@ impl Drop for Vulkan2dSurface {
             dev.destroy_pipeline(self.rect_pipeline, None);
             dev.destroy_pipeline(self.circle_pipeline, None);
             dev.destroy_pipeline(self.gradient_pipeline, None);
+            dev.destroy_pipeline(self.image_pipeline, None);
+            dev.destroy_pipeline_layout(self.image_pipeline_layout, None);
             dev.destroy_pipeline_layout(self.pipeline_layout, None);
+            dev.destroy_descriptor_pool(self.descriptor_pool, None);
+            dev.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            self.placeholder.destroy(dev);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.cmd_pool, None);
             for i in 0..MAX_FRAMES_IN_FLIGHT {
@@ -1265,6 +1442,342 @@ fn create_pipeline(
         device.destroy_shader_module(frag, None);
     }
     Ok(pipeline)
+}
+
+// ── Bindless image helpers ──────────────────────────────────────────────────
+
+/// 1×1 white texture filling unused bindless slots so every slot is valid.
+struct Placeholder {
+    image: vk::Image,
+    view: vk::ImageView,
+    memory: vk::DeviceMemory,
+    sampler: vk::Sampler,
+}
+
+unsafe impl Send for Placeholder {}
+unsafe impl Sync for Placeholder {}
+
+impl Placeholder {
+    fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+fn create_placeholder(device: &crate::device::VulkanDevice) -> Result<Placeholder> {
+    let dev = &device.inner.device;
+    let image = unsafe {
+        dev.create_image(
+            &vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                format: vk::Format::R8G8B8A8_UNORM,
+                extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+                mip_levels: 1,
+                array_layers: 1,
+                samples: vk::SampleCountFlags::TYPE_1,
+                tiling: vk::ImageTiling::OPTIMAL,
+                usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                sharing_mode: vk::SharingMode::EXCLUSIVE,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| GpuError::Backend(format!("placeholder image: {e}")))?
+    };
+    let reqs = unsafe { dev.get_image_memory_requirements(image) };
+    let mem_props = unsafe {
+        device
+            .inner
+            .shared
+            .instance
+            .get_physical_device_memory_properties(device.inner.physical)
+    };
+    let type_index = (0..mem_props.memory_type_count)
+        .find(|&i| {
+            reqs.memory_type_bits & (1 << i) != 0
+                && mem_props.memory_types[i as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        })
+        .ok_or_else(|| {
+            unsafe { dev.destroy_image(image, None) };
+            GpuError::Backend("no device-local memory for placeholder".to_string())
+        })?;
+    let memory = unsafe {
+        dev.allocate_memory(
+            &vk::MemoryAllocateInfo {
+                allocation_size: reqs.size,
+                memory_type_index: type_index,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|_| {
+            dev.destroy_image(image, None);
+            GpuError::Backend("placeholder OOM".to_string())
+        })?
+    };
+    unsafe {
+        dev.bind_image_memory(image, memory, 0).map_err(|e| {
+            dev.destroy_image(image, None);
+            dev.free_memory(memory, None);
+            GpuError::Backend(format!("placeholder bind: {e}"))
+        })?;
+    }
+    let view = unsafe {
+        dev.create_image_view(
+            &vk::ImageViewCreateInfo {
+                image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: vk::Format::R8G8B8A8_UNORM,
+                subresource_range: COLOR_SUBRESOURCE,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| {
+            dev.destroy_image(image, None);
+            dev.free_memory(memory, None);
+            GpuError::Backend(format!("placeholder view: {e}"))
+        })?
+    };
+    let sampler = unsafe {
+        dev.create_sampler(
+            &vk::SamplerCreateInfo {
+                mag_filter: vk::Filter::NEAREST,
+                min_filter: vk::Filter::NEAREST,
+                address_mode_u: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_v: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                address_mode_w: vk::SamplerAddressMode::CLAMP_TO_EDGE,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| {
+            dev.destroy_image_view(view, None);
+            dev.destroy_image(image, None);
+            dev.free_memory(memory, None);
+            GpuError::Backend(format!("placeholder sampler: {e}"))
+        })?
+    };
+
+    device.one_shot_submit(|dev, cmd| {
+        unsafe {
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[layout_barrier(
+                    image,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                )],
+            );
+            dev.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
+                &[COLOR_SUBRESOURCE],
+            );
+            dev.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[layout_barrier(
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                )],
+            );
+        }
+        Ok(())
+    })?;
+
+    Ok(Placeholder { image, view, memory, sampler })
+}
+
+const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+    aspect_mask: vk::ImageAspectFlags::COLOR,
+    base_mip_level: 0,
+    level_count: 1,
+    base_array_layer: 0,
+    layer_count: 1,
+};
+
+fn layout_barrier(
+    image: vk::Image,
+    old: vk::ImageLayout,
+    new: vk::ImageLayout,
+    src: vk::AccessFlags,
+    dst: vk::AccessFlags,
+) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier {
+        old_layout: old,
+        new_layout: new,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: COLOR_SUBRESOURCE,
+        src_access_mask: src,
+        dst_access_mask: dst,
+        ..Default::default()
+    }
+}
+
+fn create_bindless_descriptors(
+    device: &ash::Device,
+) -> Result<(vk::DescriptorPool, vk::DescriptorSetLayout, vk::DescriptorSet)> {
+    let binding = vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: IMAGE_SLOTS,
+        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        ..Default::default()
+    };
+    let layout = unsafe {
+        device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo {
+                    binding_count: 1,
+                    p_bindings: &binding,
+                    ..Default::default()
+                },
+                None,
+            )
+            .map_err(|e| GpuError::Backend(format!("descriptor set layout: {e}")))?
+    };
+    let pool_size = vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: IMAGE_SLOTS,
+    };
+    let pool = unsafe {
+        device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo {
+                    max_sets: 1,
+                    pool_size_count: 1,
+                    p_pool_sizes: &pool_size,
+                    ..Default::default()
+                },
+                None,
+            )
+            .map_err(|e| {
+                device.destroy_descriptor_set_layout(layout, None);
+                GpuError::Backend(format!("descriptor pool: {e}"))
+            })?
+    };
+    let set = unsafe {
+        device
+            .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
+                descriptor_pool: pool,
+                descriptor_set_count: 1,
+                p_set_layouts: &layout,
+                ..Default::default()
+            })
+            .map_err(|e| {
+                device.destroy_descriptor_pool(pool, None);
+                device.destroy_descriptor_set_layout(layout, None);
+                GpuError::Backend(format!("allocate descriptor set: {e}"))
+            })?[0]
+    };
+    Ok((pool, layout, set))
+}
+
+fn fill_bindless_slots(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) {
+    let infos: Vec<vk::DescriptorImageInfo> = (0..IMAGE_SLOTS)
+        .map(|_| vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        })
+        .collect();
+    let write = vk::WriteDescriptorSet {
+        dst_set: set,
+        dst_binding: 0,
+        dst_array_element: 0,
+        descriptor_count: IMAGE_SLOTS,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        p_image_info: infos.as_ptr(),
+        ..Default::default()
+    };
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+fn update_bindless_slot(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    slot: u32,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) {
+    let info = vk::DescriptorImageInfo {
+        sampler,
+        image_view: view,
+        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    };
+    let write = vk::WriteDescriptorSet {
+        dst_set: set,
+        dst_binding: 0,
+        dst_array_element: slot,
+        descriptor_count: 1,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        p_image_info: &info,
+        ..Default::default()
+    };
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+}
+
+/// Image pipeline layout: bindless set 0 + a push block of `vec2 viewport`
+/// (vertex) followed by `uint slot` (fragment).
+fn create_image_pipeline_layout(
+    device: &ash::Device,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<vk::PipelineLayout> {
+    let ranges = [
+        vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            offset: 0,
+            size: 8,
+        },
+        vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            offset: 8,
+            size: 4,
+        },
+    ];
+    let info = vk::PipelineLayoutCreateInfo {
+        set_layout_count: 1,
+        p_set_layouts: &set_layout,
+        push_constant_range_count: ranges.len() as u32,
+        p_push_constant_ranges: ranges.as_ptr(),
+        ..Default::default()
+    };
+    unsafe {
+        device
+            .create_pipeline_layout(&info, None)
+            .map_err(|e| GpuError::Backend(format!("image pipeline layout: {e}")))
+    }
 }
 
 fn create_command_pool(device: &ash::Device, queue_family: u32) -> Result<vk::CommandPool> {
