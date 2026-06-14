@@ -14,7 +14,7 @@ readme = "README.md"
 
 [workspace]
 resolver = "2"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-conformance"]
 
 [workspace.package]
 version = "0.0.1"
