@@ -68,10 +68,18 @@ pub trait GpuInstance: Send + Sync {
     /// adapter satisfies the request.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
 
-    /// Create a presentable surface from platform window handles (plan G2).
-    /// The window must outlive the surface.  Returns [`GpuError::Backend`] if
-    /// the backend does not support the platform (e.g. X11 handles on Windows).
-    fn create_surface(&self, handles: &WindowHandles) -> Result<Box<dyn GpuSurface>>;
+    /// Create a fully configured presentable surface (plan G2).
+    ///
+    /// The surface and swapchain are created together because Vulkan separates
+    /// instance-level surface creation from device-level swapchain creation.
+    /// Pass the device that will render to this surface and the initial config.
+    /// The window must outlive the returned surface.
+    fn create_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &dyn crate::device::GpuDevice,
+        config: crate::desc::SurfaceConfig,
+    ) -> Result<Box<dyn GpuSurface>>;
 }
 
 #[cfg(test)]

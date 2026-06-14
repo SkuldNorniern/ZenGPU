@@ -4,22 +4,19 @@ use std::sync::Arc;
 
 use ash::{Entry, Instance, vk};
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuError, GpuInstance,
-    PowerPreference,
+    AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, GpuSurface, PowerPreference, SurfaceConfig, WindowHandles,
 };
 
 use crate::adapter::VulkanAdapter;
+use crate::swapchain::VulkanSwapchain;
 
 /// Shared ownership of the Vulkan loader and `VkInstance`.
-/// All objects that extend the instance's lifetime hold an `Arc<VulkanShared>`.
 pub(crate) struct VulkanShared {
-    // Kept alive so the Vulkan loader stays loaded for the lifetime of the instance.
-    #[allow(dead_code)]
     pub entry: Entry,
     pub instance: Instance,
 }
 
-// ash::Entry and ash::Instance are Send + Sync in ash 0.38.
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
 
@@ -29,15 +26,14 @@ impl Drop for VulkanShared {
     }
 }
 
-/// Vulkan [`GpuInstance`]: loads the Vulkan loader and creates a `VkInstance`.
+/// Vulkan [`GpuInstance`].
 pub struct VulkanInstance {
     pub(crate) shared: Arc<VulkanShared>,
+    pub(crate) has_surface: bool,
 }
 
 impl VulkanInstance {
-    /// Load the Vulkan loader and create a `VkInstance` targeting Vulkan 1.2.
-    /// Returns [`GpuError::Backend`] if the loader is absent or creation fails.
-    pub fn new() -> zengpu_hal::Result<Self> {
+    fn create(surface_extensions: bool) -> zengpu_hal::Result<Self> {
         let entry = unsafe { Entry::load() }
             .map_err(|e| GpuError::Backend(format!("Vulkan loader: {e}")))?;
 
@@ -46,8 +42,25 @@ impl VulkanInstance {
             ..Default::default()
         };
 
+        let mut ext_names: Vec<*const i8> = Vec::new();
+        if surface_extensions {
+            ext_names.push(ash::khr::surface::NAME.as_ptr());
+            #[cfg(target_os = "windows")]
+            ext_names.push(ash::khr::win32_surface::NAME.as_ptr());
+            #[cfg(target_os = "linux")]
+            ext_names.push(ash::khr::xlib_surface::NAME.as_ptr());
+            #[cfg(target_os = "macos")]
+            ext_names.push(ash::mvk::macos_surface::NAME.as_ptr());
+        }
+
         let create_info = vk::InstanceCreateInfo {
             p_application_info: &app_info,
+            enabled_extension_count: ext_names.len() as u32,
+            pp_enabled_extension_names: if ext_names.is_empty() {
+                std::ptr::null()
+            } else {
+                ext_names.as_ptr()
+            },
             ..Default::default()
         };
 
@@ -59,7 +72,18 @@ impl VulkanInstance {
 
         Ok(Self {
             shared: Arc::new(VulkanShared { entry, instance }),
+            has_surface: surface_extensions,
         })
+    }
+
+    /// Compute-only instance (no surface/display extensions).
+    pub fn new() -> zengpu_hal::Result<Self> {
+        Self::create(false)
+    }
+
+    /// Instance with surface extensions enabled — required for presenting to windows.
+    pub fn new_with_surface() -> zengpu_hal::Result<Self> {
+        Self::create(true)
     }
 }
 
@@ -119,5 +143,27 @@ impl GpuInstance for VulkanInstance {
         let mut adapters = self.enumerate_adapters();
         adapters.sort_by_key(|a| std::cmp::Reverse(type_score(a.info().device_type, req.power)));
         adapters.into_iter().next()
+    }
+
+    fn create_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &dyn GpuDevice,
+        config: SurfaceConfig,
+    ) -> zengpu_hal::Result<Box<dyn GpuSurface>> {
+        if !self.has_surface {
+            return Err(GpuError::Backend(
+                "create_surface requires VulkanInstance::new_with_surface()".to_string(),
+            ));
+        }
+        let vk_dev = device
+            .as_any()
+            .downcast_ref::<crate::device::VulkanDevice>()
+            .ok_or_else(|| {
+                GpuError::Backend("create_surface requires a VulkanDevice".to_string())
+            })?;
+        let swapchain =
+            VulkanSwapchain::new(Arc::clone(&self.shared), vk_dev, handles, config)?;
+        Ok(Box::new(swapchain))
     }
 }
