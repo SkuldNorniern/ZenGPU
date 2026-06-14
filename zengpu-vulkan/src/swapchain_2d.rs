@@ -45,18 +45,38 @@ pub struct CircleInstance {
     pub color: [f32; 4],
 }
 
-/// One frame's 2D primitives, back-to-front per primitive type. Borrows the instance slices, no
-/// copy until upload.
+/// Two-stop gradient fill over a rect. `kind` in `a[3]`: linear (`0.0`) or radial (`1.0`).
+///
+/// - Linear: `a = [start.x, start.y, _, 0.0]`, `b = [end.x, end.y, _, _]`.
+/// - Radial: `a = [center.x, center.y, radius, 1.0]`, `b` unused.
+///
+/// `color0`/`color1` straight RGBA. 80-byte `#[repr(C)]` (five `vec4`).
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct GradientInstance {
+    pub rect: [f32; 4],
+    pub a: [f32; 4],
+    pub b: [f32; 4],
+    pub color0: [f32; 4],
+    pub color1: [f32; 4],
+}
+
+/// One frame's 2D primitives. Within a kind, draw order is back-to-front. Across kinds the
+/// order is fixed (rects, gradients, circles), so cross-kind z-order is not preserved.
+/// Borrows the instance slices.
 #[derive(Default, Clone, Copy)]
 pub struct Frame2d<'a> {
     pub clear: Option<[f32; 4]>,
     pub rects: &'a [RectInstance],
+    pub gradients: &'a [GradientInstance],
     pub circles: &'a [CircleInstance],
 }
 
-/// Both instance kinds are 32 bytes. The shared buffer and binding rely on it.
+/// Rects and circles must be 32 bytes, the shared buffer and binding rely on it.
 const INSTANCE_SIZE: usize = std::mem::size_of::<RectInstance>();
 const _: () = assert!(std::mem::size_of::<CircleInstance>() == INSTANCE_SIZE);
+const GRADIENT_SIZE: usize = std::mem::size_of::<GradientInstance>();
+const _: () = assert!(GRADIENT_SIZE == 80);
 
 const VERT_SPV: &[u32] = inline_spirv!(
     r#"
@@ -139,22 +159,78 @@ const CIRCLE_FRAG_SPV: &[u32] = inline_spirv!(
     vulkan1_0
 );
 
+const GRADIENT_VERT_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec4 i_rect;    // x, y, w, h (fill area, px)
+    layout(location = 1) in vec4 i_a;        // linear start.xy / radial centre.xy,.z=r,.w=kind
+    layout(location = 2) in vec4 i_b;        // linear end.xy
+    layout(location = 3) in vec4 i_color0;
+    layout(location = 4) in vec4 i_color1;
+    layout(push_constant) uniform PC { vec2 viewport; } pc;
+    layout(location = 0) out vec2 v_px;
+    layout(location = 1) out vec4 v_a;
+    layout(location = 2) out vec4 v_b;
+    layout(location = 3) out vec4 v_c0;
+    layout(location = 4) out vec4 v_c1;
+    void main() {
+        vec2 corners[6] = vec2[](
+            vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+            vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)
+        );
+        vec2 corner = corners[gl_VertexIndex];
+        vec2 px = i_rect.xy + corner * i_rect.zw;
+        v_px = px; v_a = i_a; v_b = i_b; v_c0 = i_color0; v_c1 = i_color1;
+        vec2 ndc = (px / pc.viewport) * 2.0 - 1.0;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+    }
+    "#,
+    vert,
+    vulkan1_0
+);
+
+const GRADIENT_FRAG_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec2 v_px;
+    layout(location = 1) in vec4 v_a;
+    layout(location = 2) in vec4 v_b;
+    layout(location = 3) in vec4 v_c0;
+    layout(location = 4) in vec4 v_c1;
+    layout(location = 0) out vec4 o_color;
+    void main() {
+        float t;
+        if (v_a.w < 0.5) {
+            vec2 d = v_b.xy - v_a.xy;
+            t = dot(v_px - v_a.xy, d) / max(dot(d, d), 1e-6);
+        } else {
+            t = length(v_px - v_a.xy) / max(v_a.z, 1e-6);
+        }
+        o_color = mix(v_c0, v_c1, clamp(t, 0.0, 1.0));
+    }
+    "#,
+    frag,
+    vulkan1_0
+);
+
 /// Persistently-mapped host-visible vertex buffer. One per frame-in-flight, so the CPU can fill
 /// frame N+1 while the GPU reads N. Grows when needed.
 struct InstanceBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
+    /// Instance size in bytes (32 for rects/circles, 80 for gradients).
+    elem_size: usize,
     capacity: usize,
 }
 
 impl InstanceBuffer {
-    fn new(inner: &VulkanDeviceInner, capacity: usize) -> Result<Self> {
-        let (buffer, memory, mapped) = alloc_mapped_vertex_buffer(inner, capacity)?;
-        Ok(Self { buffer, memory, mapped, capacity })
+    fn new(inner: &VulkanDeviceInner, elem_size: usize, capacity: usize) -> Result<Self> {
+        let (buffer, memory, mapped) = alloc_mapped_vertex_buffer(inner, elem_size, capacity)?;
+        Ok(Self { buffer, memory, mapped, elem_size, capacity })
     }
 
-    /// Doubles capacity when `needed` rects do not fit.
+    /// Doubles capacity when `needed` does not fit.
     fn ensure_capacity(&mut self, inner: &VulkanDeviceInner, needed: usize) -> Result<()> {
         if needed <= self.capacity {
             return Ok(());
@@ -163,11 +239,12 @@ impl InstanceBuffer {
         while new_cap < needed {
             new_cap *= 2;
         }
-        let (buffer, memory, mapped) = alloc_mapped_vertex_buffer(inner, new_cap)?;
+        let (buffer, memory, mapped) = alloc_mapped_vertex_buffer(inner, self.elem_size, new_cap)?;
         let old = InstanceBuffer {
             buffer: self.buffer,
             memory: self.memory,
             mapped: self.mapped,
+            elem_size: self.elem_size,
             capacity: self.capacity,
         };
         self.buffer = buffer;
@@ -178,10 +255,9 @@ impl InstanceBuffer {
         Ok(())
     }
 
-    /// Copy `items` into the mapped buffer. Caller guarantees capacity. Works for any 32-byte
-    /// instance type.
+    /// Caller guarantees capacity. `T` must match the element size.
     fn upload_bytes<T>(&self, items: &[T]) {
-        debug_assert_eq!(std::mem::size_of::<T>(), INSTANCE_SIZE);
+        debug_assert_eq!(std::mem::size_of::<T>(), self.elem_size);
         if items.is_empty() {
             return;
         }
@@ -189,7 +265,7 @@ impl InstanceBuffer {
             std::ptr::copy_nonoverlapping(
                 items.as_ptr() as *const u8,
                 self.mapped,
-                items.len() * INSTANCE_SIZE,
+                std::mem::size_of_val(items),
             );
         }
     }
@@ -205,9 +281,10 @@ impl InstanceBuffer {
 
 fn alloc_mapped_vertex_buffer(
     inner: &VulkanDeviceInner,
+    elem_size: usize,
     capacity: usize,
 ) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
-    let size = (capacity.max(1) * INSTANCE_SIZE) as u64;
+    let size = (capacity.max(1) * elem_size) as u64;
     let info = vk::BufferCreateInfo {
         size,
         usage: vk::BufferUsageFlags::VERTEX_BUFFER,
@@ -304,12 +381,14 @@ pub struct Vulkan2dSurface {
     pipeline_layout: vk::PipelineLayout,
     rect_pipeline: vk::Pipeline,
     circle_pipeline: vk::Pipeline,
+    gradient_pipeline: vk::Pipeline,
     cmd_pool: vk::CommandPool,
     /// One command buffer per frame-in-flight, re-recorded each present.
     cmd_buffers: Vec<vk::CommandBuffer>,
     /// Growable instance buffers per frame-in-flight, one set per primitive kind.
     rect_buffers: Vec<Mutex<InstanceBuffer>>,
     circle_buffers: Vec<Mutex<InstanceBuffer>>,
+    gradient_buffers: Vec<Mutex<InstanceBuffer>>,
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
@@ -367,14 +446,32 @@ impl Vulkan2dSurface {
         let render_pass = create_render_pass(&inner.device, format)?;
         let framebuffers = create_framebuffers(&inner.device, render_pass, &image_views, extent)?;
         let pipeline_layout = create_pipeline_layout(&inner.device)?;
-        let rect_pipeline =
-            create_pipeline(&inner.device, pipeline_layout, render_pass, VERT_SPV, FRAG_SPV)?;
+        let rect_pipeline = create_pipeline(
+            &inner.device,
+            pipeline_layout,
+            render_pass,
+            VERT_SPV,
+            FRAG_SPV,
+            INSTANCE_SIZE as u32,
+            2,
+        )?;
         let circle_pipeline = create_pipeline(
             &inner.device,
             pipeline_layout,
             render_pass,
             CIRCLE_VERT_SPV,
             CIRCLE_FRAG_SPV,
+            INSTANCE_SIZE as u32,
+            2,
+        )?;
+        let gradient_pipeline = create_pipeline(
+            &inner.device,
+            pipeline_layout,
+            render_pass,
+            GRADIENT_VERT_SPV,
+            GRADIENT_FRAG_SPV,
+            GRADIENT_SIZE as u32,
+            5,
         )?;
 
         let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
@@ -382,9 +479,13 @@ impl Vulkan2dSurface {
 
         let mut rect_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut circle_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut gradient_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INITIAL_RECTS)?));
-            circle_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INITIAL_RECTS)?));
+            rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
+            circle_buffers
+                .push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
+            gradient_buffers
+                .push(Mutex::new(InstanceBuffer::new(&inner, GRADIENT_SIZE, INITIAL_RECTS)?));
         }
 
         let (image_available, render_finished, in_flight) =
@@ -399,10 +500,12 @@ impl Vulkan2dSurface {
             pipeline_layout,
             rect_pipeline,
             circle_pipeline,
+            gradient_pipeline,
             cmd_pool,
             cmd_buffers,
             rect_buffers,
             circle_buffers,
+            gradient_buffers,
             image_available,
             render_finished,
             in_flight,
@@ -488,6 +591,12 @@ impl Vulkan2dSurface {
             ib.upload_bytes(frame.circles);
             ib.buffer
         };
+        let gradient_buf = {
+            let mut ib = self.gradient_buffers[current].lock().unwrap();
+            ib.ensure_capacity(&self.inner, frame.gradients.len())?;
+            ib.upload_bytes(frame.gradients);
+            ib.buffer
+        };
 
         let cmd = self.cmd_buffers[current];
         self.record(
@@ -495,8 +604,7 @@ impl Vulkan2dSurface {
             res.framebuffers[image_index as usize],
             res.extent,
             &frame,
-            rect_buf,
-            circle_buf,
+            [rect_buf, gradient_buf, circle_buf],
         )?;
 
         let wait_semaphores = [self.image_available[current]];
@@ -585,8 +693,7 @@ impl Vulkan2dSurface {
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
         frame: &Frame2d,
-        rect_buf: vk::Buffer,
-        circle_buf: vk::Buffer,
+        bufs: [vk::Buffer; 3],
     ) -> Result<()> {
         let dev = &self.inner.device;
         unsafe {
@@ -639,10 +746,16 @@ impl Vulkan2dSurface {
                 std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
             );
 
+            let [rect_buf, gradient_buf, circle_buf] = bufs;
             if !frame.rects.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rect_pipeline);
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
                 dev.cmd_draw(cmd, 6, frame.rects.len() as u32, 0, 0);
+            }
+            if !frame.gradients.is_empty() {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gradient_pipeline);
+                dev.cmd_bind_vertex_buffers(cmd, 0, &[gradient_buf], &[0]);
+                dev.cmd_draw(cmd, 6, frame.gradients.len() as u32, 0, 0);
             }
             if !frame.circles.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.circle_pipeline);
@@ -663,7 +776,12 @@ impl Drop for Vulkan2dSurface {
         unsafe {
             let _ = self.inner.device.device_wait_idle();
         }
-        for ib in self.rect_buffers.iter().chain(&self.circle_buffers) {
+        for ib in self
+            .rect_buffers
+            .iter()
+            .chain(&self.circle_buffers)
+            .chain(&self.gradient_buffers)
+        {
             ib.lock().unwrap().destroy(&self.inner);
         }
         {
@@ -678,6 +796,7 @@ impl Drop for Vulkan2dSurface {
             dev.free_command_buffers(self.cmd_pool, &self.cmd_buffers);
             dev.destroy_pipeline(self.rect_pipeline, None);
             dev.destroy_pipeline(self.circle_pipeline, None);
+            dev.destroy_pipeline(self.gradient_pipeline, None);
             dev.destroy_pipeline_layout(self.pipeline_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.cmd_pool, None);
@@ -969,14 +1088,29 @@ fn create_pipeline_layout(device: &ash::Device) -> Result<vk::PipelineLayout> {
     }
 }
 
-/// Build an instanced 2D pipeline from the given shaders. Callers vary only the shaders. Vertex
-/// binding, dynamic viewport/scissor and alpha blend are fixed.
+/// `vec4` attributes at 16-byte offsets, `location` in `0..count`. Both 2D instance layouts are
+/// packed `vec4`s.
+fn vec4_attributes(count: u32) -> Vec<vk::VertexInputAttributeDescription> {
+    (0..count)
+        .map(|i| vk::VertexInputAttributeDescription {
+            location: i,
+            binding: 0,
+            format: vk::Format::R32G32B32A32_SFLOAT,
+            offset: i * 16,
+        })
+        .collect()
+}
+
+/// Instanced 2D pipeline. Callers vary shaders, `stride` and attribute `count`. Dynamic
+/// viewport/scissor and alpha blend are fixed.
 fn create_pipeline(
     device: &ash::Device,
     layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
     vert_spv: &[u32],
     frag_spv: &[u32],
+    stride: u32,
+    attr_count: u32,
 ) -> Result<vk::Pipeline> {
     let vert = create_shader_module(device, vert_spv)?;
     let frag = create_shader_module(device, frag_spv)?;
@@ -998,23 +1132,10 @@ fn create_pipeline(
 
     let binding = vk::VertexInputBindingDescription {
         binding: 0,
-        stride: INSTANCE_SIZE as u32,
+        stride,
         input_rate: vk::VertexInputRate::INSTANCE,
     };
-    let attributes = [
-        vk::VertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: vk::Format::R32G32B32A32_SFLOAT,
-            offset: 0,
-        },
-        vk::VertexInputAttributeDescription {
-            location: 1,
-            binding: 0,
-            format: vk::Format::R32G32B32A32_SFLOAT,
-            offset: 16,
-        },
-    ];
+    let attributes = vec4_attributes(attr_count);
     let vertex_input = vk::PipelineVertexInputStateCreateInfo {
         vertex_binding_description_count: 1,
         p_vertex_binding_descriptions: &binding,
