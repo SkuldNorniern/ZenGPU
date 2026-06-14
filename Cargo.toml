@@ -1,6 +1,19 @@
-[package]
-name = "ZenGPU"
-version = "0.1.0"
-edition = "2024"
+# ZenGPU workspace — native-first GPU runtime (graphics + general compute).
+# Crates are added as they gain real content (no empty placeholders — plan D8).
+[workspace]
+resolver = "2"
+members = [
+    "zengpu",
+    "zengpu-hal",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/SkuldNorniern/ZenGPU"
+authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
+
+[workspace.dependencies]
+zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
