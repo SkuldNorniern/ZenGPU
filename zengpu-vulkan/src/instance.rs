@@ -10,6 +10,7 @@ use zengpu_hal::{
 
 use crate::adapter::VulkanAdapter;
 use crate::swapchain::VulkanSwapchain;
+use crate::swapchain_2d::Vulkan2dSurface;
 use crate::swapchain_textured::VulkanTexturedSwapchain;
 
 pub(crate) struct VulkanShared {
@@ -111,6 +112,22 @@ impl VulkanInstance {
             sampler,
         )?;
         Ok(Box::new(sc))
+    }
+
+    /// Creates a surface for batches of solid-colour rects. Call [`Vulkan2dSurface::present`] once
+    /// per frame.
+    pub fn create_2d_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &crate::device::VulkanDevice,
+        config: SurfaceConfig,
+    ) -> zengpu_hal::Result<Vulkan2dSurface> {
+        if !self.has_surface {
+            return Err(GpuError::Backend(
+                "create_2d_surface requires VulkanInstance::new_with_surface()".to_string(),
+            ));
+        }
+        Vulkan2dSurface::new(Arc::clone(&self.shared), device, handles, config)
     }
 
     /// First adapter as a concrete [`VulkanAdapter`], or `None`.
