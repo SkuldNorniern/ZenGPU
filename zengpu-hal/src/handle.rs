@@ -125,6 +125,11 @@ impl<T> SlotMap<T> {
         self.get(handle).is_some()
     }
 
+    /// Current generation of the slot at `index`, if in range. For stale-handle diagnostics.
+    pub fn generation_at(&self, index: u32) -> Option<u32> {
+        self.slots.get(index as usize).map(|slot| slot.generation)
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len() - self.free.len()
     }
@@ -197,5 +202,15 @@ mod tests {
         let mut other: SlotMap<i32> = SlotMap::new();
         let foreign = other.insert(1);
         assert_eq!(real.get(foreign), None);
+    }
+
+    #[test]
+    fn generation_at_tracks_slot() {
+        let mut map: SlotMap<i32> = SlotMap::new();
+        let h = map.insert(1);
+        assert_eq!(map.generation_at(h.index()), Some(0));
+        map.remove(h);
+        assert_eq!(map.generation_at(h.index()), Some(1));
+        assert_eq!(map.generation_at(999), None);
     }
 }
