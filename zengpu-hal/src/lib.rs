@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+mod adapter;
 mod command;
 mod desc;
 mod device;
@@ -21,6 +22,7 @@ mod handle;
 mod request;
 mod types;
 
+pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
 pub use command::{Bindings, Scalar};
 pub use device::GpuDevice;
 pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
