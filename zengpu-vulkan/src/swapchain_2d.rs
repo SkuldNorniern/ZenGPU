@@ -19,13 +19,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use ash::{khr, vk};
+use ash::vk;
 use inline_spirv::inline_spirv;
-use zengpu_hal::{GpuError, PresentMode, Result, SamplerHandle, SurfaceError, TextureHandle};
+use zengpu_hal::{GpuError, Result, SamplerHandle, TextureHandle};
 
 use crate::device::VulkanDeviceInner;
 use crate::instance::VulkanShared;
-use crate::swapchain::create_platform_surface;
+use crate::swapchain::{BeginFrame, Swapchain};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
@@ -526,39 +526,10 @@ fn alloc_mapped_vertex_buffer(
 
 // ── Swapchain-dependent resources (recreated on resize / surface loss) ──────
 
-struct SwapchainResources {
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
-    extent: vk::Extent2D,
-}
-
-impl SwapchainResources {
-    /// Destroy the per-swapchain objects (not the swapchain itself, which the
-    /// caller may pass as `old_swapchain` during recreation).
-    fn destroy_views_framebuffers(&self, device: &ash::Device) {
-        unsafe {
-            for &fb in &self.framebuffers {
-                device.destroy_framebuffer(fb, None);
-            }
-            for &iv in &self.image_views {
-                device.destroy_image_view(iv, None);
-            }
-        }
-    }
-}
-
-struct FrameState {
-    current: usize,
-}
 
 /// Vulkan swapchain that draws a batch of instanced rectangles per frame.
 pub struct Vulkan2dSurface {
     inner: Arc<VulkanDeviceInner>,
-    surface_loader: khr::surface::Instance,
-    swapchain_loader: khr::swapchain::Device,
-    surface: vk::SurfaceKHR,
     // Extent-independent (dynamic viewport/scissor), so they survive resize.
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
@@ -573,22 +544,17 @@ pub struct Vulkan2dSurface {
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
     placeholder: Placeholder,
-    cmd_pool: vk::CommandPool,
-    /// One command buffer per frame-in-flight (re-recorded each present).
-    cmd_buffers: Vec<vk::CommandBuffer>,
     /// Growable instance buffers per frame-in-flight, one set per primitive kind.
     rect_buffers: Vec<Mutex<InstanceBuffer>>,
     circle_buffers: Vec<Mutex<InstanceBuffer>>,
     gradient_buffers: Vec<Mutex<InstanceBuffer>>,
     image_buffers: Vec<Mutex<InstanceBuffer>>,
     text_buffers: Vec<Mutex<InstanceBuffer>>,
-    image_available: Vec<vk::Semaphore>,
-    render_finished: Vec<vk::Semaphore>,
-    in_flight: Vec<vk::Fence>,
-    resources: Mutex<SwapchainResources>,
-    frame_state: Mutex<FrameState>,
-    format: vk::Format,
-    present_mode: vk::PresentModeKHR,
+    /// Per-swapchain-image framebuffers; rebuilt on swapchain recreation.
+    framebuffers: Mutex<Vec<vk::Framebuffer>>,
+    /// Shared swapchain plumbing. Placed last so it drops after all resources
+    /// derived from its image views (framebuffers, pipelines, render pass).
+    swapchain: Swapchain,
 }
 
 // Safety: all mutable cross-frame state is behind Mutex; ash types are Send+Sync.
@@ -603,45 +569,17 @@ impl Vulkan2dSurface {
         config: zengpu_hal::SurfaceConfig,
     ) -> Result<Self> {
         let inner = Arc::clone(&device.inner);
-        let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
-        let surface = create_platform_surface(&shared, handles)?;
-
-        let supports_present = unsafe {
-            surface_loader.get_physical_device_surface_support(
-                inner.physical,
-                inner.queue_family,
-                surface,
-            )
-        }
-        .map_err(|e| GpuError::Backend(format!("surface support query: {e}")))?;
-        if !supports_present {
-            unsafe { surface_loader.destroy_surface(surface, None) };
-            return Err(GpuError::Backend(
-                "selected queue family cannot present to this surface".to_string(),
-            ));
-        }
-
-        let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
-        let present_mode = pick_present_mode(
-            &surface_loader,
-            inner.physical,
-            surface,
-            config.present_mode,
+        let swapchain = Swapchain::new(
+            Arc::clone(&shared),
+            Arc::clone(&inner),
+            handles,
+            config,
+            MAX_FRAMES_IN_FLIGHT,
         )?;
-        let format = pick_format(&surface_loader, inner.physical, surface)?;
+        let format = swapchain.format();
+        let image_views = swapchain.image_views();
+        let extent = swapchain.extent();
 
-        let (swapchain, images, extent) = create_swapchain(
-            &surface_loader,
-            &swapchain_loader,
-            inner.physical,
-            surface,
-            format,
-            present_mode,
-            config.width,
-            config.height,
-            vk::SwapchainKHR::null(),
-        )?;
-        let image_views = create_image_views(&inner.device, &images, format)?;
         let render_pass = create_render_pass(&inner.device, format)?;
         let framebuffers = create_framebuffers(&inner.device, render_pass, &image_views, extent)?;
         let pipeline_layout = create_pipeline_layout(&inner.device)?;
@@ -710,9 +648,6 @@ impl Vulkan2dSurface {
             inner.dual_src_blend,
         )?;
 
-        let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
-        let cmd_buffers = allocate_cmd_buffers(&inner.device, cmd_pool, MAX_FRAMES_IN_FLIGHT)?;
-
         let mut rect_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut circle_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut gradient_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
@@ -746,14 +681,8 @@ impl Vulkan2dSurface {
             )?));
         }
 
-        let (image_available, render_finished, in_flight) =
-            create_sync(&inner.device, MAX_FRAMES_IN_FLIGHT)?;
-
         Ok(Self {
             inner,
-            surface_loader,
-            swapchain_loader,
-            surface,
             render_pass,
             pipeline_layout,
             rect_pipeline,
@@ -766,45 +695,32 @@ impl Vulkan2dSurface {
             descriptor_set_layout,
             descriptor_set,
             placeholder,
-            cmd_pool,
-            cmd_buffers,
             rect_buffers,
             circle_buffers,
             gradient_buffers,
             image_buffers,
             text_buffers,
-            image_available,
-            render_finished,
-            in_flight,
-            resources: Mutex::new(SwapchainResources {
-                swapchain,
-                images,
-                image_views,
-                framebuffers,
-                extent,
-            }),
-            frame_state: Mutex::new(FrameState { current: 0 }),
-            format,
-            present_mode,
+            framebuffers: Mutex::new(framebuffers),
+            swapchain,
         })
     }
 
     /// Swapchain extent in physical pixels.
     pub fn size(&self) -> (u32, u32) {
-        let res = self.resources.lock().unwrap();
-        (res.extent.width, res.extent.height)
+        let e = self.swapchain.extent();
+        (e.width, e.height)
     }
 
     /// Number of swapchain images.
     pub fn image_count(&self) -> u32 {
-        self.resources.lock().unwrap().images.len() as u32
+        self.swapchain.image_count() as u32
     }
 
     /// Recreate the swapchain (e.g. after a resize or surface-lost). Safe to
     /// call when the window is minimised — bails out while the extent is zero.
     pub fn resize(&self, width: u32, height: u32) -> Result<()> {
-        let mut res = self.resources.lock().unwrap();
-        self.recreate(&mut res, width, height)
+        self.swapchain.resize(width, height)?;
+        self.rebuild_framebuffers()
     }
 
     /// Bindless slot capacity for image textures.
@@ -871,45 +787,15 @@ impl Vulkan2dSurface {
     /// Draw `frame`'s primitives (clear, then rects, then circles) and present.
     /// Recreates the swapchain transparently on resize / surface loss.
     pub fn present(&self, frame: Frame2d) -> Result<()> {
-        let mut state = self.frame_state.lock().unwrap();
-        let current = state.current;
-
-        unsafe {
-            self.inner
-                .device
-                .wait_for_fences(&[self.in_flight[current]], true, u64::MAX)
-                .map_err(|e| GpuError::Backend(format!("wait_for_fences: {e}")))?;
-        }
-
-        let mut res = self.resources.lock().unwrap();
-        if res.extent.width == 0 || res.extent.height == 0 {
-            return Ok(()); // minimised — nothing to present
-        }
-
-        let image_index = match unsafe {
-            self.swapchain_loader.acquire_next_image(
-                res.swapchain,
-                u64::MAX,
-                self.image_available[current],
-                vk::Fence::null(),
-            )
-        } {
-            Ok((index, _suboptimal)) => index,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                // Swapchain stale: recreate and skip this frame. The fence was
-                // not reset, so the slot stays usable next call.
-                let (w, h) = (res.extent.width, res.extent.height);
-                return self.recreate(&mut res, w, h);
-            }
-            Err(e) => return Err(map_surface_err(e)),
+        let bf = match self.swapchain.begin_frame()? {
+            BeginFrame::Skip => return Ok(()),
+            BeginFrame::Recreated => return self.rebuild_framebuffers(),
+            bf => bf,
         };
-
-        unsafe {
-            self.inner
-                .device
-                .reset_fences(&[self.in_flight[current]])
-                .map_err(|e| GpuError::Backend(format!("reset_fences: {e}")))?;
-        }
+        let (current, index) = match bf {
+            BeginFrame::Image { current, index } => (current, index),
+            _ => unreachable!(),
+        };
 
         // Upload instances (growing each buffer if needed).
         let rect_buf = {
@@ -943,95 +829,35 @@ impl Vulkan2dSurface {
             ib.buffer
         };
 
-        let cmd = self.cmd_buffers[current];
+        // Hold framebuffers lock across record+submit so a concurrent resize
+        // can't destroy them while GPU work is being recorded.
+        let fbs = self.framebuffers.lock().unwrap();
+        let cmd = self.swapchain.cmd_buffer(current);
         self.record(
             cmd,
-            res.framebuffers[image_index as usize],
-            res.extent,
+            fbs[index as usize],
+            self.swapchain.extent(),
             &frame,
             [rect_buf, gradient_buf, image_buf, text_buf, circle_buf],
         )?;
+        drop(fbs);
 
-        let wait_semaphores = [self.image_available[current]];
-        let signal_semaphores = [self.render_finished[current]];
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let cmd_bufs = [cmd];
-        let submit_info = vk::SubmitInfo {
-            wait_semaphore_count: 1,
-            p_wait_semaphores: wait_semaphores.as_ptr(),
-            p_wait_dst_stage_mask: wait_stages.as_ptr(),
-            command_buffer_count: 1,
-            p_command_buffers: cmd_bufs.as_ptr(),
-            signal_semaphore_count: 1,
-            p_signal_semaphores: signal_semaphores.as_ptr(),
-            ..Default::default()
-        };
-        unsafe {
-            self.inner
-                .device
-                .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
-                .map_err(|e| GpuError::Backend(format!("queue_submit: {e}")))?;
+        if self.swapchain.end_frame(&bf, cmd)? {
+            self.rebuild_framebuffers()?;
         }
-
-        let swapchains = [res.swapchain];
-        let image_indices = [image_index];
-        let present_info = vk::PresentInfoKHR {
-            wait_semaphore_count: 1,
-            p_wait_semaphores: signal_semaphores.as_ptr(),
-            swapchain_count: 1,
-            p_swapchains: swapchains.as_ptr(),
-            p_image_indices: image_indices.as_ptr(),
-            ..Default::default()
-        };
-        match unsafe {
-            self.swapchain_loader
-                .queue_present(self.inner.queue, &present_info)
-        } {
-            Ok(_suboptimal) => {}
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                let (w, h) = (res.extent.width, res.extent.height);
-                self.recreate(&mut res, w, h)?;
-            }
-            Err(e) => return Err(map_surface_err(e)),
-        }
-
-        state.current = (current + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }
 
-    /// Recreate swapchain + image views + framebuffers in place. Keeps the
-    /// render pass and pipeline (format-only, viewport is dynamic).
-    fn recreate(&self, res: &mut SwapchainResources, width: u32, height: u32) -> Result<()> {
-        unsafe {
-            let _ = self.inner.device.device_wait_idle();
+    /// Destroy old framebuffers and create new ones from current image views.
+    fn rebuild_framebuffers(&self) -> Result<()> {
+        let image_views = self.swapchain.image_views();
+        let extent = self.swapchain.extent();
+        let new_fbs = create_framebuffers(&self.inner.device, self.render_pass, &image_views, extent)?;
+        let mut fbs = self.framebuffers.lock().unwrap();
+        for &fb in fbs.iter() {
+            unsafe { self.inner.device.destroy_framebuffer(fb, None); }
         }
-        let old_swapchain = res.swapchain;
-        let (swapchain, images, extent) = create_swapchain(
-            &self.surface_loader,
-            &self.swapchain_loader,
-            self.inner.physical,
-            self.surface,
-            self.format,
-            self.present_mode,
-            width,
-            height,
-            old_swapchain,
-        )?;
-
-        res.destroy_views_framebuffers(&self.inner.device);
-        unsafe {
-            self.swapchain_loader.destroy_swapchain(old_swapchain, None);
-        }
-
-        let image_views = create_image_views(&self.inner.device, &images, self.format)?;
-        let framebuffers =
-            create_framebuffers(&self.inner.device, self.render_pass, &image_views, extent)?;
-
-        res.swapchain = swapchain;
-        res.images = images;
-        res.image_views = image_views;
-        res.framebuffers = framebuffers;
-        res.extent = extent;
+        *fbs = new_fbs;
         Ok(())
     }
 
@@ -1218,16 +1044,11 @@ impl Drop for Vulkan2dSurface {
         {
             ib.lock().unwrap().destroy(&self.inner);
         }
-        {
-            let res = self.resources.lock().unwrap();
-            res.destroy_views_framebuffers(&self.inner.device);
-            unsafe {
-                self.swapchain_loader.destroy_swapchain(res.swapchain, None);
-            }
-        }
         unsafe {
             let dev = &self.inner.device;
-            dev.free_command_buffers(self.cmd_pool, &self.cmd_buffers);
+            for &fb in self.framebuffers.lock().unwrap().iter() {
+                dev.destroy_framebuffer(fb, None);
+            }
             dev.destroy_pipeline(self.rect_pipeline, None);
             dev.destroy_pipeline(self.circle_pipeline, None);
             dev.destroy_pipeline(self.gradient_pipeline, None);
@@ -1239,26 +1060,13 @@ impl Drop for Vulkan2dSurface {
             dev.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             self.placeholder.destroy(dev);
             dev.destroy_render_pass(self.render_pass, None);
-            dev.destroy_command_pool(self.cmd_pool, None);
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                dev.destroy_semaphore(self.image_available[i], None);
-                dev.destroy_semaphore(self.render_finished[i], None);
-                dev.destroy_fence(self.in_flight[i], None);
-            }
-            self.surface_loader.destroy_surface(self.surface, None);
+            // self.swapchain drops automatically after this body and destroys
+            // image views, swapchain, surface, cmd pool, and sync objects.
         }
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-fn map_surface_err(e: vk::Result) -> GpuError {
-    GpuError::Surface(match e {
-        vk::Result::ERROR_OUT_OF_DATE_KHR => SurfaceError::Outdated,
-        vk::Result::ERROR_SURFACE_LOST_KHR => SurfaceError::Lost,
-        _ => SurfaceError::OutOfMemory,
-    })
-}
 
 fn find_memory_type(
     inner: &VulkanDeviceInner,
@@ -1277,155 +1085,6 @@ fn find_memory_type(
                 .property_flags
                 .contains(props)
     })
-}
-
-fn pick_format(
-    surface_loader: &khr::surface::Instance,
-    physical: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-) -> Result<vk::Format> {
-    let formats = unsafe {
-        surface_loader
-            .get_physical_device_surface_formats(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface formats: {e}")))?
-    };
-    // Prefer a non-sRGB BGRA format so straight sRGB colour bytes pass through
-    // unchanged (matching the CPU rasterizer). Fall back to whatever's first.
-    formats
-        .iter()
-        .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
-        .or_else(|| formats.first())
-        .map(|f| f.format)
-        .ok_or_else(|| GpuError::Backend("no surface formats".to_string()))
-}
-
-fn pick_present_mode(
-    surface_loader: &khr::surface::Instance,
-    physical: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-    requested: PresentMode,
-) -> Result<vk::PresentModeKHR> {
-    let modes = unsafe {
-        surface_loader
-            .get_physical_device_surface_present_modes(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface present modes: {e}")))?
-    };
-    let desired = match requested {
-        PresentMode::Mailbox => vk::PresentModeKHR::MAILBOX,
-        PresentMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
-        PresentMode::Fifo => vk::PresentModeKHR::FIFO,
-    };
-    Ok(if modes.contains(&desired) {
-        desired
-    } else {
-        vk::PresentModeKHR::FIFO // guaranteed available
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn create_swapchain(
-    surface_loader: &khr::surface::Instance,
-    swapchain_loader: &khr::swapchain::Device,
-    physical: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-    format: vk::Format,
-    present_mode: vk::PresentModeKHR,
-    width: u32,
-    height: u32,
-    old_swapchain: vk::SwapchainKHR,
-) -> Result<(vk::SwapchainKHR, Vec<vk::Image>, vk::Extent2D)> {
-    let caps = unsafe {
-        surface_loader
-            .get_physical_device_surface_capabilities(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface capabilities: {e}")))?
-    };
-    let color_space = unsafe {
-        surface_loader
-            .get_physical_device_surface_formats(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface formats: {e}")))?
-    }
-    .iter()
-    .find(|f| f.format == format)
-    .map(|f| f.color_space)
-    .unwrap_or(vk::ColorSpaceKHR::SRGB_NONLINEAR);
-
-    let extent = if caps.current_extent.width != u32::MAX {
-        caps.current_extent
-    } else {
-        vk::Extent2D {
-            width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-            height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
-        }
-    };
-    // Minimised window: zero extent. Return an empty swapchain handle so the
-    // caller can detect and skip presenting.
-    if extent.width == 0 || extent.height == 0 {
-        return Ok((vk::SwapchainKHR::null(), Vec::new(), extent));
-    }
-
-    let mut image_count = caps.min_image_count + 1;
-    if caps.max_image_count > 0 {
-        image_count = image_count.min(caps.max_image_count);
-    }
-
-    let create_info = vk::SwapchainCreateInfoKHR {
-        surface,
-        min_image_count: image_count,
-        image_format: format,
-        image_color_space: color_space,
-        image_extent: extent,
-        image_array_layers: 1,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        pre_transform: caps.current_transform,
-        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode,
-        clipped: vk::TRUE,
-        old_swapchain,
-        ..Default::default()
-    };
-    let swapchain = unsafe {
-        swapchain_loader
-            .create_swapchain(&create_info, None)
-            .map_err(|e| GpuError::Backend(format!("vkCreateSwapchainKHR: {e}")))?
-    };
-    let images = unsafe {
-        swapchain_loader
-            .get_swapchain_images(swapchain)
-            .map_err(|e| GpuError::Backend(format!("get_swapchain_images: {e}")))?
-    };
-    Ok((swapchain, images, extent))
-}
-
-fn create_image_views(
-    device: &ash::Device,
-    images: &[vk::Image],
-    format: vk::Format,
-) -> Result<Vec<vk::ImageView>> {
-    images
-        .iter()
-        .map(|&image| {
-            let info = vk::ImageViewCreateInfo {
-                image,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format,
-                components: vk::ComponentMapping::default(),
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                ..Default::default()
-            };
-            unsafe {
-                device
-                    .create_image_view(&info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_image_view: {e}")))
-            }
-        })
-        .collect()
 }
 
 fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass> {
@@ -2061,67 +1720,3 @@ fn create_image_pipeline_layout(
     }
 }
 
-fn create_command_pool(device: &ash::Device, queue_family: u32) -> Result<vk::CommandPool> {
-    let info = vk::CommandPoolCreateInfo {
-        queue_family_index: queue_family,
-        flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-        ..Default::default()
-    };
-    unsafe {
-        device
-            .create_command_pool(&info, None)
-            .map_err(|e| GpuError::Backend(format!("create_command_pool: {e}")))
-    }
-}
-
-fn allocate_cmd_buffers(
-    device: &ash::Device,
-    pool: vk::CommandPool,
-    count: usize,
-) -> Result<Vec<vk::CommandBuffer>> {
-    let alloc_info = vk::CommandBufferAllocateInfo {
-        command_pool: pool,
-        level: vk::CommandBufferLevel::PRIMARY,
-        command_buffer_count: count as u32,
-        ..Default::default()
-    };
-    unsafe {
-        device
-            .allocate_command_buffers(&alloc_info)
-            .map_err(|e| GpuError::Backend(format!("allocate_command_buffers: {e}")))
-    }
-}
-
-fn create_sync(
-    device: &ash::Device,
-    count: usize,
-) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
-    let sem_info = vk::SemaphoreCreateInfo::default();
-    let fence_info = vk::FenceCreateInfo {
-        flags: vk::FenceCreateFlags::SIGNALED,
-        ..Default::default()
-    };
-    let mut image_available = Vec::with_capacity(count);
-    let mut render_finished = Vec::with_capacity(count);
-    let mut fences = Vec::with_capacity(count);
-    for _ in 0..count {
-        unsafe {
-            image_available.push(
-                device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            render_finished.push(
-                device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            fences.push(
-                device
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_fence: {e}")))?,
-            );
-        }
-    }
-    Ok((image_available, render_finished, fences))
-}
