@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use ash::{khr, vk};
 use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
 
-use crate::device::VulkanDeviceInner;
+use crate::device::{VulkanDevice, VulkanDeviceInner};
 use crate::instance::VulkanShared;
 
 /// Per-swapchain-image state that's rebuilt on resize / surface loss.
@@ -38,7 +38,7 @@ struct FrameState {
 
 /// Result of [`Swapchain::begin_frame`].
 #[derive(Copy, Clone)]
-pub(crate) enum BeginFrame {
+pub enum BeginFrame {
     /// Window is minimised (zero extent) — skip this frame entirely.
     Skip,
     /// The swapchain was just rebuilt — the caller must rebuild any
@@ -52,7 +52,7 @@ pub(crate) enum BeginFrame {
 }
 
 /// Shared surface/swapchain/sync/command-pool plumbing. See module docs.
-pub(crate) struct Swapchain {
+pub struct Swapchain {
     inner: Arc<VulkanDeviceInner>,
     surface_loader: khr::surface::Instance,
     swapchain_loader: khr::swapchain::Device,
@@ -74,13 +74,14 @@ unsafe impl Send for Swapchain {}
 unsafe impl Sync for Swapchain {}
 
 impl Swapchain {
-    pub(crate) fn new(
-        shared: Arc<VulkanShared>,
-        inner: Arc<VulkanDeviceInner>,
+    pub fn new(
+        device: &VulkanDevice,
         handles: &zengpu_hal::WindowHandles,
         config: zengpu_hal::SurfaceConfig,
         frames_in_flight: usize,
     ) -> Result<Self> {
+        let inner = Arc::clone(&device.inner);
+        let shared = Arc::clone(&inner.shared);
         let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
         let surface = create_platform_surface(&shared, handles)?;
 
@@ -149,23 +150,31 @@ impl Swapchain {
         })
     }
 
-    pub(crate) fn format(&self) -> vk::Format {
+    /// Raw device handles for building render-pass-shaped resources on top of
+    /// this swapchain. See [`DeviceContext`].
+    pub fn context(&self) -> DeviceContext {
+        DeviceContext {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn format(&self) -> vk::Format {
         self.format
     }
 
-    pub(crate) fn extent(&self) -> vk::Extent2D {
+    pub fn extent(&self) -> vk::Extent2D {
         self.resources.lock().unwrap().extent
     }
 
-    pub(crate) fn image_views(&self) -> Vec<vk::ImageView> {
+    pub fn image_views(&self) -> Vec<vk::ImageView> {
         self.resources.lock().unwrap().image_views.clone()
     }
 
-    pub(crate) fn image_count(&self) -> usize {
+    pub fn image_count(&self) -> usize {
         self.resources.lock().unwrap().images.len()
     }
 
-    pub(crate) fn cmd_buffer(&self, current: usize) -> vk::CommandBuffer {
+    pub fn cmd_buffer(&self, current: usize) -> vk::CommandBuffer {
         self.cmd_buffers[current]
     }
 
@@ -173,7 +182,7 @@ impl Swapchain {
     /// image. Returns [`BeginFrame::Skip`] for a minimised window or
     /// [`BeginFrame::Recreated`] if the swapchain was just rebuilt — in
     /// either case the caller skips this frame (no [`Swapchain::end_frame`] call).
-    pub(crate) fn begin_frame(&self) -> Result<BeginFrame> {
+    pub fn begin_frame(&self) -> Result<BeginFrame> {
         let current = self.frame_state.lock().unwrap().current;
 
         unsafe {
@@ -219,7 +228,7 @@ impl Swapchain {
     /// and present. Returns `true` if the swapchain was recreated, in which
     /// case the caller must rebuild framebuffers/depth before the next frame.
     /// No-op (returns `Ok(false)`) for [`BeginFrame::Skip`]/[`BeginFrame::Recreated`].
-    pub(crate) fn end_frame(&self, frame: &BeginFrame, cmd: vk::CommandBuffer) -> Result<bool> {
+    pub fn end_frame(&self, frame: &BeginFrame, cmd: vk::CommandBuffer) -> Result<bool> {
         let (current, index) = match *frame {
             BeginFrame::Image { current, index } => (current, index),
             _ => return Ok(false),
@@ -277,7 +286,7 @@ impl Swapchain {
 
     /// Force a swapchain recreation (e.g. after a resize). Safe to call when
     /// the window is minimised — the new extent may be zero.
-    pub(crate) fn resize(&self, width: u32, height: u32) -> Result<()> {
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         let mut res = self.resources.lock().unwrap();
         self.recreate(&mut res, width, height)
     }
@@ -337,6 +346,61 @@ impl Drop for Swapchain {
                 dev.destroy_fence(self.in_flight[i], None);
             }
             self.surface_loader.destroy_surface(self.surface, None);
+        }
+    }
+}
+
+/// Clean accessor over the raw Vulkan handles a consumer needs to build
+/// render-pass-shaped resources (render pass, pipelines, framebuffers, depth
+/// targets, vertex/index buffers) on top of a [`Swapchain`]. Obtained from
+/// [`Swapchain::context`].
+///
+/// Intentionally raw for now: it hands back `ash`/`vk` handles plus the
+/// physical-device memory properties, leaving buffer/image allocation to the
+/// caller. Convenience allocators may be layered on later.
+#[derive(Clone)]
+pub struct DeviceContext {
+    inner: Arc<VulkanDeviceInner>,
+}
+
+// Safety: same as VulkanDeviceInner — ash handles are Send+Sync.
+unsafe impl Send for DeviceContext {}
+unsafe impl Sync for DeviceContext {}
+
+impl DeviceContext {
+    /// Logical device — create render passes, pipelines, framebuffers, images.
+    pub fn device(&self) -> &ash::Device {
+        &self.inner.device
+    }
+
+    /// Instance — physical-device queries.
+    pub fn instance(&self) -> &ash::Instance {
+        &self.inner.shared.instance
+    }
+
+    /// Physical device backing the logical device.
+    pub fn physical(&self) -> vk::PhysicalDevice {
+        self.inner.physical
+    }
+
+    /// Queue used for submission/present.
+    pub fn queue(&self) -> vk::Queue {
+        self.inner.queue
+    }
+
+    /// Queue-family index of [`queue`](Self::queue).
+    pub fn queue_family(&self) -> u32 {
+        self.inner.queue_family
+    }
+
+    /// Physical-device memory properties, for picking a memory type when
+    /// allocating buffers/images.
+    pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            self.inner
+                .shared
+                .instance
+                .get_physical_device_memory_properties(self.inner.physical)
         }
     }
 }
