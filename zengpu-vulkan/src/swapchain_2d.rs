@@ -36,7 +36,27 @@ pub struct RectInstance {
     pub color: [f32; 4],
 }
 
+/// `center_radius` is `[cx, cy, radius, _]` in physical pixels. Same 32-byte
+/// layout as [`RectInstance`].
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct CircleInstance {
+    pub center_radius: [f32; 4],
+    pub color: [f32; 4],
+}
+
+/// One frame's 2D primitives, back-to-front per primitive type. Borrows the instance slices, no
+/// copy until upload.
+#[derive(Default, Clone, Copy)]
+pub struct Frame2d<'a> {
+    pub clear: Option<[f32; 4]>,
+    pub rects: &'a [RectInstance],
+    pub circles: &'a [CircleInstance],
+}
+
+/// Both instance kinds are 32 bytes. The shared buffer and binding rely on it.
 const INSTANCE_SIZE: usize = std::mem::size_of::<RectInstance>();
+const _: () = assert!(std::mem::size_of::<CircleInstance>() == INSTANCE_SIZE);
 
 const VERT_SPV: &[u32] = inline_spirv!(
     r#"
@@ -68,6 +88,52 @@ const FRAG_SPV: &[u32] = inline_spirv!(
     layout(location = 0) in vec4 v_color;
     layout(location = 0) out vec4 o_color;
     void main() { o_color = v_color; }
+    "#,
+    frag,
+    vulkan1_0
+);
+
+const CIRCLE_VERT_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec4 i_data;   // cx, cy, radius, _
+    layout(location = 1) in vec4 i_color;  // straight RGBA
+    layout(push_constant) uniform PC { vec2 viewport; } pc;
+    layout(location = 0) out vec2 v_local;   // offset from centre (px)
+    layout(location = 1) out vec4 v_color;
+    layout(location = 2) out float v_radius;
+    void main() {
+        vec2 corners[6] = vec2[](
+            vec2(-1.0, -1.0), vec2(1.0, -1.0), vec2(-1.0, 1.0),
+            vec2( 1.0, -1.0), vec2(1.0,  1.0), vec2(-1.0, 1.0)
+        );
+        vec2 corner = corners[gl_VertexIndex];
+        float r = i_data.z;
+        vec2 px = i_data.xy + corner * r;
+        v_local = corner * r;
+        v_radius = r;
+        v_color = i_color;
+        vec2 ndc = (px / pc.viewport) * 2.0 - 1.0;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+    }
+    "#,
+    vert,
+    vulkan1_0
+);
+
+const CIRCLE_FRAG_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec2 v_local;
+    layout(location = 1) in vec4 v_color;
+    layout(location = 2) in float v_radius;
+    layout(location = 0) out vec4 o_color;
+    void main() {
+        float dist = length(v_local);
+        float alpha = 1.0 - smoothstep(v_radius - 1.0, v_radius, dist);
+        if (alpha <= 0.0) discard;
+        o_color = vec4(v_color.rgb, v_color.a * alpha);
+    }
     "#,
     frag,
     vulkan1_0
@@ -112,15 +178,18 @@ impl InstanceBuffer {
         Ok(())
     }
 
-    fn upload(&self, rects: &[RectInstance]) {
-        if rects.is_empty() {
+    /// Copy `items` into the mapped buffer. Caller guarantees capacity. Works for any 32-byte
+    /// instance type.
+    fn upload_bytes<T>(&self, items: &[T]) {
+        debug_assert_eq!(std::mem::size_of::<T>(), INSTANCE_SIZE);
+        if items.is_empty() {
             return;
         }
         unsafe {
             std::ptr::copy_nonoverlapping(
-                rects.as_ptr() as *const u8,
+                items.as_ptr() as *const u8,
                 self.mapped,
-                rects.len() * INSTANCE_SIZE,
+                items.len() * INSTANCE_SIZE,
             );
         }
     }
@@ -233,12 +302,14 @@ pub struct Vulkan2dSurface {
     surface: vk::SurfaceKHR,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+    rect_pipeline: vk::Pipeline,
+    circle_pipeline: vk::Pipeline,
     cmd_pool: vk::CommandPool,
     /// One command buffer per frame-in-flight, re-recorded each present.
     cmd_buffers: Vec<vk::CommandBuffer>,
-    /// One growable instance buffer per frame-in-flight.
-    instance_buffers: Vec<Mutex<InstanceBuffer>>,
+    /// Growable instance buffers per frame-in-flight, one set per primitive kind.
+    rect_buffers: Vec<Mutex<InstanceBuffer>>,
+    circle_buffers: Vec<Mutex<InstanceBuffer>>,
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
@@ -295,14 +366,25 @@ impl Vulkan2dSurface {
         let image_views = create_image_views(&inner.device, &images, format)?;
         let render_pass = create_render_pass(&inner.device, format)?;
         let framebuffers = create_framebuffers(&inner.device, render_pass, &image_views, extent)?;
-        let (pipeline_layout, pipeline) = create_pipeline(&inner.device, render_pass)?;
+        let pipeline_layout = create_pipeline_layout(&inner.device)?;
+        let rect_pipeline =
+            create_pipeline(&inner.device, pipeline_layout, render_pass, VERT_SPV, FRAG_SPV)?;
+        let circle_pipeline = create_pipeline(
+            &inner.device,
+            pipeline_layout,
+            render_pass,
+            CIRCLE_VERT_SPV,
+            CIRCLE_FRAG_SPV,
+        )?;
 
         let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
         let cmd_buffers = allocate_cmd_buffers(&inner.device, cmd_pool, MAX_FRAMES_IN_FLIGHT)?;
 
-        let mut instance_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut rect_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut circle_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            instance_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INITIAL_RECTS)?));
+            rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INITIAL_RECTS)?));
+            circle_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INITIAL_RECTS)?));
         }
 
         let (image_available, render_finished, in_flight) =
@@ -315,10 +397,12 @@ impl Vulkan2dSurface {
             surface,
             render_pass,
             pipeline_layout,
-            pipeline,
+            rect_pipeline,
+            circle_pipeline,
             cmd_pool,
             cmd_buffers,
-            instance_buffers,
+            rect_buffers,
+            circle_buffers,
             image_available,
             render_finished,
             in_flight,
@@ -351,9 +435,9 @@ impl Vulkan2dSurface {
         self.recreate(&mut res, width, height)
     }
 
-    /// Clears to `clear` (default opaque black), draws `rects`, presents. Recreates the swapchain
-    /// on resize / surface loss.
-    pub fn present(&self, clear: Option<[f32; 4]>, rects: &[RectInstance]) -> Result<()> {
+    /// Draws one frame: clear, rects, circles, then present. Recreates the swapchain on resize or
+    /// surface loss.
+    pub fn present(&self, frame: Frame2d) -> Result<()> {
         let mut state = self.frame_state.lock().unwrap();
         let current = state.current;
 
@@ -392,11 +476,16 @@ impl Vulkan2dSurface {
                 .map_err(|e| GpuError::Backend(format!("reset_fences: {e}")))?;
         }
 
-        let instance_count = rects.len() as u32;
-        let instance_buf = {
-            let mut ib = self.instance_buffers[current].lock().unwrap();
-            ib.ensure_capacity(&self.inner, rects.len())?;
-            ib.upload(rects);
+        let rect_buf = {
+            let mut ib = self.rect_buffers[current].lock().unwrap();
+            ib.ensure_capacity(&self.inner, frame.rects.len())?;
+            ib.upload_bytes(frame.rects);
+            ib.buffer
+        };
+        let circle_buf = {
+            let mut ib = self.circle_buffers[current].lock().unwrap();
+            ib.ensure_capacity(&self.inner, frame.circles.len())?;
+            ib.upload_bytes(frame.circles);
             ib.buffer
         };
 
@@ -405,9 +494,9 @@ impl Vulkan2dSurface {
             cmd,
             res.framebuffers[image_index as usize],
             res.extent,
-            instance_buf,
-            clear,
-            instance_count,
+            &frame,
+            rect_buf,
+            circle_buf,
         )?;
 
         let wait_semaphores = [self.image_available[current]];
@@ -495,9 +584,9 @@ impl Vulkan2dSurface {
         cmd: vk::CommandBuffer,
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
-        instance_buf: vk::Buffer,
-        clear: Option<[f32; 4]>,
-        instance_count: u32,
+        frame: &Frame2d,
+        rect_buf: vk::Buffer,
+        circle_buf: vk::Buffer,
     ) -> Result<()> {
         let dev = &self.inner.device;
         unsafe {
@@ -509,7 +598,7 @@ impl Vulkan2dSurface {
 
         let clear_value = vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: clear.unwrap_or([0.0, 0.0, 0.0, 1.0]),
+                float32: frame.clear.unwrap_or([0.0, 0.0, 0.0, 1.0]),
             },
         };
         let rp_begin = vk::RenderPassBeginInfo {
@@ -540,20 +629,27 @@ impl Vulkan2dSurface {
 
         unsafe {
             dev.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
-            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
             dev.cmd_set_viewport(cmd, 0, &[viewport]);
             dev.cmd_set_scissor(cmd, 0, &[scissor]);
-            if instance_count > 0 {
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[instance_buf], &[0]);
-                dev.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
-                );
-                dev.cmd_draw(cmd, 6, instance_count, 0, 0);
+            dev.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
+            );
+
+            if !frame.rects.is_empty() {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rect_pipeline);
+                dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
+                dev.cmd_draw(cmd, 6, frame.rects.len() as u32, 0, 0);
             }
+            if !frame.circles.is_empty() {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.circle_pipeline);
+                dev.cmd_bind_vertex_buffers(cmd, 0, &[circle_buf], &[0]);
+                dev.cmd_draw(cmd, 6, frame.circles.len() as u32, 0, 0);
+            }
+
             dev.cmd_end_render_pass(cmd);
             dev.end_command_buffer(cmd)
                 .map_err(|e| GpuError::Backend(format!("end_command_buffer: {e}")))?;
@@ -567,7 +663,7 @@ impl Drop for Vulkan2dSurface {
         unsafe {
             let _ = self.inner.device.device_wait_idle();
         }
-        for ib in &self.instance_buffers {
+        for ib in self.rect_buffers.iter().chain(&self.circle_buffers) {
             ib.lock().unwrap().destroy(&self.inner);
         }
         {
@@ -580,7 +676,8 @@ impl Drop for Vulkan2dSurface {
         unsafe {
             let dev = &self.inner.device;
             dev.free_command_buffers(self.cmd_pool, &self.cmd_buffers);
-            dev.destroy_pipeline(self.pipeline, None);
+            dev.destroy_pipeline(self.rect_pipeline, None);
+            dev.destroy_pipeline(self.circle_pipeline, None);
             dev.destroy_pipeline_layout(self.pipeline_layout, None);
             dev.destroy_render_pass(self.render_pass, None);
             dev.destroy_command_pool(self.cmd_pool, None);
@@ -853,12 +950,36 @@ fn create_shader_module(device: &ash::Device, spv: &[u32]) -> Result<vk::ShaderM
     }
 }
 
+/// Shared by rect and circle pipelines (same vertex push constant).
+fn create_pipeline_layout(device: &ash::Device) -> Result<vk::PipelineLayout> {
+    let push_constant = vk::PushConstantRange {
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        offset: 0,
+        size: 8,
+    };
+    let layout_info = vk::PipelineLayoutCreateInfo {
+        push_constant_range_count: 1,
+        p_push_constant_ranges: &push_constant,
+        ..Default::default()
+    };
+    unsafe {
+        device
+            .create_pipeline_layout(&layout_info, None)
+            .map_err(|e| GpuError::Backend(format!("create_pipeline_layout: {e}")))
+    }
+}
+
+/// Build an instanced 2D pipeline from the given shaders. Callers vary only the shaders. Vertex
+/// binding, dynamic viewport/scissor and alpha blend are fixed.
 fn create_pipeline(
     device: &ash::Device,
+    layout: vk::PipelineLayout,
     render_pass: vk::RenderPass,
-) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
-    let vert = create_shader_module(device, VERT_SPV)?;
-    let frag = create_shader_module(device, FRAG_SPV)?;
+    vert_spv: &[u32],
+    frag_spv: &[u32],
+) -> Result<vk::Pipeline> {
+    let vert = create_shader_module(device, vert_spv)?;
+    let frag = create_shader_module(device, frag_spv)?;
     let entry = std::ffi::CString::new("main").unwrap();
     let stages = [
         vk::PipelineShaderStageCreateInfo {
@@ -946,22 +1067,6 @@ fn create_pipeline(
         ..Default::default()
     };
 
-    let push_constant = vk::PushConstantRange {
-        stage_flags: vk::ShaderStageFlags::VERTEX,
-        offset: 0,
-        size: 8,
-    };
-    let layout_info = vk::PipelineLayoutCreateInfo {
-        push_constant_range_count: 1,
-        p_push_constant_ranges: &push_constant,
-        ..Default::default()
-    };
-    let layout = unsafe {
-        device
-            .create_pipeline_layout(&layout_info, None)
-            .map_err(|e| GpuError::Backend(format!("create_pipeline_layout: {e}")))?
-    };
-
     let pipeline_info = vk::GraphicsPipelineCreateInfo {
         stage_count: stages.len() as u32,
         p_stages: stages.as_ptr(),
@@ -989,7 +1094,7 @@ fn create_pipeline(
         device.destroy_shader_module(vert, None);
         device.destroy_shader_module(frag, None);
     }
-    Ok((layout, pipeline))
+    Ok(pipeline)
 }
 
 fn create_command_pool(device: &ash::Device, queue_family: u32) -> Result<vk::CommandPool> {
