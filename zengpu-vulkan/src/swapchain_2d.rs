@@ -53,21 +53,21 @@ pub struct CircleInstance {
     pub color: [f32; 4],
 }
 
-/// One 2-stop gradient fill over a rect. `kind` in `a[3]` selects linear
-/// (`0.0`) vs radial (`1.0`).
+/// One LUT-sampled gradient fill over a rect. `kind` in `a[3]` selects linear
+/// (`0.0`) vs radial (`1.0`); `slot` selects a 256x1 RGBA bindless texture.
 ///
 /// - **Linear:** `a = [start.x, start.y, _, 0.0]`, `b = [end.x, end.y, _, _]`.
 /// - **Radial:** `a = [center.x, center.y, radius, 1.0]`, `b` unused.
 ///
-/// `color0`/`color1` are straight RGBA. 80-byte `#[repr(C)]` (five `vec4`).
+/// 64-byte `#[repr(C)]` (three `vec4`s plus slot/padding).
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct GradientInstance {
     pub rect: [f32; 4],
     pub a: [f32; 4],
     pub b: [f32; 4],
-    pub color0: [f32; 4],
-    pub color1: [f32; 4],
+    pub slot: u32,
+    pub _pad: [u32; 3],
 }
 
 /// One textured image quad. `rect` is the dest `[x, y, w, h]` in physical
@@ -102,7 +102,7 @@ pub struct Frame2d<'a> {
 const INSTANCE_SIZE: usize = std::mem::size_of::<RectInstance>();
 const _: () = assert!(std::mem::size_of::<CircleInstance>() == INSTANCE_SIZE);
 const GRADIENT_SIZE: usize = std::mem::size_of::<GradientInstance>();
-const _: () = assert!(GRADIENT_SIZE == 80);
+const _: () = assert!(GRADIENT_SIZE == 64);
 const IMAGE_SIZE: usize = std::mem::size_of::<ImageInstance>();
 const _: () = assert!(IMAGE_SIZE == 64);
 
@@ -194,23 +194,18 @@ const CIRCLE_FRAG_SPV: &[u32] = inline_spirv!(
     vulkan1_0
 );
 
-// Gradient: expand the fill rect, then in the fragment shader compute the
-// gradient parameter `t` (linear projection or radial distance) and mix the two
-// stop colours.
+// Gradient: expand the fill rect, then compute `t` in the fragment shader and
+// sample a cached 256x1 RGBA lookup texture from the bindless array.
 const GRADIENT_VERT_SPV: &[u32] = inline_spirv!(
     r#"
     #version 450
     layout(location = 0) in vec4 i_rect;    // x, y, w, h (fill area, px)
     layout(location = 1) in vec4 i_a;        // linear start.xy / radial centre.xy,.z=r,.w=kind
     layout(location = 2) in vec4 i_b;        // linear end.xy
-    layout(location = 3) in vec4 i_color0;
-    layout(location = 4) in vec4 i_color1;
-    layout(push_constant) uniform PC { vec2 viewport; } pc;
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
     layout(location = 0) out vec2 v_px;
     layout(location = 1) out vec4 v_a;
     layout(location = 2) out vec4 v_b;
-    layout(location = 3) out vec4 v_c0;
-    layout(location = 4) out vec4 v_c1;
     void main() {
         vec2 corners[6] = vec2[](
             vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
@@ -218,7 +213,7 @@ const GRADIENT_VERT_SPV: &[u32] = inline_spirv!(
         );
         vec2 corner = corners[gl_VertexIndex];
         vec2 px = i_rect.xy + corner * i_rect.zw;
-        v_px = px; v_a = i_a; v_b = i_b; v_c0 = i_color0; v_c1 = i_color1;
+        v_px = px; v_a = i_a; v_b = i_b;
         vec2 ndc = (px / pc.viewport) * 2.0 - 1.0;
         gl_Position = vec4(ndc, 0.0, 1.0);
     }
@@ -230,11 +225,11 @@ const GRADIENT_VERT_SPV: &[u32] = inline_spirv!(
 const GRADIENT_FRAG_SPV: &[u32] = inline_spirv!(
     r#"
     #version 450
+    layout(set = 0, binding = 0) uniform sampler2D textures[64];
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
     layout(location = 0) in vec2 v_px;
     layout(location = 1) in vec4 v_a;
     layout(location = 2) in vec4 v_b;
-    layout(location = 3) in vec4 v_c0;
-    layout(location = 4) in vec4 v_c1;
     layout(location = 0) out vec4 o_color;
     void main() {
         float t;
@@ -244,7 +239,8 @@ const GRADIENT_FRAG_SPV: &[u32] = inline_spirv!(
         } else {
             t = length(v_px - v_a.xy) / max(v_a.z, 1e-6);
         }
-        o_color = mix(v_c0, v_c1, clamp(t, 0.0, 1.0));
+        float lut_u = (clamp(t, 0.0, 1.0) * 255.0 + 0.5) / 256.0;
+        o_color = texture(textures[pc.slot], vec2(lut_u, 0.5));
     }
     "#,
     frag,
@@ -566,24 +562,23 @@ impl Vulkan2dSurface {
             INSTANCE_SIZE as u32,
             2,
         )?;
-        let gradient_pipeline = create_pipeline(
-            &inner.device,
-            pipeline_layout,
-            render_pass,
-            GRADIENT_VERT_SPV,
-            GRADIENT_FRAG_SPV,
-            GRADIENT_SIZE as u32,
-            5,
-        )?;
-
-        // Bindless image path: descriptor set (64 slots), placeholder fill,
-        // and a dedicated pipeline/layout.
+        // Bindless texture path shared by gradients and images: descriptor set
+        // (64 slots), placeholder fill, and a viewport+slot pipeline layout.
         let (descriptor_pool, descriptor_set_layout, descriptor_set) =
             create_bindless_descriptors(&inner.device)?;
         let placeholder = create_placeholder(device)?;
         fill_bindless_slots(&inner.device, descriptor_set, placeholder.view, placeholder.sampler);
         let image_pipeline_layout =
             create_image_pipeline_layout(&inner.device, descriptor_set_layout)?;
+        let gradient_pipeline = create_pipeline(
+            &inner.device,
+            image_pipeline_layout,
+            render_pass,
+            GRADIENT_VERT_SPV,
+            GRADIENT_FRAG_SPV,
+            GRADIENT_SIZE as u32,
+            3,
+        )?;
         let image_pipeline = create_pipeline(
             &inner.device,
             image_pipeline_layout,
@@ -957,8 +952,32 @@ impl Vulkan2dSurface {
             }
             if !frame.gradients.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gradient_pipeline);
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.image_pipeline_layout,
+                    0,
+                    &[self.descriptor_set],
+                    &[],
+                );
+                dev.cmd_push_constants(
+                    cmd,
+                    self.image_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
+                );
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[gradient_buf], &[0]);
-                dev.cmd_draw(cmd, 6, frame.gradients.len() as u32, 0, 0);
+                for (i, gradient) in frame.gradients.iter().enumerate() {
+                    dev.cmd_push_constants(
+                        cmd,
+                        self.image_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        8,
+                        &gradient.slot.to_ne_bytes(),
+                    );
+                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
+                }
             }
             if !frame.images.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.image_pipeline);
