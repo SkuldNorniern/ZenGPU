@@ -13,3 +13,6 @@ zengpu-hal.workspace = true
 ash = "0.38"
 inline-spirv = { version = "0.2", features = ["glsl"] }
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+winit = "0.30"
