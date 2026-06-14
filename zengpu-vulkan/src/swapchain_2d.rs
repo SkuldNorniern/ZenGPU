@@ -96,10 +96,18 @@ pub struct TextInstance {
     pub _pad: [u32; 3],
 }
 
-/// One frame's 2D primitives to draw. Within a primitive kind the order is
-/// back-to-front (painter's algorithm); across kinds the draw order is fixed
-/// (rects, gradients, images, text, circles), so cross-kind z-order is not yet
-/// preserved — true interleaving is a scene-graph concern. Borrows the slices.
+/// One primitive reference in painter submission order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrawRef {
+    Rect(u32),
+    Gradient(u32),
+    Image(u32),
+    Text(u32),
+    Circle(u32),
+}
+
+/// One frame's 2D primitives to draw. `order` preserves painter submission
+/// order across primitive kinds and indexes the corresponding instance slices.
 #[derive(Default, Clone, Copy)]
 pub struct Frame2d<'a> {
     pub clear: Option<[f32; 4]>,
@@ -108,6 +116,7 @@ pub struct Frame2d<'a> {
     pub images: &'a [ImageInstance],
     pub texts: &'a [TextInstance],
     pub circles: &'a [CircleInstance],
+    pub order: &'a [DrawRef],
 }
 
 /// Rects and circles are 32 bytes; the shared 32-byte buffer/binding rely on it.
@@ -388,7 +397,13 @@ struct InstanceBuffer {
 impl InstanceBuffer {
     fn new(inner: &VulkanDeviceInner, elem_size: usize, capacity: usize) -> Result<Self> {
         let (buffer, memory, mapped) = alloc_mapped_vertex_buffer(inner, elem_size, capacity)?;
-        Ok(Self { buffer, memory, mapped, elem_size, capacity })
+        Ok(Self {
+            buffer,
+            memory,
+            mapped,
+            elem_size,
+            capacity,
+        })
     }
 
     /// Ensure room for `needed` instances, reallocating (doubling) if required.
@@ -607,7 +622,12 @@ impl Vulkan2dSurface {
         }
 
         let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
-        let present_mode = pick_present_mode(&surface_loader, inner.physical, surface, config.present_mode)?;
+        let present_mode = pick_present_mode(
+            &surface_loader,
+            inner.physical,
+            surface,
+            config.present_mode,
+        )?;
         let format = pick_format(&surface_loader, inner.physical, surface)?;
 
         let (swapchain, images, extent) = create_swapchain(
@@ -648,7 +668,12 @@ impl Vulkan2dSurface {
         let (descriptor_pool, descriptor_set_layout, descriptor_set) =
             create_bindless_descriptors(&inner.device)?;
         let placeholder = create_placeholder(device)?;
-        fill_bindless_slots(&inner.device, descriptor_set, placeholder.view, placeholder.sampler);
+        fill_bindless_slots(
+            &inner.device,
+            descriptor_set,
+            placeholder.view,
+            placeholder.sampler,
+        );
         let image_pipeline_layout =
             create_image_pipeline_layout(&inner.device, descriptor_set_layout)?;
         let gradient_pipeline = create_pipeline(
@@ -694,12 +719,26 @@ impl Vulkan2dSurface {
         let mut image_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut text_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
-            rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
-            circle_buffers
-                .push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
-            gradient_buffers
-                .push(Mutex::new(InstanceBuffer::new(&inner, GRADIENT_SIZE, INITIAL_RECTS)?));
-            image_buffers.push(Mutex::new(InstanceBuffer::new(&inner, IMAGE_SIZE, INITIAL_RECTS)?));
+            rect_buffers.push(Mutex::new(InstanceBuffer::new(
+                &inner,
+                INSTANCE_SIZE,
+                INITIAL_RECTS,
+            )?));
+            circle_buffers.push(Mutex::new(InstanceBuffer::new(
+                &inner,
+                INSTANCE_SIZE,
+                INITIAL_RECTS,
+            )?));
+            gradient_buffers.push(Mutex::new(InstanceBuffer::new(
+                &inner,
+                GRADIENT_SIZE,
+                INITIAL_RECTS,
+            )?));
+            image_buffers.push(Mutex::new(InstanceBuffer::new(
+                &inner,
+                IMAGE_SIZE,
+                INITIAL_RECTS,
+            )?));
             text_buffers.push(Mutex::new(InstanceBuffer::new(
                 &inner,
                 TEXT_SIZE,
@@ -944,7 +983,10 @@ impl Vulkan2dSurface {
             p_image_indices: image_indices.as_ptr(),
             ..Default::default()
         };
-        match unsafe { self.swapchain_loader.queue_present(self.inner.queue, &present_info) } {
+        match unsafe {
+            self.swapchain_loader
+                .queue_present(self.inner.queue, &present_info)
+        } {
             Ok(_suboptimal) => {}
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let (w, h) = (res.extent.width, res.extent.height);
@@ -991,6 +1033,41 @@ impl Vulkan2dSurface {
         res.framebuffers = framebuffers;
         res.extent = extent;
         Ok(())
+    }
+
+    fn bind_textured_draw(
+        &self,
+        cmd: vk::CommandBuffer,
+        viewport: [f32; 2],
+        buffer: vk::Buffer,
+        slot: u32,
+    ) {
+        let dev = &self.inner.device;
+        unsafe {
+            dev.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.image_pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            dev.cmd_push_constants(
+                cmd,
+                self.image_pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                std::slice::from_raw_parts(viewport.as_ptr() as *const u8, 8),
+            );
+            dev.cmd_push_constants(
+                cmd,
+                self.image_pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                8,
+                &slot.to_ne_bytes(),
+            );
+            dev.cmd_bind_vertex_buffers(cmd, 0, &[buffer], &[0]);
+        }
     }
 
     fn record(
@@ -1053,106 +1130,69 @@ impl Vulkan2dSurface {
             );
 
             let [rect_buf, gradient_buf, image_buf, text_buf, circle_buf] = bufs;
-            // Fixed per-kind order: rects, gradients, images, text, circles.
-            // See Frame2d note on cross-kind z-order.
-            if !frame.rects.is_empty() {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rect_pipeline);
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
-                dev.cmd_draw(cmd, 6, frame.rects.len() as u32, 0, 0);
-            }
-            if !frame.gradients.is_empty() {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.gradient_pipeline);
-                dev.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.image_pipeline_layout,
-                    0,
-                    &[self.descriptor_set],
-                    &[],
-                );
-                dev.cmd_push_constants(
-                    cmd,
-                    self.image_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
-                );
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[gradient_buf], &[0]);
-                for (i, gradient) in frame.gradients.iter().enumerate() {
-                    dev.cmd_push_constants(
-                        cmd,
-                        self.image_pipeline_layout,
-                        vk::ShaderStageFlags::FRAGMENT,
-                        8,
-                        &gradient.slot.to_ne_bytes(),
-                    );
-                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
+            for draw in frame.order {
+                match *draw {
+                    DrawRef::Rect(index) => {
+                        if index as usize >= frame.rects.len() {
+                            return Err(GpuError::Backend("rect draw index out of range".into()));
+                        }
+                        dev.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.rect_pipeline,
+                        );
+                        dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
+                        dev.cmd_draw(cmd, 6, 1, 0, index);
+                    }
+                    DrawRef::Circle(index) => {
+                        if index as usize >= frame.circles.len() {
+                            return Err(GpuError::Backend("circle draw index out of range".into()));
+                        }
+                        dev.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.circle_pipeline,
+                        );
+                        dev.cmd_bind_vertex_buffers(cmd, 0, &[circle_buf], &[0]);
+                        dev.cmd_draw(cmd, 6, 1, 0, index);
+                    }
+                    DrawRef::Gradient(index) => {
+                        let gradient = frame.gradients.get(index as usize).ok_or_else(|| {
+                            GpuError::Backend("gradient draw index out of range".into())
+                        })?;
+                        dev.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.gradient_pipeline,
+                        );
+                        self.bind_textured_draw(cmd, push, gradient_buf, gradient.slot);
+                        dev.cmd_draw(cmd, 6, 1, 0, index);
+                    }
+                    DrawRef::Image(index) => {
+                        let image = frame.images.get(index as usize).ok_or_else(|| {
+                            GpuError::Backend("image draw index out of range".into())
+                        })?;
+                        dev.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.image_pipeline,
+                        );
+                        self.bind_textured_draw(cmd, push, image_buf, image.slot);
+                        dev.cmd_draw(cmd, 6, 1, 0, index);
+                    }
+                    DrawRef::Text(index) => {
+                        let text = frame.texts.get(index as usize).ok_or_else(|| {
+                            GpuError::Backend("text draw index out of range".into())
+                        })?;
+                        dev.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.text_pipeline,
+                        );
+                        self.bind_textured_draw(cmd, push, text_buf, text.slot);
+                        dev.cmd_draw(cmd, 6, 1, 0, index);
+                    }
                 }
-            }
-            if !frame.images.is_empty() {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.image_pipeline);
-                dev.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.image_pipeline_layout,
-                    0,
-                    &[self.descriptor_set],
-                    &[],
-                );
-                // Viewport push (vertex, offset 0) for the image layout.
-                dev.cmd_push_constants(
-                    cmd,
-                    self.image_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
-                );
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[image_buf], &[0]);
-                // Per-image draw: slot is a uniform-per-draw fragment push.
-                for (i, img) in frame.images.iter().enumerate() {
-                    dev.cmd_push_constants(
-                        cmd,
-                        self.image_pipeline_layout,
-                        vk::ShaderStageFlags::FRAGMENT,
-                        8,
-                        &img.slot.to_ne_bytes(),
-                    );
-                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
-                }
-            }
-            if !frame.texts.is_empty() {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.text_pipeline);
-                dev.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.image_pipeline_layout,
-                    0,
-                    &[self.descriptor_set],
-                    &[],
-                );
-                dev.cmd_push_constants(
-                    cmd,
-                    self.image_pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
-                );
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[text_buf], &[0]);
-                for (i, text) in frame.texts.iter().enumerate() {
-                    dev.cmd_push_constants(
-                        cmd,
-                        self.image_pipeline_layout,
-                        vk::ShaderStageFlags::FRAGMENT,
-                        8,
-                        &text.slot.to_ne_bytes(),
-                    );
-                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
-                }
-            }
-            if !frame.circles.is_empty() {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.circle_pipeline);
-                dev.cmd_bind_vertex_buffers(cmd, 0, &[circle_buf], &[0]);
-                dev.cmd_draw(cmd, 6, frame.circles.len() as u32, 0, 0);
             }
 
             dev.cmd_end_render_pass(cmd);
@@ -1701,7 +1741,11 @@ fn create_placeholder(device: &crate::device::VulkanDevice) -> Result<Placeholde
             &vk::ImageCreateInfo {
                 image_type: vk::ImageType::TYPE_2D,
                 format: vk::Format::R8G8B8A8_UNORM,
-                extent: vk::Extent3D { width: 1, height: 1, depth: 1 },
+                extent: vk::Extent3D {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
                 mip_levels: 1,
                 array_layers: 1,
                 samples: vk::SampleCountFlags::TYPE_1,
@@ -1813,7 +1857,9 @@ fn create_placeholder(device: &crate::device::VulkanDevice) -> Result<Placeholde
                 cmd,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
+                &vk::ClearColorValue {
+                    float32: [1.0, 1.0, 1.0, 1.0],
+                },
                 &[COLOR_SUBRESOURCE],
             );
             dev.cmd_pipeline_barrier(
@@ -1835,7 +1881,12 @@ fn create_placeholder(device: &crate::device::VulkanDevice) -> Result<Placeholde
         Ok(())
     })?;
 
-    Ok(Placeholder { image, view, memory, sampler })
+    Ok(Placeholder {
+        image,
+        view,
+        memory,
+        sampler,
+    })
 }
 
 const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
@@ -1868,7 +1919,11 @@ fn layout_barrier(
 
 fn create_bindless_descriptors(
     device: &ash::Device,
-) -> Result<(vk::DescriptorPool, vk::DescriptorSetLayout, vk::DescriptorSet)> {
+) -> Result<(
+    vk::DescriptorPool,
+    vk::DescriptorSetLayout,
+    vk::DescriptorSet,
+)> {
     let binding = vk::DescriptorSetLayoutBinding {
         binding: 0,
         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
