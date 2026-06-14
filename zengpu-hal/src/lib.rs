@@ -13,10 +13,16 @@
 
 #![forbid(unsafe_code)]
 
+mod desc;
 mod error;
 mod handle;
 mod types;
 
+pub use desc::{
+    AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,
+    GraphicsPipelineDesc, PrimitiveTopology, RenderTargetDesc, SamplerDesc, ShaderDesc,
+    SurfaceConfig, TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
+};
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{
     BufferHandle, Handle, PipelineHandle, SamplerHandle, ShaderHandle, SlotMap, SurfaceHandle,
