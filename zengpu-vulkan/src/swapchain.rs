@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use ash::{khr, vk};
 use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
 
-use crate::device::VulkanDeviceInner;
+use crate::device::{VulkanDevice, VulkanDeviceInner};
 use crate::instance::VulkanShared;
 
 /// Per-image state, rebuilt on resize or surface loss.
@@ -30,7 +30,7 @@ struct FrameState {
 }
 
 #[derive(Copy, Clone)]
-pub(crate) enum BeginFrame {
+pub enum BeginFrame {
     /// Window minimised (zero extent): skip the frame.
     Skip,
     /// Swapchain was rebuilt: rebuild resources derived from `image_views()`/`extent()`, then skip
@@ -40,7 +40,7 @@ pub(crate) enum BeginFrame {
     Image { current: usize, index: u32 },
 }
 
-pub(crate) struct Swapchain {
+pub struct Swapchain {
     inner: Arc<VulkanDeviceInner>,
     surface_loader: khr::surface::Instance,
     swapchain_loader: khr::swapchain::Device,
@@ -61,13 +61,14 @@ unsafe impl Send for Swapchain {}
 unsafe impl Sync for Swapchain {}
 
 impl Swapchain {
-    pub(crate) fn new(
-        shared: Arc<VulkanShared>,
-        inner: Arc<VulkanDeviceInner>,
+    pub fn new(
+        device: &VulkanDevice,
         handles: &zengpu_hal::WindowHandles,
         config: zengpu_hal::SurfaceConfig,
         frames_in_flight: usize,
     ) -> Result<Self> {
+        let inner = Arc::clone(&device.inner);
+        let shared = Arc::clone(&inner.shared);
         let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
         let surface = create_platform_surface(&shared, handles)?;
 
@@ -136,29 +137,37 @@ impl Swapchain {
         })
     }
 
-    pub(crate) fn format(&self) -> vk::Format {
+    /// Raw handles for building render-pass-shaped resources on this swapchain.
+    /// See `DeviceContext`.
+    pub fn context(&self) -> DeviceContext {
+        DeviceContext {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    pub fn format(&self) -> vk::Format {
         self.format
     }
 
-    pub(crate) fn extent(&self) -> vk::Extent2D {
+    pub fn extent(&self) -> vk::Extent2D {
         self.resources.lock().unwrap().extent
     }
 
-    pub(crate) fn image_views(&self) -> Vec<vk::ImageView> {
+    pub fn image_views(&self) -> Vec<vk::ImageView> {
         self.resources.lock().unwrap().image_views.clone()
     }
 
-    pub(crate) fn image_count(&self) -> usize {
+    pub fn image_count(&self) -> usize {
         self.resources.lock().unwrap().images.len()
     }
 
-    pub(crate) fn cmd_buffer(&self, current: usize) -> vk::CommandBuffer {
+    pub fn cmd_buffer(&self, current: usize) -> vk::CommandBuffer {
         self.cmd_buffers[current]
     }
 
     /// Wait for the next in-flight slot, then acquire an image. `Skip` (minimised) and `Recreated`
     /// both mean skip the frame, with no `end_frame` call.
-    pub(crate) fn begin_frame(&self) -> Result<BeginFrame> {
+    pub fn begin_frame(&self) -> Result<BeginFrame> {
         let current = self.frame_state.lock().unwrap().current;
 
         unsafe {
@@ -202,7 +211,7 @@ impl Swapchain {
 
     /// Submit `cmd` and present. `true` if the swapchain was recreated: rebuild framebuffers and
     /// depth before the next frame. No-op (`Ok(false)`) for `Skip` and `Recreated`.
-    pub(crate) fn end_frame(&self, frame: &BeginFrame, cmd: vk::CommandBuffer) -> Result<bool> {
+    pub fn end_frame(&self, frame: &BeginFrame, cmd: vk::CommandBuffer) -> Result<bool> {
         let (current, index) = match *frame {
             BeginFrame::Image { current, index } => (current, index),
             _ => return Ok(false),
@@ -259,7 +268,7 @@ impl Swapchain {
     }
 
     /// Force a recreation, e.g. after a resize. Safe while minimised: the extent may be zero.
-    pub(crate) fn resize(&self, width: u32, height: u32) -> Result<()> {
+    pub fn resize(&self, width: u32, height: u32) -> Result<()> {
         let mut res = self.resources.lock().unwrap();
         self.recreate(&mut res, width, height)
     }
@@ -318,6 +327,49 @@ impl Drop for Swapchain {
                 dev.destroy_fence(self.in_flight[i], None);
             }
             self.surface_loader.destroy_surface(self.surface, None);
+        }
+    }
+}
+
+/// Raw Vulkan handles needed to build render-pass-shaped resources on a [`Swapchain`],
+/// from [`Swapchain::context`].
+///
+/// Raw by design: buffer and image allocation is left to the caller.
+#[derive(Clone)]
+pub struct DeviceContext {
+    inner: Arc<VulkanDeviceInner>,
+}
+
+unsafe impl Send for DeviceContext {}
+unsafe impl Sync for DeviceContext {}
+
+impl DeviceContext {
+    pub fn device(&self) -> &ash::Device {
+        &self.inner.device
+    }
+
+    pub fn instance(&self) -> &ash::Instance {
+        &self.inner.shared.instance
+    }
+
+    pub fn physical(&self) -> vk::PhysicalDevice {
+        self.inner.physical
+    }
+
+    pub fn queue(&self) -> vk::Queue {
+        self.inner.queue
+    }
+
+    pub fn queue_family(&self) -> u32 {
+        self.inner.queue_family
+    }
+
+    pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
+        unsafe {
+            self.inner
+                .shared
+                .instance
+                .get_physical_device_memory_properties(self.inner.physical)
         }
     }
 }

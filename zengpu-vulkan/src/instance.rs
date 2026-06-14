@@ -146,14 +146,8 @@ impl VulkanInstance {
                 "create_textured_surface requires VulkanInstance::new_with_surface()".to_string(),
             ));
         }
-        let sc = VulkanTexturedSwapchain::new(
-            Arc::clone(&self.shared),
-            device,
-            handles,
-            config,
-            texture,
-            sampler,
-        )?;
+        let sc =
+            VulkanTexturedSwapchain::new(device, handles, config, texture, sampler)?;
         Ok(Box::new(sc))
     }
 
@@ -170,7 +164,7 @@ impl VulkanInstance {
                 "create_2d_surface requires VulkanInstance::new_with_surface()".to_string(),
             ));
         }
-        Vulkan2dSurface::new(Arc::clone(&self.shared), device, handles, config)
+        Vulkan2dSurface::new(device, handles, config)
     }
 
     /// First adapter as a concrete [`VulkanAdapter`], or `None`.
