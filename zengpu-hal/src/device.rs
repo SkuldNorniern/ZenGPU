@@ -11,6 +11,10 @@ use crate::request::HalCapabilities;
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker threads can allocate
 /// and upload concurrently.
 pub trait GpuDevice: Send + Sync {
+    /// Returns the backend device for backend-specific calls, e.g. a Vulkan swapchain
+    /// from a `VulkanDevice`.
+    fn as_any(&self) -> &dyn core::any::Any;
+
     fn capabilities(&self) -> HalCapabilities;
 
     /// Returned handle is generational.

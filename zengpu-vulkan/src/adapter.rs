@@ -40,9 +40,17 @@ impl GpuAdapter for VulkanAdapter {
         HalCapabilities::all()
     }
 
+    /// Opens a compute-only device (no swapchain extension).
     fn open(&self, req: DeviceRequest) -> zengpu_hal::Result<Box<dyn GpuDevice>> {
-        let device =
-            VulkanDevice::new(Arc::clone(&self.shared), self.physical, req)?;
+        let device = VulkanDevice::new(Arc::clone(&self.shared), self.physical, req)?;
         Ok(Box::new(device))
+    }
+}
+
+impl VulkanAdapter {
+    /// Whether the swapchain extension is enabled. Required for presenting to a surface
+    /// from [`VulkanInstance::create_surface`].
+    pub fn open_with_surface(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
+        VulkanDevice::new_with_swapchain(Arc::clone(&self.shared), self.physical, req)
     }
 }

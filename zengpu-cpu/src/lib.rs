@@ -55,6 +55,10 @@ fn out_of_bounds(start: usize, end: usize, len: usize) -> GpuError {
 }
 
 impl GpuDevice for CpuDevice {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn capabilities(&self) -> HalCapabilities {
         HalCapabilities::compute_only()
     }
@@ -159,7 +163,12 @@ impl GpuInstance for CpuInstance {
         Some(Box::new(CpuAdapter::new()))
     }
 
-    fn create_surface(&self, _handles: &WindowHandles) -> Result<Box<dyn GpuSurface>> {
+    fn create_surface(
+        &self,
+        _handles: &WindowHandles,
+        _device: &dyn zengpu_hal::GpuDevice,
+        _config: zengpu_hal::SurfaceConfig,
+    ) -> Result<Box<dyn GpuSurface>> {
         Err(GpuError::Backend(
             "CPU backend does not support presentable surfaces".to_string(),
         ))

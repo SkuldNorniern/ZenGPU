@@ -57,10 +57,13 @@ pub trait GpuInstance: Send + Sync {
     /// Returns `None` if nothing matches.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
 
-    /// Create a presentable surface from platform window handles. The window must outlive the
-    /// surface. Returns [`GpuError::Backend`] if the platform is unsupported (e.g. X11
-    /// handles on Windows).
-    fn create_surface(&self, handles: &WindowHandles) -> Result<Box<dyn GpuSurface>>;
+    /// Creates the surface and swapchain together. Window must outlive the returned surface.
+    fn create_surface(
+        &self,
+        handles: &WindowHandles,
+        device: &dyn crate::device::GpuDevice,
+        config: crate::desc::SurfaceConfig,
+    ) -> Result<Box<dyn GpuSurface>>;
 }
 
 #[cfg(test)]

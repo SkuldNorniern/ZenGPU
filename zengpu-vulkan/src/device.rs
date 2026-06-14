@@ -1,8 +1,3 @@
-//! Vulkan logical device and buffer operations.
-//!
-//! Host-visible buffers (Upload / Readback / CpuToGpu) are persistently mapped, with no staging or
-//! command buffers. Not yet: GpuOnly buffers return an error on write and read, since staging is
-//! not implemented.
 
 use std::sync::{Arc, Mutex};
 
@@ -14,24 +9,40 @@ use zengpu_hal::{
 
 use crate::instance::VulkanShared;
 
+/// Shared device state. `Arc`, so swapchains hold a ref.
+pub(crate) struct VulkanDeviceInner {
+    pub shared: Arc<VulkanShared>,
+    pub device: Device,
+    pub physical: vk::PhysicalDevice,
+    pub queue_family: u32,
+    pub queue: vk::Queue,
+}
+
+unsafe impl Send for VulkanDeviceInner {}
+unsafe impl Sync for VulkanDeviceInner {}
+
+impl Drop for VulkanDeviceInner {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+        }
+    }
+}
+
 struct VulkanBuffer {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     size: u64,
     usage: BufferUsage,
-    /// Non-null when the buffer's memory is persistently mapped (host-visible).
     mapped: *mut u8,
 }
 
 unsafe impl Send for VulkanBuffer {}
 unsafe impl Sync for VulkanBuffer {}
 
-/// Vulkan logical device implementing [`GpuDevice`]. `Send + Sync`: all mutable state is behind a
-/// `Mutex`. `ash::Device` and `vk::Queue` are safe to access from multiple threads.
 pub struct VulkanDevice {
-    shared: Arc<VulkanShared>,
-    device: Device,
-    physical: vk::PhysicalDevice,
+    pub(crate) inner: Arc<VulkanDeviceInner>,
     buffers: Mutex<SlotMap<marker::Buffer, VulkanBuffer>>,
 }
 
@@ -39,10 +50,11 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
-    pub(crate) fn new(
+    pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
         _req: DeviceRequest,
+        extra_extensions: &[*const i8],
     ) -> Result<Self> {
         let queue_family = compute_queue_family(&shared.instance, physical)
             .ok_or_else(|| GpuError::Backend("no compute queue family".to_string()))?;
@@ -58,6 +70,12 @@ impl VulkanDevice {
         let device_create_info = vk::DeviceCreateInfo {
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
+            enabled_extension_count: extra_extensions.len() as u32,
+            pp_enabled_extension_names: if extra_extensions.is_empty() {
+                std::ptr::null()
+            } else {
+                extra_extensions.as_ptr()
+            },
             ..Default::default()
         };
 
@@ -68,19 +86,47 @@ impl VulkanDevice {
                 .map_err(|e| GpuError::Backend(format!("vkCreateDevice: {e}")))?
         };
 
+        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+
         Ok(Self {
-            shared,
-            device,
-            physical,
+            inner: Arc::new(VulkanDeviceInner {
+                shared,
+                device,
+                physical,
+                queue_family,
+                queue,
+            }),
             buffers: Mutex::new(SlotMap::new()),
         })
     }
 
+    pub(crate) fn new(
+        shared: Arc<VulkanShared>,
+        physical: vk::PhysicalDevice,
+        req: DeviceRequest,
+    ) -> Result<Self> {
+        Self::create(shared, physical, req, &[])
+    }
+
+    pub(crate) fn new_with_swapchain(
+        shared: Arc<VulkanShared>,
+        physical: vk::PhysicalDevice,
+        req: DeviceRequest,
+    ) -> Result<Self> {
+        Self::create(
+            shared,
+            physical,
+            req,
+            &[ash::khr::swapchain::NAME.as_ptr()],
+        )
+    }
+
     fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
         let mem_props = unsafe {
-            self.shared
+            self.inner
+                .shared
                 .instance
-                .get_physical_device_memory_properties(self.physical)
+                .get_physical_device_memory_properties(self.inner.physical)
         };
         (0..mem_props.memory_type_count).find(|&i| {
             type_bits & (1 << i) != 0
@@ -136,7 +182,10 @@ fn buffer_usage_to_vk(usage: BufferUsage) -> vk::BufferUsageFlags {
 fn memory_usage_to_vk(usage: MemoryUsage) -> vk::MemoryPropertyFlags {
     match usage {
         MemoryUsage::GpuOnly | MemoryUsage::Pooled => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        MemoryUsage::Upload | MemoryUsage::CpuToGpu | MemoryUsage::Transient | MemoryUsage::Persistent => {
+        MemoryUsage::Upload
+        | MemoryUsage::CpuToGpu
+        | MemoryUsage::Transient
+        | MemoryUsage::Persistent => {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
         }
         MemoryUsage::Readback => {
@@ -156,13 +205,16 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 }
 
 impl GpuDevice for VulkanDevice {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn capabilities(&self) -> HalCapabilities {
         HalCapabilities::all()
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         let vk_usage = buffer_usage_to_vk(desc.usage);
-
         let buffer_info = vk::BufferCreateInfo {
             size: desc.size,
             usage: vk_usage,
@@ -171,12 +223,14 @@ impl GpuDevice for VulkanDevice {
         };
 
         let buffer = unsafe {
-            self.device
+            self.inner
+                .device
                 .create_buffer(&buffer_info, None)
                 .map_err(|e| GpuError::Backend(format!("vkCreateBuffer: {e}")))?
         };
 
-        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let mem_reqs =
+            unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
 
         let preferred_flags = memory_usage_to_vk(desc.memory);
         let type_index = self
@@ -196,7 +250,7 @@ impl GpuDevice for VulkanDevice {
         let type_index = match type_index {
             Some(i) => i,
             None => {
-                unsafe { self.device.destroy_buffer(buffer, None) };
+                unsafe { self.inner.device.destroy_buffer(buffer, None) };
                 return Err(GpuError::OutOfMemory(desc.memory));
             }
         };
@@ -208,19 +262,21 @@ impl GpuDevice for VulkanDevice {
         };
 
         let memory = unsafe {
-            match self.device.allocate_memory(&alloc_info, None) {
+            match self.inner.device.allocate_memory(&alloc_info, None) {
                 Ok(m) => m,
                 Err(_) => {
-                    self.device.destroy_buffer(buffer, None);
+                    self.inner.device.destroy_buffer(buffer, None);
                     return Err(GpuError::OutOfMemory(desc.memory));
                 }
             }
         };
 
-        if let Err(e) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+        if let Err(e) = unsafe {
+            self.inner.device.bind_buffer_memory(buffer, memory, 0)
+        } {
             unsafe {
-                self.device.destroy_buffer(buffer, None);
-                self.device.free_memory(memory, None);
+                self.inner.device.destroy_buffer(buffer, None);
+                self.inner.device.free_memory(memory, None);
             }
             return Err(GpuError::Backend(format!("vkBindBufferMemory: {e}")));
         }
@@ -230,13 +286,18 @@ impl GpuDevice for VulkanDevice {
 
         let mapped = if is_host_visible {
             match unsafe {
-                self.device.map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
+                self.inner.device.map_memory(
+                    memory,
+                    0,
+                    desc.size,
+                    vk::MemoryMapFlags::empty(),
+                )
             } {
                 Ok(ptr) => ptr as *mut u8,
                 Err(e) => {
                     unsafe {
-                        self.device.destroy_buffer(buffer, None);
-                        self.device.free_memory(memory, None);
+                        self.inner.device.destroy_buffer(buffer, None);
+                        self.inner.device.free_memory(memory, None);
                     }
                     return Err(GpuError::Backend(format!("vkMapMemory: {e}")));
                 }
@@ -245,15 +306,13 @@ impl GpuDevice for VulkanDevice {
             std::ptr::null_mut()
         };
 
-        let vk_buf = VulkanBuffer {
+        Ok(self.buffers.lock().unwrap().insert(VulkanBuffer {
             buffer,
             memory,
             size: desc.size,
             usage: desc.usage,
             mapped,
-        };
-
-        Ok(self.buffers.lock().unwrap().insert(vk_buf))
+        }))
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
@@ -262,10 +321,9 @@ impl GpuDevice for VulkanDevice {
 
         if buf.mapped.is_null() {
             return Err(GpuError::Backend(
-                "write_buffer on non-host-visible buffer; use a staging buffer".to_string(),
+                "write_buffer on non-host-visible buffer".to_string(),
             ));
         }
-
         let start = offset as usize;
         let end = start.checked_add(data.len()).ok_or_else(|| {
             GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
@@ -279,7 +337,6 @@ impl GpuDevice for VulkanDevice {
                 buf.size
             ))));
         }
-
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.mapped.add(start), data.len());
         }
@@ -301,7 +358,6 @@ impl GpuDevice for VulkanDevice {
                 "read_buffer on non-host-visible buffer".to_string(),
             ));
         }
-
         let start = offset as usize;
         let end = start.checked_add(len as usize).ok_or_else(|| {
             GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
@@ -315,7 +371,6 @@ impl GpuDevice for VulkanDevice {
                 buf.size
             ))));
         }
-
         let mut out = vec![0u8; len as usize];
         unsafe {
             std::ptr::copy_nonoverlapping(buf.mapped.add(start), out.as_mut_ptr(), len as usize);
@@ -328,10 +383,10 @@ impl GpuDevice for VulkanDevice {
         if let Some(buf) = buffers.remove(buffer) {
             unsafe {
                 if !buf.mapped.is_null() {
-                    self.device.unmap_memory(buf.memory);
+                    self.inner.device.unmap_memory(buf.memory);
                 }
-                self.device.destroy_buffer(buf.buffer, None);
-                self.device.free_memory(buf.memory, None);
+                self.inner.device.destroy_buffer(buf.buffer, None);
+                self.inner.device.free_memory(buf.memory, None);
             }
         }
     }
@@ -343,16 +398,11 @@ impl Drop for VulkanDevice {
         for buf in buffers.drain() {
             unsafe {
                 if !buf.mapped.is_null() {
-                    self.device.unmap_memory(buf.memory);
+                    self.inner.device.unmap_memory(buf.memory);
                 }
-                self.device.destroy_buffer(buf.buffer, None);
-                self.device.free_memory(buf.memory, None);
+                self.inner.device.destroy_buffer(buf.buffer, None);
+                self.inner.device.free_memory(buf.memory, None);
             }
-        }
-        drop(buffers);
-        unsafe {
-            let _ = self.device.device_wait_idle();
-            self.device.destroy_device(None);
         }
     }
 }
