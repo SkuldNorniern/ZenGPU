@@ -14,7 +14,7 @@ readme = "README.md"
 
 [workspace]
 resolver = "2"
-members = ["zengpu-hal", "zengpu-cpu"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan"]
 
 [workspace.package]
 version = "0.0.1"
@@ -26,6 +26,7 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
+zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
 
 [lib]
 name = "zengpu"

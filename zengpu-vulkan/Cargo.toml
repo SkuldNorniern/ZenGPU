@@ -1,0 +1,13 @@
+[package]
+name = "zengpu-vulkan"
+description = "ZenGPU Vulkan backend — native GPU runtime on Vulkan 1.2+."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
+ash = "0.38"
