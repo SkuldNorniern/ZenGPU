@@ -11,6 +11,7 @@ pub mod swapchain_triangle;
 pub use adapter::VulkanAdapter;
 pub use device::VulkanDevice;
 pub use instance::VulkanInstance;
+pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 pub use swapchain_triangle::VulkanSwapchain;
 pub use swapchain_2d::{
     CircleInstance, DrawRef, Frame2d, GradientInstance, IMAGE_SLOTS, ImageInstance, RectInstance,

@@ -15,7 +15,6 @@ use zengpu_hal::{
 };
 
 use crate::device::VulkanDevice;
-use crate::instance::VulkanShared;
 use crate::swapchain::{BeginFrame, Swapchain};
 
 /// Maximum number of textures in the bindless array (must match the shader).
@@ -281,7 +280,6 @@ impl VulkanTexturedSwapchain {
     /// live handles in `device`; they will be bound into slot 0 of the
     /// bindless array and must remain alive for the lifetime of this surface.
     pub(crate) fn new(
-        shared: Arc<VulkanShared>,
         device: &VulkanDevice,
         handles: &zengpu_hal::WindowHandles,
         config: SurfaceConfig,
@@ -289,13 +287,7 @@ impl VulkanTexturedSwapchain {
         sampler: SamplerHandle,
     ) -> Result<Self> {
         let inner = Arc::clone(&device.inner);
-        let swapchain = Swapchain::new(
-            Arc::clone(&shared),
-            Arc::clone(&inner),
-            handles,
-            config,
-            MAX_FRAMES_IN_FLIGHT,
-        )?;
+        let swapchain = Swapchain::new(device, handles, config, MAX_FRAMES_IN_FLIGHT)?;
         let format = swapchain.format();
         let image_views = swapchain.image_views();
         let extent = swapchain.extent();
