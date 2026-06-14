@@ -4,21 +4,19 @@
 //! set 0) accessible by a `uint tex_index` push constant.  All unused slots
 //! are pre-filled with a 1×1 white placeholder so no slot is ever invalid.
 //!
-//! Command buffers are pre-recorded at creation; the render loop is the same
-//! acquire → (pre-recorded draw) → present pattern as `VulkanSwapchain`.
+//! Command buffers are re-recorded every frame (one triangle draw).
 
 use std::sync::{Arc, Mutex};
 
-use ash::{Device, khr, vk};
+use ash::{Device, vk};
 use inline_spirv::inline_spirv;
 use zengpu_hal::{
-    GpuError, GpuSurface, PresentMode, Result, SamplerHandle, SurfaceConfig, SurfaceFrame,
-    TextureHandle,
+    GpuError, GpuSurface, Result, SamplerHandle, SurfaceConfig, SurfaceFrame, TextureHandle,
 };
 
 use crate::device::VulkanDevice;
 use crate::instance::VulkanShared;
-use crate::swapchain::create_platform_surface;
+use crate::swapchain::{BeginFrame, Swapchain};
 
 /// Maximum number of textures in the bindless array (must match the shader).
 pub const BINDLESS_CAPACITY: u32 = 64;
@@ -56,12 +54,6 @@ const FRAG_SPV: &[u32] = inline_spirv!(
     frag,
     vulkan1_0
 );
-
-// ── Frame sync state ──────────────────────────────────────────────────────────
-
-struct FrameState {
-    current: usize,
-}
 
 // ── Placeholder texture (fills unused bindless slots) ─────────────────────────
 
@@ -264,36 +256,21 @@ fn create_placeholder(device: &VulkanDevice) -> Result<Placeholder> {
 /// white placeholder so the descriptor set is always complete.
 pub struct VulkanTexturedSwapchain {
     inner: Arc<crate::device::VulkanDeviceInner>,
-    surface_loader: khr::surface::Instance,
-    swapchain_loader: khr::swapchain::Device,
-    surface: vk::SurfaceKHR,
-    swapchain: vk::SwapchainKHR,
-    images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
-    framebuffers: Vec<vk::Framebuffer>,
-    // Bindless descriptors
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
-    #[allow(dead_code)] // bound into pre-recorded command buffers; kept for future re-recording
+    #[allow(dead_code)]
     descriptor_set: vk::DescriptorSet,
-    // Pipeline (has push constant for tex_index)
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    // Commands
-    cmd_pool: vk::CommandPool,
-    cmd_buffers: Vec<vk::CommandBuffer>,
-    // Sync
-    image_available: Vec<vk::Semaphore>,
-    render_finished: Vec<vk::Semaphore>,
-    in_flight: Vec<vk::Fence>,
-    frame_state: Mutex<FrameState>,
-    extent: Mutex<vk::Extent2D>,
-    // Placeholder texture that fills unused bindless slots
     placeholder: Placeholder,
-    // Kept for swapchain recreation on resize (deferred to post-G3).
-    #[allow(dead_code)]
-    format: vk::Format,
+    /// Per-swapchain-image framebuffers; rebuilt on swapchain recreation.
+    framebuffers: Mutex<Vec<vk::Framebuffer>>,
+    /// BeginFrame token carried between acquire_frame and present_frame.
+    pending_frame: Mutex<Option<BeginFrame>>,
+    /// Shared swapchain plumbing. Placed last so it drops after all resources
+    /// derived from its image views (framebuffers, pipelines, render pass).
+    swapchain: Swapchain,
 }
 
 unsafe impl Send for VulkanTexturedSwapchain {}
@@ -312,55 +289,28 @@ impl VulkanTexturedSwapchain {
         sampler: SamplerHandle,
     ) -> Result<Self> {
         let inner = Arc::clone(&device.inner);
-        let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
-        let surface = create_platform_surface(&shared, handles)?;
-
-        let supports_present = unsafe {
-            surface_loader.get_physical_device_surface_support(
-                inner.physical,
-                inner.queue_family,
-                surface,
-            )
-        }
-        .map_err(|e| GpuError::Backend(format!("surface support query: {e}")))?;
-
-        if !supports_present {
-            unsafe { surface_loader.destroy_surface(surface, None) };
-            return Err(GpuError::Backend(
-                "selected queue family cannot present to this surface".to_string(),
-            ));
-        }
-
-        let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
-
-        let (swapchain, images, format, extent) = create_swapchain(
-            &surface_loader,
-            &swapchain_loader,
-            inner.physical,
-            surface,
-            &config,
+        let swapchain = Swapchain::new(
+            Arc::clone(&shared),
+            Arc::clone(&inner),
+            handles,
+            config,
+            MAX_FRAMES_IN_FLIGHT,
         )?;
+        let format = swapchain.format();
+        let image_views = swapchain.image_views();
+        let extent = swapchain.extent();
 
-        let image_views = create_image_views(&inner.device, &images, format)?;
         let render_pass = create_render_pass(&inner.device, format)?;
         let framebuffers = create_framebuffers(&inner.device, render_pass, &image_views, extent)?;
 
         let (descriptor_pool, descriptor_set_layout, descriptor_set) =
             create_bindless_descriptors(&inner.device)?;
-
         let (pipeline_layout, pipeline) =
-            create_textured_pipeline(&inner.device, render_pass, extent, descriptor_set_layout)?;
+            create_textured_pipeline(&inner.device, render_pass, descriptor_set_layout)?;
 
-        // Create placeholder and fill all bindless slots with it.
         let placeholder = create_placeholder(device)?;
-        fill_bindless_slots(
-            &inner.device,
-            descriptor_set,
-            placeholder.view,
-            placeholder.sampler,
-        );
+        fill_bindless_slots(&inner.device, descriptor_set, placeholder.view, placeholder.sampler);
 
-        // Register the user texture at slot 0.
         let tex_view = device.texture_view(texture).ok_or_else(|| {
             GpuError::Backend("create_textured_surface: stale TextureHandle".to_string())
         })?;
@@ -369,46 +319,86 @@ impl VulkanTexturedSwapchain {
         })?;
         update_bindless_slot(&inner.device, descriptor_set, 0, tex_view, samp_vk);
 
-        let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
-        let cmd_buffers = record_cmd_buffers(
-            &inner.device,
-            cmd_pool,
-            render_pass,
-            &framebuffers,
-            pipeline,
-            pipeline_layout,
-            descriptor_set,
-            extent,
-        )?;
-
-        let (image_available, render_finished, in_flight) =
-            create_sync(&inner.device, MAX_FRAMES_IN_FLIGHT)?;
-
         Ok(Self {
             inner,
-            surface_loader,
-            swapchain_loader,
-            surface,
-            swapchain,
-            images,
-            image_views,
             render_pass,
-            framebuffers,
             descriptor_pool,
             descriptor_set_layout,
             descriptor_set,
             pipeline_layout,
             pipeline,
-            cmd_pool,
-            cmd_buffers,
-            image_available,
-            render_finished,
-            in_flight,
-            frame_state: Mutex::new(FrameState { current: 0 }),
-            extent: Mutex::new(extent),
             placeholder,
-            format,
+            framebuffers: Mutex::new(framebuffers),
+            pending_frame: Mutex::new(None),
+            swapchain,
         })
+    }
+
+    fn rebuild_framebuffers(&self) -> Result<()> {
+        let image_views = self.swapchain.image_views();
+        let extent = self.swapchain.extent();
+        let new_fbs = create_framebuffers(&self.inner.device, self.render_pass, &image_views, extent)?;
+        let mut fbs = self.framebuffers.lock().unwrap();
+        for &fb in fbs.iter() {
+            unsafe { self.inner.device.destroy_framebuffer(fb, None); }
+        }
+        *fbs = new_fbs;
+        Ok(())
+    }
+
+    fn record(&self, cmd: vk::CommandBuffer, framebuffer: vk::Framebuffer, extent: vk::Extent2D) -> Result<()> {
+        let dev = &self.inner.device;
+        unsafe {
+            dev.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                .map_err(|e| GpuError::Backend(format!("reset_command_buffer: {e}")))?;
+            dev.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                .map_err(|e| GpuError::Backend(format!("begin_command_buffer: {e}")))?;
+
+            let clear = vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.02, 0.02, 0.02, 1.0] },
+            };
+            dev.cmd_begin_render_pass(
+                cmd,
+                &vk::RenderPassBeginInfo {
+                    render_pass: self.render_pass,
+                    framebuffer,
+                    render_area: vk::Rect2D { offset: vk::Offset2D::default(), extent },
+                    clear_value_count: 1,
+                    p_clear_values: &clear,
+                    ..Default::default()
+                },
+                vk::SubpassContents::INLINE,
+            );
+            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            dev.cmd_set_viewport(cmd, 0, &[vk::Viewport {
+                x: 0.0, y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }]);
+            dev.cmd_set_scissor(cmd, 0, &[vk::Rect2D { offset: vk::Offset2D::default(), extent }]);
+            dev.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+            dev.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &0u32.to_ne_bytes(),
+            );
+            dev.cmd_draw(cmd, 3, 1, 0, 0);
+            dev.cmd_end_render_pass(cmd);
+            dev.end_command_buffer(cmd)
+                .map_err(|e| GpuError::Backend(format!("end_command_buffer: {e}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -417,14 +407,6 @@ impl Drop for VulkanTexturedSwapchain {
         unsafe {
             let _ = self.inner.device.device_wait_idle();
             let dev = &self.inner.device;
-
-            dev.free_command_buffers(self.cmd_pool, &self.cmd_buffers);
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                dev.destroy_semaphore(self.image_available[i], None);
-                dev.destroy_semaphore(self.render_finished[i], None);
-                dev.destroy_fence(self.in_flight[i], None);
-            }
-            dev.destroy_command_pool(self.cmd_pool, None);
 
             dev.destroy_pipeline(self.pipeline, None);
             dev.destroy_pipeline_layout(self.pipeline_layout, None);
@@ -436,233 +418,70 @@ impl Drop for VulkanTexturedSwapchain {
             dev.destroy_image(self.placeholder.image, None);
             dev.free_memory(self.placeholder.memory, None);
 
-            for &fb in &self.framebuffers {
+            for &fb in self.framebuffers.lock().unwrap().iter() {
                 dev.destroy_framebuffer(fb, None);
             }
             dev.destroy_render_pass(self.render_pass, None);
-            for &iv in &self.image_views {
-                dev.destroy_image_view(iv, None);
-            }
-            self.swapchain_loader.destroy_swapchain(self.swapchain, None);
-            self.surface_loader.destroy_surface(self.surface, None);
+            // self.swapchain drops automatically after this body.
         }
     }
 }
 
 impl GpuSurface for VulkanTexturedSwapchain {
     fn configure(&self, _config: SurfaceConfig) -> Result<()> {
-        // Resize/recreation deferred to post-G3.
         Ok(())
     }
 
     fn acquire_frame(&self) -> Result<SurfaceFrame> {
-        let mut state = self.frame_state.lock().unwrap();
-        let current = state.current;
-
-        unsafe {
-            self.inner
-                .device
-                .wait_for_fences(&[self.in_flight[current]], true, u64::MAX)
-                .map_err(|e| GpuError::Backend(format!("wait_for_fences: {e}")))?;
-            self.inner
-                .device
-                .reset_fences(&[self.in_flight[current]])
-                .map_err(|e| GpuError::Backend(format!("reset_fences: {e}")))?;
-        }
-
-        let (image_index, _suboptimal) = unsafe {
-            self.swapchain_loader
-                .acquire_next_image(
-                    self.swapchain,
-                    u64::MAX,
-                    self.image_available[current],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| {
-                    GpuError::Surface(match e {
-                        vk::Result::ERROR_OUT_OF_DATE_KHR => zengpu_hal::SurfaceError::Outdated,
-                        vk::Result::ERROR_SURFACE_LOST_KHR => zengpu_hal::SurfaceError::Lost,
-                        _ => zengpu_hal::SurfaceError::OutOfMemory,
-                    })
-                })?
+        let bf = self.swapchain.begin_frame()?;
+        let index = match bf {
+            BeginFrame::Image { index, .. } => index,
+            BeginFrame::Recreated => {
+                self.rebuild_framebuffers()?;
+                *self.pending_frame.lock().unwrap() = None;
+                return Ok(SurfaceFrame { index: 0 });
+            }
+            BeginFrame::Skip => {
+                *self.pending_frame.lock().unwrap() = None;
+                return Ok(SurfaceFrame { index: 0 });
+            }
         };
-
-        state.current = current;
-        Ok(SurfaceFrame { index: image_index })
+        *self.pending_frame.lock().unwrap() = Some(bf);
+        Ok(SurfaceFrame { index })
     }
 
-    fn present_frame(&self, frame: SurfaceFrame) -> Result<()> {
-        let mut state = self.frame_state.lock().unwrap();
-        let current = state.current;
-        let image_index = frame.index;
-
-        let wait_semaphores = [self.image_available[current]];
-        let signal_semaphores = [self.render_finished[current]];
-        let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-        let cmd_bufs = [self.cmd_buffers[image_index as usize]];
-
-        let submit_info = vk::SubmitInfo {
-            wait_semaphore_count: 1,
-            p_wait_semaphores: wait_semaphores.as_ptr(),
-            p_wait_dst_stage_mask: wait_stages.as_ptr(),
-            command_buffer_count: 1,
-            p_command_buffers: cmd_bufs.as_ptr(),
-            signal_semaphore_count: 1,
-            p_signal_semaphores: signal_semaphores.as_ptr(),
-            ..Default::default()
+    fn present_frame(&self, _frame: SurfaceFrame) -> Result<()> {
+        let bf = match self.pending_frame.lock().unwrap().take() {
+            Some(bf) => bf,
+            None => return Ok(()),
+        };
+        let (current, index) = match bf {
+            BeginFrame::Image { current, index } => (current, index),
+            _ => return Ok(()),
         };
 
-        unsafe {
-            self.inner
-                .device
-                .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
-                .map_err(|e| GpuError::Backend(format!("queue_submit: {e}")))?;
+        let fbs = self.framebuffers.lock().unwrap();
+        let cmd = self.swapchain.cmd_buffer(current);
+        self.record(cmd, fbs[index as usize], self.swapchain.extent())?;
+        drop(fbs);
+
+        if self.swapchain.end_frame(&bf, cmd)? {
+            self.rebuild_framebuffers()?;
         }
-
-        let swapchains = [self.swapchain];
-        let image_indices = [image_index];
-        let present_info = vk::PresentInfoKHR {
-            wait_semaphore_count: 1,
-            p_wait_semaphores: signal_semaphores.as_ptr(),
-            swapchain_count: 1,
-            p_swapchains: swapchains.as_ptr(),
-            p_image_indices: image_indices.as_ptr(),
-            ..Default::default()
-        };
-
-        unsafe {
-            self.swapchain_loader
-                .queue_present(self.inner.queue, &present_info)
-                .map_err(|e| {
-                    GpuError::Surface(match e {
-                        vk::Result::ERROR_OUT_OF_DATE_KHR => zengpu_hal::SurfaceError::Outdated,
-                        vk::Result::ERROR_SURFACE_LOST_KHR => zengpu_hal::SurfaceError::Lost,
-                        _ => zengpu_hal::SurfaceError::OutOfMemory,
-                    })
-                })?;
-        }
-
-        state.current = (current + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }
 
     fn size(&self) -> (u32, u32) {
-        let ext = *self.extent.lock().unwrap();
-        (ext.width, ext.height)
+        let e = self.swapchain.extent();
+        (e.width, e.height)
     }
 
     fn image_count(&self) -> u32 {
-        self.images.len() as u32
+        self.swapchain.image_count() as u32
     }
 }
 
 // ── Helper functions ──────────────────────────────────────────────────────────
-
-fn create_swapchain(
-    surface_loader: &khr::surface::Instance,
-    swapchain_loader: &khr::swapchain::Device,
-    physical: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-    config: &SurfaceConfig,
-) -> Result<(vk::SwapchainKHR, Vec<vk::Image>, vk::Format, vk::Extent2D)> {
-    let caps = unsafe {
-        surface_loader
-            .get_physical_device_surface_capabilities(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface capabilities: {e}")))?
-    };
-    let formats = unsafe {
-        surface_loader
-            .get_physical_device_surface_formats(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface formats: {e}")))?
-    };
-    let present_modes = unsafe {
-        surface_loader
-            .get_physical_device_surface_present_modes(physical, surface)
-            .map_err(|e| GpuError::Backend(format!("surface present modes: {e}")))?
-    };
-
-    let surface_format = formats
-        .iter()
-        .find(|f| {
-            f.format == vk::Format::B8G8R8A8_SRGB
-                && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-        })
-        .or_else(|| formats.first())
-        .copied()
-        .ok_or_else(|| GpuError::Backend("no surface formats".to_string()))?;
-
-    let desired = match config.present_mode {
-        PresentMode::Mailbox => vk::PresentModeKHR::MAILBOX,
-        PresentMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
-        PresentMode::Fifo => vk::PresentModeKHR::FIFO,
-    };
-    let present_mode = if present_modes.contains(&desired) { desired } else { vk::PresentModeKHR::FIFO };
-
-    let extent = if caps.current_extent.width != u32::MAX {
-        caps.current_extent
-    } else {
-        vk::Extent2D {
-            width: config.width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
-            height: config.height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
-        }
-    };
-
-    let mut image_count = caps.min_image_count + 1;
-    if caps.max_image_count > 0 {
-        image_count = image_count.min(caps.max_image_count);
-    }
-
-    let create_info = vk::SwapchainCreateInfoKHR {
-        surface,
-        min_image_count: image_count,
-        image_format: surface_format.format,
-        image_color_space: surface_format.color_space,
-        image_extent: extent,
-        image_array_layers: 1,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
-        image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        pre_transform: caps.current_transform,
-        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
-        present_mode,
-        clipped: vk::TRUE,
-        ..Default::default()
-    };
-
-    let swapchain = unsafe {
-        swapchain_loader
-            .create_swapchain(&create_info, None)
-            .map_err(|e| GpuError::Backend(format!("vkCreateSwapchainKHR: {e}")))?
-    };
-    let images = unsafe {
-        swapchain_loader
-            .get_swapchain_images(swapchain)
-            .map_err(|e| GpuError::Backend(format!("get_swapchain_images: {e}")))?
-    };
-
-    Ok((swapchain, images, surface_format.format, extent))
-}
-
-fn create_image_views(device: &Device, images: &[vk::Image], format: vk::Format) -> Result<Vec<vk::ImageView>> {
-    images.iter().map(|&image| {
-        unsafe {
-            device.create_image_view(
-                &vk::ImageViewCreateInfo {
-                    image,
-                    view_type: vk::ImageViewType::TYPE_2D,
-                    format,
-                    subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0, level_count: 1,
-                        base_array_layer: 0, layer_count: 1,
-                    },
-                    ..Default::default()
-                },
-                None,
-            )
-            .map_err(|e| GpuError::Backend(format!("create_image_view: {e}")))
-        }
-    }).collect()
-}
 
 fn create_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderPass> {
     let attachment = vk::AttachmentDescription {
@@ -872,7 +691,6 @@ fn create_shader_module(device: &Device, spv: &[u32]) -> Result<vk::ShaderModule
 fn create_textured_pipeline(
     device: &Device,
     render_pass: vk::RenderPass,
-    extent: vk::Extent2D,
     set_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let vert = create_shader_module(device, VERT_SPV)?;
@@ -915,14 +733,7 @@ fn create_textured_pipeline(
             .map_err(|e| GpuError::Backend(format!("create_pipeline_layout: {e}")))?
     };
 
-    let viewport = vk::Viewport {
-        x: 0.0, y: 0.0,
-        width: extent.width as f32,
-        height: extent.height as f32,
-        min_depth: 0.0, max_depth: 1.0,
-    };
-    let scissor = vk::Rect2D { offset: vk::Offset2D::default(), extent };
-
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let blend_attachment = vk::PipelineColorBlendAttachmentState {
         color_write_mask: vk::ColorComponentFlags::RGBA,
         ..Default::default()
@@ -938,9 +749,7 @@ fn create_textured_pipeline(
         },
         p_viewport_state: &vk::PipelineViewportStateCreateInfo {
             viewport_count: 1,
-            p_viewports: &viewport,
             scissor_count: 1,
-            p_scissors: &scissor,
             ..Default::default()
         },
         p_rasterization_state: &vk::PipelineRasterizationStateCreateInfo {
@@ -957,6 +766,11 @@ fn create_textured_pipeline(
         p_color_blend_state: &vk::PipelineColorBlendStateCreateInfo {
             attachment_count: 1,
             p_attachments: &blend_attachment,
+            ..Default::default()
+        },
+        p_dynamic_state: &vk::PipelineDynamicStateCreateInfo {
+            dynamic_state_count: dynamic_states.len() as u32,
+            p_dynamic_states: dynamic_states.as_ptr(),
             ..Default::default()
         },
         layout,
@@ -980,119 +794,4 @@ fn create_textured_pipeline(
     }
 
     Ok((layout, pipeline))
-}
-
-fn create_command_pool(device: &Device, queue_family: u32) -> Result<vk::CommandPool> {
-    unsafe {
-        device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo {
-                    queue_family_index: queue_family,
-                    flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                    ..Default::default()
-                },
-                None,
-            )
-            .map_err(|e| GpuError::Backend(format!("create_command_pool: {e}")))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn record_cmd_buffers(
-    device: &Device,
-    pool: vk::CommandPool,
-    render_pass: vk::RenderPass,
-    framebuffers: &[vk::Framebuffer],
-    pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
-    descriptor_set: vk::DescriptorSet,
-    extent: vk::Extent2D,
-) -> Result<Vec<vk::CommandBuffer>> {
-    let cmd_buffers = unsafe {
-        device
-            .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-                command_pool: pool,
-                level: vk::CommandBufferLevel::PRIMARY,
-                command_buffer_count: framebuffers.len() as u32,
-                ..Default::default()
-            })
-            .map_err(|e| GpuError::Backend(format!("allocate_command_buffers: {e}")))?
-    };
-
-    let tex_index_bytes = 0u32.to_ne_bytes();
-
-    for (i, &cb) in cmd_buffers.iter().enumerate() {
-        unsafe {
-            device
-                .begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default())
-                .map_err(|e| GpuError::Backend(format!("begin_command_buffer: {e}")))?;
-
-            let clear = vk::ClearValue {
-                color: vk::ClearColorValue { float32: [0.02, 0.02, 0.02, 1.0] },
-            };
-            device.cmd_begin_render_pass(
-                cb,
-                &vk::RenderPassBeginInfo {
-                    render_pass,
-                    framebuffer: framebuffers[i],
-                    render_area: vk::Rect2D { offset: vk::Offset2D::default(), extent },
-                    clear_value_count: 1,
-                    p_clear_values: &clear,
-                    ..Default::default()
-                },
-                vk::SubpassContents::INLINE,
-            );
-            device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
-            device.cmd_bind_descriptor_sets(
-                cb,
-                vk::PipelineBindPoint::GRAPHICS,
-                pipeline_layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-            device.cmd_push_constants(
-                cb,
-                pipeline_layout,
-                vk::ShaderStageFlags::FRAGMENT,
-                0,
-                &tex_index_bytes,
-            );
-            device.cmd_draw(cb, 3, 1, 0, 0);
-            device.cmd_end_render_pass(cb);
-            device
-                .end_command_buffer(cb)
-                .map_err(|e| GpuError::Backend(format!("end_command_buffer: {e}")))?;
-        }
-    }
-
-    Ok(cmd_buffers)
-}
-
-fn create_sync(device: &Device, count: usize) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
-    let sem_info = vk::SemaphoreCreateInfo::default();
-    let fence_info = vk::FenceCreateInfo { flags: vk::FenceCreateFlags::SIGNALED, ..Default::default() };
-
-    let mut image_available = Vec::with_capacity(count);
-    let mut render_finished = Vec::with_capacity(count);
-    let mut fences = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        unsafe {
-            image_available.push(
-                device.create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            render_finished.push(
-                device.create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            fences.push(
-                device.create_fence(&fence_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_fence: {e}")))?,
-            );
-        }
-    }
-
-    Ok((image_available, render_finished, fences))
 }
