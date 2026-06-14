@@ -697,9 +697,36 @@ impl Vulkan2dSurface {
             .sampler_vk(sampler)
             .ok_or_else(|| GpuError::Backend("set_image_slot: stale SamplerHandle".to_string()))?;
         unsafe {
-            let _ = self.inner.device.device_wait_idle();
+            self.inner
+                .device
+                .device_wait_idle()
+                .map_err(|e| GpuError::Backend(format!("set_image_slot wait idle: {e}")))?;
         }
         update_bindless_slot(&self.inner.device, self.descriptor_set, slot, view, samp);
+        Ok(())
+    }
+
+    /// Restore an image slot to the surface-owned white placeholder. After
+    /// this returns, the texture that occupied the slot may be destroyed.
+    pub fn clear_image_slot(&self, slot: u32) -> Result<()> {
+        if slot >= IMAGE_SLOTS {
+            return Err(GpuError::Backend(format!(
+                "image slot {slot} out of range (capacity {IMAGE_SLOTS})"
+            )));
+        }
+        unsafe {
+            self.inner
+                .device
+                .device_wait_idle()
+                .map_err(|e| GpuError::Backend(format!("clear_image_slot wait idle: {e}")))?;
+        }
+        update_bindless_slot(
+            &self.inner.device,
+            self.descriptor_set,
+            slot,
+            self.placeholder.view,
+            self.placeholder.sampler,
+        );
         Ok(())
     }
 
