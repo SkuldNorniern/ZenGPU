@@ -17,6 +17,7 @@ pub(crate) struct VulkanDeviceInner {
     pub physical: vk::PhysicalDevice,
     pub queue_family: u32,
     pub queue: vk::Queue,
+    pub dual_src_blend: bool,
 }
 
 unsafe impl Send for VulkanDeviceInner {}
@@ -80,8 +81,12 @@ impl VulkanDevice {
             ..Default::default()
         };
 
+        let supported_features =
+            unsafe { shared.instance.get_physical_device_features(physical) };
+        let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
         let features = vk::PhysicalDeviceFeatures {
             shader_sampled_image_array_dynamic_indexing: vk::TRUE,
+            dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
             ..Default::default()
         };
 
@@ -114,6 +119,7 @@ impl VulkanDevice {
                 physical,
                 queue_family,
                 queue,
+                dual_src_blend,
             }),
             buffers: Mutex::new(SlotMap::new()),
             textures: Mutex::new(SlotMap::new()),

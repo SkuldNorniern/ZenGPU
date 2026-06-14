@@ -75,14 +75,26 @@ pub struct ImageInstance {
     pub _pad: [u32; 3],
 }
 
+/// Text-run coverage quad. Bound texture holds RGB subpixel coverage, max coverage in alpha.
+/// `color` straight RGBA.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct TextInstance {
+    pub rect: [f32; 4],
+    pub color: [f32; 4],
+    pub slot: u32,
+    pub _pad: [u32; 3],
+}
+
 /// One frame's 2D primitives. Within a kind, draw order is back-to-front. Across kinds the order is
-/// fixed (rects, gradients, images, circles), so cross-kind z-order is not preserved.
+/// fixed (rects, gradients, images, text, circles), so cross-kind z-order is not preserved.
 #[derive(Default, Clone, Copy)]
 pub struct Frame2d<'a> {
     pub clear: Option<[f32; 4]>,
     pub rects: &'a [RectInstance],
     pub gradients: &'a [GradientInstance],
     pub images: &'a [ImageInstance],
+    pub texts: &'a [TextInstance],
     pub circles: &'a [CircleInstance],
 }
 
@@ -93,6 +105,8 @@ const GRADIENT_SIZE: usize = std::mem::size_of::<GradientInstance>();
 const _: () = assert!(GRADIENT_SIZE == 64);
 const IMAGE_SIZE: usize = std::mem::size_of::<ImageInstance>();
 const _: () = assert!(IMAGE_SIZE == 64);
+const TEXT_SIZE: usize = std::mem::size_of::<TextInstance>();
+const _: () = assert!(TEXT_SIZE == 48);
 
 /// Must match the image fragment shader.
 pub const IMAGE_SLOTS: u32 = 64;
@@ -271,6 +285,71 @@ const IMAGE_FRAG_SPV: &[u32] = inline_spirv!(
     vulkan1_0
 );
 
+const TEXT_VERT_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(location = 0) in vec4 i_rect;
+    layout(location = 1) in vec4 i_color;
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
+    layout(location = 0) out vec2 v_uv;
+    layout(location = 1) out vec4 v_color;
+    void main() {
+        vec2 corners[6] = vec2[](
+            vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(0.0, 1.0),
+            vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0)
+        );
+        vec2 corner = corners[gl_VertexIndex];
+        vec2 px = i_rect.xy + corner * i_rect.zw;
+        v_uv = corner;
+        v_color = i_color;
+        vec2 ndc = (px / pc.viewport) * 2.0 - 1.0;
+        gl_Position = vec4(ndc, 0.0, 1.0);
+    }
+    "#,
+    vert,
+    vulkan1_0
+);
+
+const TEXT_FRAG_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(set = 0, binding = 0) uniform sampler2D textures[64];
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
+    layout(location = 0) in vec2 v_uv;
+    layout(location = 1) in vec4 v_color;
+    layout(location = 0) out vec4 o_color;
+    void main() {
+        vec4 coverage = texture(textures[pc.slot], v_uv);
+        float alpha = coverage.a * v_color.a;
+        if (alpha <= 0.0) discard;
+        o_color = vec4(v_color.rgb, alpha);
+    }
+    "#,
+    frag,
+    vulkan1_0
+);
+
+const TEXT_DUAL_SOURCE_FRAG_SPV: &[u32] = inline_spirv!(
+    r#"
+    #version 450
+    layout(set = 0, binding = 0) uniform sampler2D textures[64];
+    layout(push_constant) uniform PC { vec2 viewport; uint slot; } pc;
+    layout(location = 0) in vec2 v_uv;
+    layout(location = 1) in vec4 v_color;
+    layout(location = 0, index = 0) out vec4 o_color;
+    layout(location = 0, index = 1) out vec4 o_coverage;
+    void main() {
+        vec3 coverage = texture(textures[pc.slot], v_uv).rgb * v_color.a;
+        float alpha = max(coverage.r, max(coverage.g, coverage.b));
+        if (alpha <= 0.0) discard;
+        o_color = vec4(v_color.rgb, 1.0);
+        o_coverage = vec4(coverage, alpha);
+    }
+    "#,
+    frag,
+    vulkan1_0
+);
+
 /// Persistently-mapped host-visible vertex buffer. One per frame-in-flight, so the CPU can fill
 /// frame N+1 while the GPU reads N. Grows when needed.
 struct InstanceBuffer {
@@ -442,6 +521,7 @@ pub struct Vulkan2dSurface {
     gradient_pipeline: vk::Pipeline,
     image_pipeline_layout: vk::PipelineLayout,
     image_pipeline: vk::Pipeline,
+    text_pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_set: vk::DescriptorSet,
@@ -454,6 +534,7 @@ pub struct Vulkan2dSurface {
     circle_buffers: Vec<Mutex<InstanceBuffer>>,
     gradient_buffers: Vec<Mutex<InstanceBuffer>>,
     image_buffers: Vec<Mutex<InstanceBuffer>>,
+    text_buffers: Vec<Mutex<InstanceBuffer>>,
     image_available: Vec<vk::Semaphore>,
     render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
@@ -553,6 +634,21 @@ impl Vulkan2dSurface {
             IMAGE_SIZE as u32,
             3,
         )?;
+        let text_frag = if inner.dual_src_blend {
+            TEXT_DUAL_SOURCE_FRAG_SPV
+        } else {
+            TEXT_FRAG_SPV
+        };
+        let text_pipeline = create_pipeline_with_blend(
+            &inner.device,
+            image_pipeline_layout,
+            render_pass,
+            TEXT_VERT_SPV,
+            text_frag,
+            TEXT_SIZE as u32,
+            2,
+            inner.dual_src_blend,
+        )?;
 
         let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
         let cmd_buffers = allocate_cmd_buffers(&inner.device, cmd_pool, MAX_FRAMES_IN_FLIGHT)?;
@@ -561,6 +657,7 @@ impl Vulkan2dSurface {
         let mut circle_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut gradient_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         let mut image_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
+        let mut text_buffers = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
         for _ in 0..MAX_FRAMES_IN_FLIGHT {
             rect_buffers.push(Mutex::new(InstanceBuffer::new(&inner, INSTANCE_SIZE, INITIAL_RECTS)?));
             circle_buffers
@@ -568,6 +665,11 @@ impl Vulkan2dSurface {
             gradient_buffers
                 .push(Mutex::new(InstanceBuffer::new(&inner, GRADIENT_SIZE, INITIAL_RECTS)?));
             image_buffers.push(Mutex::new(InstanceBuffer::new(&inner, IMAGE_SIZE, INITIAL_RECTS)?));
+            text_buffers.push(Mutex::new(InstanceBuffer::new(
+                &inner,
+                TEXT_SIZE,
+                INITIAL_RECTS,
+            )?));
         }
 
         let (image_available, render_finished, in_flight) =
@@ -585,6 +687,7 @@ impl Vulkan2dSurface {
             gradient_pipeline,
             image_pipeline_layout,
             image_pipeline,
+            text_pipeline,
             descriptor_pool,
             descriptor_set_layout,
             descriptor_set,
@@ -595,6 +698,7 @@ impl Vulkan2dSurface {
             circle_buffers,
             gradient_buffers,
             image_buffers,
+            text_buffers,
             image_available,
             render_finished,
             in_flight,
@@ -749,6 +853,12 @@ impl Vulkan2dSurface {
             ib.upload_bytes(frame.images);
             ib.buffer
         };
+        let text_buf = {
+            let mut ib = self.text_buffers[current].lock().unwrap();
+            ib.ensure_capacity(&self.inner, frame.texts.len())?;
+            ib.upload_bytes(frame.texts);
+            ib.buffer
+        };
 
         let cmd = self.cmd_buffers[current];
         self.record(
@@ -756,7 +866,7 @@ impl Vulkan2dSurface {
             res.framebuffers[image_index as usize],
             res.extent,
             &frame,
-            [rect_buf, gradient_buf, image_buf, circle_buf],
+            [rect_buf, gradient_buf, image_buf, text_buf, circle_buf],
         )?;
 
         let wait_semaphores = [self.image_available[current]];
@@ -845,7 +955,7 @@ impl Vulkan2dSurface {
         framebuffer: vk::Framebuffer,
         extent: vk::Extent2D,
         frame: &Frame2d,
-        bufs: [vk::Buffer; 4],
+        bufs: [vk::Buffer; 5],
     ) -> Result<()> {
         let dev = &self.inner.device;
         unsafe {
@@ -898,7 +1008,7 @@ impl Vulkan2dSurface {
                 std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
             );
 
-            let [rect_buf, gradient_buf, image_buf, circle_buf] = bufs;
+            let [rect_buf, gradient_buf, image_buf, text_buf, circle_buf] = bufs;
             if !frame.rects.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.rect_pipeline);
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[rect_buf], &[0]);
@@ -962,6 +1072,35 @@ impl Vulkan2dSurface {
                     dev.cmd_draw(cmd, 6, 1, 0, i as u32);
                 }
             }
+            if !frame.texts.is_empty() {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.text_pipeline);
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.image_pipeline_layout,
+                    0,
+                    &[self.descriptor_set],
+                    &[],
+                );
+                dev.cmd_push_constants(
+                    cmd,
+                    self.image_pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(push.as_ptr() as *const u8, 8),
+                );
+                dev.cmd_bind_vertex_buffers(cmd, 0, &[text_buf], &[0]);
+                for (i, text) in frame.texts.iter().enumerate() {
+                    dev.cmd_push_constants(
+                        cmd,
+                        self.image_pipeline_layout,
+                        vk::ShaderStageFlags::FRAGMENT,
+                        8,
+                        &text.slot.to_ne_bytes(),
+                    );
+                    dev.cmd_draw(cmd, 6, 1, 0, i as u32);
+                }
+            }
             if !frame.circles.is_empty() {
                 dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.circle_pipeline);
                 dev.cmd_bind_vertex_buffers(cmd, 0, &[circle_buf], &[0]);
@@ -987,6 +1126,7 @@ impl Drop for Vulkan2dSurface {
             .chain(&self.circle_buffers)
             .chain(&self.gradient_buffers)
             .chain(&self.image_buffers)
+            .chain(&self.text_buffers)
         {
             ib.lock().unwrap().destroy(&self.inner);
         }
@@ -1004,6 +1144,7 @@ impl Drop for Vulkan2dSurface {
             dev.destroy_pipeline(self.circle_pipeline, None);
             dev.destroy_pipeline(self.gradient_pipeline, None);
             dev.destroy_pipeline(self.image_pipeline, None);
+            dev.destroy_pipeline(self.text_pipeline, None);
             dev.destroy_pipeline_layout(self.image_pipeline_layout, None);
             dev.destroy_pipeline_layout(self.pipeline_layout, None);
             dev.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -1323,6 +1464,29 @@ fn create_pipeline(
     stride: u32,
     attr_count: u32,
 ) -> Result<vk::Pipeline> {
+    create_pipeline_with_blend(
+        device,
+        layout,
+        render_pass,
+        vert_spv,
+        frag_spv,
+        stride,
+        attr_count,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_pipeline_with_blend(
+    device: &ash::Device,
+    layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+    vert_spv: &[u32],
+    frag_spv: &[u32],
+    stride: u32,
+    attr_count: u32,
+    dual_source: bool,
+) -> Result<vk::Pipeline> {
     let vert = create_shader_module(device, vert_spv)?;
     let frag = create_shader_module(device, frag_spv)?;
     let entry = std::ffi::CString::new("main").unwrap();
@@ -1385,11 +1549,27 @@ fn create_pipeline(
 
     let blend_attachment = vk::PipelineColorBlendAttachmentState {
         blend_enable: vk::TRUE,
-        src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
-        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        src_color_blend_factor: if dual_source {
+            vk::BlendFactor::SRC1_COLOR
+        } else {
+            vk::BlendFactor::SRC_ALPHA
+        },
+        dst_color_blend_factor: if dual_source {
+            vk::BlendFactor::ONE_MINUS_SRC1_COLOR
+        } else {
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        },
         color_blend_op: vk::BlendOp::ADD,
-        src_alpha_blend_factor: vk::BlendFactor::ONE,
-        dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        src_alpha_blend_factor: if dual_source {
+            vk::BlendFactor::SRC1_ALPHA
+        } else {
+            vk::BlendFactor::ONE
+        },
+        dst_alpha_blend_factor: if dual_source {
+            vk::BlendFactor::ONE_MINUS_SRC1_ALPHA
+        } else {
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA
+        },
         alpha_blend_op: vk::BlendOp::ADD,
         color_write_mask: vk::ColorComponentFlags::RGBA,
     };
