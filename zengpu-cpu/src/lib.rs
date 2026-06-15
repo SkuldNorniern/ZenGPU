@@ -2,36 +2,76 @@
 //!
 //! Plain Rust over `Vec<u8>` buffers: correctness and determinism over speed. The GPU backends are
 //! validated against it, not a product fallback (consumers like aurea keep their own CPU paths).
+//!
+//! # Compute dispatch
+//!
+//! The CPU backend cannot run SPIR-V. Callers register a Rust function keyed by entry-point name
+//! via [`CpuDevice::register_kernel`]. On [`GpuDevice::dispatch`], the function runs on copies of
+//! the bound buffers in a [`CpuKernelCtx`], and modified buffers are written back. CPU kernels are
+//! hand-written Rust that should match the GPU SPIR-V bit for bit.
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage,
-    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSurface,
-    HalCapabilities, Result, SamplerDesc, SamplerHandle, SlotMap, TextureDesc, TextureHandle,
-    UsageError, WindowHandles, marker,
+    AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
+    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
+    GpuError, GpuInstance, GpuSurface, HalCapabilities, PipelineHandle, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, TextureDesc,
+    TextureHandle, UsageError, WindowHandles, marker,
 };
+
+/// Arguments for a CPU kernel. `buffers[i]` is a clone of slot `bindings.buffers[i]`. Modify in
+/// place; the backend writes changes back after the kernel returns.
+pub struct CpuKernelCtx {
+    pub buffers: Vec<Vec<u8>>,
+    pub scalars: Vec<Scalar>,
+    pub grid: [u32; 3],
+}
+
+/// A CPU-side kernel function, registered under the SPIR-V entry-point name it matches
+/// (e.g. `"main"`).
+pub type CpuKernel = Box<dyn Fn(&mut CpuKernelCtx) + Send + Sync>;
 
 struct CpuBuffer {
     data: Vec<u8>,
     usage: BufferUsage,
 }
 
+struct CpuPipeline {
+    entry: String,
+}
+
 type BufferMap = SlotMap<marker::Buffer, CpuBuffer>;
 
-/// A CPU-backed [`GpuDevice`]. All buffers live in host memory behind a mutex, so the device is
+/// A CPU-backed [`GpuDevice`]. All state lives in host memory behind mutexes, so the device is
 /// `Send + Sync`.
 pub struct CpuDevice {
     buffers: Mutex<BufferMap>,
+    shaders: Mutex<SlotMap<marker::Shader, Vec<u8>>>,
+    pipelines: Mutex<SlotMap<marker::Pipeline, CpuPipeline>>,
+    kernels: Mutex<HashMap<String, CpuKernel>>,
 }
 
 impl CpuDevice {
     pub fn new() -> Self {
         Self {
             buffers: Mutex::new(SlotMap::new()),
+            shaders: Mutex::new(SlotMap::new()),
+            pipelines: Mutex::new(SlotMap::new()),
+            kernels: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Registers a CPU kernel under `entry_name`, matching the SPIR-V entry point
+    /// in [`ComputePipelineDesc::entry`].
+    ///
+    /// Dispatches whose pipeline entry matches `entry_name` call `kernel` with the bound
+    /// buffer data.
+    pub fn register_kernel(&self, entry_name: &str, kernel: CpuKernel) {
+        self.kernels.lock().unwrap().insert(entry_name.to_string(), kernel);
     }
 }
 
@@ -113,29 +153,106 @@ impl GpuDevice for CpuDevice {
     }
 
     fn create_texture(&self, _desc: TextureDesc) -> Result<TextureHandle> {
-        Err(GpuError::Backend(
-            "CPU backend does not support textures".to_string(),
-        ))
+        Err(GpuError::Backend("CPU backend does not support textures".to_string()))
     }
 
     fn upload_texture_data(&self, _texture: TextureHandle, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend(
-            "CPU backend does not support textures".to_string(),
-        ))
+        Err(GpuError::Backend("CPU backend does not support textures".to_string()))
     }
 
     fn destroy_texture(&self, _texture: TextureHandle) {}
 
     fn create_sampler(&self, _desc: SamplerDesc) -> Result<SamplerHandle> {
-        Err(GpuError::Backend(
-            "CPU backend does not support samplers".to_string(),
-        ))
+        Err(GpuError::Backend("CPU backend does not support samplers".to_string()))
     }
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
+
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        Ok(self.shaders.lock().unwrap().insert(desc.spirv.to_vec()))
+    }
+
+    fn destroy_shader(&self, shader: ShaderHandle) {
+        self.shaders.lock().unwrap().remove(shader);
+    }
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        {
+            let shaders = self.shaders.lock().unwrap();
+            if shaders.get(desc.shader).is_none() {
+                return Err(GpuError::PipelineCreation(format!(
+                    "shader handle {:?} is stale",
+                    desc.shader
+                )));
+            }
+        }
+        let pipeline = CpuPipeline { entry: desc.entry.to_string() };
+        Ok(self.pipelines.lock().unwrap().insert(pipeline))
+    }
+
+    fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        self.pipelines.lock().unwrap().remove(pipeline);
+    }
+
+    fn dispatch(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
+        let entry = {
+            let pipelines = self.pipelines.lock().unwrap();
+            let p = pipelines.get(pipeline).ok_or_else(|| {
+                GpuError::Dispatch("stale pipeline handle".to_string())
+            })?;
+            p.entry.clone()
+        };
+
+        let mut buf_data: Vec<Vec<u8>> = {
+            let buffers = self.buffers.lock().unwrap();
+            bindings
+                .buffers
+                .iter()
+                .map(|&idx| {
+                    buffers
+                        .get_by_slot_index(idx)
+                        .map(|b| b.data.clone())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+
+        let mut ctx = CpuKernelCtx {
+            buffers: buf_data,
+            scalars: bindings.scalars.to_vec(),
+            grid,
+        };
+        {
+            let kernels = self.kernels.lock().unwrap();
+            let kernel = kernels.get(&entry).ok_or_else(|| {
+                GpuError::Dispatch(format!(
+                    "no CPU kernel registered for entry '{entry}'; \
+                     call CpuDevice::register_kernel before dispatching"
+                ))
+            })?;
+            kernel(&mut ctx);
+        }
+        buf_data = ctx.buffers;
+
+        {
+            let mut buffers = self.buffers.lock().unwrap();
+            for (&idx, new_data) in bindings.buffers.iter().zip(buf_data.iter()) {
+                if let Some(buf) = buffers.get_mut_by_slot_index(idx) {
+                    buf.data.clear();
+                    buf.data.extend_from_slice(new_data);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
-/// The one CPU adapter.
 pub struct CpuAdapter {
     info: AdapterInfo,
 }
@@ -174,7 +291,6 @@ impl GpuAdapter for CpuAdapter {
     }
 }
 
-/// Instance for the CPU backend. Always returns the single CPU adapter, whatever the request.
 pub struct CpuInstance;
 
 impl GpuInstance for CpuInstance {
@@ -244,11 +360,9 @@ mod tests {
         dev.destroy_buffer(h);
         let err = dev.read_buffer(h, 0, 4).unwrap_err();
         match err {
-            GpuError::InvalidUsage(UsageError::StaleHandle {
-                expected_gen,
-                actual_gen,
-                ..
-            }) => assert_ne!(expected_gen, actual_gen),
+            GpuError::InvalidUsage(UsageError::StaleHandle { expected_gen, actual_gen, .. }) => {
+                assert_ne!(expected_gen, actual_gen)
+            }
             other => panic!("expected StaleHandle, got {other}"),
         }
     }
@@ -305,5 +419,108 @@ mod tests {
         let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
         let dev = adapter.open(DeviceRequest::default()).unwrap();
         assert!(dev.capabilities().compute);
+    }
+
+    #[test]
+    fn dispatch_vec_add_f32() {
+        let dev = CpuDevice::new();
+
+        dev.register_kernel("main", Box::new(|ctx: &mut CpuKernelCtx| {
+            let len = match ctx.scalars.get(0) {
+                Some(&Scalar::U32(n)) => n as usize,
+                _ => return,
+            };
+            let read_f32 = |buf: &[u8], i: usize| -> f32 {
+                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+            };
+            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
+                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+            };
+            if ctx.buffers.len() < 3 { return; }
+            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
+            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
+            for i in 0..len {
+                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
+            }
+        }));
+
+        let n: u32 = 8;
+        let size = (n as u64) * 4;
+        let usage = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let mem = MemoryUsage::Upload;
+
+        let ha = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
+        let hb = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
+        let hout = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
+
+        let a_data: Vec<u8> = (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        let b_data: Vec<u8> = (0..n).flat_map(|i| (100.0f32 * i as f32).to_le_bytes()).collect();
+        dev.write_buffer(ha, 0, &a_data).unwrap();
+        dev.write_buffer(hb, 0, &b_data).unwrap();
+
+        let dummy_spv = [0x03, 0x02, 0x23, 0x07u8];
+        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .unwrap();
+
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[ha.index(), hb.index(), hout.index()],
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+
+        let out = dev.read_buffer(hout, 0, size).unwrap();
+        for i in 0..n as usize {
+            let got = f32::from_le_bytes(out[i*4..i*4+4].try_into().unwrap());
+            let expected = i as f32 + 100.0 * i as f32;
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "out[{i}] = {got}, expected {expected}"
+            );
+        }
+
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(ha);
+        dev.destroy_buffer(hb);
+        dev.destroy_buffer(hout);
+    }
+
+    #[test]
+    fn dispatch_stale_pipeline_fails() {
+        let dev = CpuDevice::new();
+        let dummy_spv = [0u8; 4];
+        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .unwrap();
+        dev.destroy_pipeline(pipeline);
+        let err = dev
+            .dispatch(pipeline, Bindings::default(), [1, 1, 1])
+            .unwrap_err();
+        assert!(matches!(err, GpuError::Dispatch(_)));
+    }
+
+    #[test]
+    fn dispatch_missing_kernel_fails() {
+        let dev = CpuDevice::new();
+        let dummy_spv = [0u8; 4];
+        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .unwrap();
+        let err = dev
+            .dispatch(pipeline, Bindings::default(), [1, 1, 1])
+            .unwrap_err();
+        assert!(
+            matches!(err, GpuError::Dispatch(ref msg) if msg.contains("no CPU kernel")),
+            "unexpected error: {err}"
+        );
     }
 }
