@@ -35,9 +35,8 @@ pub struct OffscreenTarget {
 
 /// Borrowed sampled-image view produced by a ZenGPU render target.
 ///
-/// This is intentionally opaque: consumers can pass it to backend APIs such
-/// as [`crate::Vulkan2dSurface::set_sampled_image_slot`] without handling raw
-/// Vulkan image views or losing same-device validation.
+/// Consumers can use [`Self::raw`] for backend-specific descriptor binding and
+/// [`Self::belongs_to`] to retain same-device validation.
 #[derive(Clone, Copy)]
 pub struct SampledImageView<'a> {
     pub(crate) inner: &'a Arc<VulkanDeviceInner>,
@@ -53,6 +52,16 @@ impl SampledImageView<'_> {
 
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
+    }
+
+    /// Raw Vulkan image view for backend-specific descriptor binding.
+    pub fn raw(&self) -> vk::ImageView {
+        self.view
+    }
+
+    /// Whether this view belongs to `context`'s logical device.
+    pub fn belongs_to(&self, context: &DeviceContext) -> bool {
+        Arc::ptr_eq(self.inner, &context.inner)
     }
 }
 
@@ -230,6 +239,12 @@ mod tests {
         let sampled = target.sampled_view();
 
         assert_eq!(sampled.format(), vk::Format::R8G8B8A8_UNORM);
-        assert_eq!(sampled.extent(), vk::Extent2D { width: 64, height: 32 });
+        assert_eq!(
+            sampled.extent(),
+            vk::Extent2D {
+                width: 64,
+                height: 32
+            }
+        );
     }
 }

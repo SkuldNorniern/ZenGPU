@@ -5,9 +5,8 @@
 //! per-frame-in-flight command buffers, and sync objects (acquire/submit/
 //! present + frame-index bookkeeping). It does **not** own anything shaped by
 //! a particular render pass (render pass, framebuffers, depth buffers,
-//! pipelines, per-surface vertex/instance buffers) — those stay with the
-//! consumer ([`crate::swapchain_2d::Vulkan2dSurface`],
-//! higher-level renderers and 3D surfaces).
+//! pipelines, per-surface vertex/instance buffers) stay with the consumer or a
+//! renderer crate layered above ZenGPU.
 //!
 //! Consumers should place a `swapchain: Swapchain` field **last** in their
 //! struct: Rust drops fields in declaration order, so the consumer's own
@@ -82,6 +81,11 @@ impl Swapchain {
     ) -> Result<Self> {
         let inner = Arc::clone(&device.inner);
         let shared = Arc::clone(&inner.shared);
+        if !shared.surface_extensions {
+            return Err(GpuError::Backend(
+                "Swapchain::new requires VulkanInstance::new_with_surface()".to_string(),
+            ));
+        }
         let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
         let surface = create_platform_surface(&shared, handles)?;
 
@@ -364,7 +368,7 @@ impl Drop for Swapchain {
 /// caller. Convenience allocators may be layered on later.
 #[derive(Clone)]
 pub struct DeviceContext {
-    inner: Arc<VulkanDeviceInner>,
+    pub(crate) inner: Arc<VulkanDeviceInner>,
 }
 
 // Safety: same as VulkanDeviceInner — ash handles are Send+Sync.
@@ -399,6 +403,16 @@ impl DeviceContext {
     /// Queue-family index of [`queue`](Self::queue).
     pub fn queue_family(&self) -> u32 {
         self.inner.queue_family
+    }
+
+    /// Whether `device` is the logical device represented by this context.
+    pub fn is_device(&self, device: &VulkanDevice) -> bool {
+        Arc::ptr_eq(&self.inner, &device.inner)
+    }
+
+    /// Whether the selected physical device supports dual-source blending.
+    pub fn supports_dual_source_blending(&self) -> bool {
+        self.inner.dual_src_blend
     }
 
     /// Physical-device memory properties, for picking a memory type when
@@ -445,7 +459,9 @@ impl DeviceContext {
                 Ok(v) => v[0],
                 Err(e) => {
                     dev.destroy_command_pool(pool, None);
-                    return Err(GpuError::Backend(format!("one_shot allocate_command_buffers: {e}")));
+                    return Err(GpuError::Backend(format!(
+                        "one_shot allocate_command_buffers: {e}"
+                    )));
                 }
             }
         };
@@ -459,10 +475,14 @@ impl DeviceContext {
             )
         } {
             unsafe { dev.destroy_command_pool(pool, None) };
-            return Err(GpuError::Backend(format!("one_shot begin_command_buffer: {e}")));
+            return Err(GpuError::Backend(format!(
+                "one_shot begin_command_buffer: {e}"
+            )));
         }
         let result = record(dev, cmd);
-        unsafe { let _ = dev.end_command_buffer(cmd); }
+        unsafe {
+            let _ = dev.end_command_buffer(cmd);
+        }
         if let Err(e) = result {
             unsafe { dev.destroy_command_pool(pool, None) };
             return Err(e);
@@ -816,5 +836,7 @@ pub(crate) fn create_platform_surface(
     _shared: &VulkanShared,
     _handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
-    Err(GpuError::Backend("unsupported surface platform".to_string()))
+    Err(GpuError::Backend(
+        "unsupported surface platform".to_string(),
+    ))
 }
