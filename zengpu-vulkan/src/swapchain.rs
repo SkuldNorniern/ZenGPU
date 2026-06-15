@@ -404,6 +404,10 @@ impl DeviceContext {
         }
     }
 
+    pub(crate) fn inner_arc(&self) -> Arc<VulkanDeviceInner> {
+        Arc::clone(&self.inner)
+    }
+
     /// Submit a one-shot command buffer — records work via `f`, then waits for
     /// completion. Useful for staging uploads and layout transitions in user-side
     /// surfaces that build on top of [`Swapchain`].

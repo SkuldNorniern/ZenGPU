@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod device;
 pub mod instance;
+pub mod offscreen;
 pub mod swapchain;
 pub mod swapchain_2d;
 
@@ -11,6 +12,7 @@ pub use ash::vk;
 pub use adapter::VulkanAdapter;
 pub use device::VulkanDevice;
 pub use instance::VulkanInstance;
+pub use offscreen::OffscreenTarget;
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 pub use swapchain_2d::{
     CircleInstance, DrawRef, Frame2d, GradientInstance, IMAGE_SLOTS, ImageInstance, RectInstance,
