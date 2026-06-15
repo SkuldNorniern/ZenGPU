@@ -48,6 +48,12 @@ impl GpuAdapter for VulkanAdapter {
 }
 
 impl VulkanAdapter {
+    /// Opens a headless graphics device with no swapchain extension. For windowed rendering,
+    /// use `open_with_surface`.
+    pub fn open_headless(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
+        VulkanDevice::new(Arc::clone(&self.shared), self.physical, req)
+    }
+
     /// Opens a device with the swapchain extension, required for presenting
     /// through a [`crate::Swapchain`].
     pub fn open_with_surface(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
