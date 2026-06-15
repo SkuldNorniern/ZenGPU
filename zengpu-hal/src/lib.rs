@@ -1,9 +1,7 @@
-//! ZenGPU HAL: the backend-independent foundation. No GPU and no backend dependencies.
-//!
-//! - [`error`]: structured, enum-based errors.
-//! - [`handle`]: generational-index [`SlotMap`] and typed resource handles, with use-after-free
-//!    detection.
-//! - [`types`]: backend selection, memory/usage classes, feature flags, formats, dtypes.
+//! ZenGPU HAL: backend-independent core with no GPU and no backend dependencies.
+//! - [`GpuError`]: structured errors.
+//! - [`SlotMap`] and typed handles: use-after-free detection.
+//! - Backend selection, memory and usage classes, feature flags, formats, dtypes.
 
 #![forbid(unsafe_code)]
 

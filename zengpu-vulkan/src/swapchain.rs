@@ -3,11 +3,10 @@
 //! [`Swapchain`] owns the surface, swapchain, image views, command pool, per-frame command buffers
 //! and sync objects. It does not own render-pass-shaped resources (render pass, framebuffers,
 //! depth, pipelines, vertex/instance buffers). Those stay with the consumer
-//! ([`crate::swapchain_2d::Vulkan2dSurface`],
-//! [`crate::swapchain_textured::VulkanTexturedSwapchain`], the 3D surface).
+//! ([`crate::swapchain_2d::Vulkan2dSurface`], renderers, 3D surfaces).
 //!
 //! Put `swapchain: Swapchain` last in the consumer struct. Fields drop in declaration order, so the
-//! consumer's `Drop` runs before the swapchain's, while its resources are still alive.
+//! consumer's `Drop` runs before the swapchain's, while the resources it frees still exist.
 
 use std::sync::{Arc, Mutex};
 

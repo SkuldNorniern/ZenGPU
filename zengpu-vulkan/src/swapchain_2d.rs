@@ -9,8 +9,8 @@
 //! Prefers a non-sRGB (`B8G8R8A8_UNORM`) swapchain format so sRGB bytes pass through, matching the
 //! CPU rasterizer.
 //!
-//! Resize and surface loss recreate the resources in [`SwapchainResources`]. Pipeline uses dynamic
-//! viewport and scissor. Instance buffers grow on demand.
+//! Resize and surface loss recreate swapchain-dependent resources. Pipeline uses dynamic viewport
+//! and scissor. Instance buffers grow on demand.
 
 use std::sync::{Arc, Mutex};
 

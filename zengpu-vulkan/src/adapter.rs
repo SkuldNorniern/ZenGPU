@@ -48,8 +48,8 @@ impl GpuAdapter for VulkanAdapter {
 }
 
 impl VulkanAdapter {
-    /// Whether the swapchain extension is enabled. Required for presenting to a surface
-    /// from [`VulkanInstance::create_surface`].
+    /// Whether the swapchain extension is enabled. Required for presenting via [`crate::Swapchain`]
+    /// or [`crate::Vulkan2dSurface`].
     pub fn open_with_surface(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
         VulkanDevice::new_with_swapchain(Arc::clone(&self.shared), self.physical, req)
     }
