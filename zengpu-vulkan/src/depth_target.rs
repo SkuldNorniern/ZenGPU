@@ -97,20 +97,25 @@ impl DepthTarget {
         Ok(Self { inner, image, memory, view, extent })
     }
 
-    pub fn format(&self) -> vk::Format {
-        DEPTH_FORMAT
+    pub fn format(&self) -> zengpu_hal::Format {
+        zengpu_hal::Format::Depth32Float
     }
 
-    pub fn extent(&self) -> vk::Extent2D {
-        self.extent
+    pub fn extent(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
     }
 
     pub fn view(&self) -> vk::ImageView {
         self.view
     }
 
+    /// For FrameGraph barrier tracking.
     pub fn image(&self) -> vk::Image {
         self.image
+    }
+
+    pub(crate) fn raw_extent(&self) -> vk::Extent2D {
+        self.extent
     }
 }
 

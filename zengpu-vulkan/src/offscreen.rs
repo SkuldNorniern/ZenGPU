@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use ash::vk;
-use zengpu_hal::{GpuError, Result};
+use zengpu_hal::{Format, GpuError, Result};
 
 use crate::device::VulkanDeviceInner;
 use crate::swapchain::DeviceContext;
+use crate::{from_vk_format, to_vk_format};
 
 /// Fixed-size, device-local color image, usable as render target and sampled texture.
 ///
@@ -41,12 +42,12 @@ pub struct SampledImageView<'a> {
 }
 
 impl SampledImageView<'_> {
-    pub fn format(&self) -> vk::Format {
-        self.format
+    pub fn format(&self) -> Format {
+        from_vk_format(self.format).expect("SampledImageView has unsupported vk::Format")
     }
 
-    pub fn extent(&self) -> vk::Extent2D {
-        self.extent
+    pub fn extent(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
     }
 
     pub fn raw(&self) -> vk::ImageView {
@@ -64,7 +65,8 @@ unsafe impl Sync for OffscreenTarget {}
 impl OffscreenTarget {
     /// Image usage is `COLOR_ATTACHMENT | SAMPLED`. It starts in `UNDEFINED`, and the first render
     /// pass transitions it.
-    pub fn new(ctx: &DeviceContext, format: vk::Format, width: u32, height: u32) -> Result<Self> {
+    pub fn new(ctx: &DeviceContext, format: Format, width: u32, height: u32) -> Result<Self> {
+        let vk_fmt = to_vk_format(format);
         let inner = ctx.inner_arc();
         let dev = &inner.device;
         let extent = vk::Extent2D { width, height };
@@ -73,7 +75,7 @@ impl OffscreenTarget {
             dev.create_image(
                 &vk::ImageCreateInfo {
                     image_type: vk::ImageType::TYPE_2D,
-                    format,
+                    format: vk_fmt,
                     extent: vk::Extent3D {
                         width,
                         height,
@@ -121,7 +123,7 @@ impl OffscreenTarget {
                 &vk::ImageViewCreateInfo {
                     image,
                     view_type: vk::ImageViewType::TYPE_2D,
-                    format,
+                    format: vk_fmt,
                     components: vk::ComponentMapping::default(),
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -142,25 +144,33 @@ impl OffscreenTarget {
             image,
             memory,
             view,
-            format,
+            format: vk_fmt,
             extent,
         })
     }
 
-    pub fn format(&self) -> vk::Format {
-        self.format
+    pub fn format(&self) -> Format {
+        from_vk_format(self.format).expect("OffscreenTarget has unsupported vk::Format")
     }
 
-    pub fn extent(&self) -> vk::Extent2D {
-        self.extent
+    pub fn extent(&self) -> (u32, u32) {
+        (self.extent.width, self.extent.height)
+    }
+
+    pub fn image(&self) -> vk::Image {
+        self.image
     }
 
     pub fn view(&self) -> vk::ImageView {
         self.view
     }
 
-    pub fn image(&self) -> vk::Image {
-        self.image
+    pub(crate) fn raw_extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+
+    pub(crate) fn raw_format(&self) -> vk::Format {
+        self.format
     }
 
     /// The target must belong to the same logical device. It must stay alive and in
@@ -224,16 +234,11 @@ mod tests {
             .expect("Vulkan adapter returned a non-Vulkan device");
 
         let target =
-            OffscreenTarget::new(&device.context(), vk::Format::R8G8B8A8_UNORM, 64, 32).unwrap();
+            OffscreenTarget::new(&device.context(), zengpu_hal::Format::Rgba8Unorm, 64, 32)
+                .unwrap();
         let sampled = target.sampled_view();
 
-        assert_eq!(sampled.format(), vk::Format::R8G8B8A8_UNORM);
-        assert_eq!(
-            sampled.extent(),
-            vk::Extent2D {
-                width: 64,
-                height: 32
-            }
-        );
+        assert_eq!(sampled.format(), zengpu_hal::Format::Rgba8Unorm);
+        assert_eq!(sampled.extent(), (64, 32));
     }
 }
