@@ -1,6 +1,7 @@
 //! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+ (plan D15).
 
 pub mod adapter;
+pub mod depth_target;
 pub mod device;
 pub mod frame_graph;
 pub mod instance;
@@ -13,6 +14,7 @@ pub use ash::vk;
 pub use adapter::VulkanAdapter;
 pub use device::VulkanDevice;
 pub use instance::VulkanInstance;
+pub use depth_target::{DEPTH_FORMAT, DepthTarget};
 pub use frame_graph::{AttachmentUsage, FrameGraph, ResourceId};
 pub use offscreen::OffscreenTarget;
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
