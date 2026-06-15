@@ -1,7 +1,5 @@
-//! Instance and adapter traits, the entry point into the HAL.
-//!
-//! `GpuInstance` enumerates adapters. `GpuAdapter` opens a logical device. Both are object-safe, so
-//! the backend is picked at runtime without monomorphisation.
+//! `GpuInstance` enumerates adapters; `GpuAdapter` opens a logical device. Object-safe: the backend
+//! is chosen at runtime, not monomorphised.
 
 use crate::device::GpuDevice;
 use crate::error::Result;
@@ -29,8 +27,7 @@ pub struct AdapterInfo {
     pub backend: BackendPreference,
 }
 
-/// A physical adapter (GPU, CPU, or virtual). Reports capabilities and opens a logical device.
-/// `Send + Sync` so adapter selection can run off the main thread.
+/// `Send + Sync`, so adapter selection can run off the main thread.
 pub trait GpuAdapter: Send + Sync {
     fn info(&self) -> &AdapterInfo;
 
@@ -44,10 +41,9 @@ pub trait GpuAdapter: Send + Sync {
     fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>>;
 }
 
-/// Enumerates adapters and selects the best one for a request. Presentable surfaces come from
-/// backend constructors (e.g. `VulkanInstance::create_2d_surface`), not this trait.
-///
-/// `Send + Sync`: create once, share across threads.
+/// Enumerates adapters. Surfaces come from backend constructors, such as
+/// `VulkanInstance::create_2d_surface`, because there is no generic `Surface` trait yet. `Send +
+/// Sync`, so create it once and share it across threads.
 pub trait GpuInstance: Send + Sync {
     /// Returns the adapters in driver enumeration order.
     fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>>;

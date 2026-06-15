@@ -1,17 +1,16 @@
-//! ZenGPU compute runtime.
-//!
-//! Thin layer: [`DeviceArray`] (resident buffer + shape/stride/dtype) and pooled allocation. No
-//! op-graph, scheduler or fusion.
+//! Compute runtime: [`DeviceArray`] and pooled allocation. No op-graph, scheduler or fusion; that
+//! lives in Laminax.
 
 mod pool;
 
 pub mod elementwise;
 
+pub use elementwise::ElementwiseKernels;
 pub use pool::BufferPool;
 
 use zengpu_hal::{BufferHandle, DType};
 
-/// A resident buffer plus shape/stride/dtype. No autograd, op identity or graph membership.
+/// Resident buffer plus shape/stride/dtype. No autograd or graph state (Laminax owns it).
 #[derive(Debug, Clone)]
 pub struct DeviceArray {
     pub buffer: BufferHandle,

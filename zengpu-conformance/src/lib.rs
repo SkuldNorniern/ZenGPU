@@ -1,9 +1,7 @@
-//! ZenGPU conformance harness.
-//!
-//! Each `run_*_suite` function runs a set of ops on any [`GpuDevice`]. Run them on the CPU oracle
+//! Conformance harness. Each `run_*_suite` runs ops on any [`GpuDevice`]. Run on the CPU oracle
 //! first, then on each GPU backend.
 //!
-//! `compare_*` runs one op on two devices and asserts byte-identical results. One side is always
+//! `compare_*` runs the same op on two devices and requires byte-identical results. One of them is
 //! the CPU oracle.
 
 use zengpu_hal::{
@@ -130,8 +128,12 @@ fn buffer_multiple_allocs(label: &str, dev: &dyn GpuDevice) {
     }
 }
 
-/// Write, then read, on `a` and `b` with the same data. Asserts byte-identical results. `a` is the
+/// Writes then reads the same data on `a` and `b`. Results must be byte-identical. `a` is the
 /// CPU oracle.
+///
+/// # Panics
+///
+/// Panics if the results differ.
 pub fn compare_buffer_write(label_a: &str, a: &dyn GpuDevice, label_b: &str, b: &dyn GpuDevice) {
     let patterns: &[&[u8]] = &[
         &[0xDE, 0xAD, 0xBE, 0xEF],
@@ -237,8 +239,12 @@ pub fn run_dispatch(
     outputs
 }
 
-/// Runs vec_add (`out[i] = a[i] + b[i]`) on `a` and `b`, asserts both match the expected sum. Each
-/// device needs a vec_add pipeline. The CPU oracle also needs a registered kernel.
+/// Runs vec_add (`out[i] = a[i] + b[i]`) on `a` and `b`. The CPU oracle needs a registered
+/// vector-add kernel.
+///
+/// # Panics
+///
+/// Panics if either result differs from the expected sum.
 pub fn compare_vec_add(
     label_a: &str,
     a: &dyn GpuDevice,

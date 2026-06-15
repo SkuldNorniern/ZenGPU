@@ -1,5 +1,4 @@
-//! Resource and pipeline descriptors. Plain data, no backend or consumer types. Backends consume
-//! these to create resources.
+//! Plain descriptor data with no backend types.
 
 use crate::handle::ShaderHandle;
 use crate::types::{BufferUsage, Format, MemoryUsage, PresentMode, TextureUsage};
@@ -31,7 +30,6 @@ pub struct RenderTargetDesc {
     pub samples: u32,
 }
 
-/// Shader module source. SPIR-V only.
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderDesc<'a> {
     /// SPIR-V words as raw bytes. The length must be a multiple of 4.
@@ -135,7 +133,6 @@ pub struct DepthState {
     pub write: bool,
 }
 
-/// Graphics pipeline, 3D-capable.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,

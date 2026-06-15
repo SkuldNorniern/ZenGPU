@@ -1,7 +1,5 @@
-//! The device trait: backend-independent handle onto a GPU (or the CPU reference).
-//!
-//! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn GpuDevice>` and
-//! selected at runtime.
+//! Backend-independent device trait. Object-safe: `Box<dyn GpuDevice>` or `Arc<dyn GpuDevice>`
+//! select at runtime.
 
 use crate::command::Bindings;
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
@@ -10,8 +8,7 @@ use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, T
 use crate::request::HalCapabilities;
 use crate::types::Features;
 
-/// A created device: owns GPU resources and runs work. `Send + Sync` so worker threads can allocate
-/// and upload concurrently.
+/// `Send + Sync`, so worker threads can allocate and upload concurrently.
 pub trait GpuDevice: Send + Sync {
     /// Returns the backend device for backend-specific calls, e.g. a Vulkan swapchain
     /// from a `VulkanDevice`.
@@ -19,12 +16,11 @@ pub trait GpuDevice: Send + Sync {
 
     fn capabilities(&self) -> HalCapabilities;
 
-    /// Returned handle is generational.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()>;
 
-    /// Buffer must be created with [`crate::BufferUsage::READBACK`].
+    /// Requires `BufferUsage::READBACK`.
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
     /// A stale handle is a no-op.
@@ -32,8 +28,8 @@ pub trait GpuDevice: Send + Sync {
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle>;
 
-    /// Uploads pixel data to a texture. `data` must be tightly packed in the creation format (RGBA8
-    /// is 4 bytes per pixel). Blocks until the upload completes.
+    /// Uploads tightly packed pixels in the creation format (RGBA8: 4 bytes per pixel) and blocks
+    /// until done.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
 
     /// Nothing may still reference the image, as with `destroy_buffer`. A stale handle is a no-op.
@@ -58,11 +54,11 @@ pub trait GpuDevice: Send + Sync {
 
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
 
-    /// Blocks until GPU work completes.
+    /// Dispatches a kernel and blocks until the GPU is done.
     ///
-    /// `bindings.buffers` are slot indices into the bindless SSBO table, indexed with
-    /// `nonuniformEXT`. `bindings.scalars` become push constants, packed after the buffer indices.
-    /// `grid` is the workgroup count per axis.
+    /// `bindings.buffers` are bindless SSBO slot indices, indexed with `nonuniformEXT`.
+    /// `bindings.scalars` become push constants, packed after the indices. `grid` is the workgroup
+    /// count per axis.
     fn dispatch(
         &self,
         _pipeline: PipelineHandle,

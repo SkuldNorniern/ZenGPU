@@ -1,4 +1,4 @@
-//! Command value types: bindless bindings and inline scalars.
+//! Command-recording value types, consumed by backends when recording a dispatch or draw.
 
 /// Scalar arguments, kept push-constant sized.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -8,10 +8,8 @@ pub enum Scalar {
     F32(f32),
 }
 
-/// Bindless bindings for a dispatch or draw.
-///
-/// Resources are referenced by slot index ([`crate::Handle::index`]), not a per-pipeline descriptor
-/// slot. This keeps the compiler ABI stable as kernels gain arguments.
+/// Resources are referenced by slot index ([`crate::Handle::index`]), not by a per-pipeline
+/// descriptor slot. That keeps the compiler ABI stable as kernels gain arguments.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bindings<'a> {
     pub buffers: &'a [u32],

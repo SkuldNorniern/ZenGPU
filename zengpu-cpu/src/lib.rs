@@ -1,18 +1,17 @@
-//! ZenGPU CPU reference backend, the conformance oracle.
+//! ZenGPU CPU reference backend: the conformance oracle.
 //!
-//! Plain Rust over `Vec<u8>` buffers: correctness and determinism over speed. The GPU backends are
-//! validated against it, not a product fallback (consumers like aurea keep their own CPU paths).
+//! Plain Rust over `Vec<u8>` buffers: correctness and determinism over speed. Not a
+//! product fallback.
 //!
 //! # Compute dispatch
 //!
-//! The CPU backend cannot run SPIR-V. Create a pipeline as usual, then register a Rust
-//! function for its [`PipelineHandle`] via [`CpuDevice::register_kernel`]. On
-//! [`GpuDevice::dispatch`], the function registered for that pipeline runs on copies of the
-//! bound buffers in a [`CpuKernelCtx`], and modified buffers are written back. Kernels should
-//! give bit-identical results to the GPU SPIR-V.
+//! SPIR-V cannot run here. Callers register a Rust function per [`PipelineHandle`] with
+//! [`CpuDevice::register_kernel`]. [`GpuDevice::dispatch`] copies the bound buffers into a
+//! [`CpuKernelCtx`], calls the function, and writes modified buffers back. Kernels should match the
+//! GPU SPIR-V bit for bit.
 //!
-//! Keyed by pipeline handle, not entry-point name, so two ops can both use `"main"`
-//! without colliding.
+//! Keyed by pipeline handle, not entry-point name, so two ops that both use `"main"` do
+//! not collide.
 
 #![forbid(unsafe_code)]
 
@@ -49,8 +48,7 @@ struct CpuPipeline {
 
 type BufferMap = SlotMap<marker::Buffer, CpuBuffer>;
 
-/// A CPU-backed [`GpuDevice`]. All state lives in host memory behind mutexes, so the device is
-/// `Send + Sync`.
+/// CPU-backed [`GpuDevice`]. State lives in host memory behind mutexes, so it is `Send + Sync`.
 pub struct CpuDevice {
     buffers: Mutex<BufferMap>,
     shaders: Mutex<SlotMap<marker::Shader, Vec<u8>>>,
@@ -435,7 +433,7 @@ mod tests {
             .unwrap();
 
         dev.register_kernel(pipeline, Box::new(|ctx: &mut CpuKernelCtx| {
-            let len = match ctx.scalars.get(0) {
+            let len = match ctx.scalars.first() {
                 Some(&Scalar::U32(n)) => n as usize,
                 _ => return,
             };

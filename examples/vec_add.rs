@@ -1,8 +1,6 @@
-//! Runs `vec_add` on the GPU via bindless compute: upload, dispatch, read back. No graphics,
-//! no window.
+//! Vector add via bindless compute: upload, dispatch, read back.
 //!
-//! The GLSL shader gets the three buffer indices and the element count as push constants:
-//! `Bindings.buffers[0..2] = [a_idx, b_idx, out_idx]` as the first three u32s, and
+//! Push constants: `Bindings.buffers[0..2] = [a_idx, b_idx, out_idx]` in the first three u32s,
 //! `Bindings.scalars[0] = len`.
 
 use inline_spirv::inline_spirv;

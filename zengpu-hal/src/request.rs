@@ -18,7 +18,6 @@ pub struct DeviceRequest {
     pub optional: Features,
 }
 
-/// Which HAL shapes a backend implements: graphics, compute, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HalCapabilities {
     pub graphics: bool,

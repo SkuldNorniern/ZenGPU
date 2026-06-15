@@ -1,7 +1,6 @@
-//! Single-dispatch elementwise ops over [`DeviceArray`]s.
+//! Single-dispatch elementwise ops over [`DeviceArray`]s. No chaining, scheduling or fusion.
 //!
-//! Each op is one GPU dispatch: no chaining, scheduling or fusion. f32 only; other dtypes are
-//! rejected with [`GpuError::Dispatch`].
+//! f32 only; other dtypes fail with [`GpuError::Dispatch`].
 
 use inline_spirv::inline_spirv;
 use zengpu_hal::{
@@ -86,8 +85,9 @@ pub struct ElementwiseKernels {
 }
 
 impl ElementwiseKernels {
-    /// On the CPU oracle, also register kernels for [`Self::add_pipeline`] and
-    /// [`Self::relu_pipeline`] with `CpuDevice::register_kernel`.
+    /// Create pipelines for [`Self::add`] and [`Self::relu`] on `device`. CPU device:
+    /// also register kernels for [`Self::add_pipeline`] and [`Self::relu_pipeline`]
+    /// with `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         let add_shader = device.create_shader(ShaderDesc { spirv: spv_bytes(ADD_SPV) })?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {

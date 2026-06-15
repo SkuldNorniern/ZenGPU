@@ -1,14 +1,12 @@
-//! Core value types: backend selection, memory/usage classes, feature flags, formats, dtypes. No
-//! backend types appear here.
+//! Core value types shared across ZenGPU. No backend or consumer types.
 
-/// Which backend to use. `Auto` selects the best available native backend. WebGPU is
-/// never a target.
+/// `Auto` picks the best native backend. WebGPU is not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackendPreference {
     #[default]
     Auto,
     Vulkan,
-    /// CPU reference backend. Conformance oracle, not a product fallback.
+    /// Used as a conformance oracle, not as a product fallback.
     Cpu,
 }
 
@@ -20,14 +18,14 @@ pub enum PowerPreference {
     HighPerformance,
 }
 
-/// Memory residency intent. The allocator maps this onto backend memory types/heaps.
+/// Residency intent. The allocator maps it to backend memory types and heaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryUsage {
     /// Device-local, no host visibility (resident arrays, render targets).
     GpuOnly,
     /// Host-visible and write-combined. Staging for `GpuOnly`.
     Upload,
-    /// Host-visible, cached, for GPU to CPU readback.
+    /// Host-visible and cached, for GPU-to-CPU readback.
     Readback,
     /// Host-visible device-local where available. For small frequent writes.
     CpuToGpu,
@@ -38,8 +36,9 @@ pub enum MemoryUsage {
     Pooled,
 }
 
-/// Buffer usage flags, a `u32` bitset that composes with `|`. The validation layer rejects bindings
-/// the buffer was not created for.
+/// Bitflags over `u32`, combined with `|`.
+///
+/// Validation rejects a binding that needs a usage the buffer was not created with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct BufferUsage(u32);
 
@@ -51,7 +50,6 @@ impl BufferUsage {
     pub const INDIRECT: Self = Self(1 << 4);
     pub const TRANSFER_SRC: Self = Self(1 << 5);
     pub const TRANSFER_DST: Self = Self(1 << 6);
-    /// Mappable for readback.
     pub const READBACK: Self = Self(1 << 7);
 
     pub const fn empty() -> Self {
@@ -80,14 +78,14 @@ impl core::ops::BitOrAssign for BufferUsage {
     }
 }
 
-/// Device feature flags requested at creation, a `u32` bitset that composes with `|`.
+/// Bitflags over `u32`, combined with `|`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Features(u32);
 
 impl Features {
     pub const COMPUTE: Self = Self(1 << 0);
     pub const GRAPHICS: Self = Self(1 << 1);
-    /// Bindless / descriptor indexing. Required by the binding model.
+    /// Required by the binding model.
     pub const DESCRIPTOR_INDEXING: Self = Self(1 << 2);
     pub const TIMESTAMPS: Self = Self(1 << 3);
     pub const FLOAT16: Self = Self(1 << 4);
@@ -219,7 +217,7 @@ impl Format {
     }
 }
 
-/// Axis-aligned rectangle, in pixels.
+/// Axis-aligned pixel rectangle, for scissor and damage regions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x: f32,

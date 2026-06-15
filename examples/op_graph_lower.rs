@@ -1,10 +1,8 @@
-//! Op-graph lowering example.
+//! Lowers an ML compute graph to ZenGPU ops.
 //!
-//! A tiny tensor graph lowers each node to one ZenGPU dispatch or BLAS call over resident
-//! [`DeviceArray`]s, reading back only the result.
-//!
-//! None of the graph code is part of ZenGPU. ZenGPU supplies `DeviceArray`, `BufferPool`,
-//! `ElementwiseKernels` and `GemmKernel`.
+//! `Graph`/`Op`/`lower_and_run` stand in for an external graph compiler. ZenGPU supplies
+//! `DeviceArray`, `BufferPool`, `ElementwiseKernels` and `GemmKernel`. Each node is one dispatch or
+//! BLAS call over resident arrays, and only the final result is read back.
 //!
 //! Computes `relu(A @ B + C)`.
 

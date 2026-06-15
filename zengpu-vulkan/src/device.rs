@@ -219,8 +219,9 @@ impl VulkanDevice {
         })
     }
 
-    /// Records `f` into a one-shot command buffer and waits. For staging uploads and
-    /// layout transitions.
+    /// Records a one-shot command buffer with `f` and waits for it to complete.
+    ///
+    /// For staging uploads and layout transitions.
     pub(crate) fn one_shot_submit<F>(&self, record: F) -> Result<()>
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
@@ -319,7 +320,7 @@ impl VulkanDevice {
     }
 
     pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
-        self.samplers.lock().unwrap().get(handle).map(|s| *s)
+        self.samplers.lock().unwrap().get(handle).copied()
     }
 }
 

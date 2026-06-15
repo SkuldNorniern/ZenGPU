@@ -1,8 +1,8 @@
 //! Generational-index slotmap and typed resource handles.
 //!
-//! Every GPU resource is a small `Copy` handle: an `(index, generation)` pair into a device-owned
-//! [`SlotMap`]. A stale handle is rejected, which gives the validation layer use-after-free
-//! detection without UB.
+//! Every GPU resource is referenced by a small `Copy` handle: an `(index, generation)` pair into a
+//! device-owned [`SlotMap`]. A stale handle, whose generation no longer matches its slot, is
+//! rejected. That gives the validation layer use-after-free detection without UB.
 
 use core::marker::PhantomData;
 
@@ -40,7 +40,7 @@ impl<K> core::fmt::Debug for Handle<K> {
 }
 
 impl<K> Handle<K> {
-    /// The slot index. Also the bindless index for resources placed in a descriptor table.
+    /// Slot index, also the bindless index in a descriptor table.
     pub const fn index(self) -> u32 {
         self.idx
     }
@@ -132,13 +132,14 @@ impl<K, V> SlotMap<K, V> {
         self.get(handle).is_some()
     }
 
-    /// Current generation of the slot at `index`, if in range. For stale-handle diagnostics.
+    /// Returns the current generation of `index`, if it is in range.
     pub fn generation_at(&self, index: u32) -> Option<u32> {
         self.slots.get(index as usize).map(|slot| slot.generation)
     }
 
-    /// Live value by raw slot index, skipping the generation check. For bindless lookups:
-    /// `Bindings.buffers[i]` is a slot index, not a full handle.
+    /// Looks up by raw slot index, with no generation check.
+    ///
+    /// Used for bindless lookups, where `Bindings.buffers[i]` holds a slot index.
     pub fn get_by_slot_index(&self, idx: u32) -> Option<&V> {
         self.slots.get(idx as usize).and_then(|s| s.value.as_ref())
     }

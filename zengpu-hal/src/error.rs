@@ -1,5 +1,4 @@
-//! Structured errors. Enum-based, no external error crates. Backend detail is kept, but raw backend
-//! types never leak into the public API.
+//! Enum-based errors with no external crates. Raw backend types never leak into the public API.
 
 use crate::types::{Features, MemoryUsage};
 
@@ -21,10 +20,10 @@ pub enum GpuError {
     Backend(String),
 }
 
-/// Invalid-usage detail. Most are caught by the validation layer before reaching the driver.
+/// Most of these are caught by the validation layer before they reach the driver.
 #[derive(Debug)]
 pub enum UsageError {
-    /// Handle generation does not match its slot (use-after-free).
+    /// A handle whose generation no longer matches its slot (use-after-free).
     StaleHandle {
         index: u32,
         expected_gen: u32,
