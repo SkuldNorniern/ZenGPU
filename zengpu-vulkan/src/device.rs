@@ -397,6 +397,34 @@ impl VulkanDevice {
         }
     }
 
+    /// Register `texture` (sampled with `sampler`) in the bindless
+    /// combined-image-sampler table, at `texture`'s own slot index, for use
+    /// as a [`Bindings::textures`] index in [`RenderCommands::bind`](zengpu_hal::RenderCommands::bind).
+    /// The texture's image must already be in `SHADER_READ_ONLY_OPTIMAL`
+    /// layout (true after [`GpuDevice::upload_texture_data`]).
+    pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
+        let view = self.textures.lock().unwrap().get(texture)?.view;
+        let vk_sampler = *self.samplers.lock().unwrap().get(sampler)?;
+        let info = vk::DescriptorImageInfo {
+            sampler: vk_sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: 1,
+            dst_array_element: texture.index(),
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        Some(texture.index())
+    }
+
     /// Raw `vk::ImageView` for a HAL texture handle. For user-side pipelines that
     /// need to bind textures into descriptor sets (e.g. bindless arrays).
     pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
