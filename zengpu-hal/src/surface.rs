@@ -1,8 +1,7 @@
-//! Window-handle bridge for presentable surfaces. [`WindowHandles`] takes any `raw-window-handle`
-//! window (aurea, winit, etc.) without exposing consumer types.
+//! Window-handle bridge for presentable surfaces.
 //!
-//! Surfaces are concrete per-backend types (e.g. `Vulkan2dSurface`, `Vulkan3dSurface`). There is no
-//! generic surface trait yet. It waits for a second graphics backend.
+//! [`WindowHandles`] wraps any `raw-window-handle` window (such as winit) without exposing its
+//! types. There is no generic surface trait: a second graphics backend is needed to shape one.
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 

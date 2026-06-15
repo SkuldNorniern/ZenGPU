@@ -30,8 +30,8 @@ pub struct OffscreenTarget {
     extent: vk::Extent2D,
 }
 
-/// Opaque handle to a sampled image. Pass it to [`crate::Vulkan2dSurface::set_sampled_image_slot`]
-/// instead of a raw Vulkan view, which keeps the same-device check.
+/// Sampled-image view of a render target. [`Self::raw`] for descriptor binding,
+/// [`Self::belongs_to`] for same-device checks.
 #[derive(Clone, Copy)]
 pub struct SampledImageView<'a> {
     pub(crate) inner: &'a Arc<VulkanDeviceInner>,
@@ -47,6 +47,14 @@ impl SampledImageView<'_> {
 
     pub fn extent(&self) -> vk::Extent2D {
         self.extent
+    }
+
+    pub fn raw(&self) -> vk::ImageView {
+        self.view
+    }
+
+    pub fn belongs_to(&self, context: &DeviceContext) -> bool {
+        Arc::ptr_eq(self.inner, &context.inner)
     }
 }
 
@@ -220,6 +228,12 @@ mod tests {
         let sampled = target.sampled_view();
 
         assert_eq!(sampled.format(), vk::Format::R8G8B8A8_UNORM);
-        assert_eq!(sampled.extent(), vk::Extent2D { width: 64, height: 32 });
+        assert_eq!(
+            sampled.extent(),
+            vk::Extent2D {
+                width: 64,
+                height: 32
+            }
+        );
     }
 }

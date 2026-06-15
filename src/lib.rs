@@ -30,10 +30,9 @@ pub use zengpu_hal::{
 pub use zengpu_vulkan as vulkan;
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan::{
-    AttachmentUsage, BeginFrame, CircleInstance, DEPTH_FORMAT, DepthTarget, DeviceContext, DrawRef,
-    Frame2d, FrameGraph, GradientInstance, IMAGE_SLOTS, ImageInstance, OffscreenTarget,
-    RectInstance, ResourceId, SampledImageView, Swapchain, TextInstance, Vulkan2dSurface,
-    VulkanAdapter, VulkanDevice, VulkanInstance,
+    AttachmentUsage, BeginFrame, DepthTarget, DeviceContext, FrameGraph, OffscreenTarget,
+    ResourceId, SampledImageView, Swapchain, VulkanAdapter, VulkanDevice, VulkanInstance,
+    DEPTH_FORMAT,
 };
 
 /// CPU reference backend. Conformance oracle.
