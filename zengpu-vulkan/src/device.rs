@@ -6,8 +6,9 @@ use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
     DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, SurfaceConfig, TargetHandle,
-    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, StepMode, SurfaceConfig,
+    TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat,
+    WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -1251,7 +1252,7 @@ impl VulkanDevice {
         let binding = vk::VertexInputBindingDescription {
             binding: 0,
             stride: desc.vertex_layout.stride,
-            input_rate: vk::VertexInputRate::VERTEX,
+            input_rate: step_mode_to_vk(desc.vertex_layout.step_mode),
         };
         let attributes: Vec<vk::VertexInputAttributeDescription> = desc
             .vertex_layout
@@ -1459,6 +1460,13 @@ fn vertex_format_to_vk(f: VertexFormat) -> vk::Format {
         VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
         VertexFormat::Uint32 => vk::Format::R32_UINT,
         VertexFormat::Uint8x4Unorm => vk::Format::R8G8B8A8_UNORM,
+    }
+}
+
+fn step_mode_to_vk(s: StepMode) -> vk::VertexInputRate {
+    match s {
+        StepMode::Vertex => vk::VertexInputRate::VERTEX,
+        StepMode::Instance => vk::VertexInputRate::INSTANCE,
     }
 }
 

@@ -113,11 +113,19 @@ pub struct VertexAttribute {
     pub format: VertexFormat,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepMode {
+    #[default]
+    Vertex,
+    Instance,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 pub struct VertexLayout<'a> {
     /// Bytes between consecutive vertices.
     pub stride: u32,
     pub attributes: &'a [VertexAttribute],
+    pub step_mode: StepMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
