@@ -5,10 +5,14 @@
 //!
 //! # Compute dispatch
 //!
-//! The CPU backend cannot run SPIR-V. Callers register a Rust function keyed by entry-point name
-//! via [`CpuDevice::register_kernel`]. On [`GpuDevice::dispatch`], the function runs on copies of
-//! the bound buffers in a [`CpuKernelCtx`], and modified buffers are written back. CPU kernels are
-//! hand-written Rust that should match the GPU SPIR-V bit for bit.
+//! The CPU backend cannot run SPIR-V. Create a pipeline as usual, then register a Rust
+//! function for its [`PipelineHandle`] via [`CpuDevice::register_kernel`]. On
+//! [`GpuDevice::dispatch`], the function registered for that pipeline runs on copies of the
+//! bound buffers in a [`CpuKernelCtx`], and modified buffers are written back. Kernels should
+//! give bit-identical results to the GPU SPIR-V.
+//!
+//! Keyed by pipeline handle, not entry-point name, so two ops can both use `"main"`
+//! without colliding.
 
 #![forbid(unsafe_code)]
 
@@ -31,8 +35,7 @@ pub struct CpuKernelCtx {
     pub grid: [u32; 3],
 }
 
-/// A CPU-side kernel function, registered under the SPIR-V entry-point name it matches
-/// (e.g. `"main"`).
+/// CPU kernel for a pipeline, registered via [`CpuDevice::register_kernel`].
 pub type CpuKernel = Box<dyn Fn(&mut CpuKernelCtx) + Send + Sync>;
 
 struct CpuBuffer {
@@ -52,7 +55,7 @@ pub struct CpuDevice {
     buffers: Mutex<BufferMap>,
     shaders: Mutex<SlotMap<marker::Shader, Vec<u8>>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CpuPipeline>>,
-    kernels: Mutex<HashMap<String, CpuKernel>>,
+    kernels: Mutex<HashMap<PipelineHandle, CpuKernel>>,
 }
 
 impl CpuDevice {
@@ -65,13 +68,10 @@ impl CpuDevice {
         }
     }
 
-    /// Registers a CPU kernel under `entry_name`, matching the SPIR-V entry point
-    /// in [`ComputePipelineDesc::entry`].
-    ///
-    /// Dispatches whose pipeline entry matches `entry_name` call `kernel` with the bound
+    /// Register `kernel` for `pipeline`. Dispatching that pipeline calls it with the bound
     /// buffer data.
-    pub fn register_kernel(&self, entry_name: &str, kernel: CpuKernel) {
-        self.kernels.lock().unwrap().insert(entry_name.to_string(), kernel);
+    pub fn register_kernel(&self, pipeline: PipelineHandle, kernel: CpuKernel) {
+        self.kernels.lock().unwrap().insert(pipeline, kernel);
     }
 }
 
@@ -229,9 +229,9 @@ impl GpuDevice for CpuDevice {
         };
         {
             let kernels = self.kernels.lock().unwrap();
-            let kernel = kernels.get(&entry).ok_or_else(|| {
+            let kernel = kernels.get(&pipeline).ok_or_else(|| {
                 GpuError::Dispatch(format!(
-                    "no CPU kernel registered for entry '{entry}'; \
+                    "no CPU kernel registered for pipeline (entry '{entry}'); \
                      call CpuDevice::register_kernel before dispatching"
                 ))
             })?;
@@ -425,25 +425,6 @@ mod tests {
     fn dispatch_vec_add_f32() {
         let dev = CpuDevice::new();
 
-        dev.register_kernel("main", Box::new(|ctx: &mut CpuKernelCtx| {
-            let len = match ctx.scalars.get(0) {
-                Some(&Scalar::U32(n)) => n as usize,
-                _ => return,
-            };
-            let read_f32 = |buf: &[u8], i: usize| -> f32 {
-                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
-            };
-            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
-                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
-            };
-            if ctx.buffers.len() < 3 { return; }
-            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
-            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
-            for i in 0..len {
-                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
-            }
-        }));
-
         let n: u32 = 8;
         let size = (n as u64) * 4;
         let usage = BufferUsage::STORAGE | BufferUsage::READBACK;
@@ -463,6 +444,25 @@ mod tests {
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
             .unwrap();
+
+        dev.register_kernel(pipeline, Box::new(|ctx: &mut CpuKernelCtx| {
+            let len = match ctx.scalars.get(0) {
+                Some(&Scalar::U32(n)) => n as usize,
+                _ => return,
+            };
+            let read_f32 = |buf: &[u8], i: usize| -> f32 {
+                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+            };
+            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
+                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+            };
+            if ctx.buffers.len() < 3 { return; }
+            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
+            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
+            for i in 0..len {
+                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
+            }
+        }));
 
         dev.dispatch(
             pipeline,
