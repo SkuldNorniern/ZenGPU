@@ -106,6 +106,11 @@ pub trait GraphicsDevice: crate::GpuDevice {
     /// list records straight into a backend command buffer with no intermediate
     /// allocation.
     fn create_command_list(&self) -> Result<Self::CommandList>;
+
+    /// Whether the device supports [`BlendMode::DualSourceAlpha`](crate::desc::BlendMode::DualSourceAlpha)
+    /// (`dualSrcBlend`). Coverage-based text rendering falls back to
+    /// [`BlendMode::AlphaBlend`](crate::desc::BlendMode::AlphaBlend) where this is `false`.
+    fn supports_dual_source_blending(&self) -> bool;
 }
 
 /// An acquired-frame result: a real frame, or skip (minimized window, or the

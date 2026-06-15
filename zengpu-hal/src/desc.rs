@@ -156,6 +156,11 @@ pub enum BlendMode {
     Opaque,
     /// Standard src-alpha over (premultiplied-friendly) blend.
     AlphaBlend,
+    /// Dual-source blend for coverage-based text rendering: the fragment
+    /// shader writes a second color output (`layout(location = 0, index =
+    /// 1)`) used as the source-blend factor. Requires
+    /// [`GraphicsDevice::supports_dual_source_blending`](crate::graphics::GraphicsDevice::supports_dual_source_blending).
+    DualSourceAlpha,
 }
 
 /// Depth test/write configuration.
