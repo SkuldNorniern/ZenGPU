@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  publish:
+    name: Publish ZenGPU ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Generate release notes
+        run: |
+          # Find the previous versioned tag (skip the tag we're currently cutting).
+          PREV_TAG=$(git tag -l 'v*' --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -1 || true)
+          RANGE="${PREV_TAG:+${PREV_TAG}..HEAD}"
+          [ -z "$PREV_TAG" ] && RANGE="HEAD"
+
+          section() {
+            git log "$RANGE" --pretty=format:"%s" \
+              | grep -E "^${1}(\([^)]*\))?: " \
+              | sed -E "s/^${1}(\([^)]*\))?: /- /" \
+              || true
+          }
+
+          FEATS=$(section feat)
+          FIXES=$(section fix)
+          DOCS=$(section docs)
+          REFACTORS=$(section refactor)
+          CI=$(section ci)
+          OTHERS=$(git log "$RANGE" --pretty=format:"%s" \
+            | grep -Ev "^(feat|fix|docs|refactor|ci|chore|style|test|perf|build)(\([^)]*\))?: " \
+            || true)
+
+          {
+            echo "## What's Changed"
+            echo ""
+            if [ -n "$FEATS" ];     then echo "### Features";      echo "$FEATS";     echo ""; fi
+            if [ -n "$FIXES" ];     then echo "### Bug Fixes";     echo "$FIXES";     echo ""; fi
+            if [ -n "$DOCS" ];      then echo "### Documentation"; echo "$DOCS";      echo ""; fi
+            if [ -n "$REFACTORS" ]; then echo "### Refactor";      echo "$REFACTORS"; echo ""; fi
+            if [ -n "$CI" ];        then echo "### CI";            echo "$CI";        echo ""; fi
+            if [ -n "$OTHERS" ];    then echo "### Other";         echo "$OTHERS" | sed 's/^/- /'; echo ""; fi
+          } > release_notes.md
+
+      - name: Publish crates to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          publish() {
+            echo "Publishing $1 ..."
+            cargo publish -p "$1"
+            echo "Waiting for crates.io index to propagate ..."
+            sleep 30
+          }
+          publish zengpu-hal
+          publish zengpu-cpu
+          publish zengpu-vulkan
+          publish zengpu-compute
+          publish zengpu-blas
+          publish zengpu-conformance
+          publish zengpu
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PRERELEASE_FLAG=""
+          echo "${{ github.ref_name }}" | grep -q -- "-" && PRERELEASE_FLAG="--prerelease"
+          gh release create "${{ github.ref_name }}" \
+            --title "ZenGPU ${{ github.ref_name }}" \
+            --notes-file release_notes.md \
+            $PRERELEASE_FLAG
