@@ -31,9 +31,10 @@ pub use zengpu_hal::{
     GpuAdapter, GpuDevice, GpuError, GpuInstance, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, LoadOp, MemoryUsage, PipelineHandle, PowerPreference, PresentMode,
     PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, RenderTargetDesc, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, Surface, SurfaceConfig,
-    SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
-    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, StepMode, Surface,
+    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage,
+    UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor,
+    WindowHandles,
 };
 
 /// The Vulkan backend — graphics + compute on Vulkan 1.2+.

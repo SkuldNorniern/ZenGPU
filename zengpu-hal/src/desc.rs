@@ -129,12 +129,23 @@ pub struct VertexAttribute {
     pub format: VertexFormat,
 }
 
+/// Whether a vertex buffer advances per-vertex or per-instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StepMode {
+    /// Advance to the next element for each vertex (default).
+    #[default]
+    Vertex,
+    /// Advance to the next element for each instance.
+    Instance,
+}
+
 /// The layout of one vertex buffer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct VertexLayout<'a> {
     /// Bytes between consecutive vertices.
     pub stride: u32,
     pub attributes: &'a [VertexAttribute],
+    pub step_mode: StepMode,
 }
 
 /// Color blending for a graphics pipeline (kept simple to start).
