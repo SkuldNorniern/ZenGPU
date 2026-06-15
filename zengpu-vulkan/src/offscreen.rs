@@ -30,6 +30,26 @@ pub struct OffscreenTarget {
     extent: vk::Extent2D,
 }
 
+/// Opaque handle to a sampled image. Pass it to [`crate::Vulkan2dSurface::set_sampled_image_slot`]
+/// instead of a raw Vulkan view, which keeps the same-device check.
+#[derive(Clone, Copy)]
+pub struct SampledImageView<'a> {
+    pub(crate) inner: &'a Arc<VulkanDeviceInner>,
+    pub(crate) view: vk::ImageView,
+    format: vk::Format,
+    extent: vk::Extent2D,
+}
+
+impl SampledImageView<'_> {
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    pub fn extent(&self) -> vk::Extent2D {
+        self.extent
+    }
+}
+
 unsafe impl Send for OffscreenTarget {}
 unsafe impl Sync for OffscreenTarget {}
 
@@ -46,13 +66,16 @@ impl OffscreenTarget {
                 &vk::ImageCreateInfo {
                     image_type: vk::ImageType::TYPE_2D,
                     format,
-                    extent: vk::Extent3D { width, height, depth: 1 },
+                    extent: vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    },
                     mip_levels: 1,
                     array_layers: 1,
                     samples: vk::SampleCountFlags::TYPE_1,
                     tiling: vk::ImageTiling::OPTIMAL,
-                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT
-                        | vk::ImageUsageFlags::SAMPLED,
+                    usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                     initial_layout: vk::ImageLayout::UNDEFINED,
                     ..Default::default()
                 },
@@ -106,7 +129,14 @@ impl OffscreenTarget {
         }
         .map_err(|e| GpuError::Backend(format!("create_image_view: {e}")))?;
 
-        Ok(Self { inner, image, memory, view, format, extent })
+        Ok(Self {
+            inner,
+            image,
+            memory,
+            view,
+            format,
+            extent,
+        })
     }
 
     pub fn format(&self) -> vk::Format {
@@ -123,6 +153,17 @@ impl OffscreenTarget {
 
     pub fn image(&self) -> vk::Image {
         self.image
+    }
+
+    /// The target must belong to the same logical device. It must stay alive and in
+    /// `SHADER_READ_ONLY_OPTIMAL` while the descriptor is used.
+    pub fn sampled_view(&self) -> SampledImageView<'_> {
+        SampledImageView {
+            inner: &self.inner,
+            view: self.view,
+            format: self.format,
+            extent: self.extent,
+        }
     }
 }
 
@@ -145,7 +186,40 @@ fn find_memory_type(
     (0..props.memory_type_count)
         .find(|&i| {
             (type_filter & (1 << i)) != 0
-                && props.memory_types[i as usize].property_flags.contains(required)
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(required)
         })
         .ok_or_else(|| GpuError::Backend("no device-local memory type found".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{VulkanDevice, VulkanInstance};
+    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
+
+    #[test]
+    fn offscreen_target_exposes_sampled_view_metadata() {
+        let Ok(instance) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let Ok(device) = adapter.open(DeviceRequest::default()) else {
+            return;
+        };
+        let device = device
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("Vulkan adapter returned a non-Vulkan device");
+
+        let target =
+            OffscreenTarget::new(&device.context(), vk::Format::R8G8B8A8_UNORM, 64, 32).unwrap();
+        let sampled = target.sampled_view();
+
+        assert_eq!(sampled.format(), vk::Format::R8G8B8A8_UNORM);
+        assert_eq!(sampled.extent(), vk::Extent2D { width: 64, height: 32 });
+    }
 }
