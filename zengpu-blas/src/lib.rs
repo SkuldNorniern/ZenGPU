@@ -1,8 +1,8 @@
-//! ZenGPU BLAS bridge (plan §14 / C4).
+//! ZenGPU BLAS bridge.
 //!
 //! A bridge, not a from-scratch GEMM: the long-term shape routes to vendor
 //! libraries (cuBLAS, rocBLAS, oneMKL, MPS) when the corresponding backend is
-//! present, falling back to a portable ZenGPU compute kernel otherwise (D15).
+//! present, falling back to a portable ZenGPU compute kernel otherwise.
 //! No vendor backend exists yet, so this crate currently *is* that portable
 //! fallback: a single-dispatch f32 GEMM compute kernel over [`DeviceArray`]s.
 //! Vendor bridges slot in behind the same [`GemmKernel::gemm`] call once a
@@ -63,7 +63,7 @@ pub struct GemmKernel {
 impl GemmKernel {
     /// Compile and create the GEMM pipeline on `device`. For the CPU oracle,
     /// the caller must additionally register a matching kernel for
-    /// [`Self::pipeline`] via `CpuDevice::register_kernel` (plan D7).
+    /// [`Self::pipeline`] via `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         let shader = device.create_shader(ShaderDesc { spirv: spv_bytes(GEMM_SPV) })?;
         let pipeline = device.create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })?;
@@ -78,7 +78,7 @@ impl GemmKernel {
 
     /// `C = A @ B` for 2D row-major f32 arrays: `a.shape = [m, k]`,
     /// `b.shape = [k, n]`, returns `c.shape = [m, n]`. Allocates `c` from
-    /// `pool`. One dispatch (D9: no chaining/scheduling here).
+    /// `pool`. This performs one dispatch with no chaining or scheduling.
     pub fn gemm(&self, device: &dyn GpuDevice, pool: &BufferPool, a: &DeviceArray, b: &DeviceArray) -> Result<DeviceArray> {
         if a.dtype != DType::F32 || b.dtype != DType::F32 {
             return Err(GpuError::Dispatch(format!(

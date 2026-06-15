@@ -1,15 +1,15 @@
 //! Core value types shared across ZenGPU — backend selection, memory/usage
 //! classes, feature flags, formats, dtypes. No backend types appear here
-//! (plan D10: the public surface carries no consumer- or backend-specific types).
+//! The public surface carries no consumer- or backend-specific types.
 
 /// Which backend to use. `Auto` selects the best available *native* backend
-/// (plan D15: native-first; WebGPU is never a target).
+/// ZenGPU is native-first; WebGPU is not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackendPreference {
     #[default]
     Auto,
     Vulkan,
-    /// CPU reference backend — the conformance oracle (plan D7), not a product
+    /// CPU reference backend — the conformance oracle, not a product
     /// fallback.
     Cpu,
 }
@@ -22,7 +22,7 @@ pub enum PowerPreference {
     HighPerformance,
 }
 
-/// Memory residency intent (plan §7). The allocator maps this onto backend
+/// Memory residency intent. The allocator maps this onto backend
 /// memory types/heaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryUsage {
@@ -30,7 +30,7 @@ pub enum MemoryUsage {
     GpuOnly,
     /// Host-visible, write-combined — staging into `GpuOnly`.
     Upload,
-    /// Host-visible, cached — async GPU→CPU readback (plan D6).
+    /// Host-visible and cached for GPU-to-CPU readback.
     Readback,
     /// Host-visible device-local where available — small frequent writes.
     CpuToGpu,
@@ -43,7 +43,7 @@ pub enum MemoryUsage {
 }
 
 /// How a buffer may be used. The validation layer rejects bindings that need a
-/// usage the buffer was not created with (plan §9).
+/// usage the buffer was not created with.
 ///
 /// A set of flags over a `u32`; compose with `|`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -57,7 +57,7 @@ impl BufferUsage {
     pub const INDIRECT: Self = Self(1 << 4);
     pub const TRANSFER_SRC: Self = Self(1 << 5);
     pub const TRANSFER_DST: Self = Self(1 << 6);
-    /// Mappable for async readback (plan D6).
+    /// Mappable for readback.
     pub const READBACK: Self = Self(1 << 7);
 
     /// The empty set.
@@ -90,7 +90,7 @@ impl core::ops::BitOrAssign for BufferUsage {
     }
 }
 
-/// Device feature flags requested at creation (plan §22).
+/// Device feature flags requested at creation.
 ///
 /// A set of flags over a `u32`; compose with `|`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -99,7 +99,7 @@ pub struct Features(u32);
 impl Features {
     pub const COMPUTE: Self = Self(1 << 0);
     pub const GRAPHICS: Self = Self(1 << 1);
-    /// Bindless / descriptor indexing — required by the binding model (D4).
+    /// Bindless descriptor indexing, required by the binding model.
     pub const DESCRIPTOR_INDEXING: Self = Self(1 << 2);
     pub const TIMESTAMPS: Self = Self(1 << 3);
     pub const FLOAT16: Self = Self(1 << 4);
@@ -185,7 +185,7 @@ impl core::ops::BitOrAssign for TextureUsage {
     }
 }
 
-/// Numeric element type for device arrays (plan §13).
+/// Numeric element type for device arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F32,
@@ -215,7 +215,7 @@ impl DType {
     }
 }
 
-/// Presentation mode for a surface (plan §15 / D11).
+/// Presentation mode for a surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PresentMode {
     /// Vsync; always supported.
@@ -246,7 +246,7 @@ impl Format {
     }
 }
 
-/// An axis-aligned rectangle in pixels. Used for scissor/damage (plan §15).
+/// An axis-aligned rectangle in pixels. Used for scissor and damage regions.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
     pub x: f32,

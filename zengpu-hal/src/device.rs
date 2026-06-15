@@ -1,5 +1,5 @@
 //! The device trait — the backend-independent handle onto a GPU (or the CPU
-//! reference). This is the first slice of the split-HAL (plan §20); it grows as
+//! reference). This is the first slice of the split HAL; it grows as
 //! backends come online (compute dispatch, graphics passes, surfaces).
 //!
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn
@@ -13,29 +13,29 @@ use crate::request::HalCapabilities;
 use crate::types::Features;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
-/// threads can allocate and upload concurrently (plan D5).
+/// threads can allocate and upload concurrently.
 pub trait GpuDevice: Send + Sync {
     /// Downcast to the concrete backend type. Required for backend-specific
     /// operations (e.g. creating a Vulkan swapchain from a VulkanDevice).
     fn as_any(&self) -> &dyn core::any::Any;
 
-    /// Which HAL shapes this backend implements (plan §4 / D1).
+    /// Which HAL capabilities this backend implements.
     fn capabilities(&self) -> HalCapabilities;
 
-    /// Create a buffer. The returned handle is generational (plan §5 / D3).
+    /// Create a buffer. The returned handle is generational.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 
     /// Upload `data` into `buffer` starting at byte `offset`.
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()>;
 
     /// Read `len` bytes from `buffer` starting at byte `offset`. The buffer must
-    /// have been created with [`crate::BufferUsage::READBACK`] (plan §9).
+    /// have been created with [`crate::BufferUsage::READBACK`].
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
     /// Destroy `buffer`, invalidating its handle. A stale handle is a no-op.
     fn destroy_buffer(&self, buffer: BufferHandle);
 
-    // ── Texture API (plan G3) ─────────────────────────────────────────────────
+    // ── Texture API ───────────────────────────────────────────────────────────
 
     /// Allocate a GPU-resident texture. Data must be uploaded separately via
     /// [`Self::upload_texture_data`].
@@ -43,7 +43,7 @@ pub trait GpuDevice: Send + Sync {
 
     /// Upload `data` to the texture.  `data` must be tightly packed pixels in
     /// the format specified at creation (RGBA8 = 4 bytes per pixel).  Blocks
-    /// until the upload is complete (G3 scope; async path is plan D6).
+    /// until the upload is complete; an asynchronous path may be added later.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
 
     /// Destroy a texture, invalidating its handle. A stale handle is a no-op.
@@ -57,7 +57,7 @@ pub trait GpuDevice: Send + Sync {
     /// Destroy a sampler, invalidating its handle.
     fn destroy_sampler(&self, sampler: SamplerHandle);
 
-    // ── Compute API (plan §12 / C2) ───────────────────────────────────────────
+    // ── Compute API ───────────────────────────────────────────────────────────
 
     /// Upload a SPIR-V shader module. Returns a handle usable for pipeline
     /// creation. Default impl returns `UnsupportedFeatures` on backends that do
@@ -80,9 +80,9 @@ pub trait GpuDevice: Send + Sync {
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
 
     /// Synchronously dispatch a compute pipeline. Blocks until GPU work
-    /// completes (async dispatch is plan D6, deferred).
+    /// completes. Asynchronous dispatch is deferred.
     ///
-    /// `bindings.buffers` = slot indices (plan D4) into the bindless SSBO
+    /// `bindings.buffers` contains slot indices into the bindless SSBO
     /// table; the shader indexes them with `nonuniformEXT`. `bindings.scalars`
     /// become push-constant values (packed after the buffer indices). `grid` is
     /// the workgroup count along each axis.

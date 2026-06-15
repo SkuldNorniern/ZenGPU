@@ -1,4 +1,4 @@
-//! Vulkan 2D rect painter — instanced solid-colour quads (aurea G4 / Rung 1).
+//! Vulkan 2D rect painter using instanced solid-colour quads.
 //!
 //! Unlike [`crate::swapchain`] (which pre-records a static triangle), the 2D
 //! surface re-records its command buffer every frame because the rect set

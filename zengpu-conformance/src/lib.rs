@@ -1,4 +1,4 @@
-//! ZenGPU conformance harness (plan D7 / M1.5).
+//! ZenGPU conformance harness.
 //!
 //! Each `run_*_suite` function exercises a set of operations on any
 //! [`GpuDevice`].  Call them on the CPU oracle to prove the tests are
@@ -6,7 +6,7 @@
 //!
 //! The cross-backend `compare_*` functions run the same operation on two
 //! devices and assert byte-identical results — the CPU oracle is always one
-//! of the two (plan §18).
+//! of the two.
 
 use zengpu_hal::{
     Bindings, BufferDesc, BufferUsage, GpuDevice, GpuError, MemoryUsage, PipelineHandle, Scalar,
@@ -134,7 +134,7 @@ fn buffer_multiple_allocs(label: &str, dev: &dyn GpuDevice) {
 // ── Cross-backend comparison ──────────────────────────────────────────────────
 
 /// Run a write→read cycle on both `a` and `b` with the same data and assert
-/// byte-identical results.  `a` should be the CPU oracle (plan §18).
+/// byte-identical results. `a` should be the CPU oracle.
 pub fn compare_buffer_write(label_a: &str, a: &dyn GpuDevice, label_b: &str, b: &dyn GpuDevice) {
     let patterns: &[&[u8]] = &[
         &[0xDE, 0xAD, 0xBE, 0xEF],
@@ -166,7 +166,7 @@ pub fn compare_full(label_a: &str, a: &dyn GpuDevice, label_b: &str, b: &dyn Gpu
     compare_buffer_write(label_a, a, label_b, b);
 }
 
-// ── Compute (plan §12 / C2) ─────────────────────────────────────────────────
+// ── Compute ─────────────────────────────────────────────────────────────────
 
 fn compute_desc(size: u64) -> BufferDesc {
     BufferDesc {
@@ -242,9 +242,9 @@ pub fn run_dispatch(
 }
 
 /// Run vec_add (`out[i] = a[i] + b[i]`) on both `a` and `b` and assert the
-/// results agree and match the expected sum (plan §18: "vec_add on GPU == CPU
-/// reference"). Each device must already have a pipeline (and, for the CPU
-/// oracle, a registered kernel — plan D7) implementing vec_add.
+/// results agree and match the expected sum. Each device must already have a
+/// pipeline and, for the CPU oracle, a registered kernel implementing vector
+/// addition.
 pub fn compare_vec_add(
     label_a: &str,
     a: &dyn GpuDevice,

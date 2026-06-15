@@ -1,7 +1,8 @@
-//! Single-dispatch elementwise ops over [`DeviceArray`]s (plan §13 / C3).
+//! Single-dispatch elementwise ops over [`DeviceArray`]s.
 //!
 //! Each op below is exactly one GPU dispatch — no chaining, scheduling, or
-//! fusion (D9: that is Laminax's job). f32 only for now; other dtypes are
+//! fusion; graph-level optimization belongs to the calling compiler. f32 only
+//! for now; other dtypes are
 //! rejected with [`GpuError::Dispatch`].
 
 use inline_spirv::inline_spirv;
@@ -92,7 +93,7 @@ impl ElementwiseKernels {
     /// Compile and create pipelines for [`Self::add`] and [`Self::relu`] on
     /// `device`. For the CPU oracle, the caller must additionally register
     /// matching kernels for [`Self::add_pipeline`]/[`Self::relu_pipeline`]
-    /// via `CpuDevice::register_kernel` (plan D7).
+    /// via `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         let add_shader = device.create_shader(ShaderDesc { spirv: spv_bytes(ADD_SPV) })?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {

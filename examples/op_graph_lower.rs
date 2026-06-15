@@ -1,10 +1,10 @@
-//! C5 example: op-graph lowering spike (plan §19 / D9).
+//! Example of lowering an ML compute graph into ZenGPU operations.
 //!
 //! `Graph`/`Op`/`lower_and_run` below stand in for an ML compute-graph
 //! compiler (Laminax or otherwise): a tiny tensor graph that lowers each node
 //! to a single ZenGPU dispatch/BLAS call over resident [`DeviceArray`]s,
 //! reading back only the final result. None of this lives in ZenGPU — it owns
-//! no op-graph (D9); ZenGPU only supplies `DeviceArray`, `BufferPool`,
+//! no op-graph; ZenGPU only supplies `DeviceArray`, `BufferPool`,
 //! `ElementwiseKernels`, and `GemmKernel`.
 //!
 //! Graph computed: `relu(A @ B + C)`.
@@ -17,7 +17,7 @@ use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
 use zengpu_vulkan::VulkanInstance;
 
-// ── Stand-in for a compute-graph compiler's op-graph (D9: not part of ZenGPU) ─
+// ── Stand-in for a compute-graph compiler's op-graph (not part of ZenGPU) ─────
 
 /// A node in the toy graph. `Input` references an array passed in by the
 /// caller; the rest reference earlier node ids (so the graph is already

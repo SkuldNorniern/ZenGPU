@@ -1,11 +1,11 @@
-//! Window-handle bridge for presentable surfaces (plan G2).
+//! Window-handle bridge for presentable surfaces.
 //!
 //! [`WindowHandles`] bridges any `raw-window-handle`-capable window (aurea,
 //! winit, etc.) to ZenGPU without pulling consumer types into the public API
-//! (plan D10). Surfaces themselves are concrete per-feature backend types
+//! Surfaces themselves are concrete per-feature backend types
 //! (e.g. `Vulkan2dSurface`, `Vulkan3dSurface`) built on top of this — a
-//! generic `GpuSurface`/`Surface` HAL trait (plan §20) is deferred until a
-//! second graphics backend exists to shape it (D8/D15).
+//! generic `GpuSurface`/`Surface` HAL trait is deferred until a second graphics
+//! backend exists to shape it.
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 

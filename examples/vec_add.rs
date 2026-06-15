@@ -1,8 +1,8 @@
-//! C2 example: vec_add on GPU via ZenGPU bindless compute (plan §12 / D4).
+//! Vector addition on the GPU via ZenGPU bindless compute.
 //!
 //! Demonstrates the minimal path: upload data → dispatch a compute shader →
 //! read back the result. No graphics, no window, no ML — pure general-purpose
-//! compute (plan D16).
+//! compute.
 //!
 //! The GLSL shader receives the three buffer indices and the element count as
 //! push constants. Bindings.buffers[0..2] = [a_idx, b_idx, out_idx] packed

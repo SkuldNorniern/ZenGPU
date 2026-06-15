@@ -1,4 +1,4 @@
-//! Vulkan physical-device adapter (plan §22).
+//! Vulkan physical-device adapter.
 
 use std::sync::Arc;
 

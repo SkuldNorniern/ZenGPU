@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-blas"
-description = "ZenGPU BLAS bridge — portable compute-shader GEMM; vendor bridges added when those backends land (plan §14 / C4)."
+description = "ZenGPU BLAS bridge — portable compute-shader GEMM with room for future vendor backends."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

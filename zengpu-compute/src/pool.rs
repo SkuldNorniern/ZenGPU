@@ -1,5 +1,5 @@
-//! Pooled buffer allocation for [`crate::DeviceArray`] (plan §7 "Pooled" /
-//! C3). A simple size-classed free list absorbs the allocation churn of
+//! Pooled buffer allocation for [`crate::DeviceArray`]. A simple size-classed
+//! free list absorbs the allocation churn of
 //! repeated elementwise/BLAS ops without round-tripping through the device
 //! allocator on every call.
 

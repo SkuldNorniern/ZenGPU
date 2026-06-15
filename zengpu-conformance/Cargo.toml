@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-conformance"
-description = "ZenGPU conformance harness — validates backend correctness against the CPU oracle (plan D7 / M1.5)."
+description = "ZenGPU conformance harness — validates backend correctness against the CPU oracle."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

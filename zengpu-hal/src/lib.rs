@@ -3,11 +3,11 @@
 //! This crate holds the shared-core pieces that everything else builds on, with
 //! no GPU and no backend dependencies:
 //!
-//! - [`error`] — structured, enum-based errors (plan §21).
+//! - [`error`] — structured, enum-based errors.
 //! - [`handle`] — generational-index [`SlotMap`] and typed resource handles,
-//!   which give the validation layer use-after-free detection (plan §5 / D3).
+//!   which give the validation layer use-after-free detection.
 //! - [`types`] — backend selection, memory/usage classes, feature flags,
-//!   formats, dtypes (plan §7, §22) — all backend- and consumer-neutral (D10).
+//!   formats, dtypes — all backend- and consumer-neutral.
 //!
 //! Split-HAL traits (graphics + compute) land here as the backends come online.
 

@@ -1,4 +1,4 @@
-//! Generational-index slotmap and typed resource handles (plan §5 / D3).
+//! Generational-index slotmap and typed resource handles.
 //!
 //! Every GPU resource is referenced by a small `Copy` handle that is an
 //! `(index, generation)` pair into a device-owned [`SlotMap`]. A stale handle —
@@ -44,7 +44,7 @@ impl<K> core::fmt::Debug for Handle<K> {
 
 impl<K> Handle<K> {
     /// The slot index. Doubles as the **bindless index** for resources placed in
-    /// a descriptor table (plan D4).
+    /// a descriptor table.
     pub const fn index(self) -> u32 {
         self.idx
     }
@@ -144,14 +144,14 @@ impl<K, V> SlotMap<K, V> {
     }
 
     /// The current generation of the slot at `index`, if the index is in range.
-    /// Lets a backend build a precise stale-handle diagnostic (plan §9).
+    /// Lets a backend build a precise stale-handle diagnostic.
     pub fn generation_at(&self, index: u32) -> Option<u32> {
         self.slots.get(index as usize).map(|slot| slot.generation)
     }
 
     /// Get a live value by raw slot index, bypassing the generation check.
     /// Intended for bindless-index lookups: `Bindings.buffers[i]` is a slot
-    /// index (plan D4), not a full generational handle.
+    /// index, not a full generational handle.
     pub fn get_by_slot_index(&self, idx: u32) -> Option<&V> {
         self.slots.get(idx as usize).and_then(|s| s.value.as_ref())
     }
