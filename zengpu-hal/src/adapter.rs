@@ -6,7 +6,6 @@
 use crate::device::GpuDevice;
 use crate::error::Result;
 use crate::request::{AdapterRequest, DeviceRequest, HalCapabilities};
-use crate::surface::{GpuSurface, WindowHandles};
 use crate::types::BackendPreference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,8 +44,8 @@ pub trait GpuAdapter: Send + Sync {
     fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>>;
 }
 
-/// Entry point for a backend: enumerates adapters, selects one for a request, and creates
-/// presentable surfaces.
+/// Enumerates adapters and selects the best one for a request. Presentable surfaces come from
+/// backend constructors (e.g. `VulkanInstance::create_2d_surface`), not this trait.
 ///
 /// `Send + Sync`: create once, share across threads.
 pub trait GpuInstance: Send + Sync {
@@ -56,14 +55,6 @@ pub trait GpuInstance: Send + Sync {
     /// Picks the best adapter by priority: device type, power preference, then enumeration order.
     /// Returns `None` if nothing matches.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
-
-    /// Creates the surface and swapchain together. Window must outlive the returned surface.
-    fn create_surface(
-        &self,
-        handles: &WindowHandles,
-        device: &dyn crate::device::GpuDevice,
-        config: crate::desc::SurfaceConfig,
-    ) -> Result<Box<dyn GpuSurface>>;
 }
 
 #[cfg(test)]

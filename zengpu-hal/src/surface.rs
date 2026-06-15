@@ -1,12 +1,10 @@
-//! Surface and swapchain HAL types.
+//! Window-handle bridge for presentable surfaces. [`WindowHandles`] takes any `raw-window-handle`
+//! window (aurea, winit, etc.) without exposing consumer types.
 //!
-//! [`WindowHandles`] takes any `raw-window-handle` window (aurea, winit, etc.) without exposing
-//! consumer types. [`GpuSurface`] is the backend-independent presentable surface.
+//! Surfaces are concrete per-backend types (e.g. `Vulkan2dSurface`, `Vulkan3dSurface`). There is no
+//! generic surface trait yet. It waits for a second graphics backend.
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-
-use crate::desc::SurfaceConfig;
-use crate::error::Result;
 
 /// Window and display handles from any window implementing [`raw_window_handle::HasWindowHandle`]
 /// and [`raw_window_handle::HasDisplayHandle`].
@@ -37,28 +35,4 @@ impl WindowHandles {
     pub fn from_raw(window: RawWindowHandle, display: RawDisplayHandle) -> Self {
         Self { window, display }
     }
-}
-
-/// Token from [`GpuSurface::acquire_frame`], consumed by [`GpuSurface::present_frame`]. Holds the
-/// swapchain image index, which is also the bindless slot of the render target.
-#[must_use = "SurfaceFrame must be passed to present_frame or explicitly dropped"]
-pub struct SurfaceFrame {
-    pub index: u32,
-}
-
-/// Presentable surface: wraps the OS window, the swapchain, and the acquire/present handshake.
-/// `Send + Sync`: backends guard swapchain state with a `Mutex`.
-pub trait GpuSurface: Send + Sync {
-    /// Configure or reconfigure the swapchain. Call after creation and on resize / surface loss.
-    fn configure(&self, config: SurfaceConfig) -> Result<()>;
-
-    /// Acquire the next swapchain image. Blocks up to the driver timeout.
-    fn acquire_frame(&self) -> Result<SurfaceFrame>;
-
-    fn present_frame(&self, frame: SurfaceFrame) -> Result<()>;
-
-    /// Extent in pixels, `(width, height)`.
-    fn size(&self) -> (u32, u32);
-
-    fn image_count(&self) -> u32;
 }
