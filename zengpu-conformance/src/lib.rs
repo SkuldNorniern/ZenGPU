@@ -7,8 +7,8 @@
 //! the CPU oracle.
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, GpuDevice, GpuError, MemoryUsage,
-    Scalar, ShaderDesc, UsageError,
+    Bindings, BufferDesc, BufferUsage, GpuDevice, GpuError, MemoryUsage, PipelineHandle, Scalar,
+    UsageError,
 };
 
 fn rw_desc(size: u64) -> BufferDesc {
@@ -174,70 +174,89 @@ fn compute_desc(size: u64) -> BufferDesc {
     }
 }
 
-fn as_bytes_f32(s: &[f32]) -> &[u8] {
+pub fn as_bytes_f32(s: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
 }
 
-fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
+pub fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
     b.chunks_exact(4)
         .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
         .collect()
 }
 
-/// Runs vec_add on `dev` and returns the result. For the CPU oracle, `entry` must already have a
-/// kernel registered with `CpuDevice::register_kernel`.
-fn run_vec_add(dev: &dyn GpuDevice, spirv: &[u8], entry: &str, n: u32) -> Vec<f32> {
-    let size = (n as u64) * 4;
-    let a_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
-    let b_data: Vec<f32> = (0..n).map(|i| 100.0 * i as f32).collect();
+/// Runs one single-dispatch compute op on `dev`. Creates a buffer per input (written with its data)
+/// and per output size, dispatches `pipeline` with `Bindings.buffers = [inputs..., outputs...]` and
+/// `scalars`, and reads back the outputs. Destroys its buffers. The caller destroys `pipeline` and
+/// its shader.
+pub fn run_dispatch(
+    dev: &dyn GpuDevice,
+    pipeline: PipelineHandle,
+    inputs: &[&[u8]],
+    output_sizes: &[u64],
+    scalars: &[Scalar],
+    grid: [u32; 3],
+) -> Vec<Vec<u8>> {
+    let in_handles: Vec<_> = inputs
+        .iter()
+        .map(|data| {
+            let h = dev.create_buffer(compute_desc(data.len() as u64)).unwrap();
+            dev.write_buffer(h, 0, data).unwrap();
+            h
+        })
+        .collect();
+    let out_handles: Vec<_> = output_sizes
+        .iter()
+        .map(|&size| dev.create_buffer(compute_desc(size)).unwrap())
+        .collect();
 
-    let ha = dev.create_buffer(compute_desc(size)).unwrap();
-    let hb = dev.create_buffer(compute_desc(size)).unwrap();
-    let hout = dev.create_buffer(compute_desc(size)).unwrap();
-    dev.write_buffer(ha, 0, as_bytes_f32(&a_data)).unwrap();
-    dev.write_buffer(hb, 0, as_bytes_f32(&b_data)).unwrap();
-
-    let shader = dev.create_shader(ShaderDesc { spirv }).unwrap();
-    let pipeline = dev
-        .create_compute_pipeline(ComputePipelineDesc { shader, entry })
-        .unwrap();
-
-    let groups = n.div_ceil(256);
+    let buf_indices: Vec<u32> = in_handles
+        .iter()
+        .chain(out_handles.iter())
+        .map(|h| h.index())
+        .collect();
     dev.dispatch(
         pipeline,
         Bindings {
-            buffers: &[ha.index(), hb.index(), hout.index()],
-            scalars: &[Scalar::U32(n)],
+            buffers: &buf_indices,
+            scalars,
             textures: &[],
         },
-        [groups, 1, 1],
+        grid,
     )
     .unwrap();
 
-    let out = from_bytes_f32(&dev.read_buffer(hout, 0, size).unwrap());
+    let outputs: Vec<Vec<u8>> = out_handles
+        .iter()
+        .zip(output_sizes)
+        .map(|(&h, &size)| dev.read_buffer(h, 0, size).unwrap())
+        .collect();
 
-    dev.destroy_pipeline(pipeline);
-    dev.destroy_shader(shader);
-    dev.destroy_buffer(ha);
-    dev.destroy_buffer(hb);
-    dev.destroy_buffer(hout);
-
-    out
+    for h in in_handles.into_iter().chain(out_handles) {
+        dev.destroy_buffer(h);
+    }
+    outputs
 }
 
-/// Runs vec_add on `a` and `b`, asserts the results agree. `a` is the CPU oracle, with a matching
-/// kernel registered under `entry`.
+/// Runs vec_add (`out[i] = a[i] + b[i]`) on `a` and `b`, asserts both match the expected sum. Each
+/// device needs a vec_add pipeline. The CPU oracle also needs a registered kernel.
 pub fn compare_vec_add(
     label_a: &str,
     a: &dyn GpuDevice,
+    pipeline_a: PipelineHandle,
     label_b: &str,
     b: &dyn GpuDevice,
-    spirv: &[u8],
-    entry: &str,
+    pipeline_b: PipelineHandle,
 ) {
     const N: u32 = 1024;
-    let out_a = run_vec_add(a, spirv, entry, N);
-    let out_b = run_vec_add(b, spirv, entry, N);
+    let size = (N as u64) * 4;
+    let a_data: Vec<f32> = (0..N).map(|i| i as f32).collect();
+    let b_data: Vec<f32> = (0..N).map(|i| 100.0 * i as f32).collect();
+    let inputs: [&[u8]; 2] = [as_bytes_f32(&a_data), as_bytes_f32(&b_data)];
+    let scalars = [Scalar::U32(N)];
+    let grid = [N.div_ceil(256), 1, 1];
+
+    let out_a = from_bytes_f32(&run_dispatch(a, pipeline_a, &inputs, &[size], &scalars, grid)[0]);
+    let out_b = from_bytes_f32(&run_dispatch(b, pipeline_b, &inputs, &[size], &scalars, grid)[0]);
     for i in 0..N as usize {
         let expected = i as f32 + 100.0 * i as f32;
         assert!(

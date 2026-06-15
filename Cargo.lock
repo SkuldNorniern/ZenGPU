@@ -1883,6 +1883,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zengpu-compute"
+version = "0.0.1"
+dependencies = [
+ "zengpu-hal",
+]
+
+[[package]]
 name = "zengpu-conformance"
 version = "0.0.1"
 dependencies = [
