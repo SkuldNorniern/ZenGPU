@@ -1,0 +1,14 @@
+[package]
+name = "zengpu-blas"
+description = "ZenGPU BLAS bridge — portable compute-shader GEMM; vendor bridges added when those backends land (plan §14 / C4)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
+zengpu-compute.workspace = true
+inline-spirv.workspace = true

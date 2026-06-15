@@ -14,7 +14,7 @@ readme = "README.md"
 
 [workspace]
 resolver = "2"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance"]
 
 [workspace.package]
 version = "0.0.1"
@@ -28,6 +28,7 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
 zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
 zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
+zengpu-blas = { path = "zengpu-blas", version = "0.0.1" }
 inline-spirv = { version = "0.2", features = ["glsl"] }
 
 [lib]
