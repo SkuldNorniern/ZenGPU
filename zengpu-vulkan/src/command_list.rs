@@ -14,7 +14,7 @@ use zengpu_hal::{
 
 use crate::device::{VulkanBuffer, VulkanDeviceInner, VulkanPipeline, VulkanRenderTarget};
 
-const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
+pub(crate) const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     aspect_mask: vk::ImageAspectFlags::COLOR,
     base_mip_level: 0,
     level_count: 1,
