@@ -62,3 +62,34 @@ pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 pub use zengpu_blas as blas;
 #[cfg(feature = "blas")]
 pub use zengpu_blas::GemmKernel;
+
+// ── Convenience entry points ──────────────────────────────────────────────────
+//
+// These bridge instance + adapter selection + device open into single calls so
+// consumers never need to know which subcrate drives each step.
+
+/// Open the best available Vulkan device with surface/swapchain support.
+///
+/// Replaces the three-line `VulkanInstance::new_with_surface()` +
+/// `request_vulkan_adapter()` + `open_with_surface()` pattern. Returns a
+/// [`VulkanDevice`] ready for [`Swapchain::new`].
+#[cfg(feature = "vulkan")]
+pub fn open_vulkan_with_surface() -> Result<VulkanDevice> {
+    VulkanInstance::new_with_surface()?
+        .request_vulkan_adapter()
+        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
+        .open_with_surface(DeviceRequest::default())
+}
+
+/// Open the best available Vulkan device without surface support (headless /
+/// compute).
+///
+/// For backend-agnostic compute use. For graphics (swapchains, presents), use
+/// [`open_vulkan_with_surface`].
+#[cfg(feature = "vulkan")]
+pub fn open_vulkan() -> Result<Box<dyn GpuDevice>> {
+    VulkanInstance::new()?
+        .request_adapter(AdapterRequest::default())
+        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
+        .open(DeviceRequest::default())
+}
