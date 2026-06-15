@@ -83,14 +83,11 @@ pub fn open_vulkan_with_surface() -> Result<VulkanDevice> {
 }
 
 /// Open the best available Vulkan device without surface support (headless /
-/// compute).
-///
-/// For backend-agnostic compute use. For graphics (swapchains, presents), use
-/// [`open_vulkan_with_surface`].
+/// compute). For windowed rendering use [`open_vulkan_with_surface`].
 #[cfg(feature = "vulkan")]
-pub fn open_vulkan() -> Result<Box<dyn GpuDevice>> {
+pub fn open_vulkan() -> Result<VulkanDevice> {
     VulkanInstance::new()?
-        .request_adapter(AdapterRequest::default())
+        .request_vulkan_adapter()
         .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
-        .open(DeviceRequest::default())
+        .open_headless(DeviceRequest::default())
 }
