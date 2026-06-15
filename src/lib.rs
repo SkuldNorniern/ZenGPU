@@ -63,11 +63,11 @@ pub fn open_vulkan_with_surface() -> Result<VulkanDevice> {
         .open_with_surface(DeviceRequest::default())
 }
 
-/// Headless, compute only. For swapchains and presents use [`open_vulkan_with_surface`].
+/// Headless, compute only. For windowed rendering use [`open_vulkan_with_surface`].
 #[cfg(feature = "vulkan")]
-pub fn open_vulkan() -> Result<Box<dyn GpuDevice>> {
+pub fn open_vulkan() -> Result<VulkanDevice> {
     VulkanInstance::new()?
-        .request_adapter(AdapterRequest::default())
+        .request_vulkan_adapter()
         .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
-        .open(DeviceRequest::default())
+        .open_headless(DeviceRequest::default())
 }
