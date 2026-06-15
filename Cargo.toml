@@ -39,5 +39,7 @@ zengpu-hal.workspace = true
 
 [dev-dependencies]
 zengpu-vulkan.workspace = true
+zengpu-compute.workspace = true
+zengpu-blas.workspace = true
 inline-spirv.workspace = true
 winit = "0.30"

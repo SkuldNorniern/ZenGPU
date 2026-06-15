@@ -1878,6 +1878,8 @@ version = "0.0.1"
 dependencies = [
  "inline-spirv",
  "winit",
+ "zengpu-blas",
+ "zengpu-compute",
  "zengpu-hal",
  "zengpu-vulkan",
 ]
