@@ -85,6 +85,19 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
+    pub fn context(&self) -> crate::swapchain::DeviceContext {
+        crate::swapchain::DeviceContext::from_inner(Arc::clone(&self.inner))
+    }
+
+    pub fn wait_idle(&self) -> Result<()> {
+        unsafe {
+            self.inner
+                .device
+                .device_wait_idle()
+                .map_err(|e| GpuError::Backend(format!("device_wait_idle: {e}")))
+        }
+    }
+
     pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
