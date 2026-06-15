@@ -51,7 +51,8 @@ impl GpuAdapter for VulkanAdapter {
 
 impl VulkanAdapter {
     /// Open a device with the swapchain extension enabled (required for
-    /// presenting to a surface via [`VulkanInstance::create_surface`]).
+    /// presenting through a [`crate::Swapchain`] or
+    /// [`crate::Vulkan2dSurface`]).
     pub fn open_with_surface(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
         VulkanDevice::new_with_swapchain(Arc::clone(&self.shared), self.physical, req)
     }
