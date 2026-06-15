@@ -369,19 +369,28 @@ impl RenderCommands for VulkanCommandList {
             return;
         };
 
-        let mut pc: Vec<u8> = Vec::new();
+        let mut pc = [0u8; 128];
+        let mut len = 0usize;
+        let mut push = |bytes: [u8; 4]| {
+            if len + 4 <= pc.len() {
+                pc[len..len + 4].copy_from_slice(&bytes);
+                len += 4;
+            }
+        };
         for &idx in bindings.buffers {
-            pc.extend_from_slice(&idx.to_ne_bytes());
+            push(idx.to_ne_bytes());
+        }
+        for &idx in bindings.textures {
+            push(idx.to_ne_bytes());
         }
         for scalar in bindings.scalars {
-            let b: [u8; 4] = match scalar {
+            push(match scalar {
                 Scalar::U32(v) => v.to_ne_bytes(),
                 Scalar::I32(v) => v.to_ne_bytes(),
                 Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-            };
-            pc.extend_from_slice(&b);
+            });
         }
-        if pc.is_empty() {
+        if len == 0 {
             return;
         }
         unsafe {
@@ -390,7 +399,7 @@ impl RenderCommands for VulkanCommandList {
                 layout,
                 vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                 0,
-                &pc,
+                &pc[..len],
             );
         }
     }
