@@ -16,6 +16,8 @@ use crate::surface::VulkanSurface;
 
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
+const MAX_BINDLESS_TEXTURES: u32 = 1024;
+
 struct BindlessState {
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
@@ -176,7 +178,10 @@ impl VulkanDevice {
 
         let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
             shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
             descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
+            descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
+            descriptor_binding_partially_bound: vk::TRUE,
             runtime_descriptor_array: vk::TRUE,
             ..Default::default()
         };
@@ -387,28 +392,37 @@ impl VulkanDevice {
 }
 
 fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: MAX_BINDLESS_BUFFERS,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: MAX_BINDLESS_TEXTURES,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        },
+    ];
     let binding_flags = [
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND
-            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
+        2
     ];
     let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
-        binding_count: 1,
+        binding_count: binding_flags.len() as u32,
         p_binding_flags: binding_flags.as_ptr(),
-        ..Default::default()
-    };
-    let ssbo_binding = vk::DescriptorSetLayoutBinding {
-        binding: 0,
-        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: MAX_BINDLESS_BUFFERS,
-        stage_flags: vk::ShaderStageFlags::ALL,
         ..Default::default()
     };
     let layout = unsafe {
         dev.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo {
                 flags: vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
-                binding_count: 1,
-                p_bindings: &ssbo_binding,
+                binding_count: bindings.len() as u32,
+                p_bindings: bindings.as_ptr(),
                 p_next: &mut flags_info as *mut _ as *mut std::ffi::c_void,
                 ..Default::default()
             },
@@ -417,17 +431,23 @@ fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
         .map_err(|e| GpuError::Backend(format!("bindless layout: {e}")))?
     };
 
-    let pool_size = vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::STORAGE_BUFFER,
-        descriptor_count: MAX_BINDLESS_BUFFERS,
-    };
+    let pool_sizes = [
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: MAX_BINDLESS_BUFFERS,
+        },
+        vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: MAX_BINDLESS_TEXTURES,
+        },
+    ];
     let pool = unsafe {
         dev.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo {
                 flags: vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
                 max_sets: 1,
-                pool_size_count: 1,
-                p_pool_sizes: &pool_size,
+                pool_size_count: pool_sizes.len() as u32,
+                p_pool_sizes: pool_sizes.as_ptr(),
                 ..Default::default()
             },
             None,
