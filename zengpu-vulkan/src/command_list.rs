@@ -425,10 +425,11 @@ impl RenderCommands for VulkanCommandList {
             return;
         };
 
-        // Pack push constants: [buffer_indices…, texture_indices…, scalars…],
-        // each 4 bytes — mirrors VulkanDevice::dispatch, plus bindless
-        // textures. Fixed-size stack buffer: the 128-byte push-constant range
-        // (32 u32 slots) bounds this, and recording must not allocate.
+        // Pack push constants: [scalars…, texture_indices…, buffer_indices…],
+        // each 4 bytes, bindless ABI convention (scalars first so e.g. a
+        // `vec2` stays naturally aligned at offset 0). Fixed-size stack
+        // buffer: the 128-byte push-constant range (32 u32 slots) bounds
+        // this, and recording must not allocate.
         let mut pc = [0u8; 128];
         let mut len = 0usize;
         let mut push = |bytes: [u8; 4]| {
@@ -437,18 +438,18 @@ impl RenderCommands for VulkanCommandList {
                 len += 4;
             }
         };
-        for &idx in bindings.buffers {
-            push(idx.to_ne_bytes());
-        }
-        for &idx in bindings.textures {
-            push(idx.to_ne_bytes());
-        }
         for scalar in bindings.scalars {
             push(match scalar {
                 Scalar::U32(v) => v.to_ne_bytes(),
                 Scalar::I32(v) => v.to_ne_bytes(),
                 Scalar::F32(v) => v.to_bits().to_ne_bytes(),
             });
+        }
+        for &idx in bindings.textures {
+            push(idx.to_ne_bytes());
+        }
+        for &idx in bindings.buffers {
+            push(idx.to_ne_bytes());
         }
         if len == 0 {
             return;
