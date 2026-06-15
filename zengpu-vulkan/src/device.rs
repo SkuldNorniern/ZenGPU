@@ -7,7 +7,7 @@ use zengpu_hal::{
     DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, SurfaceConfig, TargetHandle,
-    TextureDesc, TextureHandle, UsageError, VertexFormat, WindowHandles, marker,
+    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -96,6 +96,7 @@ pub(crate) struct VulkanTexture {
     pub image: vk::Image,
     pub view: vk::ImageView,
     pub memory: vk::DeviceMemory,
+    pub format: vk::Format,
     pub extent: vk::Extent2D,
 }
 
@@ -381,9 +382,14 @@ impl VulkanDevice {
         }
     }
 
-    /// Registers `texture` and `sampler` at the texture's own slot, usable as a
-    /// [`Bindings::textures`] index. Image must be in `SHADER_READ_ONLY_OPTIMAL` (true
-    /// after [`GpuDevice::upload_texture_data`]).
+    /// Registers `texture` with `sampler` in the bindless combined-image-sampler table, at
+    /// its slot index.
+    ///
+    /// Pass the index as a [`Bindings::textures`] entry to
+    /// [`RenderCommands::bind`](zengpu_hal::RenderCommands::bind). The descriptor uses
+    /// `SHADER_READ_ONLY_OPTIMAL`, so the image must already be in that layout when
+    /// sampled. That holds after [`GpuDevice::upload_texture_data`], or after a pass
+    /// with [`zengpu_hal::ColorAttachment::sample_after`].
     pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
         let view = self.textures.lock().unwrap().get(texture)?.view;
         let vk_sampler = *self.samplers.lock().unwrap().get(sampler)?;
@@ -789,6 +795,25 @@ impl GpuDevice for VulkanDevice {
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
         let format = hal_format_to_vk(desc.format);
+        let mut usage = vk::ImageUsageFlags::empty();
+        if desc.usage.contains(TextureUsage::SAMPLED) {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        if desc.usage.contains(TextureUsage::STORAGE) {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if desc.usage.contains(TextureUsage::RENDER_TARGET) {
+            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+        }
+        if desc.usage.contains(TextureUsage::DEPTH_STENCIL) {
+            usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
+        }
+        if desc.usage.contains(TextureUsage::TRANSFER_SRC) {
+            usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        if desc.usage.contains(TextureUsage::TRANSFER_DST) {
+            usage |= vk::ImageUsageFlags::TRANSFER_DST;
+        }
         let image_info = vk::ImageCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             format,
@@ -797,7 +822,7 @@ impl GpuDevice for VulkanDevice {
             array_layers: 1,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
-            usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            usage,
             initial_layout: vk::ImageLayout::UNDEFINED,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
@@ -870,6 +895,7 @@ impl GpuDevice for VulkanDevice {
             image,
             view,
             memory,
+            format,
             extent: vk::Extent2D { width: desc.width, height: desc.height },
         }))
     }
@@ -1387,6 +1413,20 @@ impl VulkanDevice {
             extent: vk::Extent2D { width, height },
             layout: vk::ImageLayout::UNDEFINED,
         })
+    }
+
+    /// Register `texture` as a render target. It needs `TextureUsage::RENDER_TARGET`. `None` for a
+    /// stale handle. Unregister when the texture is destroyed.
+    pub fn register_color_target(&self, texture: TextureHandle) -> Option<TargetHandle> {
+        let textures = self.textures.lock().unwrap();
+        let tex = textures.get(texture)?;
+        Some(self.render_targets.lock().unwrap().insert(VulkanRenderTarget {
+            image: tex.image,
+            view: tex.view,
+            format: tex.format,
+            extent: tex.extent,
+            layout: vk::ImageLayout::UNDEFINED,
+        }))
     }
 
     pub fn unregister_render_target(&self, handle: TargetHandle) {
