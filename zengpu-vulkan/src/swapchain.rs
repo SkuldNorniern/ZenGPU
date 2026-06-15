@@ -162,11 +162,20 @@ impl Swapchain {
         }
     }
 
-    pub fn format(&self) -> vk::Format {
+    pub fn format(&self) -> zengpu_hal::Format {
+        crate::from_vk_format(self.format).expect("swapchain has unsupported vk::Format")
+    }
+
+    pub fn extent(&self) -> (u32, u32) {
+        let e = self.resources.lock().unwrap().extent;
+        (e.width, e.height)
+    }
+
+    pub(crate) fn raw_format(&self) -> vk::Format {
         self.format
     }
 
-    pub fn extent(&self) -> vk::Extent2D {
+    pub(crate) fn raw_extent(&self) -> vk::Extent2D {
         self.resources.lock().unwrap().extent
     }
 

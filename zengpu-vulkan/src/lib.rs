@@ -21,3 +21,35 @@ pub use instance::VulkanInstance;
 pub use offscreen::{OffscreenTarget, SampledImageView};
 pub use surface::{VulkanFrame, VulkanSurface};
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
+
+// ── Format conversion ─────────────────────────────────────────────────────────
+
+/// Convert a HAL [`zengpu_hal::Format`] to the matching `vk::Format`.
+pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
+    use zengpu_hal::Format;
+    match f {
+        Format::Rgba8Unorm        => vk::Format::R8G8B8A8_UNORM,
+        Format::Rgba8UnormSrgb    => vk::Format::R8G8B8A8_SRGB,
+        Format::Bgra8Unorm        => vk::Format::B8G8R8A8_UNORM,
+        Format::Bgra8UnormSrgb    => vk::Format::B8G8R8A8_SRGB,
+        Format::R32Float          => vk::Format::R32_SFLOAT,
+        Format::Depth32Float      => vk::Format::D32_SFLOAT,
+        Format::Depth24PlusStencil8 => vk::Format::D24_UNORM_S8_UINT,
+    }
+}
+
+/// Convert a `vk::Format` back to the HAL [`zengpu_hal::Format`], or `None`
+/// for Vulkan formats that have no HAL counterpart.
+pub fn from_vk_format(f: vk::Format) -> Option<zengpu_hal::Format> {
+    use zengpu_hal::Format;
+    Some(match f {
+        vk::Format::R8G8B8A8_UNORM    => Format::Rgba8Unorm,
+        vk::Format::R8G8B8A8_SRGB     => Format::Rgba8UnormSrgb,
+        vk::Format::B8G8R8A8_UNORM    => Format::Bgra8Unorm,
+        vk::Format::B8G8R8A8_SRGB     => Format::Bgra8UnormSrgb,
+        vk::Format::R32_SFLOAT        => Format::R32Float,
+        vk::Format::D32_SFLOAT        => Format::Depth32Float,
+        vk::Format::D24_UNORM_S8_UINT => Format::Depth24PlusStencil8,
+        _                             => return None,
+    })
+}
