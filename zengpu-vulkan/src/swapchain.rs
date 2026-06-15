@@ -372,6 +372,10 @@ unsafe impl Send for DeviceContext {}
 unsafe impl Sync for DeviceContext {}
 
 impl DeviceContext {
+    pub(crate) fn from_inner(inner: Arc<VulkanDeviceInner>) -> Self {
+        Self { inner }
+    }
+
     /// Logical device — create render passes, pipelines, framebuffers, images.
     pub fn device(&self) -> &ash::Device {
         &self.inner.device
