@@ -137,6 +137,16 @@ impl<K, V> SlotMap<K, V> {
         self.slots.get(index as usize).map(|slot| slot.generation)
     }
 
+    /// Live value by raw slot index, skipping the generation check. For bindless lookups:
+    /// `Bindings.buffers[i]` is a slot index, not a full handle.
+    pub fn get_by_slot_index(&self, idx: u32) -> Option<&V> {
+        self.slots.get(idx as usize).and_then(|s| s.value.as_ref())
+    }
+
+    pub fn get_mut_by_slot_index(&mut self, idx: u32) -> Option<&mut V> {
+        self.slots.get_mut(idx as usize).and_then(|s| s.value.as_mut())
+    }
+
     pub fn len(&self) -> usize {
         self.slots.len() - self.free.len()
     }

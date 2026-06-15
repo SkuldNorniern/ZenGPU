@@ -3,10 +3,12 @@
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn GpuDevice>` and
 //! selected at runtime.
 
-use crate::desc::{BufferDesc, SamplerDesc, TextureDesc};
-use crate::error::Result;
-use crate::handle::{BufferHandle, SamplerHandle, TextureHandle};
+use crate::command::Bindings;
+use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
+use crate::error::{GpuError, Result};
+use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::HalCapabilities;
+use crate::types::Features;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker threads can allocate
 /// and upload concurrently.
@@ -40,4 +42,33 @@ pub trait GpuDevice: Send + Sync {
     fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle>;
 
     fn destroy_sampler(&self, sampler: SamplerHandle);
+
+    /// The default returns `UnsupportedFeatures`, since there is no compute.
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        let _ = desc;
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    fn destroy_shader(&self, _shader: ShaderHandle) {}
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        let _ = desc;
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
+
+    /// Blocks until GPU work completes.
+    ///
+    /// `bindings.buffers` are slot indices into the bindless SSBO table, indexed with
+    /// `nonuniformEXT`. `bindings.scalars` become push constants, packed after the buffer indices.
+    /// `grid` is the workgroup count per axis.
+    fn dispatch(
+        &self,
+        _pipeline: PipelineHandle,
+        _bindings: Bindings<'_>,
+        _grid: [u32; 3],
+    ) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
 }
