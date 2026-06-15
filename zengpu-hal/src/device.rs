@@ -5,10 +5,12 @@
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn
 //! GpuDevice>` and selected at runtime.
 
-use crate::desc::{BufferDesc, SamplerDesc, TextureDesc};
-use crate::error::Result;
-use crate::handle::{BufferHandle, SamplerHandle, TextureHandle};
+use crate::command::Bindings;
+use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
+use crate::error::{GpuError, Result};
+use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::HalCapabilities;
+use crate::types::Features;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
 /// threads can allocate and upload concurrently (plan D5).
@@ -54,4 +56,42 @@ pub trait GpuDevice: Send + Sync {
 
     /// Destroy a sampler, invalidating its handle.
     fn destroy_sampler(&self, sampler: SamplerHandle);
+
+    // ── Compute API (plan §12 / C2) ───────────────────────────────────────────
+
+    /// Upload a SPIR-V shader module. Returns a handle usable for pipeline
+    /// creation. Default impl returns `UnsupportedFeatures` on backends that do
+    /// not support compute.
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        let _ = desc;
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    /// Destroy a shader module.
+    fn destroy_shader(&self, _shader: ShaderHandle) {}
+
+    /// Create a compute pipeline from a shader module + entry point.
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        let _ = desc;
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    /// Destroy a compute pipeline.
+    fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
+
+    /// Synchronously dispatch a compute pipeline. Blocks until GPU work
+    /// completes (async dispatch is plan D6, deferred).
+    ///
+    /// `bindings.buffers` = slot indices (plan D4) into the bindless SSBO
+    /// table; the shader indexes them with `nonuniformEXT`. `bindings.scalars`
+    /// become push-constant values (packed after the buffer indices). `grid` is
+    /// the workgroup count along each axis.
+    fn dispatch(
+        &self,
+        _pipeline: PipelineHandle,
+        _bindings: Bindings<'_>,
+        _grid: [u32; 3],
+    ) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
 }
