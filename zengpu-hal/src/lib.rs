@@ -10,6 +10,7 @@ mod command;
 mod desc;
 mod device;
 mod error;
+mod graphics;
 mod handle;
 mod request;
 mod surface;
@@ -18,6 +19,10 @@ mod types;
 pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
 pub use command::{Bindings, Scalar};
 pub use device::GpuDevice;
+pub use graphics::{
+    Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,
+    RenderPassDesc, Surface, ViewportScissor,
+};
 pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
 pub use surface::WindowHandles;
 
