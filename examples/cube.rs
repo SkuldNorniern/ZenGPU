@@ -192,7 +192,7 @@ impl CubeSurface {
         let swapchain = Swapchain::new(device, handles, config, 2)?;
         let ctx = swapchain.context();
 
-        let render_pass = create_render_pass(&ctx, swapchain.format())?;
+        let render_pass = create_render_pass(&ctx, zengpu::vulkan::to_vk_format(swapchain.format()))?;
         let pipeline_layout = create_pipeline_layout(&ctx)?;
         let pipeline = create_pipeline(&ctx, render_pass, pipeline_layout)?;
 
@@ -230,7 +230,8 @@ impl CubeSurface {
         };
         let targets = self.targets.lock().unwrap();
         let cmd = self.swapchain.cmd_buffer(current);
-        self.record(cmd, targets[index as usize].framebuffer, self.swapchain.extent(), mvp)?;
+        let (sw, sh) = self.swapchain.extent();
+        self.record(cmd, targets[index as usize].framebuffer, vk::Extent2D { width: sw, height: sh }, mvp)?;
         drop(targets);
         if self.swapchain.end_frame(&frame, cmd)? {
             self.rebuild_targets()?;
@@ -334,8 +335,7 @@ impl CubeSurface {
     }
 
     fn size(&self) -> (u32, u32) {
-        let e = self.swapchain.extent();
-        (e.width, e.height)
+        self.swapchain.extent()
     }
 }
 
@@ -367,7 +367,8 @@ fn build_targets(
     swapchain: &Swapchain,
 ) -> Result<Vec<FrameTarget>> {
     let dev = ctx.device();
-    let extent = swapchain.extent();
+    let (sw, sh) = swapchain.extent();
+    let extent = vk::Extent2D { width: sw, height: sh };
     swapchain
         .image_views()
         .into_iter()
