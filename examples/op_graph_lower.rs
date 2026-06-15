@@ -1,4 +1,4 @@
-//! Op-graph lowering example (stand-in for Laminax).
+//! Op-graph lowering example.
 //!
 //! A tiny tensor graph lowers each node to one ZenGPU dispatch or BLAS call over resident
 //! [`DeviceArray`]s, reading back only the result.
@@ -16,8 +16,8 @@ use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
 use zengpu_vulkan::VulkanInstance;
 
-/// Toy graph node. `Input` references a caller-passed array. Other nodes reference earlier ids, so
-/// the list is already topologically ordered.
+/// A node in the example graph. `Input` names an array the caller passes in. Other nodes reference
+/// earlier ids, so the graph is already in topological order.
 enum Op {
     Input(usize),
     Matmul(usize, usize),
@@ -120,7 +120,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     if errors == 0 {
-        eprintln!("laminax_lower_spike OK: relu(A @ B + C) correct for {M}x{K} @ {K}x{N} + {M}x{N}");
+        eprintln!("op_graph_lower OK: relu(A @ B + C) correct for {M}x{K} @ {K}x{N} + {M}x{N}");
     } else {
         return Err(format!("{errors} mismatches").into());
     }
