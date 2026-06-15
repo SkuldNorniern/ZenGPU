@@ -25,14 +25,15 @@ pub use zengpu_hal as hal;
 // Flat re-exports of the most-used foundation items, so downstream code can
 // write `zengpu::BufferHandle` rather than `zengpu::hal::BufferHandle`.
 pub use zengpu_hal::{
-    AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode, BufferDesc,
-    BufferHandle, BufferUsage, ComputePipelineDesc, DType, DepthState, DeviceRequest, DeviceType,
-    Features, FilterMode, Format, GpuAdapter, GpuDevice, GpuError, GpuInstance,
-    GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle, PowerPreference,
-    PresentMode, PrimitiveTopology, Rect, RenderTargetDesc, Result, SamplerDesc, SamplerHandle,
-    Scalar, ShaderDesc, ShaderHandle, SurfaceConfig, SurfaceError, TargetHandle, TextureDesc,
-    TextureHandle, TextureUsage, UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport,
-    WindowHandles,
+    AdapterInfo, AdapterRequest, AddressMode, Acquire, BackendPreference, Bindings, BlendMode,
+    BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputePipelineDesc, DType,
+    DepthAttachment, DepthState, DeviceRequest, DeviceType, Features, FilterMode, Format, Frame,
+    GpuAdapter, GpuDevice, GpuError, GpuInstance, GraphicsDevice, GraphicsPipelineDesc,
+    HalCapabilities, LoadOp, MemoryUsage, PipelineHandle, PowerPreference, PresentMode,
+    PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, RenderTargetDesc, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, Surface, SurfaceConfig,
+    SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
 /// The Vulkan backend — graphics + compute on Vulkan 1.2+.
@@ -41,8 +42,8 @@ pub use zengpu_vulkan as vulkan;
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan::{
     AttachmentUsage, BeginFrame, DepthTarget, DeviceContext, FrameGraph, OffscreenTarget,
-    ResourceId, SampledImageView, Swapchain, VulkanAdapter, VulkanDevice, VulkanInstance,
-    DEPTH_FORMAT,
+    ResourceId, SampledImageView, Swapchain, VulkanAdapter, VulkanCommandList, VulkanDevice,
+    VulkanFrame, VulkanInstance, VulkanSurface, DEPTH_FORMAT,
 };
 
 /// The CPU reference backend — the conformance oracle.
