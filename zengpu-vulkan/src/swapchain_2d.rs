@@ -24,6 +24,7 @@ use inline_spirv::inline_spirv;
 use zengpu_hal::{GpuError, Result, SamplerHandle, TextureHandle};
 
 use crate::device::VulkanDeviceInner;
+use crate::offscreen::SampledImageView;
 use crate::swapchain::{BeginFrame, Swapchain};
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -525,7 +526,6 @@ fn alloc_mapped_vertex_buffer(
 
 // ── Swapchain-dependent resources (recreated on resize / surface loss) ──────
 
-
 /// Vulkan swapchain that draws a batch of instanced rectangles per frame.
 pub struct Vulkan2dSurface {
     inner: Arc<VulkanDeviceInner>,
@@ -736,6 +736,12 @@ impl Vulkan2dSurface {
                 "image slot {slot} out of range (capacity {IMAGE_SLOTS})"
             )));
         }
+        if !Arc::ptr_eq(&self.inner, &device.inner) {
+            return Err(GpuError::Backend(
+                "set_image_slot: texture, sampler device, and surface must share one logical device"
+                    .to_string(),
+            ));
+        }
         let view = device
             .texture_view(texture)
             .ok_or_else(|| GpuError::Backend("set_image_slot: stale TextureHandle".to_string()))?;
@@ -749,6 +755,49 @@ impl Vulkan2dSurface {
                 .map_err(|e| GpuError::Backend(format!("set_image_slot wait idle: {e}")))?;
         }
         update_bindless_slot(&self.inner.device, self.descriptor_set, slot, view, samp);
+        Ok(())
+    }
+
+    /// Bind a GPU-produced sampled image into a bindless slot without copying
+    /// it through CPU memory.
+    ///
+    /// `image` and `sampler` must belong to this surface's logical device. The
+    /// image must remain alive and in `SHADER_READ_ONLY_OPTIMAL` layout until
+    /// the slot is cleared or replaced.
+    pub fn set_sampled_image_slot(
+        &self,
+        device: &crate::device::VulkanDevice,
+        slot: u32,
+        image: SampledImageView<'_>,
+        sampler: SamplerHandle,
+    ) -> Result<()> {
+        if slot >= IMAGE_SLOTS {
+            return Err(GpuError::Backend(format!(
+                "image slot {slot} out of range (capacity {IMAGE_SLOTS})"
+            )));
+        }
+        if !Arc::ptr_eq(&self.inner, image.inner) || !Arc::ptr_eq(&self.inner, &device.inner) {
+            return Err(GpuError::Backend(
+                "set_sampled_image_slot: image, sampler device, and surface must share one logical device"
+                    .to_string(),
+            ));
+        }
+        let samp = device.sampler_vk(sampler).ok_or_else(|| {
+            GpuError::Backend("set_sampled_image_slot: stale SamplerHandle".to_string())
+        })?;
+        unsafe {
+            self.inner
+                .device
+                .device_wait_idle()
+                .map_err(|e| GpuError::Backend(format!("set_sampled_image_slot wait idle: {e}")))?;
+        }
+        update_bindless_slot(
+            &self.inner.device,
+            self.descriptor_set,
+            slot,
+            image.view,
+            samp,
+        );
         Ok(())
     }
 
@@ -844,10 +893,13 @@ impl Vulkan2dSurface {
     fn rebuild_framebuffers(&self) -> Result<()> {
         let image_views = self.swapchain.image_views();
         let extent = self.swapchain.extent();
-        let new_fbs = create_framebuffers(&self.inner.device, self.render_pass, &image_views, extent)?;
+        let new_fbs =
+            create_framebuffers(&self.inner.device, self.render_pass, &image_views, extent)?;
         let mut fbs = self.framebuffers.lock().unwrap();
         for &fb in fbs.iter() {
-            unsafe { self.inner.device.destroy_framebuffer(fb, None); }
+            unsafe {
+                self.inner.device.destroy_framebuffer(fb, None);
+            }
         }
         *fbs = new_fbs;
         Ok(())
@@ -1711,4 +1763,3 @@ fn create_image_pipeline_layout(
             .map_err(|e| GpuError::Backend(format!("image pipeline layout: {e}")))
     }
 }
-

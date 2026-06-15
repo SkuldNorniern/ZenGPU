@@ -42,8 +42,8 @@ pub use zengpu_vulkan as vulkan;
 pub use zengpu_vulkan::{
     AttachmentUsage, BeginFrame, CircleInstance, DEPTH_FORMAT, DepthTarget, DeviceContext, DrawRef,
     Frame2d, FrameGraph, GradientInstance, IMAGE_SLOTS, ImageInstance, OffscreenTarget,
-    RectInstance, ResourceId, Swapchain, TextInstance, Vulkan2dSurface, VulkanAdapter,
-    VulkanDevice, VulkanInstance,
+    RectInstance, ResourceId, SampledImageView, Swapchain, TextInstance, Vulkan2dSurface,
+    VulkanAdapter, VulkanDevice, VulkanInstance,
 };
 
 /// The CPU reference backend — the conformance oracle.
