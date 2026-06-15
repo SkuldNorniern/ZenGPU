@@ -7,6 +7,7 @@ pub mod device;
 pub mod frame_graph;
 pub mod instance;
 pub mod offscreen;
+pub(crate) mod surface;
 pub mod swapchain;
 
 pub use adapter::VulkanAdapter;

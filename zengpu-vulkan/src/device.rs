@@ -119,7 +119,7 @@ pub struct VulkanDevice {
     /// commands can attach to. Shared with [`VulkanCommandList`](crate::command_list::VulkanCommandList).
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
-    cmd_list_pool: Arc<CmdListPool>,
+    pub(crate) cmd_list_pool: Arc<CmdListPool>,
 }
 
 unsafe impl Send for VulkanDevice {}
