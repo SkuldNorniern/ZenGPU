@@ -174,6 +174,10 @@ impl Swapchain {
         self.resources.lock().unwrap().images.len()
     }
 
+    pub fn images(&self) -> Vec<vk::Image> {
+        self.resources.lock().unwrap().images.clone()
+    }
+
     pub fn cmd_buffer(&self, current: usize) -> vk::CommandBuffer {
         self.cmd_buffers[current]
     }
