@@ -373,6 +373,10 @@ impl DeviceContext {
         }
     }
 
+    pub(crate) fn inner_arc(&self) -> Arc<VulkanDeviceInner> {
+        Arc::clone(&self.inner)
+    }
+
     /// Records via `f` and waits for completion. Staging uploads and layout transitions.
     pub fn one_shot_submit<F>(&self, record: F) -> Result<()>
     where
