@@ -1,10 +1,11 @@
-//! C5 example: Laminax lowering spike (plan §19 / D9).
+//! C5 example: op-graph lowering spike (plan §19 / D9).
 //!
-//! `Graph`/`Op`/`lower_and_run` below stand in for Laminax: a tiny tensor
-//! graph that lowers each node to a single ZenGPU dispatch/BLAS call over
-//! resident [`DeviceArray`]s, reading back only the final result. None of
-//! this lives in ZenGPU — it owns no op-graph (D9); ZenGPU only supplies
-//! `DeviceArray`, `BufferPool`, `ElementwiseKernels`, and `GemmKernel`.
+//! `Graph`/`Op`/`lower_and_run` below stand in for an ML compute-graph
+//! compiler (Laminax or otherwise): a tiny tensor graph that lowers each node
+//! to a single ZenGPU dispatch/BLAS call over resident [`DeviceArray`]s,
+//! reading back only the final result. None of this lives in ZenGPU — it owns
+//! no op-graph (D9); ZenGPU only supplies `DeviceArray`, `BufferPool`,
+//! `ElementwiseKernels`, and `GemmKernel`.
 //!
 //! Graph computed: `relu(A @ B + C)`.
 
@@ -16,11 +17,12 @@ use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
 use zengpu_vulkan::VulkanInstance;
 
-// ── Stand-in for Laminax's op-graph (D9: not part of ZenGPU) ──────────────────
+// ── Stand-in for a compute-graph compiler's op-graph (D9: not part of ZenGPU) ─
 
 /// A node in the toy graph. `Input` references an array passed in by the
 /// caller; the rest reference earlier node ids (so the graph is already
-/// topologically ordered — Laminax's DAG scheduler would produce this order).
+/// topologically ordered — the compiler's DAG scheduler would produce this
+/// order).
 enum Op {
     Input(usize),
     Matmul(usize, usize),
@@ -130,7 +132,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     if errors == 0 {
-        eprintln!("laminax_lower_spike OK: relu(A @ B + C) correct for {M}x{K} @ {K}x{N} + {M}x{N}");
+        eprintln!("op_graph_lower OK: relu(A @ B + C) correct for {M}x{K} @ {K}x{N} + {M}x{N}");
     } else {
         return Err(format!("{errors} mismatches").into());
     }
