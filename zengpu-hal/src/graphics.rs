@@ -37,6 +37,9 @@ pub struct ColorAttachment {
     pub load: LoadOp,
     /// `false` means a DONT_CARE store.
     pub store: bool,
+    /// When `true`, transitions the target to a shader-readable layout at pass end, so a later pass
+    /// can sample it bindlessly.
+    pub sample_after: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
