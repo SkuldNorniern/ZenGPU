@@ -1886,6 +1886,7 @@ dependencies = [
 name = "zengpu-conformance"
 version = "0.0.1"
 dependencies = [
+ "inline-spirv",
  "zengpu-cpu",
  "zengpu-hal",
  "zengpu-vulkan",
