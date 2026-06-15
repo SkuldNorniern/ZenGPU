@@ -381,6 +381,32 @@ impl VulkanDevice {
         }
     }
 
+    /// Registers `texture` and `sampler` at the texture's own slot, usable as a
+    /// [`Bindings::textures`] index. Image must be in `SHADER_READ_ONLY_OPTIMAL` (true
+    /// after [`GpuDevice::upload_texture_data`]).
+    pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
+        let view = self.textures.lock().unwrap().get(texture)?.view;
+        let vk_sampler = *self.samplers.lock().unwrap().get(sampler)?;
+        let info = vk::DescriptorImageInfo {
+            sampler: vk_sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: 1,
+            dst_array_element: texture.index(),
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        Some(texture.index())
+    }
+
     /// Returns the raw `vk::ImageView` for a texture handle, for user-side descriptor sets.
     pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
         self.textures.lock().unwrap().get(handle).map(|t| t.view)
