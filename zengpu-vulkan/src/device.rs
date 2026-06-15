@@ -1,7 +1,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use ash::{Device, vk};
+use ash::{Device, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
     DeviceRequest, FilterMode, Format, GpuDevice, GpuError, HalCapabilities, MemoryUsage,
@@ -23,9 +23,32 @@ struct BindlessState {
 unsafe impl Send for BindlessState {}
 unsafe impl Sync for BindlessState {}
 
-struct VulkanComputePipeline {
-    layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+/// Compute or graphics pipeline. Both share one `PipelineHandle` slotmap.
+pub(crate) enum VulkanPipeline {
+    Compute { layout: vk::PipelineLayout, pipeline: vk::Pipeline },
+    Graphics { layout: vk::PipelineLayout, pipeline: vk::Pipeline },
+}
+
+impl VulkanPipeline {
+    pub(crate) fn handles(&self) -> (vk::Pipeline, vk::PipelineLayout) {
+        match *self {
+            VulkanPipeline::Compute { layout, pipeline }
+            | VulkanPipeline::Graphics { layout, pipeline } => (pipeline, layout),
+        }
+    }
+}
+
+/// Render target for a [`RenderPassDesc`](zengpu_hal::RenderPassDesc) attachment: a swapchain image
+/// or an offscreen texture.
+///
+/// `layout` tracks the current `vk::ImageLayout` for barriers, because there is no render pass
+/// object to emit them.
+pub(crate) struct VulkanRenderTarget {
+    pub image: vk::Image,
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+    pub extent: vk::Extent2D,
+    pub layout: vk::ImageLayout,
 }
 
 /// Shared device state. `Arc`, so swapchains hold a ref.
@@ -36,6 +59,9 @@ pub(crate) struct VulkanDeviceInner {
     pub queue_family: u32,
     pub queue: vk::Queue,
     pub dual_src_blend: bool,
+    /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
+    /// `vk::RenderPass` or `vk::Framebuffer`.
+    pub dynamic_rendering: khr::dynamic_rendering::Device,
 }
 
 unsafe impl Send for VulkanDeviceInner {}
@@ -50,12 +76,12 @@ impl Drop for VulkanDeviceInner {
     }
 }
 
-struct VulkanBuffer {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-    size: u64,
-    usage: BufferUsage,
-    mapped: *mut u8,
+pub(crate) struct VulkanBuffer {
+    pub buffer: vk::Buffer,
+    pub memory: vk::DeviceMemory,
+    pub size: u64,
+    pub usage: BufferUsage,
+    pub mapped: *mut u8,
 }
 
 unsafe impl Send for VulkanBuffer {}
@@ -73,11 +99,14 @@ unsafe impl Sync for VulkanTexture {}
 
 pub struct VulkanDevice {
     pub(crate) inner: Arc<VulkanDeviceInner>,
-    buffers: Mutex<SlotMap<marker::Buffer, VulkanBuffer>>,
+    pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) textures: Mutex<SlotMap<marker::Texture, VulkanTexture>>,
     samplers: Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
     shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
-    pipelines: Mutex<SlotMap<marker::Pipeline, VulkanComputePipeline>>,
+    pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
+    /// Render targets that commands can attach to. Shared with
+    /// [`VulkanCommandList`](crate::command_list::VulkanCommandList).
+    pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
 }
 
@@ -105,20 +134,26 @@ impl VulkanDevice {
         extra_extensions: &[*const i8],
     ) -> Result<Self> {
         let mut extensions = extra_extensions.to_vec();
-        let supports_portability = unsafe {
+        let available_extensions = unsafe {
             shared
                 .instance
                 .enumerate_device_extension_properties(physical)
         }
-        .is_ok_and(|available| {
-            available.iter().any(|extension| unsafe {
-                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr())
-                    == ash::khr::portability_subset::NAME
+        .map_err(|e| GpuError::Backend(format!("enumerate device extensions: {e}")))?;
+        let supports_extension = |name: &std::ffi::CStr| {
+            available_extensions.iter().any(|extension| unsafe {
+                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
             })
-        });
-        if supports_portability {
+        };
+        if supports_extension(ash::khr::portability_subset::NAME) {
             extensions.push(ash::khr::portability_subset::NAME.as_ptr());
         }
+        if !supports_extension(khr::dynamic_rendering::NAME) {
+            return Err(GpuError::Backend(
+                "GPU does not support VK_KHR_dynamic_rendering".to_string(),
+            ));
+        }
+        extensions.push(khr::dynamic_rendering::NAME.as_ptr());
 
         let queue_family = compute_queue_family(&shared.instance, physical)
             .ok_or_else(|| GpuError::Backend("no compute queue family".to_string()))?;
@@ -141,6 +176,11 @@ impl VulkanDevice {
             runtime_descriptor_array: vk::TRUE,
             ..Default::default()
         };
+        let mut dynamic_rendering_feat = vk::PhysicalDeviceDynamicRenderingFeatures {
+            dynamic_rendering: vk::TRUE,
+            ..Default::default()
+        };
+        desc_idx.p_next = &mut dynamic_rendering_feat as *mut _ as *mut std::ffi::c_void;
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
@@ -173,6 +213,7 @@ impl VulkanDevice {
         };
 
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let dynamic_rendering = khr::dynamic_rendering::Device::new(&shared.instance, &device);
 
         let inner = Arc::new(VulkanDeviceInner {
             shared,
@@ -181,17 +222,19 @@ impl VulkanDevice {
             queue_family,
             queue,
             dual_src_blend,
+            dynamic_rendering,
         });
 
         let bindless = create_bindless(&inner.device)?;
 
         Ok(Self {
             inner,
-            buffers: Mutex::new(SlotMap::new()),
+            buffers: Arc::new(Mutex::new(SlotMap::new())),
             textures: Mutex::new(SlotMap::new()),
             samplers: Mutex::new(SlotMap::new()),
             shaders: Mutex::new(SlotMap::new()),
-            pipelines: Mutex::new(SlotMap::new()),
+            pipelines: Arc::new(Mutex::new(SlotMap::new())),
+            render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
         })
     }
@@ -1013,7 +1056,7 @@ impl GpuDevice for VulkanDevice {
                 .pipelines
                 .lock()
                 .unwrap()
-                .insert(VulkanComputePipeline { layout, pipeline: pipelines[0] })),
+                .insert(VulkanPipeline::Compute { layout, pipeline: pipelines[0] })),
             Err((_, e)) => {
                 unsafe { self.inner.device.destroy_pipeline_layout(layout, None); }
                 Err(GpuError::PipelineCreation(format!("vkCreateComputePipelines: {e}")))
@@ -1024,9 +1067,10 @@ impl GpuDevice for VulkanDevice {
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
         let mut pipelines = self.pipelines.lock().unwrap();
         if let Some(p) = pipelines.remove(pipeline) {
+            let (pipeline, layout) = p.handles();
             unsafe {
-                self.inner.device.destroy_pipeline(p.pipeline, None);
-                self.inner.device.destroy_pipeline_layout(p.layout, None);
+                self.inner.device.destroy_pipeline(pipeline, None);
+                self.inner.device.destroy_pipeline_layout(layout, None);
             }
         }
     }
@@ -1042,7 +1086,14 @@ impl GpuDevice for VulkanDevice {
             let p = pipelines
                 .get(pipeline)
                 .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
-            (p.pipeline, p.layout)
+            match p {
+                VulkanPipeline::Compute { layout, pipeline } => (*pipeline, *layout),
+                VulkanPipeline::Graphics { .. } => {
+                    return Err(GpuError::Dispatch(
+                        "dispatch called with a graphics pipeline handle".to_string(),
+                    ));
+                }
+            }
         };
 
         let mut pc: Vec<u8> = Vec::new();
@@ -1116,9 +1167,10 @@ impl Drop for VulkanDevice {
         }
         let mut pipelines = self.pipelines.lock().unwrap();
         for p in pipelines.drain() {
+            let (pipeline, layout) = p.handles();
             unsafe {
-                self.inner.device.destroy_pipeline(p.pipeline, None);
-                self.inner.device.destroy_pipeline_layout(p.layout, None);
+                self.inner.device.destroy_pipeline(pipeline, None);
+                self.inner.device.destroy_pipeline_layout(layout, None);
             }
         }
         unsafe {
