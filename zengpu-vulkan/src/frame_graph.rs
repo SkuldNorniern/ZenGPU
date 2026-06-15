@@ -18,6 +18,11 @@ pub enum AttachmentUsage {
     /// Pass samples this in a fragment shader. The graph barriers from the last write layout
     /// to `SHADER_READ_ONLY_OPTIMAL`.
     ShaderSample,
+    /// Pass writes this as a depth-stencil attachment.
+    ///
+    /// The render pass must use `initialLayout = UNDEFINED`, `finalLayout =
+    /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL`. The graph barriers if it was used differently before.
+    DepthWrite,
 }
 
 struct FrameResource {
@@ -26,6 +31,7 @@ struct FrameResource {
     _format: vk::Format,
     _extent: vk::Extent2D,
     initial_layout: vk::ImageLayout,
+    aspect: vk::ImageAspectFlags,
 }
 
 struct PassDef {
@@ -52,7 +58,8 @@ impl FrameGraph {
         Self { resources: Vec::new(), passes: Vec::new(), present_resource: None }
     }
 
-    /// `initial_layout`: layout before the first pass. Use `UNDEFINED` for transient or new images.
+    /// Register a color resource. `initial_layout` is the layout before the first pass; `UNDEFINED`
+    /// for transient or new images.
     pub fn add_resource(
         &mut self,
         image: vk::Image,
@@ -68,6 +75,29 @@ impl FrameGraph {
             _format: format,
             _extent: extent,
             initial_layout,
+            aspect: vk::ImageAspectFlags::COLOR,
+        });
+        id
+    }
+
+    /// Register a depth resource, for `AttachmentUsage::DepthWrite`. Use `UNDEFINED` when building
+    /// per frame: `loadOp = CLEAR` discards previous content.
+    pub fn add_depth_resource(
+        &mut self,
+        image: vk::Image,
+        view: vk::ImageView,
+        format: vk::Format,
+        extent: vk::Extent2D,
+        initial_layout: vk::ImageLayout,
+    ) -> ResourceId {
+        let id = ResourceId(self.resources.len());
+        self.resources.push(FrameResource {
+            image,
+            _view: view,
+            _format: format,
+            _extent: extent,
+            initial_layout,
+            aspect: vk::ImageAspectFlags::DEPTH,
         });
         id
     }
@@ -114,7 +144,10 @@ impl FrameGraph {
 
                 if cur == needed
                     || (cur == vk::ImageLayout::UNDEFINED
-                        && matches!(usage, AttachmentUsage::ColorWrite))
+                        && matches!(
+                            usage,
+                            AttachmentUsage::ColorWrite | AttachmentUsage::DepthWrite
+                        ))
                 {
                     continue;
                 }
@@ -131,7 +164,7 @@ impl FrameGraph {
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     image: self.resources[res_idx].image,
-                    subresource_range: color_subresource(),
+                    subresource_range: subresource(self.resources[res_idx].aspect),
                     ..Default::default()
                 });
             }
@@ -183,7 +216,7 @@ impl FrameGraph {
                             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                             image: self.resources[res_idx].image,
-                            subresource_range: color_subresource(),
+                            subresource_range: subresource(self.resources[res_idx].aspect),
                             ..Default::default()
                         }],
                     );
@@ -204,7 +237,9 @@ impl FrameGraph {
         for (pass_idx, pass) in self.passes.iter().enumerate() {
             for &(ResourceId(res_idx), usage) in &pass.attachments {
                 match usage {
-                    AttachmentUsage::ColorWrite => writers[res_idx].push(pass_idx),
+                    AttachmentUsage::ColorWrite | AttachmentUsage::DepthWrite => {
+                        writers[res_idx].push(pass_idx)
+                    }
                     AttachmentUsage::ShaderSample => readers[res_idx].push(pass_idx),
                 }
             }
@@ -250,6 +285,7 @@ fn target_layout(usage: AttachmentUsage) -> vk::ImageLayout {
     match usage {
         AttachmentUsage::ColorWrite => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         AttachmentUsage::ShaderSample => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        AttachmentUsage::DepthWrite => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     }
 }
 
@@ -257,6 +293,7 @@ fn post_layout(usage: AttachmentUsage) -> vk::ImageLayout {
     match usage {
         AttachmentUsage::ColorWrite => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         AttachmentUsage::ShaderSample => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        AttachmentUsage::DepthWrite => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     }
 }
 
@@ -272,6 +309,10 @@ fn src_info(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags
         vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => {
             (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ)
         }
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
+            vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        ),
         vk::ImageLayout::PRESENT_SRC_KHR => {
             (vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::AccessFlags::empty())
         }
@@ -291,12 +332,17 @@ fn dst_info(usage: AttachmentUsage) -> (vk::PipelineStageFlags, vk::AccessFlags)
         AttachmentUsage::ShaderSample => {
             (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ)
         }
+        AttachmentUsage::DepthWrite => (
+            vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+            vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+        ),
     }
 }
 
-fn color_subresource() -> vk::ImageSubresourceRange {
+fn subresource(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
+        aspect_mask: aspect,
         base_mip_level: 0,
         level_count: 1,
         base_array_layer: 0,
