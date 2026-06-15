@@ -9,16 +9,16 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use zengpu_vulkan::{ash, vk};
+use zengpu::vulkan::{ash, vk};
 use inline_spirv::inline_spirv;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
-use zengpu_hal::{
-    DeviceRequest, Format, GpuError, PresentMode, Result, SurfaceConfig, WindowHandles,
+use zengpu::{
+    BeginFrame, DeviceContext, DeviceRequest, Format, GpuError, PresentMode, Result,
+    SurfaceConfig, Swapchain, VulkanDevice, VulkanInstance, WindowHandles,
 };
-use zengpu_vulkan::{BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance};
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
 
