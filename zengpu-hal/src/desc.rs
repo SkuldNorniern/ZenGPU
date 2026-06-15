@@ -177,7 +177,12 @@ pub struct DepthState {
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,
     pub fragment_shader: ShaderHandle,
-    pub vertex_layout: VertexLayout<'a>,
+    /// One layout per bound vertex buffer; the slice index is the buffer
+    /// binding, matching [`RenderCommands::set_vertex_buffer`](crate::graphics::RenderCommands::set_vertex_buffer)'s
+    /// `slot`. An empty slice means no vertex buffers (vertices generated in the
+    /// shader). Mixed per-vertex/per-instance pipelines list multiple layouts
+    /// with differing [`VertexLayout::step_mode`].
+    pub vertex_layouts: &'a [VertexLayout<'a>],
     pub topology: PrimitiveTopology,
     /// Color attachment format.
     pub color_format: Format,

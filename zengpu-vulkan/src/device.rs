@@ -1271,25 +1271,39 @@ impl VulkanDevice {
             },
         ];
 
-        let binding = vk::VertexInputBindingDescription {
-            binding: 0,
-            stride: desc.vertex_layout.stride,
-            input_rate: step_mode_to_vk(desc.vertex_layout.step_mode),
-        };
-        let attributes: Vec<vk::VertexInputAttributeDescription> = desc
-            .vertex_layout
-            .attributes
+        // One binding per vertex layout; binding index = slice position, which
+        // is the `slot` passed to set_vertex_buffer. Attributes carry the binding
+        // of the layout they belong to so multiple streams (e.g. per-vertex quad
+        // + per-instance data) coexist.
+        let bindings: Vec<vk::VertexInputBindingDescription> = desc
+            .vertex_layouts
             .iter()
-            .map(|a| vk::VertexInputAttributeDescription {
-                location: a.location,
-                binding: 0,
-                format: vertex_format_to_vk(a.format),
-                offset: a.offset,
+            .enumerate()
+            .map(|(i, layout)| vk::VertexInputBindingDescription {
+                binding: i as u32,
+                stride: layout.stride,
+                input_rate: step_mode_to_vk(layout.step_mode),
+            })
+            .collect();
+        let attributes: Vec<vk::VertexInputAttributeDescription> = desc
+            .vertex_layouts
+            .iter()
+            .enumerate()
+            .flat_map(|(i, layout)| {
+                layout
+                    .attributes
+                    .iter()
+                    .map(move |a| vk::VertexInputAttributeDescription {
+                        location: a.location,
+                        binding: i as u32,
+                        format: vertex_format_to_vk(a.format),
+                        offset: a.offset,
+                    })
             })
             .collect();
         let vertex_input = vk::PipelineVertexInputStateCreateInfo {
-            vertex_binding_description_count: 1,
-            p_vertex_binding_descriptions: &binding,
+            vertex_binding_description_count: bindings.len() as u32,
+            p_vertex_binding_descriptions: bindings.as_ptr(),
             vertex_attribute_description_count: attributes.len() as u32,
             p_vertex_attribute_descriptions: attributes.as_ptr(),
             ..Default::default()
