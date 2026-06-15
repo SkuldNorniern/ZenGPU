@@ -12,8 +12,8 @@ Initial pre-alpha release.
   errors.
 - Object-safe compute device interface with buffers, textures, samplers,
   shaders, pipelines, and synchronous dispatch.
-- Vulkan 1.2 backend with bindless compute, swapchains, a 2D painter, offscreen
-  and depth targets, and a lightweight frame graph.
+- Vulkan 1.2 backend with bindless compute, generic swapchains, offscreen and
+  depth targets, and a lightweight frame graph.
 - Same-device zero-copy handoff from rendered targets to sampled-image slots.
 - CPU reference backend and CPU-versus-Vulkan conformance tests.
 - Resident device arrays, pooled allocation, `f32` add/ReLU kernels, and

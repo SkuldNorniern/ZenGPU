@@ -2,19 +2,19 @@
 
 use std::sync::Arc;
 
-use ash::{Entry, Instance, vk};
+use ash::{vk, Entry, Instance};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuError, GpuInstance,
-    PowerPreference, SurfaceConfig, WindowHandles,
+    PowerPreference,
 };
 
 use crate::adapter::VulkanAdapter;
-use crate::swapchain_2d::Vulkan2dSurface;
 
 /// Shared ownership of the Vulkan loader and `VkInstance`.
 pub(crate) struct VulkanShared {
     pub entry: Entry,
     pub instance: Instance,
+    pub surface_extensions: bool,
 }
 
 unsafe impl Send for VulkanShared {}
@@ -29,7 +29,6 @@ impl Drop for VulkanShared {
 /// Vulkan [`GpuInstance`].
 pub struct VulkanInstance {
     pub(crate) shared: Arc<VulkanShared>,
-    pub(crate) has_surface: bool,
 }
 
 impl VulkanInstance {
@@ -114,8 +113,11 @@ impl VulkanInstance {
         };
 
         Ok(Self {
-            shared: Arc::new(VulkanShared { entry, instance }),
-            has_surface: surface_extensions,
+            shared: Arc::new(VulkanShared {
+                entry,
+                instance,
+                surface_extensions,
+            }),
         })
     }
 
@@ -129,23 +131,6 @@ impl VulkanInstance {
         Self::create(true)
     }
 
-    /// Create a surface that paints batches of instanced solid-colour
-    /// rectangles (aurea's 2D path).  Call
-    /// [`Vulkan2dSurface::present`] each frame with the clear colour and rects.
-    pub fn create_2d_surface(
-        &self,
-        handles: &WindowHandles,
-        device: &crate::device::VulkanDevice,
-        config: SurfaceConfig,
-    ) -> zengpu_hal::Result<Vulkan2dSurface> {
-        if !self.has_surface {
-            return Err(GpuError::Backend(
-                "create_2d_surface requires VulkanInstance::new_with_surface()".to_string(),
-            ));
-        }
-        Vulkan2dSurface::new(device, handles, config)
-    }
-
     /// Return the first available adapter as a concrete [`VulkanAdapter`], or
     /// `None` if no Vulkan physical device is found.
     ///
@@ -154,7 +139,10 @@ impl VulkanInstance {
     /// trait object API.
     pub fn request_vulkan_adapter(&self) -> Option<VulkanAdapter> {
         let physicals = unsafe {
-            self.shared.instance.enumerate_physical_devices().unwrap_or_default()
+            self.shared
+                .instance
+                .enumerate_physical_devices()
+                .unwrap_or_default()
         };
         physicals.into_iter().next().map(|phys| {
             let props = unsafe { self.shared.instance.get_physical_device_properties(phys) };
@@ -209,9 +197,7 @@ impl GpuInstance for VulkanInstance {
         physicals
             .into_iter()
             .map(|phys| {
-                let props = unsafe {
-                    self.shared.instance.get_physical_device_properties(phys)
-                };
+                let props = unsafe { self.shared.instance.get_physical_device_properties(phys) };
                 let name = unsafe {
                     std::ffi::CStr::from_ptr(props.device_name.as_ptr())
                         .to_string_lossy()

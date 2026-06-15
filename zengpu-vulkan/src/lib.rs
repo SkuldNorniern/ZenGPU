@@ -7,18 +7,13 @@ pub mod frame_graph;
 pub mod instance;
 pub mod offscreen;
 pub mod swapchain;
-pub mod swapchain_2d;
 
 pub use adapter::VulkanAdapter;
 pub use ash;
 pub use ash::vk;
-pub use depth_target::{DEPTH_FORMAT, DepthTarget};
+pub use depth_target::{DepthTarget, DEPTH_FORMAT};
 pub use device::VulkanDevice;
 pub use frame_graph::{AttachmentUsage, FrameGraph, ResourceId};
 pub use instance::VulkanInstance;
 pub use offscreen::{OffscreenTarget, SampledImageView};
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
-pub use swapchain_2d::{
-    CircleInstance, DrawRef, Frame2d, GradientInstance, IMAGE_SLOTS, ImageInstance, RectInstance,
-    TextInstance, Vulkan2dSurface,
-};

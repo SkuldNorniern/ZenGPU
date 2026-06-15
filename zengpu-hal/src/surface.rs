@@ -3,7 +3,7 @@
 //! [`WindowHandles`] bridges any `raw-window-handle`-capable window (aurea,
 //! winit, etc.) to ZenGPU without pulling consumer types into the public API
 //! Surfaces themselves are concrete per-feature backend types
-//! (e.g. `Vulkan2dSurface`, `Vulkan3dSurface`) built on top of this — a
+//! (for example a UI painter or 3D renderer) built on top of this — a
 //! generic `GpuSurface`/`Surface` HAL trait is deferred until a second graphics
 //! backend exists to shape it.
 

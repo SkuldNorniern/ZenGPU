@@ -11,8 +11,8 @@ The project is pre-alpha. APIs are expected to change before `0.1.0`.
 - Backend-independent resource descriptions, typed generational handles, and
   the object-safe `GpuDevice` compute interface.
 - Vulkan 1.2 compute with descriptor-indexed storage buffers.
-- Vulkan swapchains, a 2D instanced painter, offscreen and depth targets, and a
-  lightweight frame graph with automatic image-layout barriers.
+- Vulkan swapchains, offscreen and depth targets, and a lightweight frame graph
+  with automatic image-layout barriers.
 - Zero-copy sampling of a rendered offscreen image by another renderer on the
   same logical device.
 - A deterministic CPU compute backend used as the conformance oracle.
@@ -102,6 +102,8 @@ cargo run --example cube
 - Built-in elementwise and GEMM kernels support `f32` only.
 - Graphics APIs are currently Vulkan-specific rather than exposed through a
   complete backend-independent graphics trait.
+- Renderers and UI painters are consumer-side layers built on ZenGPU's generic
+  swapchain, target, and synchronization primitives.
 - Resource synchronization and lifetime validation are still being expanded.
 - Vulkan requires a Vulkan 1.2-capable driver with descriptor indexing.
 
