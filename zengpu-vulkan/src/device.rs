@@ -1482,6 +1482,10 @@ impl GraphicsDevice for VulkanDevice {
     fn create_command_list(&self) -> Result<Self::CommandList> {
         self.create_command_list_impl()
     }
+
+    fn supports_dual_source_blending(&self) -> bool {
+        self.inner.dual_src_blend
+    }
 }
 
 fn vertex_format_to_vk(f: VertexFormat) -> vk::Format {
@@ -1524,6 +1528,16 @@ fn blend_mode_to_vk(b: BlendMode) -> vk::PipelineColorBlendAttachmentState {
             color_blend_op: vk::BlendOp::ADD,
             src_alpha_blend_factor: vk::BlendFactor::ONE,
             dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+            alpha_blend_op: vk::BlendOp::ADD,
+            color_write_mask: vk::ColorComponentFlags::RGBA,
+        },
+        BlendMode::DualSourceAlpha => vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::TRUE,
+            src_color_blend_factor: vk::BlendFactor::SRC1_COLOR,
+            dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+            color_blend_op: vk::BlendOp::ADD,
+            src_alpha_blend_factor: vk::BlendFactor::SRC1_ALPHA,
+            dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
             alpha_blend_op: vk::BlendOp::ADD,
             color_write_mask: vk::ColorComponentFlags::RGBA,
         },
