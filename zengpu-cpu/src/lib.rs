@@ -6,13 +6,19 @@
 //!
 //! # Compute dispatch
 //!
-//! The CPU backend cannot execute SPIR-V directly. Instead, callers register
-//! a Rust function keyed by the entry-point name via
-//! [`CpuDevice::register_kernel`]. When [`GpuDevice::dispatch`] is called, the
-//! backend looks up the registered function, copies the bound buffer data into
-//! a [`CpuKernelCtx`], calls the function, and writes modified buffers back.
+//! The CPU backend cannot execute SPIR-V directly. Instead, callers create a
+//! pipeline as usual and then register a Rust function for that
+//! [`PipelineHandle`] via [`CpuDevice::register_kernel`]. When
+//! [`GpuDevice::dispatch`] is called, the backend looks up the function
+//! registered for the dispatched pipeline, copies the bound buffer data into a
+//! [`CpuKernelCtx`], calls the function, and writes modified buffers back.
 //! This is the "oracle" model (plan D7): CPU kernels are hand-written Rust
 //! functions that should produce bit-identical results to the GPU SPIR-V.
+//!
+//! Keying by pipeline handle (rather than SPIR-V entry-point name) lets two
+//! different ops both use the GLSL-conventional entry point `"main"` in their
+//! SPIR-V (each its own shader module / pipeline) without colliding in the
+//! registry.
 
 #![forbid(unsafe_code)]
 
@@ -41,7 +47,7 @@ pub struct CpuKernelCtx {
 }
 
 /// A CPU-side kernel function. Registered with [`CpuDevice::register_kernel`]
-/// under the SPIR-V entry-point name it corresponds to (e.g. `"main"`).
+/// for the [`PipelineHandle`] it implements.
 pub type CpuKernel = Box<dyn Fn(&mut CpuKernelCtx) + Send + Sync>;
 
 // ── Internal slot types ───────────────────────────────────────────────────────
@@ -63,7 +69,7 @@ pub struct CpuDevice {
     buffers: Mutex<BufferMap>,
     shaders: Mutex<SlotMap<marker::Shader, Vec<u8>>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CpuPipeline>>,
-    kernels: Mutex<HashMap<String, CpuKernel>>,
+    kernels: Mutex<HashMap<PipelineHandle, CpuKernel>>,
 }
 
 impl CpuDevice {
@@ -76,13 +82,13 @@ impl CpuDevice {
         }
     }
 
-    /// Register a CPU kernel under `entry_name` (must match the SPIR-V entry
-    /// point used in [`ComputePipelineDesc::entry`]).
+    /// Register a CPU kernel for `pipeline` (returned by
+    /// [`GpuDevice::create_compute_pipeline`]).
     ///
-    /// When [`GpuDevice::dispatch`] is called with a pipeline whose entry
-    /// matches `entry_name`, `kernel` is invoked with the bound buffer data.
-    pub fn register_kernel(&self, entry_name: &str, kernel: CpuKernel) {
-        self.kernels.lock().unwrap().insert(entry_name.to_string(), kernel);
+    /// When [`GpuDevice::dispatch`] is called with this `pipeline`, `kernel`
+    /// is invoked with the bound buffer data.
+    pub fn register_kernel(&self, pipeline: PipelineHandle, kernel: CpuKernel) {
+        self.kernels.lock().unwrap().insert(pipeline, kernel);
     }
 }
 
@@ -250,9 +256,9 @@ impl GpuDevice for CpuDevice {
         };
         {
             let kernels = self.kernels.lock().unwrap();
-            let kernel = kernels.get(&entry).ok_or_else(|| {
+            let kernel = kernels.get(&pipeline).ok_or_else(|| {
                 GpuError::Dispatch(format!(
-                    "no CPU kernel registered for entry '{entry}'; \
+                    "no CPU kernel registered for pipeline (entry '{entry}'); \
                      call CpuDevice::register_kernel before dispatching"
                 ))
             })?;
@@ -453,28 +459,6 @@ mod tests {
     fn dispatch_vec_add_f32() {
         let dev = CpuDevice::new();
 
-        // Register a Rust vec_add kernel under "main".
-        dev.register_kernel("main", Box::new(|ctx: &mut CpuKernelCtx| {
-            let len = match ctx.scalars.get(0) {
-                Some(&Scalar::U32(n)) => n as usize,
-                _ => return,
-            };
-            // buffers[0]=a, [1]=b, [2]=out (4 bytes per f32)
-            let read_f32 = |buf: &[u8], i: usize| -> f32 {
-                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
-            };
-            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
-                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
-            };
-            if ctx.buffers.len() < 3 { return; }
-            // Can't borrow a[..] and out[..] simultaneously from same vec; clone a+b first.
-            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
-            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
-            for i in 0..len {
-                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
-            }
-        }));
-
         let n: u32 = 8;
         let size = (n as u64) * 4;
         let usage = BufferUsage::STORAGE | BufferUsage::READBACK;
@@ -494,6 +478,28 @@ mod tests {
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
             .unwrap();
+
+        // Register a Rust vec_add kernel for this pipeline.
+        dev.register_kernel(pipeline, Box::new(|ctx: &mut CpuKernelCtx| {
+            let len = match ctx.scalars.get(0) {
+                Some(&Scalar::U32(n)) => n as usize,
+                _ => return,
+            };
+            // buffers[0]=a, [1]=b, [2]=out (4 bytes per f32)
+            let read_f32 = |buf: &[u8], i: usize| -> f32 {
+                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
+            };
+            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
+                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
+            };
+            if ctx.buffers.len() < 3 { return; }
+            // Can't borrow a[..] and out[..] simultaneously from same vec; clone a+b first.
+            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
+            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
+            for i in 0..len {
+                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
+            }
+        }));
 
         dev.dispatch(
             pipeline,
