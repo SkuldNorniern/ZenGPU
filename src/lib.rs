@@ -52,3 +52,21 @@ pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 pub use zengpu_blas as blas;
 #[cfg(feature = "blas")]
 pub use zengpu_blas::GemmKernel;
+
+/// Vulkan device with surface/swapchain support, ready for [`Swapchain::new`].
+#[cfg(feature = "vulkan")]
+pub fn open_vulkan_with_surface() -> Result<VulkanDevice> {
+    VulkanInstance::new_with_surface()?
+        .request_vulkan_adapter()
+        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
+        .open_with_surface(DeviceRequest::default())
+}
+
+/// Headless, compute only. For swapchains and presents use [`open_vulkan_with_surface`].
+#[cfg(feature = "vulkan")]
+pub fn open_vulkan() -> Result<Box<dyn GpuDevice>> {
+    VulkanInstance::new()?
+        .request_adapter(AdapterRequest::default())
+        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
+        .open(DeviceRequest::default())
+}
