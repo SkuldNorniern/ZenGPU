@@ -27,7 +27,7 @@ pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
 pub use command::{Bindings, Scalar};
 pub use device::GpuDevice;
 pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
-pub use surface::{GpuSurface, SurfaceFrame, WindowHandles};
+pub use surface::WindowHandles;
 
 pub use desc::{
     AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,

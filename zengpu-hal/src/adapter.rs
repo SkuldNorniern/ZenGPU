@@ -8,7 +8,6 @@
 use crate::device::GpuDevice;
 use crate::error::Result;
 use crate::request::{AdapterRequest, DeviceRequest, HalCapabilities};
-use crate::surface::{GpuSurface, WindowHandles};
 use crate::types::BackendPreference;
 
 /// Physical device class reported by the driver.
@@ -55,8 +54,11 @@ pub trait GpuAdapter: Send + Sync {
     fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>>;
 }
 
-/// Entry-point for a backend: enumerates physical adapters, selects the best
-/// one for a given request, and creates presentable surfaces.
+/// Entry-point for a backend: enumerates physical adapters and selects the
+/// best one for a given request. Presentable surfaces are created via
+/// concrete backend-specific constructors (e.g. `VulkanInstance::create_2d_surface`),
+/// not through this trait (plan §20: a generic `Surface` HAL trait awaits a
+/// second graphics backend).
 ///
 /// `Send + Sync` — the instance can be created once and shared across threads.
 pub trait GpuInstance: Send + Sync {
@@ -67,19 +69,6 @@ pub trait GpuInstance: Send + Sync {
     /// then power preference, then enumeration order. Returns `None` when no
     /// adapter satisfies the request.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
-
-    /// Create a fully configured presentable surface (plan G2).
-    ///
-    /// The surface and swapchain are created together because Vulkan separates
-    /// instance-level surface creation from device-level swapchain creation.
-    /// Pass the device that will render to this surface and the initial config.
-    /// The window must outlive the returned surface.
-    fn create_surface(
-        &self,
-        handles: &WindowHandles,
-        device: &dyn crate::device::GpuDevice,
-        config: crate::desc::SurfaceConfig,
-    ) -> Result<Box<dyn GpuSurface>>;
 }
 
 #[cfg(test)]
