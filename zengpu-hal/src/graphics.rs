@@ -52,6 +52,9 @@ pub struct ColorAttachment {
     pub load: LoadOp,
     /// Whether to store the result (`false` = `DONT_CARE` store).
     pub store: bool,
+    /// If `true`, transition this target to a shader-readable layout when the
+    /// pass ends, so a later pass can sample it as a bindless texture.
+    pub sample_after: bool,
 }
 
 /// The depth/stencil attachment in a render pass.
