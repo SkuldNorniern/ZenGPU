@@ -148,7 +148,10 @@ pub struct DepthState {
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,
     pub fragment_shader: ShaderHandle,
-    pub vertex_layout: VertexLayout<'a>,
+    /// One layout per vertex buffer, indexed by buffer binding (see
+    /// `RenderCommands::set_vertex_buffer`). An empty list means no vertex buffers. For mixed
+    /// per-vertex and per-instance data, list both, with differing `step_mode`.
+    pub vertex_layouts: &'a [VertexLayout<'a>],
     pub topology: PrimitiveTopology,
     pub color_format: Format,
     pub depth_format: Option<Format>,
