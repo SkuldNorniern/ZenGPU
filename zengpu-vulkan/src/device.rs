@@ -4,12 +4,33 @@ use std::sync::{Arc, Mutex};
 
 use ash::{Device, vk};
 use zengpu_hal::{
-    AddressMode, BufferDesc, BufferHandle, BufferUsage, DeviceRequest, FilterMode, Format,
-    GpuDevice, GpuError, HalCapabilities, MemoryUsage, Result, SamplerDesc, SamplerHandle,
-    SlotMap, TextureDesc, TextureHandle, UsageError, marker,
+    AddressMode, Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
+    DeviceRequest, FilterMode, Format, GpuDevice, GpuError, HalCapabilities, MemoryUsage,
+    PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap,
+    TextureDesc, TextureHandle, UsageError, marker,
 };
 
 use crate::instance::VulkanShared;
+
+/// Maximum number of storage buffers in the bindless descriptor table (plan D4).
+const MAX_BINDLESS_BUFFERS: u32 = 4096;
+
+/// Descriptor pool + layout + set for the bindless SSBO table.
+struct BindlessState {
+    layout: vk::DescriptorSetLayout,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+}
+
+// SAFETY: the contained Vulkan handles are all u64 values; we control their
+// lifetimes through VulkanDevice (which is Send+Sync).
+unsafe impl Send for BindlessState {}
+unsafe impl Sync for BindlessState {}
+
+struct VulkanComputePipeline {
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
 
 /// Shared logical device state — owned by `Arc` so swapchains can hold a ref.
 pub(crate) struct VulkanDeviceInner {
@@ -61,6 +82,9 @@ pub struct VulkanDevice {
     buffers: Mutex<SlotMap<marker::Buffer, VulkanBuffer>>,
     pub(crate) textures: Mutex<SlotMap<marker::Texture, VulkanTexture>>,
     samplers: Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
+    shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
+    pipelines: Mutex<SlotMap<marker::Pipeline, VulkanComputePipeline>>,
+    bindless: BindlessState,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -103,13 +127,26 @@ impl VulkanDevice {
         let supported_features =
             unsafe { shared.instance.get_physical_device_features(physical) };
         let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
-        let features = vk::PhysicalDeviceFeatures {
-            shader_sampled_image_array_dynamic_indexing: vk::TRUE,
-            dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
+
+        // Enable Vulkan 1.2 descriptor-indexing features (plan D4 / bindless).
+        let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
+            shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+            descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
+            runtime_descriptor_array: vk::TRUE,
             ..Default::default()
         };
+        let mut features2 = vk::PhysicalDeviceFeatures2 {
+            features: vk::PhysicalDeviceFeatures {
+                shader_sampled_image_array_dynamic_indexing: vk::TRUE,
+                dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        features2.p_next = &mut desc_idx as *mut _ as *mut std::ffi::c_void;
 
         let device_create_info = vk::DeviceCreateInfo {
+            p_next: &features2 as *const _ as *const std::ffi::c_void,
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
             enabled_extension_count: extensions.len() as u32,
@@ -118,7 +155,7 @@ impl VulkanDevice {
             } else {
                 extensions.as_ptr()
             },
-            p_enabled_features: &features,
+            p_enabled_features: std::ptr::null(), // must be null when using features2 pNext
             ..Default::default()
         };
 
@@ -131,18 +168,25 @@ impl VulkanDevice {
 
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
 
+        let inner = Arc::new(VulkanDeviceInner {
+            shared,
+            device,
+            physical,
+            queue_family,
+            queue,
+            dual_src_blend,
+        });
+
+        let bindless = create_bindless(&inner.device)?;
+
         Ok(Self {
-            inner: Arc::new(VulkanDeviceInner {
-                shared,
-                device,
-                physical,
-                queue_family,
-                queue,
-                dual_src_blend,
-            }),
+            inner,
             buffers: Mutex::new(SlotMap::new()),
             textures: Mutex::new(SlotMap::new()),
             samplers: Mutex::new(SlotMap::new()),
+            shaders: Mutex::new(SlotMap::new()),
+            pipelines: Mutex::new(SlotMap::new()),
+            bindless,
         })
     }
 
@@ -255,6 +299,28 @@ impl VulkanDevice {
         submit_result
     }
 
+    /// Register a STORAGE buffer in the bindless SSBO table at its slot index.
+    /// Called automatically by `create_buffer` for `STORAGE`-flagged buffers.
+    fn bind_buffer_to_bindless(&self, slot: u32, buffer: vk::Buffer, size: u64) {
+        let info = vk::DescriptorBufferInfo {
+            buffer,
+            offset: 0,
+            range: if size == 0 { vk::WHOLE_SIZE } else { size },
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: 0,
+            dst_array_element: slot,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+    }
+
     /// Raw `vk::ImageView` for a HAL texture handle. For user-side pipelines that
     /// need to bind textures into descriptor sets (e.g. bindless arrays).
     pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
@@ -265,6 +331,75 @@ impl VulkanDevice {
     pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
         self.samplers.lock().unwrap().get(handle).map(|s| *s)
     }
+}
+
+fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
+    let binding_flags = [
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+    ];
+    let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
+        binding_count: 1,
+        p_binding_flags: binding_flags.as_ptr(),
+        ..Default::default()
+    };
+    let ssbo_binding = vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: MAX_BINDLESS_BUFFERS,
+        stage_flags: vk::ShaderStageFlags::ALL,
+        ..Default::default()
+    };
+    let layout = unsafe {
+        dev.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo {
+                flags: vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
+                binding_count: 1,
+                p_bindings: &ssbo_binding,
+                p_next: &mut flags_info as *mut _ as *mut std::ffi::c_void,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| GpuError::Backend(format!("bindless layout: {e}")))?
+    };
+
+    let pool_size = vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: MAX_BINDLESS_BUFFERS,
+    };
+    let pool = unsafe {
+        dev.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo {
+                flags: vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND,
+                max_sets: 1,
+                pool_size_count: 1,
+                p_pool_sizes: &pool_size,
+                ..Default::default()
+            },
+            None,
+        )
+        .map_err(|e| {
+            dev.destroy_descriptor_set_layout(layout, None);
+            GpuError::Backend(format!("bindless pool: {e}"))
+        })?
+    };
+
+    let set = unsafe {
+        dev.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo {
+            descriptor_pool: pool,
+            descriptor_set_count: 1,
+            p_set_layouts: &layout,
+            ..Default::default()
+        })
+        .map_err(|e| {
+            dev.destroy_descriptor_pool(pool, None);
+            dev.destroy_descriptor_set_layout(layout, None);
+            GpuError::Backend(format!("bindless set alloc: {e}"))
+        })?[0]
+    };
+
+    Ok(BindlessState { layout, pool, set })
 }
 
 fn filter_to_vk(f: FilterMode) -> vk::Filter {
@@ -463,13 +598,18 @@ impl GpuDevice for VulkanDevice {
             std::ptr::null_mut()
         };
 
-        Ok(self.buffers.lock().unwrap().insert(VulkanBuffer {
-            buffer,
+        let vk_buf = buffer; // Copy before moving into struct
+        let handle = self.buffers.lock().unwrap().insert(VulkanBuffer {
+            buffer: vk_buf,
             memory,
             size: desc.size,
             usage: desc.usage,
             mapped,
-        }))
+        });
+        if desc.usage.contains(BufferUsage::STORAGE) {
+            self.bind_buffer_to_bindless(handle.index(), vk_buf, desc.size);
+        }
+        Ok(handle)
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
@@ -781,6 +921,168 @@ impl GpuDevice for VulkanDevice {
             unsafe { self.inner.device.destroy_sampler(s, None) };
         }
     }
+
+    // ── Compute (C2) ──────────────────────────────────────────────────────────
+
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        if desc.spirv.len() % 4 != 0 {
+            return Err(GpuError::ShaderCompile(
+                "SPIR-V byte length must be a multiple of 4".to_string(),
+            ));
+        }
+        let words: Vec<u32> = desc
+            .spirv
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        let module = unsafe {
+            self.inner
+                .device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo {
+                        code_size: desc.spirv.len(),
+                        p_code: words.as_ptr(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .map_err(|e| GpuError::ShaderCompile(format!("vkCreateShaderModule: {e}")))?
+        };
+        Ok(self.shaders.lock().unwrap().insert(module))
+    }
+
+    fn destroy_shader(&self, shader: ShaderHandle) {
+        let mut shaders = self.shaders.lock().unwrap();
+        if let Some(m) = shaders.remove(shader) {
+            unsafe { self.inner.device.destroy_shader_module(m, None); }
+        }
+    }
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        let shader_module = {
+            let shaders = self.shaders.lock().unwrap();
+            *shaders.get(desc.shader).ok_or_else(|| {
+                GpuError::PipelineCreation("stale shader handle".to_string())
+            })?
+        };
+
+        let pc_range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: 128, // 32 u32 slots: buffer indices + scalars
+        };
+        let layout = unsafe {
+            self.inner
+                .device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo {
+                        set_layout_count: 1,
+                        p_set_layouts: &self.bindless.layout,
+                        push_constant_range_count: 1,
+                        p_push_constant_ranges: &pc_range,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .map_err(|e| GpuError::PipelineCreation(format!("vkCreatePipelineLayout: {e}")))?
+        };
+
+        let entry = std::ffi::CString::new(desc.entry)
+            .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
+        let stage = vk::PipelineShaderStageCreateInfo {
+            stage: vk::ShaderStageFlags::COMPUTE,
+            module: shader_module,
+            p_name: entry.as_ptr(),
+            ..Default::default()
+        };
+        let result = unsafe {
+            self.inner.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[vk::ComputePipelineCreateInfo {
+                    stage,
+                    layout,
+                    ..Default::default()
+                }],
+                None,
+            )
+        };
+        match result {
+            Ok(pipelines) => Ok(self
+                .pipelines
+                .lock()
+                .unwrap()
+                .insert(VulkanComputePipeline { layout, pipeline: pipelines[0] })),
+            Err((_, e)) => {
+                unsafe { self.inner.device.destroy_pipeline_layout(layout, None); }
+                Err(GpuError::PipelineCreation(format!("vkCreateComputePipelines: {e}")))
+            }
+        }
+    }
+
+    fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        let mut pipelines = self.pipelines.lock().unwrap();
+        if let Some(p) = pipelines.remove(pipeline) {
+            unsafe {
+                self.inner.device.destroy_pipeline(p.pipeline, None);
+                self.inner.device.destroy_pipeline_layout(p.layout, None);
+            }
+        }
+    }
+
+    fn dispatch(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
+        let (vk_pipeline, vk_layout) = {
+            let pipelines = self.pipelines.lock().unwrap();
+            let p = pipelines
+                .get(pipeline)
+                .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
+            (p.pipeline, p.layout)
+        };
+
+        // Pack push constants: [buffer_indices…, scalars…] each as 4 bytes.
+        let mut pc: Vec<u8> = Vec::new();
+        for &idx in bindings.buffers {
+            pc.extend_from_slice(&idx.to_ne_bytes());
+        }
+        for scalar in bindings.scalars {
+            let b: [u8; 4] = match scalar {
+                Scalar::U32(v) => v.to_ne_bytes(),
+                Scalar::I32(v) => v.to_ne_bytes(),
+                Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+            };
+            pc.extend_from_slice(&b);
+        }
+
+        let bindless_set = self.bindless.set;
+        self.one_shot_submit(move |dev, cmd| {
+            unsafe {
+                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
+                dev.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    vk_layout,
+                    0,
+                    &[bindless_set],
+                    &[],
+                );
+                if !pc.is_empty() {
+                    dev.cmd_push_constants(
+                        cmd,
+                        vk_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &pc,
+                    );
+                }
+                dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
+            }
+            Ok(())
+        })
+    }
 }
 
 impl Drop for VulkanDevice {
@@ -806,6 +1108,22 @@ impl Drop for VulkanDevice {
         let mut samplers = self.samplers.lock().unwrap();
         for s in samplers.drain() {
             unsafe { self.inner.device.destroy_sampler(s, None) };
+        }
+        let mut shaders = self.shaders.lock().unwrap();
+        for m in shaders.drain() {
+            unsafe { self.inner.device.destroy_shader_module(m, None); }
+        }
+        let mut pipelines = self.pipelines.lock().unwrap();
+        for p in pipelines.drain() {
+            unsafe {
+                self.inner.device.destroy_pipeline(p.pipeline, None);
+                self.inner.device.destroy_pipeline_layout(p.layout, None);
+            }
+        }
+        unsafe {
+            // Pool destruction also frees all descriptor sets from the pool.
+            self.inner.device.destroy_descriptor_pool(self.bindless.pool, None);
+            self.inner.device.destroy_descriptor_set_layout(self.bindless.layout, None);
         }
     }
 }
