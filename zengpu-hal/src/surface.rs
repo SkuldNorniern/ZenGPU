@@ -1,13 +1,13 @@
-//! Surface/swapchain HAL types (plan G2).
+//! Window-handle bridge for presentable surfaces (plan G2).
 //!
 //! [`WindowHandles`] bridges any `raw-window-handle`-capable window (aurea,
 //! winit, etc.) to ZenGPU without pulling consumer types into the public API
-//! (plan D10).  [`GpuSurface`] is the backend-independent presentable surface.
+//! (plan D10). Surfaces themselves are concrete per-feature backend types
+//! (e.g. `Vulkan2dSurface`, `Vulkan3dSurface`) built on top of this — a
+//! generic `GpuSurface`/`Surface` HAL trait (plan §20) is deferred until a
+//! second graphics backend exists to shape it (D8/D15).
 
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
-
-use crate::desc::SurfaceConfig;
-use crate::error::Result;
 
 /// Platform window and display handles extracted from any window that
 /// implements [`raw_window_handle::HasWindowHandle`] +
@@ -45,34 +45,4 @@ impl WindowHandles {
     pub fn from_raw(window: RawWindowHandle, display: RawDisplayHandle) -> Self {
         Self { window, display }
     }
-}
-
-/// Token returned by [`GpuSurface::acquire_frame`] and consumed by
-/// [`GpuSurface::present_frame`].  Carries the swapchain image index
-/// (also the bindless slot index for the render target, plan D4).
-#[must_use = "SurfaceFrame must be passed to present_frame or explicitly dropped"]
-pub struct SurfaceFrame {
-    pub index: u32,
-}
-
-/// A presentable surface: wraps the OS window, the swapchain, and the
-/// acquire/present handshake.  `Send + Sync` — backends protect mutable
-/// swapchain state with a `Mutex`.
-pub trait GpuSurface: Send + Sync {
-    /// Configure or reconfigure the swapchain (call once after creation and
-    /// again on resize / surface-lost events).
-    fn configure(&self, config: SurfaceConfig) -> Result<()>;
-
-    /// Acquire the next swapchain image.  Blocks until an image is available
-    /// (up to the driver timeout).
-    fn acquire_frame(&self) -> Result<SurfaceFrame>;
-
-    /// Submit and present the frame acquired by [`Self::acquire_frame`].
-    fn present_frame(&self, frame: SurfaceFrame) -> Result<()>;
-
-    /// Current surface extent in pixels `(width, height)`.
-    fn size(&self) -> (u32, u32);
-
-    /// Number of swapchain images.
-    fn image_count(&self) -> u32;
 }

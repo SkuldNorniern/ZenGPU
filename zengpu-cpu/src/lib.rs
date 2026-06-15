@@ -28,9 +28,9 @@ use std::sync::Mutex;
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
-    GpuError, GpuInstance, GpuSurface, HalCapabilities, PipelineHandle, Result,
+    GpuError, GpuInstance, HalCapabilities, PipelineHandle, Result,
     SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, TextureDesc,
-    TextureHandle, UsageError, WindowHandles, marker,
+    TextureHandle, UsageError, marker,
 };
 
 // ── Kernel registry types ─────────────────────────────────────────────────────
@@ -330,17 +330,6 @@ impl GpuInstance for CpuInstance {
 
     fn request_adapter(&self, _req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
         Some(Box::new(CpuAdapter::new()))
-    }
-
-    fn create_surface(
-        &self,
-        _handles: &WindowHandles,
-        _device: &dyn zengpu_hal::GpuDevice,
-        _config: zengpu_hal::SurfaceConfig,
-    ) -> Result<Box<dyn GpuSurface>> {
-        Err(GpuError::Backend(
-            "CPU backend does not support presentable surfaces".to_string(),
-        ))
     }
 }
 
