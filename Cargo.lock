@@ -1883,6 +1883,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zengpu-blas"
+version = "0.0.1"
+dependencies = [
+ "inline-spirv",
+ "zengpu-compute",
+ "zengpu-hal",
+]
+
+[[package]]
 name = "zengpu-compute"
 version = "0.0.1"
 dependencies = [
@@ -1895,6 +1904,7 @@ name = "zengpu-conformance"
 version = "0.0.1"
 dependencies = [
  "inline-spirv",
+ "zengpu-blas",
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-hal",
