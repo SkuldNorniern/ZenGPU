@@ -15,6 +15,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libvulkan-dev
       - run: cargo test --workspace --all-targets --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps
