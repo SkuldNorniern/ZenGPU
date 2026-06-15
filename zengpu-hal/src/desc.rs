@@ -133,6 +133,9 @@ pub enum BlendMode {
     #[default]
     Opaque,
     AlphaBlend,
+    /// Second color output used as the source factor. Needs the feature reported
+    /// by `GraphicsDevice::supports_dual_source_blending`.
+    DualSourceAlpha,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

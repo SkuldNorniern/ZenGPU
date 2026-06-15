@@ -78,6 +78,9 @@ pub trait GraphicsDevice: crate::GpuDevice {
 
     /// Pooled list that records straight into the backend command buffer.
     fn create_command_list(&self) -> Result<Self::CommandList>;
+
+    /// `dualSrcBlend` support. Text falls back to `AlphaBlend` when `false`.
+    fn supports_dual_source_blending(&self) -> bool;
 }
 
 /// The frame was skipped: the window is minimized, or the surface was recreated.
