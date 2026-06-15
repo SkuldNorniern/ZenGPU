@@ -1,6 +1,6 @@
 # ZenGPU — native-first GPU runtime (graphics + general compute).
 # Root is the `zengpu` crate and the workspace root; member crates are added as
-# they gain real content (no empty placeholders — plan D8).
+# they gain real content rather than as empty placeholders.
 [package]
 name = "zengpu"
 description = "A native-first GPU runtime for Rust — graphics and general compute under one device."
@@ -26,6 +26,7 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
+zengpu-cpu = { path = "zengpu-cpu", version = "0.0.1" }
 zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
 zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
 zengpu-blas = { path = "zengpu-blas", version = "0.0.1" }
@@ -34,12 +35,24 @@ inline-spirv = { version = "0.2", features = ["glsl"] }
 [lib]
 name = "zengpu"
 
+[features]
+default = ["vulkan", "compute", "blas"]
+# Vulkan backend (graphics + compute). The only GPU backend so far.
+vulkan = ["zengpu-vulkan"]
+# CPU reference backend: the conformance oracle, not a product fallback.
+cpu = ["zengpu-cpu"]
+# Device arrays, pooled allocation, and elementwise kernels.
+compute = ["zengpu-compute"]
+# GEMM compute kernel, on top of `compute`.
+blas = ["zengpu-blas", "compute"]
+
 [dependencies]
 zengpu-hal.workspace = true
+zengpu-cpu = { workspace = true, optional = true }
+zengpu-vulkan = { workspace = true, optional = true }
+zengpu-compute = { workspace = true, optional = true }
+zengpu-blas = { workspace = true, optional = true }
 
 [dev-dependencies]
-zengpu-vulkan.workspace = true
-zengpu-compute.workspace = true
-zengpu-blas.workspace = true
 inline-spirv.workspace = true
 winit = "0.30"

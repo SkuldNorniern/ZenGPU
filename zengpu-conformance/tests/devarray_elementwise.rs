@@ -1,5 +1,5 @@
-//! Cross-backend conformance for `zengpu-compute`'s elementwise ops (plan §13
-//! / C3): "devarray add/relu resident, conformant".
+//! Cross-backend conformance for `zengpu-compute`'s elementwise operations:
+//! device-array addition and ReLU remain resident and conformant.
 //!
 //! Skips if no Vulkan driver is present.
 

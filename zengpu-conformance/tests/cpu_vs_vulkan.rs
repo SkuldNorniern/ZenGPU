@@ -1,4 +1,4 @@
-//! Cross-backend conformance: CPU oracle vs Vulkan (plan M1.5).
+//! Cross-backend conformance: CPU oracle vs Vulkan.
 //!
 //! Each test gracefully skips if no Vulkan driver is present.
 

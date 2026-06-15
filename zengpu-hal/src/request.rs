@@ -1,11 +1,11 @@
-//! Adapter/device request and capability descriptors (plan §5, §22).
+//! Adapter/device request and capability descriptors.
 
 use crate::types::{BackendPreference, Features, PowerPreference};
 
 /// What to ask an adapter for during selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AdapterRequest {
-    /// Preferred backend; `Auto` picks the best available native one (D15).
+    /// Preferred backend; `Auto` picks the best available native one.
     pub backend: BackendPreference,
     pub power: PowerPreference,
 }
@@ -15,13 +15,13 @@ pub struct AdapterRequest {
 pub struct DeviceRequest {
     pub backend: BackendPreference,
     pub power: PowerPreference,
-    /// Features that must be present, or device creation fails (plan §22).
+    /// Features that must be present, or device creation fails.
     pub required: Features,
     /// Features to enable if available, ignored if not.
     pub optional: Features,
 }
 
-/// Which HAL shapes a backend implements (plan §4 / D1). A backend may provide
+/// Which HAL capabilities a backend implements. A backend may provide
 /// graphics, compute, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HalCapabilities {

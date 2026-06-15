@@ -1,7 +1,7 @@
-//! ZenGPU CPU reference backend — the conformance oracle (plan D7).
+//! ZenGPU CPU reference backend — the conformance oracle.
 //!
 //! Plain Rust over `Vec<u8>` buffers: correctness and determinism over speed.
-//! It is the reference the GPU backends are validated against (plan §18), **not**
+//! It is the reference the GPU backends are validated against, **not**
 //! a product fallback (consumers like aurea keep their own CPU paths).
 //!
 //! # Compute dispatch
@@ -12,7 +12,7 @@
 //! [`GpuDevice::dispatch`] is called, the backend looks up the function
 //! registered for the dispatched pipeline, copies the bound buffer data into a
 //! [`CpuKernelCtx`], calls the function, and writes modified buffers back.
-//! This is the "oracle" model (plan D7): CPU kernels are hand-written Rust
+//! This is the "oracle" model: CPU kernels are hand-written Rust
 //! functions that should produce bit-identical results to the GPU SPIR-V.
 //!
 //! Keying by pipeline handle (rather than SPIR-V entry-point name) lets two
@@ -64,7 +64,7 @@ struct CpuPipeline {
 type BufferMap = SlotMap<marker::Buffer, CpuBuffer>;
 
 /// A CPU-backed [`GpuDevice`]. All state lives in host memory behind mutexes,
-/// so the device is `Send + Sync` (plan D5).
+/// so the device is `Send + Sync`.
 pub struct CpuDevice {
     buffers: Mutex<BufferMap>,
     shaders: Mutex<SlotMap<marker::Shader, Vec<u8>>>,
@@ -470,7 +470,7 @@ mod tests {
 
         // Register a Rust vec_add kernel for this pipeline.
         dev.register_kernel(pipeline, Box::new(|ctx: &mut CpuKernelCtx| {
-            let len = match ctx.scalars.get(0) {
+            let len = match ctx.scalars.first() {
                 Some(&Scalar::U32(n)) => n as usize,
                 _ => return,
             };

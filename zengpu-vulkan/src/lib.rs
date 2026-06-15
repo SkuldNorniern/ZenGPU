@@ -1,4 +1,4 @@
-//! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+ (plan D15).
+//! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+.
 
 pub mod adapter;
 pub mod depth_target;

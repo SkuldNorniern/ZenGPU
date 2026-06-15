@@ -1,4 +1,4 @@
-//! Vulkan logical device and buffer operations (plan M1 / G2).
+//! Vulkan logical device and buffer operations.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,7 +12,7 @@ use zengpu_hal::{
 
 use crate::instance::VulkanShared;
 
-/// Maximum number of storage buffers in the bindless descriptor table (plan D4).
+/// Maximum number of storage buffers in the bindless descriptor table.
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
 /// Descriptor pool + layout + set for the bindless SSBO table.
@@ -128,7 +128,7 @@ impl VulkanDevice {
             unsafe { shared.instance.get_physical_device_features(physical) };
         let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
 
-        // Enable Vulkan 1.2 descriptor-indexing features (plan D4 / bindless).
+        // Enable Vulkan 1.2 descriptor-indexing features for bindless resources.
         let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
             shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
             descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
@@ -227,7 +227,7 @@ impl VulkanDevice {
     }
 
     /// Submit a one-shot command buffer that records work via `f`, then waits
-    /// for completion.  Used for staging uploads (G3) and layout transitions.
+    /// for completion. Used for staging uploads and layout transitions.
     pub(crate) fn one_shot_submit<F>(&self, record: F) -> Result<()>
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
@@ -329,7 +329,7 @@ impl VulkanDevice {
 
     /// Raw `vk::Sampler` for a HAL sampler handle.
     pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
-        self.samplers.lock().unwrap().get(handle).map(|s| *s)
+        self.samplers.lock().unwrap().get(handle).copied()
     }
 }
 
@@ -922,7 +922,7 @@ impl GpuDevice for VulkanDevice {
         }
     }
 
-    // ── Compute (C2) ──────────────────────────────────────────────────────────
+    // ── Compute ───────────────────────────────────────────────────────────────
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         if desc.spirv.len() % 4 != 0 {

@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-cpu"
-description = "ZenGPU CPU reference backend — the conformance oracle (plan D7), not a product fallback."
+description = "ZenGPU CPU reference backend — the conformance oracle, not a product fallback."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

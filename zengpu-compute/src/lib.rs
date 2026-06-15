@@ -1,6 +1,6 @@
-//! ZenGPU compute runtime (plan §13 / §17 / C3).
+//! ZenGPU compute runtime.
 //!
-//! ZenGPU is a pure execution runtime (D9): this crate provides only the thin
+//! ZenGPU is a pure execution runtime: this crate provides only the thin
 //! [`DeviceArray`] (a resident buffer + shape/stride/dtype) and pooled
 //! allocation. There is no op-graph, scheduler, or fusion here — that is
 //! Laminax's job.
@@ -9,11 +9,12 @@ mod pool;
 
 pub mod elementwise;
 
+pub use elementwise::ElementwiseKernels;
 pub use pool::BufferPool;
 
 use zengpu_hal::{BufferHandle, DType};
 
-/// ZenGPU's entire "tensor" surface (plan §13): a resident buffer plus the
+/// ZenGPU's entire "tensor" surface: a resident buffer plus the
 /// dimension metadata BLAS/elementwise kernels need. Carries no autograd, op
 /// identity, or graph membership — Laminax owns all of that.
 #[derive(Debug, Clone)]
@@ -52,7 +53,7 @@ impl DeviceArray {
     }
 }
 
-/// Row-major contiguous strides for `shape` (plan §13 "Contiguous" layout).
+/// Row-major contiguous strides for `shape`.
 fn contiguous_strides(shape: &[u32]) -> Vec<u32> {
     let mut stride = vec![1u32; shape.len()];
     for i in (0..shape.len().saturating_sub(1)).rev() {

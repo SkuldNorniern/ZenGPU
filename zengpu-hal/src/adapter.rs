@@ -1,4 +1,4 @@
-//! Instance and adapter traits — the top of the HAL entry-point chain (plan §22).
+//! Instance and adapter traits — the top of the HAL entry-point chain.
 //!
 //! `GpuInstance` enumerates physical adapters visible to a backend.
 //! `GpuAdapter` opens a logical device from one of those adapters.
@@ -39,7 +39,7 @@ pub struct AdapterInfo {
 
 /// A physical adapter (GPU, CPU, or virtual): reports capabilities and opens a
 /// logical device. `Send + Sync` so adapter selection can happen off the main
-/// thread (plan D5).
+/// thread.
 pub trait GpuAdapter: Send + Sync {
     /// Static description of this physical adapter.
     fn info(&self) -> &AdapterInfo;
@@ -57,8 +57,8 @@ pub trait GpuAdapter: Send + Sync {
 /// Entry-point for a backend: enumerates physical adapters and selects the
 /// best one for a given request. Presentable surfaces are created via
 /// concrete backend-specific constructors (e.g. `VulkanInstance::create_2d_surface`),
-/// not through this trait (plan §20: a generic `Surface` HAL trait awaits a
-/// second graphics backend).
+/// not through this trait — a generic `Surface` HAL trait awaits a second
+/// graphics backend.
 ///
 /// `Send + Sync` — the instance can be created once and shared across threads.
 pub trait GpuInstance: Send + Sync {

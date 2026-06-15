@@ -1,5 +1,5 @@
-//! Resource and pipeline descriptors (plan §5, §15, §20). Plain data — no
-//! backend or consumer types (D10). Backends consume these to create resources.
+//! Resource and pipeline descriptors. Plain data with no backend or consumer
+//! types. Backends consume these to create resources.
 
 use crate::handle::ShaderHandle;
 use crate::types::{BufferUsage, Format, MemoryUsage, PresentMode, TextureUsage};
@@ -11,7 +11,7 @@ pub struct BufferDesc {
     pub size: u64,
     /// How the buffer may be used.
     pub usage: BufferUsage,
-    /// Residency intent (plan §7).
+    /// Residency intent.
     pub memory: MemoryUsage,
 }
 
@@ -26,7 +26,7 @@ pub struct TextureDesc {
     pub samples: u32,
 }
 
-/// Describes an offscreen render target (plan §15 / D13).
+/// Describes an offscreen render target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderTargetDesc {
     pub width: u32,
@@ -36,7 +36,7 @@ pub struct RenderTargetDesc {
     pub samples: u32,
 }
 
-/// A shader module's source. SPIR-V to start (plan §14); other formats later.
+/// A shader module's source. SPIR-V to start; other formats may follow.
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderDesc<'a> {
     /// SPIR-V words as raw bytes (length must be a multiple of 4).
@@ -156,7 +156,7 @@ pub struct DepthState {
     pub write: bool,
 }
 
-/// Describes a graphics pipeline (3D-capable from day one — plan D12).
+/// Describes a graphics pipeline with 3D support.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,
@@ -173,7 +173,7 @@ pub struct GraphicsPipelineDesc<'a> {
     pub samples: u32,
 }
 
-/// Configuration for a presentable surface (plan D11).
+/// Configuration for a presentable surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SurfaceConfig {
     pub format: Format,

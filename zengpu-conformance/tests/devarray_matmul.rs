@@ -1,5 +1,4 @@
-//! Cross-backend conformance for `zengpu-blas`'s GEMM (plan §14 / C4):
-//! "f32 matmul correct".
+//! Cross-backend conformance for `zengpu-blas`'s f32 GEMM.
 //!
 //! Skips if no Vulkan driver is present.
 

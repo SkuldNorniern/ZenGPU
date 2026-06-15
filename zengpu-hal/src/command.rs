@@ -1,5 +1,5 @@
 //! Command-recording value types — bindless bindings and inline scalars
-//! (plan §6 / D4). Backends consume these when recording a dispatch or draw.
+//! Backends consume these when recording a dispatch or draw.
 
 /// An inline scalar argument passed to a pipeline (push-constant-sized).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -9,7 +9,7 @@ pub enum Scalar {
     F32(f32),
 }
 
-/// Bindless bindings for a dispatch or draw (plan §6 / D4).
+/// Bindless bindings for a dispatch or draw.
 ///
 /// Resources are referenced by their slot index ([`crate::Handle::index`]), not
 /// by a per-pipeline descriptor slot — which is what keeps the compiler ABI

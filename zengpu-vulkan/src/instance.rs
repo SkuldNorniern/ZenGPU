@@ -1,4 +1,4 @@
-//! Vulkan entry point and instance (plan §22 / D15).
+//! Vulkan entry point and instance.
 
 use std::sync::Arc;
 
