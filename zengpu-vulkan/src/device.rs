@@ -5,14 +5,15 @@ use std::sync::{Arc, Mutex};
 use ash::{Device, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
-    DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsPipelineDesc,
+    DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, TextureDesc, TextureHandle,
-    UsageError, VertexFormat, marker,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, SurfaceConfig, TextureDesc,
+    TextureHandle, UsageError, VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
 use crate::instance::VulkanShared;
+use crate::surface::VulkanSurface;
 
 /// Maximum number of storage buffers in the bindless descriptor table.
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
@@ -1351,6 +1352,23 @@ impl VulkanDevice {
             Arc::clone(&self.buffers),
             self.bindless.set,
         ))
+    }
+}
+
+impl GraphicsDevice for VulkanDevice {
+    type Surface = VulkanSurface;
+    type CommandList = VulkanCommandList;
+
+    fn create_surface(&self, window: &WindowHandles, config: SurfaceConfig) -> Result<Self::Surface> {
+        VulkanSurface::new(self, window, config)
+    }
+
+    fn create_graphics_pipeline(&self, desc: GraphicsPipelineDesc<'_>) -> Result<PipelineHandle> {
+        self.create_graphics_pipeline_impl(desc)
+    }
+
+    fn create_command_list(&self) -> Result<Self::CommandList> {
+        self.create_command_list_impl()
     }
 }
 
