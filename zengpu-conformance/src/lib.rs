@@ -6,7 +6,10 @@
 //! `compare_*` runs one op on two devices and asserts byte-identical results. One side is always
 //! the CPU oracle.
 
-use zengpu_hal::{BufferDesc, BufferUsage, GpuDevice, GpuError, MemoryUsage, UsageError};
+use zengpu_hal::{
+    Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, GpuDevice, GpuError, MemoryUsage,
+    Scalar, ShaderDesc, UsageError,
+};
 
 fn rw_desc(size: u64) -> BufferDesc {
     BufferDesc {
@@ -161,4 +164,92 @@ pub fn compare_full(label_a: &str, a: &dyn GpuDevice, label_b: &str, b: &dyn Gpu
     run_buffer_suite(label_a, a);
     run_buffer_suite(label_b, b);
     compare_buffer_write(label_a, a, label_b, b);
+}
+
+fn compute_desc(size: u64) -> BufferDesc {
+    BufferDesc {
+        size,
+        usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+        memory: MemoryUsage::Upload,
+    }
+}
+
+fn as_bytes_f32(s: &[f32]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+}
+
+fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// Runs vec_add on `dev` and returns the result. For the CPU oracle, `entry` must already have a
+/// kernel registered with `CpuDevice::register_kernel`.
+fn run_vec_add(dev: &dyn GpuDevice, spirv: &[u8], entry: &str, n: u32) -> Vec<f32> {
+    let size = (n as u64) * 4;
+    let a_data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+    let b_data: Vec<f32> = (0..n).map(|i| 100.0 * i as f32).collect();
+
+    let ha = dev.create_buffer(compute_desc(size)).unwrap();
+    let hb = dev.create_buffer(compute_desc(size)).unwrap();
+    let hout = dev.create_buffer(compute_desc(size)).unwrap();
+    dev.write_buffer(ha, 0, as_bytes_f32(&a_data)).unwrap();
+    dev.write_buffer(hb, 0, as_bytes_f32(&b_data)).unwrap();
+
+    let shader = dev.create_shader(ShaderDesc { spirv }).unwrap();
+    let pipeline = dev
+        .create_compute_pipeline(ComputePipelineDesc { shader, entry })
+        .unwrap();
+
+    let groups = n.div_ceil(256);
+    dev.dispatch(
+        pipeline,
+        Bindings {
+            buffers: &[ha.index(), hb.index(), hout.index()],
+            scalars: &[Scalar::U32(n)],
+            textures: &[],
+        },
+        [groups, 1, 1],
+    )
+    .unwrap();
+
+    let out = from_bytes_f32(&dev.read_buffer(hout, 0, size).unwrap());
+
+    dev.destroy_pipeline(pipeline);
+    dev.destroy_shader(shader);
+    dev.destroy_buffer(ha);
+    dev.destroy_buffer(hb);
+    dev.destroy_buffer(hout);
+
+    out
+}
+
+/// Runs vec_add on `a` and `b`, asserts the results agree. `a` is the CPU oracle, with a matching
+/// kernel registered under `entry`.
+pub fn compare_vec_add(
+    label_a: &str,
+    a: &dyn GpuDevice,
+    label_b: &str,
+    b: &dyn GpuDevice,
+    spirv: &[u8],
+    entry: &str,
+) {
+    const N: u32 = 1024;
+    let out_a = run_vec_add(a, spirv, entry, N);
+    let out_b = run_vec_add(b, spirv, entry, N);
+    for i in 0..N as usize {
+        let expected = i as f32 + 100.0 * i as f32;
+        assert!(
+            (out_a[i] - expected).abs() < 1e-4,
+            "[{label_a}] vec_add[{i}] = {}, expected {expected}",
+            out_a[i]
+        );
+        assert!(
+            (out_a[i] - out_b[i]).abs() < 1e-4,
+            "compare_vec_add[{i}]: [{label_a}]={} != [{label_b}]={}",
+            out_a[i],
+            out_b[i]
+        );
+    }
 }

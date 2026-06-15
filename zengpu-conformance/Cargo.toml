@@ -14,3 +14,4 @@ zengpu-hal.workspace = true
 [dev-dependencies]
 zengpu-cpu = { path = "../zengpu-cpu" }
 zengpu-vulkan = { path = "../zengpu-vulkan" }
+inline-spirv.workspace = true
