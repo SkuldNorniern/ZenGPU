@@ -11,6 +11,7 @@ use zengpu_hal::{
     UsageError, VertexFormat, marker,
 };
 
+use crate::command_list::{CmdListPool, VulkanCommandList};
 use crate::instance::VulkanShared;
 
 /// Maximum number of storage buffers in the bindless descriptor table.
@@ -118,6 +119,7 @@ pub struct VulkanDevice {
     /// commands can attach to. Shared with [`VulkanCommandList`](crate::command_list::VulkanCommandList).
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
+    cmd_list_pool: Arc<CmdListPool>,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -242,6 +244,7 @@ impl VulkanDevice {
         });
 
         let bindless = create_bindless(&inner.device)?;
+        let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
 
         Ok(Self {
             inner,
@@ -252,6 +255,7 @@ impl VulkanDevice {
             pipelines: Arc::new(Mutex::new(SlotMap::new())),
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
+            cmd_list_pool,
         })
     }
 
@@ -1331,6 +1335,22 @@ impl VulkanDevice {
                 )))
             }
         }
+    }
+
+    /// Acquire a pooled, reset-reusable [`VulkanCommandList`] and begin
+    /// recording. Part of the unified graphics API (D17/GU); see
+    /// [`zengpu_hal::GraphicsDevice::create_command_list`].
+    pub(crate) fn create_command_list_impl(&self) -> Result<VulkanCommandList> {
+        let cmd = self.cmd_list_pool.acquire()?;
+        Ok(VulkanCommandList::new(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.cmd_list_pool),
+            cmd,
+            Arc::clone(&self.pipelines),
+            Arc::clone(&self.render_targets),
+            Arc::clone(&self.buffers),
+            self.bindless.set,
+        ))
     }
 }
 

@@ -1,6 +1,7 @@
 //! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+.
 
 pub mod adapter;
+pub(crate) mod command_list;
 pub mod depth_target;
 pub mod device;
 pub mod frame_graph;
