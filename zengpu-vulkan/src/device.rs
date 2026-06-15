@@ -7,8 +7,8 @@ use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
     DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, SurfaceConfig, TextureDesc,
-    TextureHandle, UsageError, VertexFormat, WindowHandles, marker,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, SurfaceConfig, TargetHandle,
+    TextureDesc, TextureHandle, UsageError, VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -1352,6 +1352,26 @@ impl VulkanDevice {
             Arc::clone(&self.buffers),
             self.bindless.set,
         ))
+    }
+
+    /// Register `depth`'s image/view as a render target for use as
+    /// [`zengpu_hal::DepthAttachment::target`]. Call again with the recreated
+    /// [`crate::DepthTarget`] after a resize and use [`unregister_render_target`](Self::unregister_render_target)
+    /// to drop the stale handle.
+    pub fn register_depth_target(&self, depth: &crate::depth_target::DepthTarget) -> TargetHandle {
+        let (width, height) = depth.extent();
+        self.render_targets.lock().unwrap().insert(VulkanRenderTarget {
+            image: depth.image(),
+            view: depth.view(),
+            format: crate::depth_target::DEPTH_FORMAT,
+            extent: vk::Extent2D { width, height },
+            layout: vk::ImageLayout::UNDEFINED,
+        })
+    }
+
+    /// Drop a render-target registration created by [`register_depth_target`](Self::register_depth_target).
+    pub fn unregister_render_target(&self, handle: TargetHandle) {
+        self.render_targets.lock().unwrap().remove(handle);
     }
 }
 
