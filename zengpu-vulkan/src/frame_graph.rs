@@ -3,7 +3,9 @@ use std::collections::VecDeque;
 use ash::vk;
 use zengpu_hal::Result;
 
-use crate::swapchain::DeviceContext;
+use crate::depth_target::DepthTarget;
+use crate::offscreen::OffscreenTarget;
+use crate::swapchain::{DeviceContext, Swapchain};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ResourceId(usize);
@@ -98,6 +100,50 @@ impl FrameGraph {
             _extent: extent,
             initial_layout,
             aspect: vk::ImageAspectFlags::DEPTH,
+        });
+        id
+    }
+
+    /// Register a color `OffscreenTarget`. Same as `add_resource` with `initial_layout
+    /// = UNDEFINED`.
+    pub fn add_offscreen(&mut self, target: &OffscreenTarget) -> ResourceId {
+        let id = ResourceId(self.resources.len());
+        self.resources.push(FrameResource {
+            image: target.image(),
+            _view: target.view(),
+            _format: target.raw_format(),
+            _extent: target.raw_extent(),
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            aspect: vk::ImageAspectFlags::COLOR,
+        });
+        id
+    }
+
+    /// Register a `DepthTarget`. Same as `add_depth_resource` with `initial_layout = UNDEFINED`.
+    pub fn add_depth(&mut self, target: &DepthTarget) -> ResourceId {
+        let id = ResourceId(self.resources.len());
+        self.resources.push(FrameResource {
+            image: target.image(),
+            _view: target.view(),
+            _format: crate::DEPTH_FORMAT,
+            _extent: target.raw_extent(),
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            aspect: vk::ImageAspectFlags::DEPTH,
+        });
+        id
+    }
+
+    /// Register swapchain image `index`. Same as `add_resource` with `initial_layout = UNDEFINED`.
+    pub fn add_swapchain_image(&mut self, sc: &Swapchain, index: u32) -> ResourceId {
+        let i = index as usize;
+        let id = ResourceId(self.resources.len());
+        self.resources.push(FrameResource {
+            image: sc.images()[i],
+            _view: sc.image_views()[i],
+            _format: sc.raw_format(),
+            _extent: sc.raw_extent(),
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            aspect: vk::ImageAspectFlags::COLOR,
         });
         id
     }
