@@ -13,7 +13,7 @@
 //! sRGB colour bytes are written through unchanged, matching the CPU rasterizer.
 //!
 //! Resize and surface-loss are handled by recreating the swapchain-dependent
-//! resources ([`SwapchainResources`]); the pipeline uses **dynamic** viewport
+//! resources; the pipeline uses **dynamic** viewport
 //! and scissor so it survives a resize untouched. Instance buffers grow on
 //! demand from a small base allocation rather than reserving a fixed maximum.
 

@@ -11,6 +11,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 readme = "README.md"
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [workspace]
 resolver = "2"
@@ -22,7 +25,10 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/SkuldNorniern/ZenGPU"
+homepage = "https://github.com/SkuldNorniern/ZenGPU"
 authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
+keywords = ["gpu", "vulkan", "compute", "graphics", "rendering"]
+categories = ["graphics", "rendering", "hardware-support", "science"]
 
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
@@ -56,3 +62,6 @@ zengpu-blas = { workspace = true, optional = true }
 [dev-dependencies]
 inline-spirv.workspace = true
 winit = "0.30"
+
+[package.metadata.docs.rs]
+all-features = true

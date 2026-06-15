@@ -7,7 +7,7 @@
 //! a particular render pass (render pass, framebuffers, depth buffers,
 //! pipelines, per-surface vertex/instance buffers) — those stay with the
 //! consumer ([`crate::swapchain_2d::Vulkan2dSurface`],
-//! [`crate::swapchain_textured::VulkanTexturedSwapchain`], and the 3D surface).
+//! higher-level renderers and 3D surfaces).
 //!
 //! Consumers should place a `swapchain: Swapchain` field **last** in their
 //! struct: Rust drops fields in declaration order, so the consumer's own
