@@ -8,11 +8,10 @@
 
 use std::sync::Arc;
 
-use zengpu_blas::GemmKernel;
-use zengpu_compute::elementwise::ElementwiseKernels;
-use zengpu_compute::{BufferPool, DeviceArray};
-use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
-use zengpu_vulkan::VulkanInstance;
+use zengpu::{
+    AdapterRequest, BufferPool, DeviceArray, DeviceRequest, DType, ElementwiseKernels, GemmKernel,
+    GpuDevice, GpuInstance, VulkanInstance,
+};
 
 /// A node in the example graph. `Input` names an array the caller passes in. Other nodes reference
 /// earlier ids, so the graph is already in topological order.
