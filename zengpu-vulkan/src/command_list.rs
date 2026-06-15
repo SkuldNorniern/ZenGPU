@@ -141,6 +141,9 @@ pub struct VulkanCommandList {
     pub(crate) bindless_set: vk::DescriptorSet,
     /// Layout of the bound graphics pipeline. Scopes push constants for `bind`.
     current_layout: Option<vk::PipelineLayout>,
+    /// Targets from this pass with `sample_after` set: moved to
+    /// `SHADER_READ_ONLY_OPTIMAL` in `end_render_pass`.
+    pending_shader_read: [Option<TargetHandle>; MAX_COLOR_ATTACHMENTS],
 }
 
 impl VulkanCommandList {
@@ -163,6 +166,7 @@ impl VulkanCommandList {
             buffers,
             bindless_set,
             current_layout: None,
+            pending_shader_read: [None; MAX_COLOR_ATTACHMENTS],
         }
     }
 
@@ -198,6 +202,33 @@ impl VulkanCommandList {
                 self.cmd,
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
+    /// Emit a barrier transitioning `image` from `COLOR_ATTACHMENT_OPTIMAL` to
+    /// `SHADER_READ_ONLY_OPTIMAL`, for [`ColorAttachment::sample_after`].
+    fn transition_to_shader_read(&self, image: vk::Image) {
+        let barrier = vk::ImageMemoryBarrier {
+            old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ,
+            image,
+            subresource_range: COLOR_SUBRESOURCE,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -284,14 +315,19 @@ impl VulkanCommandList {
 impl RenderCommands for VulkanCommandList {
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         let mut color_attachments = [vk::RenderingAttachmentInfo::default(); MAX_COLOR_ATTACHMENTS];
+        let mut pending_shader_read = [None; MAX_COLOR_ATTACHMENTS];
         let mut extent = vk::Extent2D::default();
         let count = desc.color.len().min(MAX_COLOR_ATTACHMENTS);
-        for (slot, att) in color_attachments.iter_mut().take(count).zip(desc.color) {
+        for (i, att) in desc.color.iter().take(count).enumerate() {
             if let Some((info, e)) = self.color_attachment_info(att) {
-                *slot = info;
+                color_attachments[i] = info;
                 extent = e;
             }
+            if att.sample_after {
+                pending_shader_read[i] = Some(att.target);
+            }
         }
+        self.pending_shader_read = pending_shader_read;
 
         let depth_info = desc.depth.and_then(|d| self.depth_attachment_info(&d));
         if let Some((_, e)) = &depth_info {
@@ -456,6 +492,16 @@ impl RenderCommands for VulkanCommandList {
     fn end_render_pass(&mut self) {
         unsafe {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
+        }
+        let pending = std::mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
+        for target in pending.into_iter().flatten() {
+            let mut targets = self.render_targets.lock().unwrap();
+            if let Some(rt) = targets.get_mut(target) {
+                let image = rt.image;
+                rt.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+                drop(targets);
+                self.transition_to_shader_read(image);
+            }
         }
     }
 }
