@@ -9,11 +9,10 @@
 //! into the first three push-constant u32s; Bindings.scalars[0] = len.
 
 use inline_spirv::inline_spirv;
-use zengpu_hal::{
-    AdapterRequest, Bindings, BufferDesc, BufferUsage, DeviceRequest, GpuInstance, MemoryUsage,
-    Scalar,
+use zengpu::{
+    AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
+    GpuInstance, MemoryUsage, Scalar, ShaderDesc, VulkanInstance,
 };
-use zengpu_vulkan::VulkanInstance;
 
 // ── Shader ────────────────────────────────────────────────────────────────────
 
@@ -96,8 +95,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let spv_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(SHADER_SPV.as_ptr() as *const u8, SHADER_SPV.len() * 4)
     };
-    let shader = device.create_shader(zengpu_hal::ShaderDesc { spirv: spv_bytes })?;
-    let pipeline = device.create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+    let shader = device.create_shader(ShaderDesc { spirv: spv_bytes })?;
+    let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,
         entry: "main",
     })?;

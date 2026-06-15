@@ -11,11 +11,10 @@
 
 use std::sync::Arc;
 
-use zengpu_blas::GemmKernel;
-use zengpu_compute::elementwise::ElementwiseKernels;
-use zengpu_compute::{BufferPool, DeviceArray};
-use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
-use zengpu_vulkan::VulkanInstance;
+use zengpu::{
+    AdapterRequest, BufferPool, DeviceArray, DeviceRequest, DType, ElementwiseKernels, GemmKernel,
+    GpuDevice, GpuInstance, VulkanInstance,
+};
 
 // ── Stand-in for a compute-graph compiler's op-graph (not part of ZenGPU) ─────
 
