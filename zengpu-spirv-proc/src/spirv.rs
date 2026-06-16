@@ -92,11 +92,14 @@ mod cap {
 
 /// SPIR-V execution model constants.
 mod exec_model {
+    pub const VERTEX: u32 = 0;
+    pub const FRAGMENT: u32 = 4;
     pub const GL_COMPUTE: u32 = 5;
 }
 
 /// SPIR-V built-in constants.
 pub mod builtin {
+    pub const POSITION: u32 = 0;
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
 }
 
@@ -178,12 +181,37 @@ impl SpvBuilder {
         emit_raw(&mut self.entry_points, op::ENTRY_POINT, &words);
     }
 
+    pub fn entry_point_vertex(&mut self, fn_id: Id, name: &str, interface: &[Id]) {
+        let name_enc = encode_string(name);
+        let mut words = vec![exec_model::VERTEX, fn_id.0];
+        words.extend_from_slice(&name_enc);
+        for &iface in interface {
+            words.push(iface.0);
+        }
+        emit_raw(&mut self.entry_points, op::ENTRY_POINT, &words);
+    }
+
+    pub fn entry_point_fragment(&mut self, fn_id: Id, name: &str, interface: &[Id]) {
+        let name_enc = encode_string(name);
+        let mut words = vec![exec_model::FRAGMENT, fn_id.0];
+        words.extend_from_slice(&name_enc);
+        for &iface in interface {
+            words.push(iface.0);
+        }
+        emit_raw(&mut self.entry_points, op::ENTRY_POINT, &words);
+    }
+
     pub fn execution_mode_local_size(&mut self, fn_id: Id, x: u32, y: u32, z: u32) {
         emit(
             &mut self.exec_modes,
             op::EXECUTION_MODE,
             &[fn_id.0, 17, x, y, z],
         );
+    }
+
+    /// OriginUpperLeft execution mode (mode 7) — required for fragment shaders.
+    pub fn execution_mode_origin_upper_left(&mut self, fn_id: Id) {
+        emit(&mut self.exec_modes, op::EXECUTION_MODE, &[fn_id.0, 7]);
     }
 
     // ── Decorations ───────────────────────────────────────────────────────────
@@ -401,6 +429,16 @@ impl SpvBuilder {
         let mut words = vec![ty.0, id.0, composite.0];
         words.extend_from_slice(indices);
         emit_raw(&mut self.functions, op::COMPOSITE_EXTRACT, &words);
+        id
+    }
+
+    pub fn op_composite_construct(&mut self, ty: Id, components: &[Id]) -> Id {
+        let id = self.fresh_id();
+        let mut words = vec![ty.0, id.0];
+        for c in components {
+            words.push(c.0);
+        }
+        emit_raw(&mut self.functions, op::COMPOSITE_CONSTRUCT, &words);
         id
     }
 
