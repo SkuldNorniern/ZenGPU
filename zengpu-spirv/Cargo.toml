@@ -13,3 +13,4 @@ categories.workspace = true
 
 [dependencies]
 inline-spirv.workspace = true
+zengpu-spirv-proc = { path = "../zengpu-spirv-proc", version = "0.0.1" }
