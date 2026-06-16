@@ -1,4 +1,5 @@
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::{Device, khr, vk};
@@ -116,6 +117,10 @@ pub struct VulkanDevice {
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
+    /// Returns the next slot in the external range, which wraps within `[EXTERNAL_SLOT_BASE,
+    /// MAX_BINDLESS_TEXTURES)`, the same range
+    /// [`bind_raw_image_view`](Self::bind_raw_image_view) uses.
+    ext_slot_counter: AtomicU32,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -249,6 +254,7 @@ impl VulkanDevice {
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
             cmd_list_pool,
+            ext_slot_counter: AtomicU32::new(0),
         })
     }
 
@@ -412,6 +418,36 @@ impl VulkanDevice {
             self.inner.device.update_descriptor_sets(&[write], &[]);
         }
         Some(texture.index())
+    }
+
+    /// Binds a caller-owned image view to the next slot in `[512, 1024)`, wrapping at the end of
+    /// the range.
+    ///
+    /// The image must be in `SHADER_READ_ONLY_OPTIMAL`. Use this for caller-owned render targets
+    /// without a `TextureHandle`. Prefer [`bind_texture`](Self::bind_texture) otherwise.
+    pub fn bind_raw_image_view(&self, view: vk::ImageView, sampler: vk::Sampler) -> u32 {
+        const EXTERNAL_SLOT_BASE: u32 = 512;
+        const EXTERNAL_SLOT_COUNT: u32 = MAX_BINDLESS_TEXTURES - EXTERNAL_SLOT_BASE;
+        let idx = self.ext_slot_counter.fetch_add(1, Ordering::Relaxed);
+        let slot = EXTERNAL_SLOT_BASE + (idx % EXTERNAL_SLOT_COUNT);
+        let info = vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: 1,
+            dst_array_element: slot,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        slot
     }
 
     /// Returns the raw `vk::ImageView` for a texture handle, for user-side descriptor sets.
