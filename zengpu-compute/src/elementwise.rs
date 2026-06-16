@@ -35,7 +35,8 @@ const ADD_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 const RELU_SPV: &[u32] = inline_spirv!(
@@ -60,7 +61,8 @@ const RELU_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 fn spv_bytes(words: &[u32]) -> &[u8] {
@@ -89,12 +91,16 @@ impl ElementwiseKernels {
     /// also register kernels for [`Self::add_pipeline`] and [`Self::relu_pipeline`]
     /// with `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let add_shader = device.create_shader(ShaderDesc { spirv: spv_bytes(ADD_SPV) })?;
+        let add_shader = device.create_shader(ShaderDesc {
+            spirv: spv_bytes(ADD_SPV),
+        })?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: add_shader,
             entry: "main",
         })?;
-        let relu_shader = device.create_shader(ShaderDesc { spirv: spv_bytes(RELU_SPV) })?;
+        let relu_shader = device.create_shader(ShaderDesc {
+            spirv: spv_bytes(RELU_SPV),
+        })?;
         let relu_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: relu_shader,
             entry: "main",
@@ -146,7 +152,12 @@ impl ElementwiseKernels {
     }
 
     /// `a` must be `DType::F32`. `out` is allocated from `pool`.
-    pub fn relu(&self, device: &dyn GpuDevice, pool: &BufferPool, a: &DeviceArray) -> Result<DeviceArray> {
+    pub fn relu(
+        &self,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        a: &DeviceArray,
+    ) -> Result<DeviceArray> {
         check_f32(a.dtype, "elementwise::relu")?;
 
         let out = pool.alloc(a.shape.clone(), DType::F32)?;

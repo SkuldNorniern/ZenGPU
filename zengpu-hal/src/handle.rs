@@ -145,7 +145,9 @@ impl<K, V> SlotMap<K, V> {
     }
 
     pub fn get_mut_by_slot_index(&mut self, idx: u32) -> Option<&mut V> {
-        self.slots.get_mut(idx as usize).and_then(|s| s.value.as_mut())
+        self.slots
+            .get_mut(idx as usize)
+            .and_then(|s| s.value.as_mut())
     }
 
     pub fn len(&self) -> usize {

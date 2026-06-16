@@ -43,7 +43,8 @@ const SHADER_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 fn as_bytes<T>(s: &[T]) -> &[u8] {
