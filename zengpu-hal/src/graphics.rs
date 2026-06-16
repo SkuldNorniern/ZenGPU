@@ -193,7 +193,13 @@ mod tests {
 
     #[test]
     fn clear_helpers() {
-        assert_eq!(LoadOp::clear_rgb(0.1, 0.2, 0.3), LoadOp::Clear([0.1, 0.2, 0.3, 1.0]));
-        assert_eq!(LoadOp::clear_depth(1.0), LoadOp::Clear([1.0, 0.0, 0.0, 0.0]));
+        assert_eq!(
+            LoadOp::clear_rgb(0.1, 0.2, 0.3),
+            LoadOp::Clear([0.1, 0.2, 0.3, 1.0])
+        );
+        assert_eq!(
+            LoadOp::clear_depth(1.0),
+            LoadOp::Clear([1.0, 0.0, 0.0, 0.0])
+        );
     }
 }

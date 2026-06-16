@@ -47,7 +47,8 @@ const GEMM_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 fn spv_bytes(words: &[u32]) -> &[u8] {
@@ -65,8 +66,13 @@ impl GemmKernel {
     /// the caller must additionally register a matching kernel for
     /// [`Self::pipeline`] via `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let shader = device.create_shader(ShaderDesc { spirv: spv_bytes(GEMM_SPV) })?;
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })?;
+        let shader = device.create_shader(ShaderDesc {
+            spirv: spv_bytes(GEMM_SPV),
+        })?;
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader,
+            entry: "main",
+        })?;
         Ok(Self { shader, pipeline })
     }
 
@@ -79,7 +85,13 @@ impl GemmKernel {
     /// `C = A @ B` for 2D row-major f32 arrays: `a.shape = [m, k]`,
     /// `b.shape = [k, n]`, returns `c.shape = [m, n]`. Allocates `c` from
     /// `pool`. This performs one dispatch with no chaining or scheduling.
-    pub fn gemm(&self, device: &dyn GpuDevice, pool: &BufferPool, a: &DeviceArray, b: &DeviceArray) -> Result<DeviceArray> {
+    pub fn gemm(
+        &self,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        a: &DeviceArray,
+        b: &DeviceArray,
+    ) -> Result<DeviceArray> {
         if a.dtype != DType::F32 || b.dtype != DType::F32 {
             return Err(GpuError::Dispatch(format!(
                 "gemm: only DType::F32 is supported, got {:?} and {:?}",

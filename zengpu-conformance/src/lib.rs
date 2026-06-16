@@ -45,7 +45,8 @@ fn buffer_roundtrip(label: &str, dev: &dyn GpuDevice) {
 
 fn buffer_partial_read(label: &str, dev: &dyn GpuDevice) {
     let h = dev.create_buffer(rw_desc(8)).unwrap();
-    dev.write_buffer(h, 0, &[10, 20, 30, 40, 50, 60, 70, 80]).unwrap();
+    dev.write_buffer(h, 0, &[10, 20, 30, 40, 50, 60, 70, 80])
+        .unwrap();
     assert_eq!(
         dev.read_buffer(h, 2, 4).unwrap(),
         [30, 40, 50, 60],
@@ -78,7 +79,10 @@ fn buffer_missing_readback_usage(label: &str, dev: &dyn GpuDevice) {
     assert!(
         matches!(
             err,
-            GpuError::InvalidUsage(UsageError::MissingUsage { needed: "READBACK", .. })
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "READBACK",
+                ..
+            })
         ),
         "[{label}] missing-readback: expected MissingUsage, got {err}"
     );
@@ -90,10 +94,7 @@ fn buffer_stale_after_destroy(label: &str, dev: &dyn GpuDevice) {
     dev.destroy_buffer(h);
     let err = dev.read_buffer(h, 0, 4).unwrap_err();
     assert!(
-        matches!(
-            err,
-            GpuError::InvalidUsage(UsageError::StaleHandle { .. })
-        ),
+        matches!(err, GpuError::InvalidUsage(UsageError::StaleHandle { .. })),
         "[{label}] stale-after-destroy: expected StaleHandle, got {err}"
     );
 }
@@ -102,10 +103,7 @@ fn buffer_out_of_bounds_write(label: &str, dev: &dyn GpuDevice) {
     let h = dev.create_buffer(rw_desc(4)).unwrap();
     let err = dev.write_buffer(h, 2, &[1, 2, 3]).unwrap_err();
     assert!(
-        matches!(
-            err,
-            GpuError::InvalidUsage(UsageError::BindingMismatch(_))
-        ),
+        matches!(err, GpuError::InvalidUsage(UsageError::BindingMismatch(_))),
         "[{label}] out-of-bounds-write: expected BindingMismatch, got {err}"
     );
     dev.destroy_buffer(h);

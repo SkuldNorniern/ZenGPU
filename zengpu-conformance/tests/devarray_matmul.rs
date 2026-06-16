@@ -24,10 +24,14 @@ fn register_cpu_gemm_kernel(cpu: &CpuDevice, pipeline: zengpu_hal::PipelineHandl
         pipeline,
         Box::new(|ctx: &mut CpuKernelCtx| {
             let (m, n, k) = match ctx.scalars[..] {
-                [Scalar::U32(m), Scalar::U32(n), Scalar::U32(k)] => (m as usize, n as usize, k as usize),
+                [Scalar::U32(m), Scalar::U32(n), Scalar::U32(k)] => {
+                    (m as usize, n as usize, k as usize)
+                }
                 _ => return,
             };
-            let read = |buf: &[u8], i: usize| f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+            let read = |buf: &[u8], i: usize| {
+                f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap())
+            };
             let a = &ctx.buffers[0];
             let b = &ctx.buffers[1];
             let mut c = vec![0u8; m * n * 4];
@@ -37,7 +41,8 @@ fn register_cpu_gemm_kernel(cpu: &CpuDevice, pipeline: zengpu_hal::PipelineHandl
                     for i in 0..k {
                         sum += read(a, row * k + i) * read(b, i * n + col);
                     }
-                    c[(row * n + col) * 4..(row * n + col) * 4 + 4].copy_from_slice(&sum.to_le_bytes());
+                    c[(row * n + col) * 4..(row * n + col) * 4 + 4]
+                        .copy_from_slice(&sum.to_le_bytes());
                 }
             }
             ctx.buffers[2] = c;
@@ -51,7 +56,10 @@ fn devarray_matmul_cpu_vs_vulkan() {
     let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
 
     let cpu_gemm = GemmKernel::new(&*cpu).unwrap();
-    register_cpu_gemm_kernel(cpu.as_any().downcast_ref::<CpuDevice>().unwrap(), cpu_gemm.pipeline);
+    register_cpu_gemm_kernel(
+        cpu.as_any().downcast_ref::<CpuDevice>().unwrap(),
+        cpu_gemm.pipeline,
+    );
     let vk_gemm = GemmKernel::new(&*vk).unwrap();
 
     let cpu_pool = BufferPool::new(cpu.clone());
@@ -82,8 +90,10 @@ fn devarray_matmul_cpu_vs_vulkan() {
     ] {
         let a = pool.alloc(vec![M, K], DType::F32).unwrap();
         let b = pool.alloc(vec![K, N], DType::F32).unwrap();
-        dev.write_buffer(a.buffer, 0, as_bytes_f32(&a_data)).unwrap();
-        dev.write_buffer(b.buffer, 0, as_bytes_f32(&b_data)).unwrap();
+        dev.write_buffer(a.buffer, 0, as_bytes_f32(&a_data))
+            .unwrap();
+        dev.write_buffer(b.buffer, 0, as_bytes_f32(&b_data))
+            .unwrap();
 
         let c = gemm.gemm(&**dev, pool, &a, &b).unwrap();
         assert_eq!(c.shape, vec![M, N], "[{label}] gemm output shape");

@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use zengpu_conformance::{as_bytes_f32, from_bytes_f32};
-use zengpu_compute::elementwise::ElementwiseKernels;
 use zengpu_compute::BufferPool;
+use zengpu_compute::elementwise::ElementwiseKernels;
+use zengpu_conformance::{as_bytes_f32, from_bytes_f32};
 use zengpu_cpu::{CpuDevice, CpuKernelCtx};
 use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance, Scalar};
 use zengpu_vulkan::VulkanInstance;
@@ -62,7 +62,10 @@ fn devarray_add_relu_cpu_vs_vulkan() {
     let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
 
     let cpu_kernels = ElementwiseKernels::new(&*cpu).unwrap();
-    register_cpu_kernels(cpu.as_any().downcast_ref::<CpuDevice>().unwrap(), &cpu_kernels);
+    register_cpu_kernels(
+        cpu.as_any().downcast_ref::<CpuDevice>().unwrap(),
+        &cpu_kernels,
+    );
     let vk_kernels = ElementwiseKernels::new(&*vk).unwrap();
 
     let cpu_pool = BufferPool::new(cpu.clone());
@@ -81,14 +84,18 @@ fn devarray_add_relu_cpu_vs_vulkan() {
     ] {
         let a = pool.alloc(shape.clone(), DType::F32).unwrap();
         let b = pool.alloc(shape.clone(), DType::F32).unwrap();
-        dev.write_buffer(a.buffer, 0, as_bytes_f32(&a_data)).unwrap();
-        dev.write_buffer(b.buffer, 0, as_bytes_f32(&b_data)).unwrap();
+        dev.write_buffer(a.buffer, 0, as_bytes_f32(&a_data))
+            .unwrap();
+        dev.write_buffer(b.buffer, 0, as_bytes_f32(&b_data))
+            .unwrap();
 
         let sum = kernels.add(&**dev, pool, &a, &b).unwrap();
         let relu_out = kernels.relu(&**dev, pool, &sum).unwrap();
 
         let sum_bytes = dev.read_buffer(sum.buffer, 0, sum.size_bytes()).unwrap();
-        let relu_bytes = dev.read_buffer(relu_out.buffer, 0, relu_out.size_bytes()).unwrap();
+        let relu_bytes = dev
+            .read_buffer(relu_out.buffer, 0, relu_out.size_bytes())
+            .unwrap();
         let sum_out = from_bytes_f32(&sum_bytes);
         let relu_result = from_bytes_f32(&relu_bytes);
 

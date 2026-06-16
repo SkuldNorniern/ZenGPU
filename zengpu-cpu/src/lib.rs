@@ -27,10 +27,9 @@ use std::sync::Mutex;
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
-    GpuError, GpuInstance, HalCapabilities, PipelineHandle, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, TextureDesc,
-    TextureHandle, UsageError, marker,
+    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, SlotMap, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 // ── Kernel registry types ─────────────────────────────────────────────────────
@@ -174,17 +173,23 @@ impl GpuDevice for CpuDevice {
     }
 
     fn create_texture(&self, _desc: TextureDesc) -> Result<TextureHandle> {
-        Err(GpuError::Backend("CPU backend does not support textures".to_string()))
+        Err(GpuError::Backend(
+            "CPU backend does not support textures".to_string(),
+        ))
     }
 
     fn upload_texture_data(&self, _texture: TextureHandle, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("CPU backend does not support textures".to_string()))
+        Err(GpuError::Backend(
+            "CPU backend does not support textures".to_string(),
+        ))
     }
 
     fn destroy_texture(&self, _texture: TextureHandle) {}
 
     fn create_sampler(&self, _desc: SamplerDesc) -> Result<SamplerHandle> {
-        Err(GpuError::Backend("CPU backend does not support samplers".to_string()))
+        Err(GpuError::Backend(
+            "CPU backend does not support samplers".to_string(),
+        ))
     }
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
@@ -210,7 +215,9 @@ impl GpuDevice for CpuDevice {
                 )));
             }
         }
-        let pipeline = CpuPipeline { entry: desc.entry.to_string() };
+        let pipeline = CpuPipeline {
+            entry: desc.entry.to_string(),
+        };
         Ok(self.pipelines.lock().unwrap().insert(pipeline))
     }
 
@@ -227,9 +234,9 @@ impl GpuDevice for CpuDevice {
         // Get entry name.
         let entry = {
             let pipelines = self.pipelines.lock().unwrap();
-            let p = pipelines.get(pipeline).ok_or_else(|| {
-                GpuError::Dispatch("stale pipeline handle".to_string())
-            })?;
+            let p = pipelines
+                .get(pipeline)
+                .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
             p.entry.clone()
         };
 
@@ -370,7 +377,10 @@ mod tests {
         let err = dev.read_buffer(h, 0, 4).unwrap_err();
         assert!(matches!(
             err,
-            GpuError::InvalidUsage(UsageError::MissingUsage { needed: "READBACK", .. })
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "READBACK",
+                ..
+            })
         ));
     }
 
@@ -381,7 +391,11 @@ mod tests {
         dev.destroy_buffer(h);
         let err = dev.read_buffer(h, 0, 4).unwrap_err();
         match err {
-            GpuError::InvalidUsage(UsageError::StaleHandle { expected_gen, actual_gen, .. }) => {
+            GpuError::InvalidUsage(UsageError::StaleHandle {
+                expected_gen,
+                actual_gen,
+                ..
+            }) => {
                 assert_ne!(expected_gen, actual_gen)
             }
             other => panic!("expected StaleHandle, got {other}"),
@@ -453,42 +467,70 @@ mod tests {
         let usage = BufferUsage::STORAGE | BufferUsage::READBACK;
         let mem = MemoryUsage::Upload;
 
-        let ha = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
-        let hb = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
-        let hout = dev.create_buffer(BufferDesc { size, usage, memory: mem }).unwrap();
+        let ha = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage,
+                memory: mem,
+            })
+            .unwrap();
+        let hb = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage,
+                memory: mem,
+            })
+            .unwrap();
+        let hout = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage,
+                memory: mem,
+            })
+            .unwrap();
 
         let a_data: Vec<u8> = (0..n).flat_map(|i| (i as f32).to_le_bytes()).collect();
-        let b_data: Vec<u8> = (0..n).flat_map(|i| (100.0f32 * i as f32).to_le_bytes()).collect();
+        let b_data: Vec<u8> = (0..n)
+            .flat_map(|i| (100.0f32 * i as f32).to_le_bytes())
+            .collect();
         dev.write_buffer(ha, 0, &a_data).unwrap();
         dev.write_buffer(hb, 0, &b_data).unwrap();
 
         let dummy_spv = [0x03, 0x02, 0x23, 0x07u8]; // fake SPIR-V magic
         let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
         let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+            })
             .unwrap();
 
         // Register a Rust vec_add kernel for this pipeline.
-        dev.register_kernel(pipeline, Box::new(|ctx: &mut CpuKernelCtx| {
-            let len = match ctx.scalars.first() {
-                Some(&Scalar::U32(n)) => n as usize,
-                _ => return,
-            };
-            // buffers[0]=a, [1]=b, [2]=out (4 bytes per f32)
-            let read_f32 = |buf: &[u8], i: usize| -> f32 {
-                f32::from_le_bytes(buf[i*4..i*4+4].try_into().unwrap())
-            };
-            let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
-                buf[i*4..i*4+4].copy_from_slice(&v.to_le_bytes());
-            };
-            if ctx.buffers.len() < 3 { return; }
-            // Can't borrow a[..] and out[..] simultaneously from same vec; clone a+b first.
-            let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
-            let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
-            for i in 0..len {
-                write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
-            }
-        }));
+        dev.register_kernel(
+            pipeline,
+            Box::new(|ctx: &mut CpuKernelCtx| {
+                let len = match ctx.scalars.first() {
+                    Some(&Scalar::U32(n)) => n as usize,
+                    _ => return,
+                };
+                // buffers[0]=a, [1]=b, [2]=out (4 bytes per f32)
+                let read_f32 = |buf: &[u8], i: usize| -> f32 {
+                    f32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap())
+                };
+                let write_f32 = |buf: &mut Vec<u8>, i: usize, v: f32| {
+                    buf[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                };
+                if ctx.buffers.len() < 3 {
+                    return;
+                }
+                // Can't borrow a[..] and out[..] simultaneously from same vec; clone a+b first.
+                let a: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[0], i)).collect();
+                let b: Vec<f32> = (0..len).map(|i| read_f32(&ctx.buffers[1], i)).collect();
+                for i in 0..len {
+                    write_f32(&mut ctx.buffers[2], i, a[i] + b[i]);
+                }
+            }),
+        );
 
         dev.dispatch(
             pipeline,
@@ -503,7 +545,7 @@ mod tests {
 
         let out = dev.read_buffer(hout, 0, size).unwrap();
         for i in 0..n as usize {
-            let got = f32::from_le_bytes(out[i*4..i*4+4].try_into().unwrap());
+            let got = f32::from_le_bytes(out[i * 4..i * 4 + 4].try_into().unwrap());
             let expected = i as f32 + 100.0 * i as f32;
             assert!(
                 (got - expected).abs() < 1e-5,
@@ -524,7 +566,10 @@ mod tests {
         let dummy_spv = [0u8; 4];
         let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
         let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+            })
             .unwrap();
         dev.destroy_pipeline(pipeline);
         let err = dev
@@ -539,7 +584,10 @@ mod tests {
         let dummy_spv = [0u8; 4];
         let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
         let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc { shader, entry: "main" })
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+            })
             .unwrap();
         // No kernel registered → should fail with Dispatch error.
         let err = dev

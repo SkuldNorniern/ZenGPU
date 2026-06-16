@@ -5,7 +5,9 @@
 use inline_spirv::inline_spirv;
 use zengpu_conformance::{compare_full, compare_vec_add, run_buffer_suite};
 use zengpu_cpu::CpuDevice;
-use zengpu_hal::{AdapterRequest, ComputePipelineDesc, DeviceRequest, GpuDevice, GpuInstance, ShaderDesc};
+use zengpu_hal::{
+    AdapterRequest, ComputePipelineDesc, DeviceRequest, GpuDevice, GpuInstance, ShaderDesc,
+};
 use zengpu_vulkan::VulkanInstance;
 
 /// vec_add: out[i] = a[i] + b[i] for i in 0..len (matches `ZenGPU/examples/vec_add.rs`).
@@ -33,7 +35,8 @@ const VEC_ADD_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 fn vec_add_spv_bytes() -> &'static [u8] {
@@ -94,15 +97,29 @@ fn cpu_vs_vulkan_vec_add() {
     let Some(vk) = vulkan_device() else { return };
 
     let cpu = CpuDevice::new();
-    let cpu_shader = cpu.create_shader(ShaderDesc { spirv: vec_add_spv_bytes() }).unwrap();
+    let cpu_shader = cpu
+        .create_shader(ShaderDesc {
+            spirv: vec_add_spv_bytes(),
+        })
+        .unwrap();
     let cpu_pipeline = cpu
-        .create_compute_pipeline(ComputePipelineDesc { shader: cpu_shader, entry: "main" })
+        .create_compute_pipeline(ComputePipelineDesc {
+            shader: cpu_shader,
+            entry: "main",
+        })
         .unwrap();
     register_vec_add_kernel(&cpu, cpu_pipeline);
 
-    let vk_shader = vk.create_shader(ShaderDesc { spirv: vec_add_spv_bytes() }).unwrap();
+    let vk_shader = vk
+        .create_shader(ShaderDesc {
+            spirv: vec_add_spv_bytes(),
+        })
+        .unwrap();
     let vk_pipeline = vk
-        .create_compute_pipeline(ComputePipelineDesc { shader: vk_shader, entry: "main" })
+        .create_compute_pipeline(ComputePipelineDesc {
+            shader: vk_shader,
+            entry: "main",
+        })
         .unwrap();
 
     compare_vec_add("cpu", &cpu, cpu_pipeline, "vulkan", &*vk, vk_pipeline);

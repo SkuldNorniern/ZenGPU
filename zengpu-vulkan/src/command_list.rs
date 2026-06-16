@@ -52,7 +52,11 @@ impl CmdListPool {
             )
         }
         .map_err(|e| GpuError::Backend(format!("create command list pool: {e}")))?;
-        Ok(Self { inner, pool, free: Mutex::new(Vec::new()) })
+        Ok(Self {
+            inner,
+            pool,
+            free: Mutex::new(Vec::new()),
+        })
     }
 
     /// Acquire a command buffer — reused from the free list if one is
@@ -62,12 +66,14 @@ impl CmdListPool {
             Some(cmd) => cmd,
             None => {
                 let bufs = unsafe {
-                    self.inner.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-                        command_pool: self.pool,
-                        level: vk::CommandBufferLevel::PRIMARY,
-                        command_buffer_count: 1,
-                        ..Default::default()
-                    })
+                    self.inner
+                        .device
+                        .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
+                            command_pool: self.pool,
+                            level: vk::CommandBufferLevel::PRIMARY,
+                            command_buffer_count: 1,
+                            ..Default::default()
+                        })
                 }
                 .map_err(|e| GpuError::Backend(format!("allocate command buffer: {e}")))?;
                 bufs[0]
@@ -106,7 +112,9 @@ fn color_load_op(load: LoadOp) -> (vk::AttachmentLoadOp, vk::ClearValue) {
     match load {
         LoadOp::Clear(c) => (
             vk::AttachmentLoadOp::CLEAR,
-            vk::ClearValue { color: vk::ClearColorValue { float32: c } },
+            vk::ClearValue {
+                color: vk::ClearColorValue { float32: c },
+            },
         ),
         LoadOp::Load => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
         LoadOp::DontCare => (vk::AttachmentLoadOp::DONT_CARE, vk::ClearValue::default()),
@@ -120,7 +128,10 @@ fn depth_load_op(load: LoadOp) -> (vk::AttachmentLoadOp, vk::ClearValue) {
         LoadOp::Clear(c) => (
             vk::AttachmentLoadOp::CLEAR,
             vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: c[0], stencil: 0 },
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: c[0],
+                    stencil: 0,
+                },
             },
         ),
         LoadOp::Load => (vk::AttachmentLoadOp::LOAD, vk::ClearValue::default()),
@@ -129,7 +140,11 @@ fn depth_load_op(load: LoadOp) -> (vk::AttachmentLoadOp, vk::ClearValue) {
 }
 
 fn store_op(store: bool) -> vk::AttachmentStoreOp {
-    if store { vk::AttachmentStoreOp::STORE } else { vk::AttachmentStoreOp::DONT_CARE }
+    if store {
+        vk::AttachmentStoreOp::STORE
+    } else {
+        vk::AttachmentStoreOp::DONT_CARE
+    }
 }
 
 /// Maximum color attachments in a single render pass. Lets [`VulkanCommandList::begin_render_pass`]
@@ -289,7 +304,11 @@ impl VulkanCommandList {
     ) -> Option<(vk::RenderingAttachmentInfo<'static>, vk::Extent2D)> {
         let mut targets = self.render_targets.lock().unwrap();
         let rt = targets.get_mut(att.target)?;
-        self.transition_color(rt.image, rt.layout, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        self.transition_color(
+            rt.image,
+            rt.layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        );
         rt.layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
         let (load_op, clear_value) = color_load_op(att.load);
         Some((
@@ -313,7 +332,11 @@ impl VulkanCommandList {
     ) -> Option<(vk::RenderingAttachmentInfo<'static>, vk::Extent2D)> {
         let mut targets = self.render_targets.lock().unwrap();
         let rt = targets.get_mut(att.target)?;
-        self.transition_depth(rt.image, rt.layout, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
+        self.transition_depth(
+            rt.image,
+            rt.layout,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+        );
         rt.layout = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
         let (load_op, clear_value) = depth_load_op(att.load);
         Some((
@@ -353,7 +376,10 @@ impl RenderCommands for VulkanCommandList {
         }
 
         let rendering_info = vk::RenderingInfo {
-            render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent },
+            render_area: vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent,
+            },
             layer_count: 1,
             color_attachment_count: count as u32,
             p_color_attachments: color_attachments.as_ptr(),
@@ -363,14 +389,18 @@ impl RenderCommands for VulkanCommandList {
             ..Default::default()
         };
         unsafe {
-            self.inner.dynamic_rendering.cmd_begin_rendering(self.cmd, &rendering_info);
+            self.inner
+                .dynamic_rendering
+                .cmd_begin_rendering(self.cmd, &rendering_info);
         }
     }
 
     fn set_pipeline(&mut self, pipeline: PipelineHandle) {
         let pipelines = self.pipelines.lock().unwrap();
-        let Some(VulkanPipeline::Graphics { layout, pipeline: vk_pipeline }) =
-            pipelines.get(pipeline)
+        let Some(VulkanPipeline::Graphics {
+            layout,
+            pipeline: vk_pipeline,
+        }) = pipelines.get(pipeline)
         else {
             // Stale handle, or a compute pipeline used where a graphics
             // pipeline is required: leave the current binding unchanged.
@@ -379,7 +409,11 @@ impl RenderCommands for VulkanCommandList {
         let (layout, vk_pipeline) = (*layout, *vk_pipeline);
         drop(pipelines);
         unsafe {
-            self.inner.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::GRAPHICS, vk_pipeline);
+            self.inner.device.cmd_bind_pipeline(
+                self.cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                vk_pipeline,
+            );
             self.inner.device.cmd_bind_descriptor_sets(
                 self.cmd,
                 vk::PipelineBindPoint::GRAPHICS,
@@ -403,11 +437,20 @@ impl RenderCommands for VulkanCommandList {
         };
         let scissor = match vs.scissor {
             Some(r) => vk::Rect2D {
-                offset: vk::Offset2D { x: r.x as i32, y: r.y as i32 },
-                extent: vk::Extent2D { width: r.width as u32, height: r.height as u32 },
+                offset: vk::Offset2D {
+                    x: r.x as i32,
+                    y: r.y as i32,
+                },
+                extent: vk::Extent2D {
+                    width: r.width as u32,
+                    height: r.height as u32,
+                },
             },
             None => vk::Rect2D {
-                offset: vk::Offset2D { x: vs.viewport.x as i32, y: vs.viewport.y as i32 },
+                offset: vk::Offset2D {
+                    x: vs.viewport.x as i32,
+                    y: vs.viewport.y as i32,
+                },
                 extent: vk::Extent2D {
                     width: vs.viewport.width as u32,
                     height: vs.viewport.height as u32,
@@ -473,7 +516,9 @@ impl RenderCommands for VulkanCommandList {
         let vk_buf = buf.buffer;
         drop(buffers);
         unsafe {
-            self.inner.device.cmd_bind_vertex_buffers(self.cmd, slot, &[vk_buf], &[0]);
+            self.inner
+                .device
+                .cmd_bind_vertex_buffers(self.cmd, slot, &[vk_buf], &[0]);
         }
     }
 
@@ -485,7 +530,9 @@ impl RenderCommands for VulkanCommandList {
         let vk_buf = buf.buffer;
         drop(buffers);
         unsafe {
-            self.inner.device.cmd_bind_index_buffer(self.cmd, vk_buf, 0, vk::IndexType::UINT32);
+            self.inner
+                .device
+                .cmd_bind_index_buffer(self.cmd, vk_buf, 0, vk::IndexType::UINT32);
         }
     }
 
@@ -518,7 +565,8 @@ impl RenderCommands for VulkanCommandList {
         unsafe {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
         }
-        let pending = std::mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
+        let pending =
+            std::mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
         for target in pending.into_iter().flatten() {
             let mut targets = self.render_targets.lock().unwrap();
             if let Some(rt) = targets.get_mut(target) {

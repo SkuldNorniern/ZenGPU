@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use zengpu::{
-    AdapterRequest, BufferPool, DeviceArray, DeviceRequest, DType, ElementwiseKernels, GemmKernel,
+    AdapterRequest, BufferPool, DType, DeviceArray, DeviceRequest, ElementwiseKernels, GemmKernel,
     GpuDevice, GpuInstance, VulkanInstance,
 };
 
@@ -48,8 +48,18 @@ fn lower_and_run(
     for (id, op) in graph.nodes.iter().enumerate() {
         let value = match *op {
             Op::Input(i) => inputs[i].clone(),
-            Op::Matmul(a, b) => gemm.gemm(device, pool, values[a].as_ref().unwrap(), values[b].as_ref().unwrap())?,
-            Op::Add(a, b) => ew.add(device, pool, values[a].as_ref().unwrap(), values[b].as_ref().unwrap())?,
+            Op::Matmul(a, b) => gemm.gemm(
+                device,
+                pool,
+                values[a].as_ref().unwrap(),
+                values[b].as_ref().unwrap(),
+            )?,
+            Op::Add(a, b) => ew.add(
+                device,
+                pool,
+                values[a].as_ref().unwrap(),
+                values[b].as_ref().unwrap(),
+            )?,
             Op::Relu(a) => ew.relu(device, pool, values[a].as_ref().unwrap())?,
         };
         values[id] = Some(value);

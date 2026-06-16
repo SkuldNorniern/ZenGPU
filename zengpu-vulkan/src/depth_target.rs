@@ -41,7 +41,11 @@ impl DepthTarget {
                 &vk::ImageCreateInfo {
                     image_type: vk::ImageType::TYPE_2D,
                     format: DEPTH_FORMAT,
-                    extent: vk::Extent3D { width, height, depth: 1 },
+                    extent: vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    },
                     mip_levels: 1,
                     array_layers: 1,
                     samples: vk::SampleCountFlags::TYPE_1,
@@ -100,7 +104,13 @@ impl DepthTarget {
         }
         .map_err(|e| GpuError::Backend(format!("create depth view: {e}")))?;
 
-        Ok(Self { inner, image, memory, view, extent })
+        Ok(Self {
+            inner,
+            image,
+            memory,
+            view,
+            extent,
+        })
     }
 
     pub fn format(&self) -> zengpu_hal::Format {
@@ -145,7 +155,9 @@ fn find_memory_type(
     (0..props.memory_type_count)
         .find(|&i| {
             (type_filter & (1 << i)) != 0
-                && props.memory_types[i as usize].property_flags.contains(required)
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(required)
         })
         .ok_or_else(|| GpuError::Backend("no device-local memory type for depth".to_string()))
 }

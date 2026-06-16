@@ -9,15 +9,15 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
-use zengpu::vulkan::{ash, vk};
 use inline_spirv::inline_spirv;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
+use zengpu::vulkan::{ash, vk};
 use zengpu::{
-    BeginFrame, DeviceContext, DeviceRequest, Format, GpuError, PresentMode, Result,
-    SurfaceConfig, Swapchain, VulkanDevice, VulkanInstance, WindowHandles,
+    BeginFrame, DeviceContext, DeviceRequest, Format, GpuError, PresentMode, Result, SurfaceConfig,
+    Swapchain, VulkanDevice, VulkanInstance, WindowHandles,
 };
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
@@ -192,12 +192,16 @@ impl CubeSurface {
         let swapchain = Swapchain::new(device, handles, config, 2)?;
         let ctx = swapchain.context();
 
-        let render_pass = create_render_pass(&ctx, zengpu::vulkan::to_vk_format(swapchain.format()))?;
+        let render_pass =
+            create_render_pass(&ctx, zengpu::vulkan::to_vk_format(swapchain.format()))?;
         let pipeline_layout = create_pipeline_layout(&ctx)?;
         let pipeline = create_pipeline(&ctx, render_pass, pipeline_layout)?;
 
-        let (vertex_buf, vertex_mem) =
-            create_host_buffer(&ctx, as_bytes(vertices), vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (vertex_buf, vertex_mem) = create_host_buffer(
+            &ctx,
+            as_bytes(vertices),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
         let (index_buf, index_mem) =
             create_host_buffer(&ctx, as_bytes(indices), vk::BufferUsageFlags::INDEX_BUFFER)?;
 
@@ -231,7 +235,15 @@ impl CubeSurface {
         let targets = self.targets.lock().unwrap();
         let cmd = self.swapchain.cmd_buffer(current);
         let (sw, sh) = self.swapchain.extent();
-        self.record(cmd, targets[index as usize].framebuffer, vk::Extent2D { width: sw, height: sh }, mvp)?;
+        self.record(
+            cmd,
+            targets[index as usize].framebuffer,
+            vk::Extent2D {
+                width: sw,
+                height: sh,
+            },
+            mvp,
+        )?;
         drop(targets);
         if self.swapchain.end_frame(&frame, cmd)? {
             self.rebuild_targets()?;
@@ -258,9 +270,16 @@ impl CubeSurface {
             .map_err(|e| GpuError::Backend(format!("begin_command_buffer: {e}")))?;
         }
         let clears = [
-            vk::ClearValue { color: vk::ClearColorValue { float32: [0.02, 0.02, 0.05, 1.0] } },
             vk::ClearValue {
-                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                color: vk::ClearColorValue {
+                    float32: [0.02, 0.02, 0.05, 1.0],
+                },
+            },
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
             },
         ];
         unsafe {
@@ -297,7 +316,10 @@ impl CubeSurface {
             dev.cmd_set_scissor(
                 cmd,
                 0,
-                &[vk::Rect2D { offset: vk::Offset2D::default(), extent }],
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                }],
             );
             dev.cmd_push_constants(
                 cmd,
@@ -368,7 +390,10 @@ fn build_targets(
 ) -> Result<Vec<FrameTarget>> {
     let dev = ctx.device();
     let (sw, sh) = swapchain.extent();
-    let extent = vk::Extent2D { width: sw, height: sh };
+    let extent = vk::Extent2D {
+        width: sw,
+        height: sh,
+    };
     swapchain
         .image_views()
         .into_iter()
@@ -390,7 +415,12 @@ fn build_targets(
                 )
             }
             .map_err(|e| GpuError::Backend(format!("create_framebuffer: {e}")))?;
-            Ok(FrameTarget { framebuffer, depth_image, depth_view, depth_mem })
+            Ok(FrameTarget {
+                framebuffer,
+                depth_image,
+                depth_view,
+                depth_mem,
+            })
         })
         .collect()
 }
@@ -434,9 +464,12 @@ fn create_depth(
     .map_err(|e| GpuError::Backend(format!("depth create_image: {e}")))?;
 
     let reqs = unsafe { dev.get_image_memory_requirements(image) };
-    let type_index =
-        find_memory_type(ctx, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            .ok_or_else(|| GpuError::Backend("no device-local memory for depth".to_string()))?;
+    let type_index = find_memory_type(
+        ctx,
+        reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .ok_or_else(|| GpuError::Backend("no device-local memory for depth".to_string()))?;
     let memory = unsafe {
         dev.allocate_memory(
             &vk::MemoryAllocateInfo {
@@ -499,8 +532,10 @@ fn create_render_pass(ctx: &DeviceContext, color_format: vk::Format) -> Result<v
             ..Default::default()
         },
     ];
-    let color_ref =
-        vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL };
+    let color_ref = vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    };
     let depth_ref = vk::AttachmentReference {
         attachment: 1,
         layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -739,15 +774,12 @@ fn find_memory_type(
 ) -> Option<u32> {
     let mem = ctx.memory_properties();
     (0..mem.memory_type_count).find(|&i| {
-        type_bits & (1 << i) != 0
-            && mem.memory_types[i as usize].property_flags.contains(props)
+        type_bits & (1 << i) != 0 && mem.memory_types[i as usize].property_flags.contains(props)
     })
 }
 
 fn as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
-    unsafe {
-        std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice))
-    }
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
 // ── winit application ─────────────────────────────────────────────────────────
@@ -782,8 +814,12 @@ impl ApplicationHandler for App {
             .expect("create window");
         let size = window.inner_size();
         let instance = VulkanInstance::new_with_surface().expect("vulkan instance");
-        let adapter = instance.request_vulkan_adapter().expect("no vulkan adapter");
-        let device = adapter.open_with_surface(DeviceRequest::default()).expect("open device");
+        let adapter = instance
+            .request_vulkan_adapter()
+            .expect("no vulkan adapter");
+        let device = adapter
+            .open_with_surface(DeviceRequest::default())
+            .expect("open device");
         let handles = WindowHandles::from_window(&window).expect("window handles");
         let surface = CubeSurface::new(
             &device,
@@ -818,7 +854,8 @@ impl ApplicationHandler for App {
                     let t = self.start.elapsed().as_secs_f32();
                     let model = mat_mul(&rotate_y(t * 0.6), &rotate_x(t * 0.3));
                     let view = translate(0.0, 0.0, -5.0);
-                    let proj = perspective(60f32.to_radians(), w as f32 / h.max(1) as f32, 0.1, 100.0);
+                    let proj =
+                        perspective(60f32.to_radians(), w as f32 / h.max(1) as f32, 0.1, 100.0);
                     let mvp = mat_mul(&proj, &mat_mul(&view, &model));
                     let _ = surface.present(&mvp);
                     window.request_redraw();
