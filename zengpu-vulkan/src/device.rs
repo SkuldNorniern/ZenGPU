@@ -1,6 +1,5 @@
 //! Vulkan logical device and buffer operations.
 
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::{Device, khr, vk};
@@ -38,8 +37,14 @@ unsafe impl Sync for BindlessState {}
 /// A compute or graphics pipeline. Both kinds share one [`PipelineHandle`]
 /// slotmap (the HAL has a single `PipelineHandle` type for both).
 pub(crate) enum VulkanPipeline {
-    Compute { layout: vk::PipelineLayout, pipeline: vk::Pipeline },
-    Graphics { layout: vk::PipelineLayout, pipeline: vk::Pipeline },
+    Compute {
+        layout: vk::PipelineLayout,
+        pipeline: vk::Pipeline,
+    },
+    Graphics {
+        layout: vk::PipelineLayout,
+        pipeline: vk::Pipeline,
+    },
 }
 
 impl VulkanPipeline {
@@ -118,7 +123,7 @@ unsafe impl Sync for VulkanTexture {}
 pub struct VulkanDevice {
     pub(crate) inner: Arc<VulkanDeviceInner>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
-    pub(crate) textures: Mutex<SlotMap<marker::Texture, VulkanTexture>>,
+    pub(crate) textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
     samplers: Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
     shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
@@ -127,9 +132,6 @@ pub struct VulkanDevice {
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
-    /// Wrapping counter for [`bind_raw_image_view`](Self::bind_raw_image_view)
-    /// slots in `[EXTERNAL_SLOT_BASE, MAX_BINDLESS_TEXTURES)`.
-    ext_slot_counter: AtomicU32,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -193,8 +195,7 @@ impl VulkanDevice {
             ..Default::default()
         };
 
-        let supported_features =
-            unsafe { shared.instance.get_physical_device_features(physical) };
+        let supported_features = unsafe { shared.instance.get_physical_device_features(physical) };
         let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
 
         // Enable Vulkan 1.2 descriptor-indexing features for bindless resources.
@@ -262,14 +263,13 @@ impl VulkanDevice {
         Ok(Self {
             inner,
             buffers: Arc::new(Mutex::new(SlotMap::new())),
-            textures: Mutex::new(SlotMap::new()),
+            textures: Arc::new(Mutex::new(SlotMap::new())),
             samplers: Mutex::new(SlotMap::new()),
             shaders: Mutex::new(SlotMap::new()),
             pipelines: Arc::new(Mutex::new(SlotMap::new())),
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
             cmd_list_pool,
-            ext_slot_counter: AtomicU32::new(0),
         })
     }
 
@@ -286,12 +286,7 @@ impl VulkanDevice {
         physical: vk::PhysicalDevice,
         req: DeviceRequest,
     ) -> Result<Self> {
-        Self::create(
-            shared,
-            physical,
-            req,
-            &[ash::khr::swapchain::NAME.as_ptr()],
-        )
+        Self::create(shared, physical, req, &[ash::khr::swapchain::NAME.as_ptr()])
     }
 
     fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
@@ -433,50 +428,6 @@ impl VulkanDevice {
         }
         Some(texture.index())
     }
-
-    /// Bind a raw image view (e.g. from an [`crate::OffscreenTarget`]) into the
-    /// global bindless texture table using a slot in the reserved external range
-    /// `[512, 1024)`. Slots wrap within that range; the image must already be in
-    /// `SHADER_READ_ONLY_OPTIMAL`. Returns the assigned slot index.
-    ///
-    /// Prefer [`bind_texture`](Self::bind_texture) for device-owned textures.
-    /// This escape hatch is for caller-owned render targets that do not have a
-    /// `TextureHandle` (plan.md P8-A step 7 will replace it with a proper API).
-    pub fn bind_raw_image_view(&self, view: vk::ImageView, sampler: vk::Sampler) -> u32 {
-        const EXTERNAL_SLOT_BASE: u32 = 512;
-        const EXTERNAL_SLOT_COUNT: u32 = MAX_BINDLESS_TEXTURES - EXTERNAL_SLOT_BASE;
-        let idx = self.ext_slot_counter.fetch_add(1, Ordering::Relaxed);
-        let slot = EXTERNAL_SLOT_BASE + (idx % EXTERNAL_SLOT_COUNT);
-        let info = vk::DescriptorImageInfo {
-            sampler,
-            image_view: view,
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        };
-        let write = vk::WriteDescriptorSet {
-            dst_set: self.bindless.set,
-            dst_binding: 1,
-            dst_array_element: slot,
-            descriptor_count: 1,
-            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            p_image_info: &info,
-            ..Default::default()
-        };
-        unsafe {
-            self.inner.device.update_descriptor_sets(&[write], &[]);
-        }
-        slot
-    }
-
-    /// Raw `vk::ImageView` for a HAL texture handle. For user-side pipelines that
-    /// need to bind textures into descriptor sets (e.g. bindless arrays).
-    pub fn texture_view(&self, handle: TextureHandle) -> Option<vk::ImageView> {
-        self.textures.lock().unwrap().get(handle).map(|t| t.view)
-    }
-
-    /// Raw `vk::Sampler` for a HAL sampler handle.
-    pub fn sampler_vk(&self, handle: SamplerHandle) -> Option<vk::Sampler> {
-        self.samplers.lock().unwrap().get(handle).copied()
-    }
 }
 
 fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
@@ -496,10 +447,8 @@ fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
             ..Default::default()
         },
     ];
-    let binding_flags = [
-        vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
-        2
-    ];
+    let binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND
+        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; 2];
     let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
         binding_count: binding_flags.len() as u32,
         p_binding_flags: binding_flags.as_ptr(),
@@ -682,8 +631,7 @@ impl GpuDevice for VulkanDevice {
                 .map_err(|e| GpuError::Backend(format!("vkCreateBuffer: {e}")))?
         };
 
-        let mem_reqs =
-            unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
+        let mem_reqs = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
 
         let preferred_flags = memory_usage_to_vk(desc.memory);
         let type_index = self
@@ -724,9 +672,7 @@ impl GpuDevice for VulkanDevice {
             }
         };
 
-        if let Err(e) = unsafe {
-            self.inner.device.bind_buffer_memory(buffer, memory, 0)
-        } {
+        if let Err(e) = unsafe { self.inner.device.bind_buffer_memory(buffer, memory, 0) } {
             unsafe {
                 self.inner.device.destroy_buffer(buffer, None);
                 self.inner.device.free_memory(memory, None);
@@ -739,12 +685,9 @@ impl GpuDevice for VulkanDevice {
 
         let mapped = if is_host_visible {
             match unsafe {
-                self.inner.device.map_memory(
-                    memory,
-                    0,
-                    desc.size,
-                    vk::MemoryMapFlags::empty(),
-                )
+                self.inner
+                    .device
+                    .map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
             } {
                 Ok(ptr) => ptr as *mut u8,
                 Err(e) => {
@@ -790,10 +733,9 @@ impl GpuDevice for VulkanDevice {
             )))
         })?;
         if end > buf.size as usize {
-            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
-                "range {start}..{end} exceeds buffer size {}",
-                buf.size
-            ))));
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!("range {start}..{end} exceeds buffer size {}", buf.size),
+            )));
         }
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.mapped.add(start), data.len());
@@ -824,10 +766,9 @@ impl GpuDevice for VulkanDevice {
             )))
         })?;
         if end > buf.size as usize {
-            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
-                "range {start}..{end} exceeds buffer size {}",
-                buf.size
-            ))));
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!("range {start}..{end} exceeds buffer size {}", buf.size),
+            )));
         }
         let mut out = vec![0u8; len as usize];
         unsafe {
@@ -873,7 +814,11 @@ impl GpuDevice for VulkanDevice {
         let image_info = vk::ImageCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             format,
-            extent: vk::Extent3D { width: desc.width, height: desc.height, depth: 1 },
+            extent: vk::Extent3D {
+                width: desc.width,
+                height: desc.height,
+                depth: 1,
+            },
             mip_levels: 1,
             array_layers: 1,
             samples: vk::SampleCountFlags::TYPE_1,
@@ -884,7 +829,9 @@ impl GpuDevice for VulkanDevice {
             ..Default::default()
         };
         let image = unsafe {
-            self.inner.device.create_image(&image_info, None)
+            self.inner
+                .device
+                .create_image(&image_info, None)
                 .map_err(|e| GpuError::Backend(format!("vkCreateImage: {e}")))?
         };
         let mem_reqs = unsafe { self.inner.device.get_image_memory_requirements(image) };
@@ -952,7 +899,10 @@ impl GpuDevice for VulkanDevice {
             view,
             memory,
             format,
-            extent: vk::Extent2D { width: desc.width, height: desc.height },
+            extent: vk::Extent2D {
+                width: desc.width,
+                height: desc.height,
+            },
         }))
     }
 
@@ -1090,7 +1040,9 @@ impl GpuDevice for VulkanDevice {
             ..Default::default()
         };
         let sampler = unsafe {
-            self.inner.device.create_sampler(&info, None)
+            self.inner
+                .device
+                .create_sampler(&info, None)
                 .map_err(|e| GpuError::Backend(format!("vkCreateSampler: {e}")))?
         };
         Ok(self.samplers.lock().unwrap().insert(sampler))
@@ -1135,16 +1087,18 @@ impl GpuDevice for VulkanDevice {
     fn destroy_shader(&self, shader: ShaderHandle) {
         let mut shaders = self.shaders.lock().unwrap();
         if let Some(m) = shaders.remove(shader) {
-            unsafe { self.inner.device.destroy_shader_module(m, None); }
+            unsafe {
+                self.inner.device.destroy_shader_module(m, None);
+            }
         }
     }
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
         let shader_module = {
             let shaders = self.shaders.lock().unwrap();
-            *shaders.get(desc.shader).ok_or_else(|| {
-                GpuError::PipelineCreation("stale shader handle".to_string())
-            })?
+            *shaders
+                .get(desc.shader)
+                .ok_or_else(|| GpuError::PipelineCreation("stale shader handle".to_string()))?
         };
 
         let pc_range = vk::PushConstantRange {
@@ -1192,10 +1146,17 @@ impl GpuDevice for VulkanDevice {
                 .pipelines
                 .lock()
                 .unwrap()
-                .insert(VulkanPipeline::Compute { layout, pipeline: pipelines[0] })),
+                .insert(VulkanPipeline::Compute {
+                    layout,
+                    pipeline: pipelines[0],
+                })),
             Err((_, e)) => {
-                unsafe { self.inner.device.destroy_pipeline_layout(layout, None); }
-                Err(GpuError::PipelineCreation(format!("vkCreateComputePipelines: {e}")))
+                unsafe {
+                    self.inner.device.destroy_pipeline_layout(layout, None);
+                }
+                Err(GpuError::PipelineCreation(format!(
+                    "vkCreateComputePipelines: {e}"
+                )))
             }
         }
     }
@@ -1259,13 +1220,7 @@ impl GpuDevice for VulkanDevice {
                     &[],
                 );
                 if !pc.is_empty() {
-                    dev.cmd_push_constants(
-                        cmd,
-                        vk_layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        &pc,
-                    );
+                    dev.cmd_push_constants(cmd, vk_layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
                 }
                 dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
             }
@@ -1373,7 +1328,11 @@ impl VulkanDevice {
 
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
             depth_test_enable: if desc.depth.test { vk::TRUE } else { vk::FALSE },
-            depth_write_enable: if desc.depth.write { vk::TRUE } else { vk::FALSE },
+            depth_write_enable: if desc.depth.write {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
             depth_compare_op: vk::CompareOp::LESS,
             ..Default::default()
         };
@@ -1442,16 +1401,21 @@ impl VulkanDevice {
         };
 
         let result = unsafe {
-            self.inner
-                .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
+            self.inner.device.create_graphics_pipelines(
+                vk::PipelineCache::null(),
+                &[create_info],
+                None,
+            )
         };
         match result {
             Ok(pipelines) => Ok(self
                 .pipelines
                 .lock()
                 .unwrap()
-                .insert(VulkanPipeline::Graphics { layout, pipeline: pipelines[0] })),
+                .insert(VulkanPipeline::Graphics {
+                    layout,
+                    pipeline: pipelines[0],
+                })),
             Err((_, e)) => {
                 unsafe {
                     self.inner.device.destroy_pipeline_layout(layout, None);
@@ -1485,13 +1449,16 @@ impl VulkanDevice {
     /// to drop the stale handle.
     pub fn register_depth_target(&self, depth: &crate::depth_target::DepthTarget) -> TargetHandle {
         let (width, height) = depth.extent();
-        self.render_targets.lock().unwrap().insert(VulkanRenderTarget {
-            image: depth.image(),
-            view: depth.view(),
-            format: crate::depth_target::DEPTH_FORMAT,
-            extent: vk::Extent2D { width, height },
-            layout: vk::ImageLayout::UNDEFINED,
-        })
+        self.render_targets
+            .lock()
+            .unwrap()
+            .insert(VulkanRenderTarget {
+                image: depth.image(),
+                view: depth.view(),
+                format: crate::depth_target::DEPTH_FORMAT,
+                extent: vk::Extent2D { width, height },
+                layout: vk::ImageLayout::UNDEFINED,
+            })
     }
 
     /// Register `texture`'s image/view as a render target for use as
@@ -1503,13 +1470,18 @@ impl VulkanDevice {
     pub fn register_color_target(&self, texture: TextureHandle) -> Option<TargetHandle> {
         let textures = self.textures.lock().unwrap();
         let tex = textures.get(texture)?;
-        Some(self.render_targets.lock().unwrap().insert(VulkanRenderTarget {
-            image: tex.image,
-            view: tex.view,
-            format: tex.format,
-            extent: tex.extent,
-            layout: vk::ImageLayout::UNDEFINED,
-        }))
+        Some(
+            self.render_targets
+                .lock()
+                .unwrap()
+                .insert(VulkanRenderTarget {
+                    image: tex.image,
+                    view: tex.view,
+                    format: tex.format,
+                    extent: tex.extent,
+                    layout: vk::ImageLayout::UNDEFINED,
+                }),
+        )
     }
 
     /// Drop a render-target registration created by [`register_depth_target`](Self::register_depth_target)
@@ -1523,7 +1495,11 @@ impl GraphicsDevice for VulkanDevice {
     type Surface = VulkanSurface;
     type CommandList = VulkanCommandList;
 
-    fn create_surface(&self, window: &WindowHandles, config: SurfaceConfig) -> Result<Self::Surface> {
+    fn create_surface(
+        &self,
+        window: &WindowHandles,
+        config: SurfaceConfig,
+    ) -> Result<Self::Surface> {
         VulkanSurface::new(self, window, config)
     }
 
@@ -1632,7 +1608,9 @@ impl Drop for VulkanDevice {
         }
         let mut shaders = self.shaders.lock().unwrap();
         for m in shaders.drain() {
-            unsafe { self.inner.device.destroy_shader_module(m, None); }
+            unsafe {
+                self.inner.device.destroy_shader_module(m, None);
+            }
         }
         let mut pipelines = self.pipelines.lock().unwrap();
         for p in pipelines.drain() {
@@ -1644,8 +1622,12 @@ impl Drop for VulkanDevice {
         }
         unsafe {
             // Pool destruction also frees all descriptor sets from the pool.
-            self.inner.device.destroy_descriptor_pool(self.bindless.pool, None);
-            self.inner.device.destroy_descriptor_set_layout(self.bindless.layout, None);
+            self.inner
+                .device
+                .destroy_descriptor_pool(self.bindless.pool, None);
+            self.inner
+                .device
+                .destroy_descriptor_set_layout(self.bindless.layout, None);
         }
     }
 }
@@ -1653,8 +1635,8 @@ impl Drop for VulkanDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
     use crate::instance::VulkanInstance;
+    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
 
     fn try_device() -> Option<Box<dyn GpuDevice>> {
         let inst = VulkanInstance::new().ok()?;
@@ -1692,7 +1674,10 @@ mod tests {
         let err = dev.read_buffer(h, 0, 4).unwrap_err();
         assert!(matches!(
             err,
-            GpuError::InvalidUsage(UsageError::MissingUsage { needed: "READBACK", .. })
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "READBACK",
+                ..
+            })
         ));
     }
 
