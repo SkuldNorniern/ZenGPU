@@ -47,7 +47,8 @@ const SHADER_SPV: &[u32] = inline_spirv!(
         }
     }
     "#,
-    comp, vulkan1_2
+    comp,
+    vulkan1_2
 );
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

@@ -76,7 +76,11 @@ pub struct FrameGraph {
 
 impl FrameGraph {
     pub fn new() -> Self {
-        Self { resources: Vec::new(), passes: Vec::new(), present_resource: None }
+        Self {
+            resources: Vec::new(),
+            passes: Vec::new(),
+            present_resource: None,
+        }
     }
 
     /// Register a color resource (image + view). `initial_layout` is the layout
@@ -183,11 +187,8 @@ impl FrameGraph {
     /// reads or writes. `record` is called with the command buffer; it should
     /// call `cmd_begin_render_pass`, record draw commands, and
     /// `cmd_end_render_pass`.
-    pub fn add_pass<F>(
-        &mut self,
-        attachments: &[(ResourceId, AttachmentUsage)],
-        record: F,
-    ) where
+    pub fn add_pass<F>(&mut self, attachments: &[(ResourceId, AttachmentUsage)], record: F)
+    where
         F: Fn(vk::CommandBuffer) -> Result<()> + 'static,
     {
         self.passes.push(PassDef {
@@ -348,8 +349,7 @@ impl FrameGraph {
             }
         }
 
-        let mut queue: VecDeque<usize> =
-            (0..n).filter(|&i| in_deg[i] == 0).collect();
+        let mut queue: VecDeque<usize> = (0..n).filter(|&i| in_deg[i] == 0).collect();
         let mut order = Vec::with_capacity(n);
         while let Some(u) = queue.pop_front() {
             order.push(u);
@@ -390,23 +390,26 @@ fn post_layout(usage: AttachmentUsage) -> vk::ImageLayout {
 
 fn src_info(layout: vk::ImageLayout) -> (vk::PipelineStageFlags, vk::AccessFlags) {
     match layout {
-        vk::ImageLayout::UNDEFINED => {
-            (vk::PipelineStageFlags::TOP_OF_PIPE, vk::AccessFlags::empty())
-        }
+        vk::ImageLayout::UNDEFINED => (
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::AccessFlags::empty(),
+        ),
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         ),
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => {
-            (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ)
-        }
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        ),
         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL => (
             vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         ),
-        vk::ImageLayout::PRESENT_SRC_KHR => {
-            (vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::AccessFlags::empty())
-        }
+        vk::ImageLayout::PRESENT_SRC_KHR => (
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            vk::AccessFlags::empty(),
+        ),
         _ => (
             vk::PipelineStageFlags::ALL_COMMANDS,
             vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
@@ -420,9 +423,10 @@ fn dst_info(usage: AttachmentUsage) -> (vk::PipelineStageFlags, vk::AccessFlags)
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         ),
-        AttachmentUsage::ShaderSample => {
-            (vk::PipelineStageFlags::FRAGMENT_SHADER, vk::AccessFlags::SHADER_READ)
-        }
+        AttachmentUsage::ShaderSample => (
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::AccessFlags::SHADER_READ,
+        ),
         AttachmentUsage::DepthWrite => (
             vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
             vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE

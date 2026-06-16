@@ -56,7 +56,12 @@ impl BufferPool {
     /// of the same byte size. Does not destroy the buffer.
     pub fn free(&self, array: DeviceArray) {
         let size = array.size_bytes();
-        self.free.lock().unwrap().entry(size).or_default().push(array.buffer);
+        self.free
+            .lock()
+            .unwrap()
+            .entry(size)
+            .or_default()
+            .push(array.buffer);
     }
 }
 

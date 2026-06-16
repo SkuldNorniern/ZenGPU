@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use ash::{vk, Entry, Instance};
+use ash::{Entry, Instance, vk};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuError, GpuInstance,
     PowerPreference,

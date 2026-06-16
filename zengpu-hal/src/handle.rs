@@ -158,7 +158,9 @@ impl<K, V> SlotMap<K, V> {
 
     /// Mutably get a live value by raw slot index.
     pub fn get_mut_by_slot_index(&mut self, idx: u32) -> Option<&mut V> {
-        self.slots.get_mut(idx as usize).and_then(|s| s.value.as_mut())
+        self.slots
+            .get_mut(idx as usize)
+            .and_then(|s| s.value.as_mut())
     }
 
     /// Number of live values.

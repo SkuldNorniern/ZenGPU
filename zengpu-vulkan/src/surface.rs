@@ -7,11 +7,11 @@ use std::sync::{Arc, Mutex};
 
 use ash::vk;
 use zengpu_hal::{
-    Acquire, Frame, GpuError, Result, SlotMap, Surface, SurfaceConfig, TargetHandle,
-    WindowHandles, marker,
+    Acquire, Frame, GpuError, Result, SlotMap, Surface, SurfaceConfig, TargetHandle, WindowHandles,
+    marker,
 };
 
-use crate::command_list::{CmdListPool, VulkanCommandList, COLOR_SUBRESOURCE};
+use crate::command_list::{COLOR_SUBRESOURCE, CmdListPool, VulkanCommandList};
 use crate::device::{VulkanDevice, VulkanDeviceInner, VulkanRenderTarget};
 use crate::swapchain::{BeginFrame, Swapchain};
 
