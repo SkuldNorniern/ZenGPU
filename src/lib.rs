@@ -14,6 +14,17 @@
 /// Backend-independent types, handles and errors. Always available.
 pub use zengpu_hal as hal;
 
+/// Compile GLSL to SPIR-V at build time. Re-exports `zengpu_spirv`.
+pub use zengpu_spirv as spirv;
+
+/// Compile GLSL shader source to SPIR-V at build time.
+#[macro_export]
+macro_rules! zengpu_spirv {
+    ($($tt:tt)*) => {
+        ::zengpu_spirv::zengpu_spirv!($($tt)*)
+    };
+}
+
 pub use zengpu_hal::{
     Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,
     BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputePipelineDesc, DType,
