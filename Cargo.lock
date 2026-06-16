@@ -1934,6 +1934,7 @@ name = "zengpu-spirv"
 version = "0.0.1"
 dependencies = [
  "inline-spirv",
+ "zengpu-hal",
  "zengpu-spirv-proc",
 ]
 

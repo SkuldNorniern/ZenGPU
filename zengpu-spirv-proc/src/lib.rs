@@ -14,7 +14,8 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::quote;
 use syn::{
-    Attribute, ItemFn, Meta, parse::Parse, parse::ParseStream, parse_macro_input, spanned::Spanned,
+    Attribute, DeriveInput, ItemFn, Meta, parse::Parse, parse::ParseStream, parse_macro_input,
+    spanned::Spanned,
 };
 
 use ast::{Stage, ZslEntryPoint};
@@ -126,6 +127,76 @@ fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
         .into_iter()
         .map(|(span, msg)| syn::Error::new(span, msg).to_compile_error())
         .collect()
+}
+
+/// Derive `to_scalars()` for a push-constant struct.
+///
+/// Every field must be `u32`, `i32`, or `f32`. The generated method returns a
+/// fixed-size array of [`zengpu_hal::Scalar`] in field-declaration order,
+/// suitable for passing as `Bindings::scalars` in a dispatch call.
+///
+/// Import via `use zengpu_spirv::ZslPushConst;`.
+#[proc_macro_derive(ZslPushConst)]
+pub fn derive_zsl_push_const(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as DeriveInput);
+    push_const_impl(input)
+        .unwrap_or_else(|e| e.to_compile_error())
+        .into()
+}
+
+fn push_const_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let name = &input.ident;
+
+    let syn::Data::Struct(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(ZslPushConst)] only supports structs",
+        ));
+    };
+
+    let syn::Fields::Named(fields) = &data.fields else {
+        return Err(syn::Error::new_spanned(
+            &input.ident,
+            "#[derive(ZslPushConst)] requires named fields",
+        ));
+    };
+
+    let mut exprs: Vec<proc_macro2::TokenStream> = Vec::new();
+    for field in &fields.named {
+        let fname = field.ident.as_ref().unwrap();
+        let expr = scalar_field_expr(&field.ty, fname)?;
+        exprs.push(expr);
+    }
+
+    let n = exprs.len();
+    Ok(quote! {
+        impl #name {
+            pub fn to_scalars(&self) -> [::zengpu_spirv::_zsl_priv::Scalar; #n] {
+                [#(#exprs),*]
+            }
+        }
+    })
+}
+
+fn scalar_field_expr(ty: &syn::Type, fname: &syn::Ident) -> syn::Result<proc_macro2::TokenStream> {
+    let syn::Type::Path(tp) = ty else {
+        return Err(syn::Error::new_spanned(
+            ty,
+            "ZslPushConst fields must be u32, i32, or f32",
+        ));
+    };
+    if tp.path.is_ident("u32") {
+        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::U32(self.#fname)))
+    } else if tp.path.is_ident("i32") {
+        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::I32(self.#fname)))
+    } else if tp.path.is_ident("f32") {
+        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname)))
+    } else {
+        Err(syn::Error::new_spanned(
+            ty,
+            "ZslPushConst fields must be u32, i32, or f32",
+        ))
+    }
 }
 
 /// Internal proc-macro invoked by `zengpu_spirv!` when ZSL input is detected.
