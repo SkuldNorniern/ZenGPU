@@ -2,16 +2,16 @@
 //!
 //! f32 only; other dtypes fail with [`GpuError::Dispatch`].
 
-use inline_spirv::inline_spirv;
 use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
     ShaderDesc, ShaderHandle,
 };
+use zengpu_spirv::zengpu_spirv;
 
 use crate::{BufferPool, DeviceArray};
 
 /// `out[i] = a[i] + b[i]` (matches `ZenGPU/examples/vec_add.rs`).
-const ADD_SPV: &[u32] = inline_spirv!(
+const ADD_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     #extension GL_EXT_nonuniform_qualifier : require
@@ -39,7 +39,7 @@ const ADD_SPV: &[u32] = inline_spirv!(
     vulkan1_2
 );
 
-const RELU_SPV: &[u32] = inline_spirv!(
+const RELU_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     #extension GL_EXT_nonuniform_qualifier : require
