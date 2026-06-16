@@ -60,6 +60,7 @@ zengpu-compute = { workspace = true, optional = true }
 zengpu-blas = { workspace = true, optional = true }
 
 [dev-dependencies]
+ash = "0.38"
 inline-spirv.workspace = true
 winit = "0.30"
 
