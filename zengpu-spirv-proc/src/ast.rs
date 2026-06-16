@@ -35,9 +35,11 @@ pub struct ZslParam {
 
 #[derive(Debug)]
 pub struct ZslEntryPoint {
+    #[allow(dead_code)]
     pub stage: Stage,
     pub ident: Ident,
     pub params: Vec<ZslParam>,
+    #[allow(dead_code)]
     pub ret: ZslType,
 }
 
