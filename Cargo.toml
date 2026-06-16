@@ -63,7 +63,6 @@ zengpu-spirv.workspace = true
 
 [dev-dependencies]
 ash = "0.38"
-inline-spirv.workspace = true
 winit = "0.30"
 
 [package.metadata.docs.rs]
