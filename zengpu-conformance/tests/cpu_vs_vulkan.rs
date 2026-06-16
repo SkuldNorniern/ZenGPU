@@ -2,16 +2,16 @@
 //!
 //! Each test gracefully skips if no Vulkan driver is present.
 
-use inline_spirv::inline_spirv;
 use zengpu_conformance::{compare_full, compare_vec_add, run_buffer_suite};
 use zengpu_cpu::CpuDevice;
 use zengpu_hal::{
     AdapterRequest, ComputePipelineDesc, DeviceRequest, GpuDevice, GpuInstance, ShaderDesc,
 };
+use zengpu_spirv::zengpu_spirv;
 use zengpu_vulkan::VulkanInstance;
 
 /// vec_add: out[i] = a[i] + b[i] for i in 0..len (matches `ZenGPU/examples/vec_add.rs`).
-const VEC_ADD_SPV: &[u32] = inline_spirv!(
+const VEC_ADD_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     #extension GL_EXT_nonuniform_qualifier : require
