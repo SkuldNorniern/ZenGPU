@@ -3,15 +3,15 @@
 //! Vendor libraries (cuBLAS, rocBLAS, oneMKL, MPS) are not used. [`GemmKernel::gemm`] is a portable
 //! single-dispatch f32 GEMM over [`DeviceArray`]s.
 
-use inline_spirv::inline_spirv;
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
     ShaderDesc, ShaderHandle,
 };
+use zengpu_spirv::zengpu_spirv;
 
 /// Computes `C[m,n] = sum_k A[m,k] * B[k,n]` in untiled f32.
-const GEMM_SPV: &[u32] = inline_spirv!(
+const GEMM_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     #extension GL_EXT_nonuniform_qualifier : require
