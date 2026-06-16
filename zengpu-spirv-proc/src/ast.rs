@@ -39,9 +39,13 @@ pub struct ZslParam {
 /// The fully-parsed ZSL entry point — ready for SPIR-V lowering (step 4).
 #[derive(Debug)]
 pub struct ZslEntryPoint {
+    // stage/ret read by the lib.rs dispatch; dead_code lint fires because the
+    // fields are pub and the lint doesn't see cross-module reads in proc-macros.
+    #[allow(dead_code)]
     pub stage: Stage,
     pub ident: Ident,
     pub params: Vec<ZslParam>,
+    #[allow(dead_code)]
     pub ret: ZslType,
 }
 
