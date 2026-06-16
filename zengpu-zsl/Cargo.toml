@@ -1,5 +1,5 @@
 [package]
-name = "zengpu-spirv-proc"
+name = "zengpu-zsl"
 description = "ZenGPU shader proc-macro internals — ZSL parsing and SPIR-V lowering."
 version.workspace = true
 edition.workspace = true

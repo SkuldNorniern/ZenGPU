@@ -29,9 +29,9 @@
 #[doc(hidden)]
 pub use inline_spirv;
 
-/// Re-export so that `$crate::zengpu_spirv_proc` resolves inside `zengpu_spirv!`.
+/// Re-export so that `$crate::zengpu_zsl` resolves inside `zengpu_spirv!`.
 #[doc(hidden)]
-pub use zengpu_spirv_proc;
+pub use zengpu_zsl;
 
 /// Private re-exports referenced by code emitted by `#[derive(ZslPushConst)]`.
 /// Semver-exempt; do not use directly.
@@ -63,7 +63,7 @@ pub mod _zsl_priv {
 ///     ..Default::default()
 /// }, [16, 1, 1])?;
 /// ```
-pub use zengpu_spirv_proc::ZslPushConst;
+pub use zengpu_zsl::ZslPushConst;
 
 /// Compile shader source to SPIR-V at build time.
 ///
@@ -86,7 +86,7 @@ pub use zengpu_spirv_proc::ZslPushConst;
 macro_rules! zengpu_spirv {
     // ZSL path: input starts with an outer attribute (#[vertex/fragment/compute] fn ...)
     (#[$attr:meta] $($rest:tt)*) => {
-        $crate::zengpu_spirv_proc::zsl_spirv!(#[$attr] $($rest)*)
+        $crate::zengpu_zsl::zsl_spirv!(#[$attr] $($rest)*)
     };
     // GLSL path: string literal + stage token (existing inline_spirv behaviour)
     ($($tt:tt)*) => {
