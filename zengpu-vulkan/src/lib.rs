@@ -11,8 +11,6 @@ pub(crate) mod surface;
 pub mod swapchain;
 
 pub use adapter::VulkanAdapter;
-pub use ash;
-pub use ash::vk;
 pub use command_list::VulkanCommandList;
 pub use depth_target::{DEPTH_FORMAT, DepthTarget};
 pub use device::VulkanDevice;
@@ -21,6 +19,8 @@ pub use instance::VulkanInstance;
 pub use offscreen::OffscreenTarget;
 pub use surface::{VulkanFrame, VulkanSurface};
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
+
+use ash::vk;
 
 // ── Format conversion ─────────────────────────────────────────────────────────
 
