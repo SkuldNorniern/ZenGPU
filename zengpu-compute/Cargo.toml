@@ -13,4 +13,4 @@ categories.workspace = true
 
 [dependencies]
 zengpu-hal.workspace = true
-inline-spirv.workspace = true
+zengpu-spirv.workspace = true
