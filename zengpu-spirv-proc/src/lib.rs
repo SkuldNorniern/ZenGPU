@@ -2,10 +2,18 @@
 
 extern crate proc_macro;
 
+mod ast;
+mod types;
+
 use proc_macro::TokenStream;
 use proc_macro2::Span;
-use syn::{Attribute, ItemFn, parse::Parse, parse::ParseStream, parse_macro_input};
+use syn::{
+    Attribute, ItemFn, parse::Parse, parse::ParseStream, parse_macro_input, spanned::Spanned,
+};
 
+use ast::{Stage, ZslEntryPoint};
+
+/// ZSL input: outer attributes and a fn item.
 struct ZslInput {
     attrs: Vec<Attribute>,
     func: ItemFn,
@@ -20,47 +28,67 @@ impl Parse for ZslInput {
     }
 }
 
-fn stage_from_attrs(attrs: &[Attribute]) -> Option<&'static str> {
+fn stage_from_attrs(attrs: &[Attribute]) -> Result<Stage, (Span, String)> {
     for attr in attrs {
         if attr.path().is_ident("vertex") {
-            return Some("vertex");
+            return Ok(Stage::Vertex);
         }
         if attr.path().is_ident("fragment") {
-            return Some("fragment");
+            return Ok(Stage::Fragment);
         }
         if attr.path().is_ident("compute") {
-            return Some("compute");
+            return Ok(Stage::Compute);
         }
     }
-    None
+    Err((
+        Span::call_site(),
+        "zengpu_spirv!: ZSL entry point must have a \
+         #[vertex], #[fragment], or #[compute] attribute"
+            .to_string(),
+    ))
 }
 
-/// Internal proc-macro for ZSL input. Validates the stage attribute and entry-point signature.
+fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
+    errors
+        .into_iter()
+        .map(|(span, msg)| syn::Error::new(span, msg).to_compile_error())
+        .collect()
+}
+
+/// Internal proc-macro for ZSL input. Checks the entry point's param and return types (Vec2/3/4,
+/// Mat4, Buf<T>, BufMut<T>, f32).
 #[proc_macro]
 pub fn zsl_spirv(input: TokenStream) -> TokenStream {
     let parsed = parse_macro_input!(input as ZslInput);
 
     let stage = match stage_from_attrs(&parsed.attrs) {
-        Some(s) => s,
-        None => {
-            return syn::Error::new(
-                Span::call_site(),
-                "zengpu_spirv!: ZSL entry point must have a #[vertex], #[fragment], \
-                 or #[compute] attribute",
-            )
-            .to_compile_error()
-            .into();
+        Ok(s) => s,
+        Err((span, msg)) => {
+            return syn::Error::new(span, msg).to_compile_error().into();
         }
     };
 
-    let fn_name = &parsed.func.sig.ident;
+    let entry = match ZslEntryPoint::from_fn(stage, &parsed.func) {
+        Ok(e) => e,
+        Err(errs) => return errors_to_ts(errs).into(),
+    };
+
+    let fn_name = &entry.ident;
+    let stage_name = entry.stage.name();
+    let param_summary: Vec<String> = entry
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.ident, p.ty.display()))
+        .collect();
+
     let msg = format!(
-        "zengpu_spirv!: ZSL codegen not yet implemented (step 3). \
-         Entry point `{fn_name}` with stage `{stage}` was parsed successfully. \
-         Use GLSL string input until ZSL lowering lands."
+        "zengpu_spirv!: ZSL SPIR-V lowering not yet implemented (step 4). \
+         Parsed `{fn_name}` ({stage_name}): params: [{}] → {}",
+        param_summary.join(", "),
+        entry.ret.display(),
     );
 
-    syn::Error::new(Span::call_site(), msg)
+    syn::Error::new(parsed.func.sig.fn_token.span(), msg)
         .to_compile_error()
         .into()
 }
