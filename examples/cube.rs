@@ -10,14 +10,13 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use ash::vk;
-use inline_spirv::inline_spirv;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use zengpu::{
     BeginFrame, DeviceContext, DeviceRequest, Format, GpuError, PresentMode, Result, SurfaceConfig,
-    Swapchain, VulkanDevice, VulkanInstance, WindowHandles,
+    Swapchain, VulkanDevice, VulkanInstance, WindowHandles, zengpu_spirv,
 };
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
@@ -126,7 +125,7 @@ fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
 
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
-const VERT_SPV: &[u32] = inline_spirv!(
+const VERT_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     layout(location = 0) in vec3 in_pos;
@@ -142,7 +141,7 @@ const VERT_SPV: &[u32] = inline_spirv!(
     vulkan1_0
 );
 
-const FRAG_SPV: &[u32] = inline_spirv!(
+const FRAG_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     layout(location = 0) in vec3 v_color;

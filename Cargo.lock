@@ -1883,6 +1883,7 @@ dependencies = [
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-hal",
+ "zengpu-spirv",
  "zengpu-vulkan",
 ]
 
@@ -1927,6 +1928,13 @@ name = "zengpu-hal"
 version = "0.0.1"
 dependencies = [
  "raw-window-handle",
+]
+
+[[package]]
+name = "zengpu-spirv"
+version = "0.0.1"
+dependencies = [
+ "inline-spirv",
 ]
 
 [[package]]
