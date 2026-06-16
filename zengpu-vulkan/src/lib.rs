@@ -14,11 +14,11 @@ pub use adapter::VulkanAdapter;
 pub use ash;
 pub use ash::vk;
 pub use command_list::VulkanCommandList;
-pub use depth_target::{DepthTarget, DEPTH_FORMAT};
+pub use depth_target::{DEPTH_FORMAT, DepthTarget};
 pub use device::VulkanDevice;
 pub use frame_graph::{AttachmentUsage, FrameGraph, ResourceId};
 pub use instance::VulkanInstance;
-pub use offscreen::{OffscreenTarget, SampledImageView};
+pub use offscreen::OffscreenTarget;
 pub use surface::{VulkanFrame, VulkanSurface};
 pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 
@@ -28,12 +28,12 @@ pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
     use zengpu_hal::Format;
     match f {
-        Format::Rgba8Unorm        => vk::Format::R8G8B8A8_UNORM,
-        Format::Rgba8UnormSrgb    => vk::Format::R8G8B8A8_SRGB,
-        Format::Bgra8Unorm        => vk::Format::B8G8R8A8_UNORM,
-        Format::Bgra8UnormSrgb    => vk::Format::B8G8R8A8_SRGB,
-        Format::R32Float          => vk::Format::R32_SFLOAT,
-        Format::Depth32Float      => vk::Format::D32_SFLOAT,
+        Format::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
+        Format::Rgba8UnormSrgb => vk::Format::R8G8B8A8_SRGB,
+        Format::Bgra8Unorm => vk::Format::B8G8R8A8_UNORM,
+        Format::Bgra8UnormSrgb => vk::Format::B8G8R8A8_SRGB,
+        Format::R32Float => vk::Format::R32_SFLOAT,
+        Format::Depth32Float => vk::Format::D32_SFLOAT,
         Format::Depth24PlusStencil8 => vk::Format::D24_UNORM_S8_UINT,
     }
 }
@@ -43,13 +43,13 @@ pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
 pub fn from_vk_format(f: vk::Format) -> Option<zengpu_hal::Format> {
     use zengpu_hal::Format;
     Some(match f {
-        vk::Format::R8G8B8A8_UNORM    => Format::Rgba8Unorm,
-        vk::Format::R8G8B8A8_SRGB     => Format::Rgba8UnormSrgb,
-        vk::Format::B8G8R8A8_UNORM    => Format::Bgra8Unorm,
-        vk::Format::B8G8R8A8_SRGB     => Format::Bgra8UnormSrgb,
-        vk::Format::R32_SFLOAT        => Format::R32Float,
-        vk::Format::D32_SFLOAT        => Format::Depth32Float,
+        vk::Format::R8G8B8A8_UNORM => Format::Rgba8Unorm,
+        vk::Format::R8G8B8A8_SRGB => Format::Rgba8UnormSrgb,
+        vk::Format::B8G8R8A8_UNORM => Format::Bgra8Unorm,
+        vk::Format::B8G8R8A8_SRGB => Format::Bgra8UnormSrgb,
+        vk::Format::R32_SFLOAT => Format::R32Float,
+        vk::Format::D32_SFLOAT => Format::Depth32Float,
         vk::Format::D24_UNORM_S8_UINT => Format::Depth24PlusStencil8,
-        _                             => return None,
+        _ => return None,
     })
 }
