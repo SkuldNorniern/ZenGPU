@@ -15,16 +15,15 @@
 pub use zengpu_hal as hal;
 
 pub use zengpu_hal::{
-    AdapterInfo, AdapterRequest, AddressMode, Acquire, BackendPreference, Bindings, BlendMode,
+    Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,
     BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputePipelineDesc, DType,
     DepthAttachment, DepthState, DeviceRequest, DeviceType, Features, FilterMode, Format, Frame,
     GpuAdapter, GpuDevice, GpuError, GpuInstance, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, LoadOp, MemoryUsage, PipelineHandle, PowerPreference, PresentMode,
-    PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, RenderTargetDesc, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, StepMode, Surface,
-    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage,
-    UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor,
-    WindowHandles,
+    PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, RenderTargetDesc, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, StepMode, Surface, SurfaceConfig,
+    SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
 /// Vulkan 1.2+ backend, graphics + compute.
@@ -32,9 +31,9 @@ pub use zengpu_hal::{
 pub use zengpu_vulkan as vulkan;
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan::{
-    AttachmentUsage, BeginFrame, DepthTarget, DeviceContext, FrameGraph, OffscreenTarget,
-    ResourceId, SampledImageView, Swapchain, VulkanAdapter, VulkanCommandList, VulkanDevice,
-    VulkanFrame, VulkanInstance, VulkanSurface, DEPTH_FORMAT,
+    AttachmentUsage, BeginFrame, DEPTH_FORMAT, DepthTarget, DeviceContext, FrameGraph,
+    OffscreenTarget, ResourceId, Swapchain, VulkanAdapter, VulkanCommandList, VulkanDevice,
+    VulkanFrame, VulkanInstance, VulkanSurface,
 };
 
 /// CPU reference backend. Conformance oracle.
