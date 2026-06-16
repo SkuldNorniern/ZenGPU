@@ -18,9 +18,8 @@
 #[doc(hidden)]
 pub use inline_spirv;
 
-/// Keeps `$crate::zengpu_spirv_proc` resolvable inside `zengpu_spirv!`.
 #[doc(hidden)]
-pub use zengpu_spirv_proc;
+pub use zengpu_zsl;
 
 /// Private re-exports referenced by code emitted by `#[derive(ZslPushConst)]`. Semver-exempt; do
 /// not use directly.
@@ -50,7 +49,7 @@ pub mod _zsl_priv {
 ///     ..Default::default()
 /// }, [16, 1, 1])?;
 /// ```
-pub use zengpu_spirv_proc::ZslPushConst;
+pub use zengpu_zsl::ZslPushConst;
 
 /// Compile GLSL source to SPIR-V at build time.
 ///
@@ -75,7 +74,7 @@ pub use zengpu_spirv_proc::ZslPushConst;
 #[macro_export]
 macro_rules! zengpu_spirv {
     (#[$attr:meta] $($rest:tt)*) => {
-        $crate::zengpu_spirv_proc::zsl_spirv!(#[$attr] $($rest)*)
+        $crate::zengpu_zsl::zsl_spirv!(#[$attr] $($rest)*)
     };
     ($($tt:tt)*) => {
         $crate::inline_spirv::inline_spirv!($($tt)*)
