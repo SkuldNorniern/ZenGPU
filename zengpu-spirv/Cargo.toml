@@ -12,4 +12,4 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-inline-spirv = { version = "0.2", features = ["glsl"] }
+inline-spirv.workspace = true
