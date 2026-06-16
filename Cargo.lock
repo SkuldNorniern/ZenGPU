@@ -1934,6 +1934,16 @@ name = "zengpu-spirv"
 version = "0.0.1"
 dependencies = [
  "inline-spirv",
+ "zengpu-spirv-proc",
+]
+
+[[package]]
+name = "zengpu-spirv-proc"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
