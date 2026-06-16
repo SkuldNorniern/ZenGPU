@@ -33,6 +33,38 @@ pub use inline_spirv;
 #[doc(hidden)]
 pub use zengpu_spirv_proc;
 
+/// Private re-exports referenced by code emitted by `#[derive(ZslPushConst)]`.
+/// Semver-exempt; do not use directly.
+#[doc(hidden)]
+pub mod _zsl_priv {
+    pub use zengpu_hal::Scalar;
+}
+
+/// Derive `to_scalars()` for a push-constant struct.
+///
+/// Fields must be `u32`, `i32`, or `f32`. The generated method returns a
+/// fixed-size array of [`zengpu_hal::Scalar`] in field order, ready for
+/// `Bindings::scalars` in a dispatch call.
+///
+/// # Example
+///
+/// ```ignore
+/// use zengpu_spirv::ZslPushConst;
+///
+/// #[derive(ZslPushConst)]
+/// struct ScalePush {
+///     len: u32,
+///     scale: f32,
+/// }
+///
+/// let push = ScalePush { len: 1024, scale: 2.0 };
+/// device.dispatch(pipeline, Bindings {
+///     scalars: &push.to_scalars(),
+///     ..Default::default()
+/// }, [16, 1, 1])?;
+/// ```
+pub use zengpu_spirv_proc::ZslPushConst;
+
 /// Compile shader source to SPIR-V at build time.
 ///
 /// # GLSL (current)
