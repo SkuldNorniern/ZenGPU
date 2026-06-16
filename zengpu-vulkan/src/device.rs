@@ -1,5 +1,6 @@
 //! Vulkan logical device and buffer operations.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ash::{Device, khr, vk};
@@ -126,6 +127,9 @@ pub struct VulkanDevice {
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
+    /// Wrapping counter for [`bind_raw_image_view`](Self::bind_raw_image_view)
+    /// slots in `[EXTERNAL_SLOT_BASE, MAX_BINDLESS_TEXTURES)`.
+    ext_slot_counter: AtomicU32,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -265,6 +269,7 @@ impl VulkanDevice {
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
             cmd_list_pool,
+            ext_slot_counter: AtomicU32::new(0),
         })
     }
 
@@ -427,6 +432,39 @@ impl VulkanDevice {
             self.inner.device.update_descriptor_sets(&[write], &[]);
         }
         Some(texture.index())
+    }
+
+    /// Bind a raw image view (e.g. from an [`crate::OffscreenTarget`]) into the
+    /// global bindless texture table using a slot in the reserved external range
+    /// `[512, 1024)`. Slots wrap within that range; the image must already be in
+    /// `SHADER_READ_ONLY_OPTIMAL`. Returns the assigned slot index.
+    ///
+    /// Prefer [`bind_texture`](Self::bind_texture) for device-owned textures.
+    /// This escape hatch is for caller-owned render targets that do not have a
+    /// `TextureHandle` (plan.md P8-A step 7 will replace it with a proper API).
+    pub fn bind_raw_image_view(&self, view: vk::ImageView, sampler: vk::Sampler) -> u32 {
+        const EXTERNAL_SLOT_BASE: u32 = 512;
+        const EXTERNAL_SLOT_COUNT: u32 = MAX_BINDLESS_TEXTURES - EXTERNAL_SLOT_BASE;
+        let idx = self.ext_slot_counter.fetch_add(1, Ordering::Relaxed);
+        let slot = EXTERNAL_SLOT_BASE + (idx % EXTERNAL_SLOT_COUNT);
+        let info = vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: 1,
+            dst_array_element: slot,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        slot
     }
 
     /// Raw `vk::ImageView` for a HAL texture handle. For user-side pipelines that
