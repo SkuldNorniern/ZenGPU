@@ -3,10 +3,9 @@
 //! Push constants: `Bindings.buffers[0..2] = [a_idx, b_idx, out_idx]` in the first three u32s,
 //! `Bindings.scalars[0] = len`.
 
-use inline_spirv::inline_spirv;
 use zengpu::{
     AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
-    GpuInstance, MemoryUsage, Scalar, ShaderDesc, VulkanInstance,
+    GpuInstance, MemoryUsage, Scalar, ShaderDesc, VulkanInstance, zengpu_spirv,
 };
 
 /// Element-wise add: `out[i] = a[i] + b[i]` for `i` in `0..len`.
@@ -19,7 +18,7 @@ use zengpu::{
 /// offset 8: uint out_idx = bindings.buffers[2]
 /// offset 12: uint len    = bindings.scalars[0]
 /// ```
-const SHADER_SPV: &[u32] = inline_spirv!(
+const SHADER_SPV: &[u32] = zengpu_spirv!(
     r#"
     #version 450
     #extension GL_EXT_nonuniform_qualifier : require
