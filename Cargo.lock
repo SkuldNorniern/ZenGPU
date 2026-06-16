@@ -1877,7 +1877,6 @@ name = "zengpu"
 version = "0.0.1"
 dependencies = [
  "ash",
- "inline-spirv",
  "winit",
  "zengpu-blas",
  "zengpu-compute",
@@ -1891,28 +1890,28 @@ dependencies = [
 name = "zengpu-blas"
 version = "0.0.1"
 dependencies = [
- "inline-spirv",
  "zengpu-compute",
  "zengpu-hal",
+ "zengpu-spirv",
 ]
 
 [[package]]
 name = "zengpu-compute"
 version = "0.0.1"
 dependencies = [
- "inline-spirv",
  "zengpu-hal",
+ "zengpu-spirv",
 ]
 
 [[package]]
 name = "zengpu-conformance"
 version = "0.0.1"
 dependencies = [
- "inline-spirv",
  "zengpu-blas",
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-hal",
+ "zengpu-spirv",
  "zengpu-vulkan",
 ]
 
