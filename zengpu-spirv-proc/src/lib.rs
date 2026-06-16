@@ -7,11 +7,12 @@ extern crate proc_macro;
 
 mod ast;
 mod lower;
+mod lower_graphics;
 mod spirv;
 mod types;
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
+use proc_macro2::{Literal, Span};
 use quote::quote;
 use syn::{
     Attribute, DeriveInput, ItemFn, Meta, parse::Parse, parse::ParseStream, parse_macro_input,
@@ -224,21 +225,33 @@ pub fn zsl_spirv(input: TokenStream) -> TokenStream {
                 Ok(w) => w,
                 Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
             };
-            let words_lit = words.iter().map(|&w| quote!(#w u32));
+            let words_lit = words.iter().map(|&w| {
+                let lit = Literal::u32_suffixed(w);
+                quote!(#lit)
+            });
             quote! { &[#(#words_lit),*] }.into()
         }
-        Stage::Vertex | Stage::Fragment => {
-            let name = &entry.ident;
-            syn::Error::new(
-                parsed.func.sig.fn_token.span(),
-                format!(
-                    "zengpu_spirv!: ZSL {stage} shader lowering not yet implemented (step 5). \
-                     Parsed `{name}`.",
-                    stage = stage.name(),
-                ),
-            )
-            .to_compile_error()
-            .into()
+        Stage::Vertex => {
+            let words = match lower_graphics::lower_vertex(&entry, &parsed.func.block) {
+                Ok(w) => w,
+                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
+            };
+            let words_lit = words.iter().map(|&w| {
+                let lit = Literal::u32_suffixed(w);
+                quote!(#lit)
+            });
+            quote! { &[#(#words_lit),*] }.into()
+        }
+        Stage::Fragment => {
+            let words = match lower_graphics::lower_fragment(&entry, &parsed.func.block) {
+                Ok(w) => w,
+                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
+            };
+            let words_lit = words.iter().map(|&w| {
+                let lit = Literal::u32_suffixed(w);
+                quote!(#lit)
+            });
+            quote! { &[#(#words_lit),*] }.into()
         }
     }
 }
