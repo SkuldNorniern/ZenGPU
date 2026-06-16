@@ -17,7 +17,7 @@ categories.workspace = true
 
 [workspace]
 resolver = "2"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-spirv-proc"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-zsl"]
 
 [workspace.package]
 version = "0.0.1"
@@ -37,7 +37,7 @@ zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
 zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
 zengpu-blas = { path = "zengpu-blas", version = "0.0.1" }
 zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
-zengpu-spirv-proc = { path = "zengpu-spirv-proc", version = "0.0.1" }
+zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
 inline-spirv = { version = "0.2", features = ["glsl"] }
 
 [lib]

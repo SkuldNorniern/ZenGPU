@@ -1935,16 +1935,7 @@ version = "0.0.1"
 dependencies = [
  "inline-spirv",
  "zengpu-hal",
- "zengpu-spirv-proc",
-]
-
-[[package]]
-name = "zengpu-spirv-proc"
-version = "0.0.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
+ "zengpu-zsl",
 ]
 
 [[package]]
@@ -1955,6 +1946,15 @@ dependencies = [
  "inline-spirv",
  "raw-window-handle",
  "zengpu-hal",
+]
+
+[[package]]
+name = "zengpu-zsl"
+version = "0.0.1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
