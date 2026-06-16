@@ -22,6 +22,19 @@
 /// available).
 pub use zengpu_hal as hal;
 
+/// Shader macro — compile GLSL (and later ZSL/WGSL) to SPIR-V at build time.
+/// Re-exports `zengpu_spirv` crate for sub-crate access.
+pub use zengpu_spirv as spirv;
+
+/// Compile shader source to SPIR-V at build time. GLSL in step 1; ZSL and
+/// WGSL support will be added transparently in later steps.
+#[macro_export]
+macro_rules! zengpu_spirv {
+    ($($tt:tt)*) => {
+        ::zengpu_spirv::zengpu_spirv!($($tt)*)
+    };
+}
+
 // Flat re-exports of the most-used foundation items, so downstream code can
 // write `zengpu::BufferHandle` rather than `zengpu::hal::BufferHandle`.
 pub use zengpu_hal::{
