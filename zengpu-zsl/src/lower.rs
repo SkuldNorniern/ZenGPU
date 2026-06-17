@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprIndex, ExprLit, ExprPath, Lit, Member,
-    Stmt, spanned::Spanned,
+    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprIndex, ExprLit, ExprPath, ExprUnary,
+    Lit, Member, Stmt, UnOp, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -573,6 +573,20 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
             func.span(),
             "ZSL: unknown function call; use `global_id().x/y/z` for compute built-ins".into(),
         )),
+
+        Expr::Unary(ExprUnary { op, expr, .. }) => match op {
+            UnOp::Neg(_) => {
+                let val = lower_expr(ctx, expr)?;
+                let ty_id = ctx.spv_ty(val.ty);
+                let id = if val.ty == ScalarTy::F32 {
+                    ctx.spv.op_fnegate(ty_id, val.id)
+                } else {
+                    ctx.spv.op_snegate(ty_id, val.id)
+                };
+                Ok(Val { id, ty: val.ty })
+            }
+            other => Err((other.span(), "ZSL: only unary `-` is supported".into())),
+        },
 
         Expr::Binary(ExprBinary {
             left, op, right, ..

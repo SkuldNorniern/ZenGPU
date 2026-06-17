@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use proc_macro2::Span;
 use syn::{
     BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprMethodCall, ExprPath,
-    ExprTuple, Lit, Member, Stmt, spanned::Spanned,
+    ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -38,6 +38,7 @@ enum GvTy {
     Mat4,
 }
 
+#[derive(Clone, Copy)]
 struct GVal {
     id: Id,
     ty: GvTy,
@@ -649,7 +650,24 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
             Ok(GVal { id, ty: gty })
         }
 
-        // Scalar binary ops
+        // Unary negation: -scalar or -vec
+        Expr::Unary(ExprUnary { op, expr, .. }) => match op {
+            UnOp::Neg(_) => {
+                let val = lower_gfx_expr(ctx, expr)?;
+                match val.ty {
+                    GvTy::U32 => Err((expr.span(), "ZSL: cannot negate u32".into())),
+                    GvTy::Mat4 => Err((expr.span(), "ZSL: cannot negate Mat4".into())),
+                    _ => {
+                        let ty_id = ctx.spv_elem_ty(val.ty);
+                        let id = ctx.spv.op_fnegate(ty_id, val.id);
+                        Ok(GVal { id, ty: val.ty })
+                    }
+                }
+            }
+            other => Err((other.span(), "ZSL: only unary `-` is supported".into())),
+        },
+
+        // Binary ops: scalar arithmetic and vec*scalar
         Expr::Binary(ExprBinary {
             left, op, right, ..
         }) => {
@@ -767,10 +785,26 @@ fn gfx_binary_arith(
         let id = ctx.spv.op_matrix_times_vector(t_vec4, lhs.id, rhs.id);
         return Ok(GVal { id, ty: GvTy::Vec4 });
     }
+    // vec * scalar  or  scalar * vec  →  OpVectorTimesScalar
+    if let BinOp::Mul(_) = op {
+        let (vec_val, scalar_val) = match (lhs.ty, rhs.ty) {
+            (GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4, GvTy::F32 | GvTy::U32) => (lhs, rhs),
+            (GvTy::F32 | GvTy::U32, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) => (rhs, lhs),
+            _ => (lhs, rhs), // fall through to scalar path
+        };
+        if matches!(vec_val.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+            let scalar_f32 = scalar_to_f32(ctx, scalar_val);
+            let vec_ty_id = ctx.spv_elem_ty(vec_val.ty);
+            let id = ctx
+                .spv
+                .op_vector_times_scalar(vec_ty_id, vec_val.id, scalar_f32);
+            return Ok(GVal { id, ty: vec_val.ty });
+        }
+    }
     if !matches!(lhs.ty, GvTy::F32 | GvTy::U32) {
         return Err((
             op.span(),
-            "ZSL: binary arithmetic only on scalar types (f32, u32)".into(),
+            "ZSL: binary arithmetic only on scalar or vector types".into(),
         ));
     }
     let (lhs, rhs) = gfx_unify_scalars(ctx, lhs, rhs);
