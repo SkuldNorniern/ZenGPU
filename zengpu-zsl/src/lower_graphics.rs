@@ -1,7 +1,7 @@
 //! ZSL lowering to SPIR-V for vertex and fragment shaders.
 //!
-//! Supports `#[location(N)]` inputs, scalar push constants, Vec2/3/4 constructors, component access
-//! and scalar arithmetic. Return type must be Vec4.
+//! Supports `#[location(N)]` inputs, push constants (f32/u32/Mat4), Vec2/3/4 constructors and
+//! component access, `dot`, Mat4*Vec4, comparisons, and `if`/`else` with variable reassignment.
 
 use std::collections::HashMap;
 
