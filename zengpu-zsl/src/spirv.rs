@@ -1,5 +1,5 @@
-//! Minimal SPIR-V binary builder, enough for ZSL compute shaders: SSBOs, push constants,
-//! `u32`/`f32` scalars, basic arithmetic.
+//! SPIR-V binary builder for the ZSL subset: SSBOs, push constants, scalars, vectors,
+//! matrices, arithmetic/logic.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(pub u32);

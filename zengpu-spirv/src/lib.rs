@@ -1,6 +1,8 @@
-//! ZenGPU shader macro: compiles GLSL to SPIR-V at build time.
+//! Shader macro that compiles GLSL or ZSL to SPIR-V at build time.
 //!
-//! `zengpu_spirv!` accepts the same syntax as `inline_spirv::inline_spirv!`:
+//! # GLSL
+//!
+//! A GLSL string with a stage token, forwarded to `inline_spirv`:
 //!
 //! ```ignore
 //! use zengpu_spirv::zengpu_spirv;
@@ -12,6 +14,20 @@
 //!     "#,
 //!     vert,
 //!     vulkan1_0
+//! );
+//! ```
+//!
+//! # ZSL
+//!
+//! A `#[vertex]`, `#[fragment]` or `#[compute]` annotated Rust function, lowered directly to
+//! SPIR-V:
+//!
+//! ```ignore
+//! const VERT: &[u32] = zengpu_spirv!(
+//!     #[vertex]
+//!     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
+//!         mvp * in_pos.extend(1.0)
+//!     }
 //! );
 //! ```
 
@@ -58,24 +74,22 @@ pub mod _zsl_priv {
 /// ```
 pub use zengpu_zsl::ZslPushConst;
 
-/// Compile GLSL source to SPIR-V at build time.
+/// Compile shader source to SPIR-V at build time.
 ///
 /// # GLSL
-///
-/// Pass a GLSL source string with a stage token, same as `inline_spirv!`:
-///
+/// Same as `inline_spirv!`:
 /// ```ignore
 /// const SPV: &[u32] = zengpu_spirv!(r#"#version 450 ..."#, vert, vulkan1_0);
 /// ```
 ///
 /// # ZSL
-///
-/// Pass a Rust-flavored function with a stage attribute:
-///
+/// A stage-attributed Rust function:
 /// ```ignore
 /// const SPV: &[u32] = zengpu_spirv!(
 ///     #[vertex]
-///     fn vs_main(in_pos: Vec3) -> Vec4 { ... }
+///     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
+///         mvp * in_pos.extend(1.0)
+///     }
 /// );
 /// ```
 #[macro_export]

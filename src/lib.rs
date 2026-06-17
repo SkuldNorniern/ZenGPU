@@ -14,10 +14,10 @@
 /// Backend-independent types, handles and errors. Always available.
 pub use zengpu_hal as hal;
 
-/// Compile GLSL to SPIR-V at build time. Re-exports `zengpu_spirv`.
+/// Compile GLSL and ZSL to SPIR-V at build time. Re-exports `zengpu_spirv`.
 pub use zengpu_spirv as spirv;
 
-/// Compile GLSL shader source to SPIR-V at build time.
+/// GLSL or ZSL to SPIR-V at build time. See [`zengpu_spirv::zengpu_spirv`].
 #[macro_export]
 macro_rules! zengpu_spirv {
     ($($tt:tt)*) => {
