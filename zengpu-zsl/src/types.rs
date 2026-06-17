@@ -27,6 +27,7 @@ pub enum ZslType {
     Buf(Box<ZslType>),
     BufMut(Box<ZslType>),
     Void,
+    Tuple(Vec<ZslType>),
 }
 
 impl ZslType {
@@ -82,6 +83,11 @@ impl ZslType {
                 ))
             }
             Type::Tuple(t) if t.elems.is_empty() => Ok(ZslType::Void),
+            Type::Tuple(t) => {
+                let elems: Result<Vec<ZslType>, _> =
+                    t.elems.iter().map(ZslType::from_syn).collect();
+                Ok(ZslType::Tuple(elems?))
+            }
             _ => Err((
                 Span::call_site(),
                 format!(
@@ -118,6 +124,7 @@ impl ZslType {
             ZslType::Buf(_) => "Buf<T>",
             ZslType::BufMut(_) => "BufMut<T>",
             ZslType::Void => "()",
+            ZslType::Tuple(_) => "(..)",
         }
     }
 
