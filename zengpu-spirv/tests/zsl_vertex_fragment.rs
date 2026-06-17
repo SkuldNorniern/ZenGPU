@@ -221,6 +221,41 @@ fn vertex_scalar_times_vec() {
     assert!(spv_valid(SPV));
 }
 
+// ── Vec-vec arithmetic ────────────────────────────────────────────────────────
+
+#[test]
+fn fragment_vec4_add() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_add(#[location(0)] a: Vec4, #[location(1)] b: Vec4) -> Vec4 {
+            a + b
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_vec4_sub() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_sub(#[location(0)] a: Vec4, #[location(1)] b: Vec4) -> Vec4 {
+            a - b
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_vec3_mul_scalar_add_vec() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_lerp(#[location(0)] a: Vec3, #[location(1)] b: Vec3, t: f32) -> Vec4 {
+            (a * t + b * (1.0 - t)).extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
