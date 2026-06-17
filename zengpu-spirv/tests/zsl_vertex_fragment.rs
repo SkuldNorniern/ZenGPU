@@ -366,6 +366,159 @@ fn fragment_diffuse_lighting() {
     assert!(spv_valid(SPV));
 }
 
+// ── == / != comparisons ───────────────────────────────────────────────────────
+
+#[test]
+fn fragment_if_eq_f32() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_eq(#[location(0)] color: Vec4, t: f32) -> Vec4 {
+            let r: Vec4 = color;
+            if t == 0.0 {
+                r = Vec4(0.0, 0.0, 0.0, 1.0);
+            }
+            r
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_if_ne_u32() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_ne(#[location(0)] pos: Vec4, flag: u32) -> Vec4 {
+            let p: Vec4 = pos;
+            if flag != 0 {
+                p = Vec4(0.0, 0.0, 0.0, 1.0);
+            }
+            p
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+// ── && / || logical operators ─────────────────────────────────────────────────
+
+#[test]
+fn fragment_if_and() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_and(#[location(0)] color: Vec4, a: f32, b: f32) -> Vec4 {
+            let r: Vec4 = color;
+            if a > 0.0 && b > 0.0 {
+                r = Vec4(1.0, 1.0, 1.0, 1.0);
+            }
+            r
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_if_or() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_or(#[location(0)] color: Vec4, a: f32, b: f32) -> Vec4 {
+            let r: Vec4 = color;
+            if a < 0.0 || b < 0.0 {
+                r = Vec4(0.0, 0.0, 0.0, 1.0);
+            }
+            r
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+// ── GLSL built-ins ────────────────────────────────────────────────────────────
+
+#[test]
+fn fragment_abs() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_abs(#[location(0)] color: Vec4) -> Vec4 {
+            abs(color)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_clamp_builtin() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_clamp2(#[location(0)] color: Vec4) -> Vec4 {
+            clamp(color, Vec4(0.0, 0.0, 0.0, 0.0), Vec4(1.0, 1.0, 1.0, 1.0))
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_normalize_length() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_norm(#[location(0)] v: Vec3) -> Vec4 {
+            let n: Vec3 = normalize(v);
+            let len: f32 = length(v);
+            Vec4(n.x, n.y, n.z, len)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_min_max() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_minmax(#[location(0)] a: Vec4, #[location(1)] b: Vec4) -> Vec4 {
+            max(a, b)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_floor_ceil_fract() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_floor(#[location(0)] uv: Vec2) -> Vec4 {
+            let f: Vec2 = floor(uv);
+            let c: Vec2 = ceil(uv);
+            let fr: Vec2 = fract(uv);
+            Vec4(f.x, c.y, fr.x, 1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_sqrt_pow() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_sqrt(#[location(0)] color: Vec4, gamma: f32) -> Vec4 {
+            let r: f32 = pow(color.x, gamma);
+            let g: f32 = sqrt(color.y);
+            Vec4(r, g, color.z, color.w)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_mix_scalar() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_mix(#[location(0)] a: Vec4, #[location(1)] b: Vec4, t: f32) -> Vec4 {
+            let ax: f32 = a.x;
+            let bx: f32 = b.x;
+            let m: f32 = mix(ax, bx, t);
+            Vec4(m, a.y, b.z, 1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
