@@ -69,7 +69,7 @@ pub fn lower_compute(
         .filter(|p| matches!(p.ty, ZslType::U32 | ZslType::F32))
         .collect();
 
-    // ── SSBO types (f32 element only in step 4) ──────────────────────────────
+    // ── SSBO types (f32 element) ─────────────────────────────────────────────
     let t_ra_f32 = spv.type_runtime_array(t_f32);
     spv.decorate(t_ra_f32, deco::ARRAY_STRIDE, &[4]);
     let t_struct_buf_f32 = spv.type_struct(&[t_ra_f32]);
