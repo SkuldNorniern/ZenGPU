@@ -28,7 +28,6 @@ impl Stage {
 pub struct ZslParam {
     pub ident: Ident,
     pub ty: ZslType,
-    #[allow(dead_code)]
     pub location: Option<u32>,
     #[allow(dead_code)]
     pub builtin: Option<String>,
@@ -40,7 +39,6 @@ pub struct ZslEntryPoint {
     pub stage: Stage,
     pub ident: Ident,
     pub params: Vec<ZslParam>,
-    #[allow(dead_code)]
     pub ret: ZslType,
 }
 
