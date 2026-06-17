@@ -56,6 +56,8 @@ mod op {
     pub const CONVERT_F_TO_U: u32 = 109;
     pub const CONVERT_U_TO_F: u32 = 112;
     pub const BITCAST: u32 = 124;
+    pub const TYPE_MATRIX: u32 = 24;
+    pub const MATRIX_TIMES_VECTOR: u32 = 144;
 }
 
 /// SPIR-V decoration constants.
@@ -63,7 +65,9 @@ mod op {
 pub mod deco {
     pub const BLOCK: u32 = 2;
     pub const BUFFER_BLOCK: u32 = 3;
+    pub const COL_MAJOR: u32 = 5;
     pub const ARRAY_STRIDE: u32 = 6;
+    pub const MATRIX_STRIDE: u32 = 7;
     pub const BUILT_IN: u32 = 11;
     pub const NON_WRITABLE: u32 = 24;
     pub const LOCATION: u32 = 30;
@@ -304,6 +308,16 @@ impl SpvBuilder {
         id
     }
 
+    pub fn type_matrix(&mut self, col_ty: Id, col_count: u32) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.types,
+            op::TYPE_MATRIX,
+            &[id.0, col_ty.0, col_count],
+        );
+        id
+    }
+
     pub fn type_vector3_uint(&mut self, uint_id: Id) -> Id {
         self.type_vector(uint_id, 3)
     }
@@ -516,6 +530,16 @@ impl SpvBuilder {
             &mut self.functions,
             op::CONVERT_F_TO_U,
             &[u32_ty.0, id.0, val.0],
+        );
+        id
+    }
+
+    pub fn op_matrix_times_vector(&mut self, result_ty: Id, mat: Id, vec: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::MATRIX_TIMES_VECTOR,
+            &[result_ty.0, id.0, mat.0, vec.0],
         );
         id
     }
