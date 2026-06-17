@@ -49,7 +49,14 @@ mod op {
     pub const UDIV: u32 = 134;
     pub const FDIV: u32 = 136;
     pub const ULESS_THAN: u32 = 176;
+    pub const ULESS_THAN_EQ: u32 = 178;
+    pub const UGREATER_THAN: u32 = 172;
+    pub const UGREATER_THAN_EQ: u32 = 174;
     pub const SLESS_THAN: u32 = 177;
+    pub const FORD_LESS_THAN: u32 = 184;
+    pub const FORD_GREATER_THAN: u32 = 186;
+    pub const FORD_LESS_THAN_EQ: u32 = 188;
+    pub const FORD_GREATER_THAN_EQ: u32 = 190;
     pub const FLESS_THAN: u32 = 185;
     pub const COMPOSITE_CONSTRUCT: u32 = 80;
     pub const COMPOSITE_EXTRACT: u32 = 81;
@@ -534,6 +541,76 @@ impl SpvBuilder {
         emit(
             &mut self.functions,
             op::ULESS_THAN,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ule(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::ULESS_THAN_EQ,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ugt(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::UGREATER_THAN,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_uge(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::UGREATER_THAN_EQ,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_lt(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_LESS_THAN,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_le(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_LESS_THAN_EQ,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_gt(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_GREATER_THAN,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_ge(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_GREATER_THAN_EQ,
             &[bool_ty.0, id.0, a.0, b.0],
         );
         id
