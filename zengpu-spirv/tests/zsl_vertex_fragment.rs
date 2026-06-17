@@ -221,6 +221,33 @@ fn vertex_scalar_times_vec() {
     assert!(spv_valid(SPV));
 }
 
+// ── Fragment push constants ───────────────────────────────────────────────────
+
+#[test]
+fn fragment_scalar_push_const() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_tint(#[location(0)] color: Vec4, tint: f32) -> Vec4 {
+            color * tint
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_mat4_push_const() {
+    // Mat4 in fragment is unusual but valid (e.g. inverse VP for deferred passes).
+    // This verifies the PC struct machinery works in the fragment execution model.
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_pc(#[location(0)] uv: Vec2, scale: f32, bias: f32) -> Vec4 {
+            let r: f32 = uv.x * scale + bias;
+            Vec4(r, uv.y, 0.0, 1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── Vec-vec arithmetic ────────────────────────────────────────────────────────
 
 #[test]
