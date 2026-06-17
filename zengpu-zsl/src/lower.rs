@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprIndex, ExprLit, ExprPath, Lit, Stmt,
-    spanned::Spanned,
+    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprIndex, ExprLit, ExprPath, Lit, Member,
+    Stmt, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -500,9 +500,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
                         "ZSL: push-constant pointer type not allocated".into(),
                     ));
                 }
-                let c0 = ctx.const_0_u32;
                 let pc_idx = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
-                let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[c0, pc_idx]);
+                let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
                 let id = ctx.spv.op_load(info.ty, chain);
                 let ty = if is_u32 { ScalarTy::U32 } else { ScalarTy::F32 };
                 return Ok(Val { id, ty });
@@ -533,25 +532,47 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
             })
         }
 
-        Expr::Call(ExprCall { func, args, .. }) => {
-            if let Expr::Path(p) = &**func {
-                if p.path.is_ident("gl_global_id_x") && args.is_empty() {
-                    let gid_var = ctx.gid_var;
-                    let t_uvec3 = ctx.t_uvec3;
-                    let gid = ctx.spv.op_load(t_uvec3, gid_var);
-                    let t_u32 = ctx.t_u32;
-                    let x = ctx.spv.op_composite_extract(t_u32, gid, &[0]);
-                    return Ok(Val {
-                        id: x,
-                        ty: ScalarTy::U32,
-                    });
+        // global_id().x / global_id().y / global_id().z
+        Expr::Field(ExprField {
+            base,
+            member: Member::Named(field),
+            ..
+        }) => {
+            if let Expr::Call(ExprCall { func, args, .. }) = base.as_ref() {
+                if let Expr::Path(p) = func.as_ref() {
+                    if p.path.is_ident("global_id") && args.is_empty() {
+                        let component = match field.to_string().as_str() {
+                            "x" => 0u32,
+                            "y" => 1,
+                            "z" => 2,
+                            other => {
+                                return Err((
+                                    field.span(),
+                                    format!(
+                                        "ZSL: `global_id()` has no field `.{other}`; use .x, .y, or .z"
+                                    ),
+                                ));
+                            }
+                        };
+                        let gid_var = ctx.gid_var;
+                        let t_uvec3 = ctx.t_uvec3;
+                        let gid = ctx.spv.op_load(t_uvec3, gid_var);
+                        let t_u32 = ctx.t_u32;
+                        let val = ctx.spv.op_composite_extract(t_u32, gid, &[component]);
+                        return Ok(Val {
+                            id: val,
+                            ty: ScalarTy::U32,
+                        });
+                    }
                 }
             }
-            Err((
-                func.span(),
-                "ZSL: only `gl_global_id_x()` is supported (step 4)".into(),
-            ))
+            Err((base.span(), "ZSL: unsupported field access".into()))
         }
+
+        Expr::Call(ExprCall { func, .. }) => Err((
+            func.span(),
+            "ZSL: unknown function call; use `global_id().x/y/z` for compute built-ins".into(),
+        )),
 
         Expr::Binary(ExprBinary {
             left, op, right, ..
