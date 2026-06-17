@@ -785,6 +785,29 @@ fn gfx_binary_arith(
         let id = ctx.spv.op_matrix_times_vector(t_vec4, lhs.id, rhs.id);
         return Ok(GVal { id, ty: GvTy::Vec4 });
     }
+    // vec op vec  →  component-wise float op (OpFAdd / FSub / FMul / FDiv)
+    if matches!(lhs.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4)
+        && matches!(rhs.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4)
+    {
+        if lhs.ty != rhs.ty {
+            return Err((
+                op.span(),
+                format!(
+                    "ZSL: vec op requires matching types; got {:?} and {:?}",
+                    lhs.ty, rhs.ty
+                ),
+            ));
+        }
+        let ty_id = ctx.spv_elem_ty(lhs.ty);
+        let id = match op {
+            BinOp::Add(_) => ctx.spv.op_fadd(ty_id, lhs.id, rhs.id),
+            BinOp::Sub(_) => ctx.spv.op_fsub(ty_id, lhs.id, rhs.id),
+            BinOp::Mul(_) => ctx.spv.op_fmul(ty_id, lhs.id, rhs.id),
+            BinOp::Div(_) => ctx.spv.op_fdiv(ty_id, lhs.id, rhs.id),
+            other => return Err((other.span(), "ZSL: vec op: use +, -, *, /".into())),
+        };
+        return Ok(GVal { id, ty: lhs.ty });
+    }
     // vec * scalar  or  scalar * vec  →  OpVectorTimesScalar
     if let BinOp::Mul(_) = op {
         let (vec_val, scalar_val) = match (lhs.ty, rhs.ty) {
