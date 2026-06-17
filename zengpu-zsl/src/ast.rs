@@ -93,19 +93,7 @@ impl ZslEntryPoint {
                         ));
                     }
 
-                    // Validate buffer element type.
-                    if let ZslType::Buf(inner) | ZslType::BufMut(inner) = &ty {
-                        if !inner.is_buffer_elem() {
-                            errors.push((
-                                pat_ty.ty.span(),
-                                format!(
-                                    "unsupported buffer element type `{}`. \
-                                     Buffer elements must be scalar, vector, or matrix types.",
-                                    inner.display()
-                                ),
-                            ));
-                        }
-                    }
+                    // Buffer element type validity is enforced by BufElem at parse time.
 
                     params.push(ZslParam {
                         ident,

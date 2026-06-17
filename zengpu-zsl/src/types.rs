@@ -3,6 +3,73 @@
 use proc_macro2::Span;
 use syn::{GenericArgument, PathArguments, Type, TypePath};
 
+/// Scalar and vector types allowed as `Buf<T>` / `BufMut<T>` element types.
+///
+/// Using a separate flat enum avoids `Box<ZslType>` in the recursive `ZslType`
+/// while statically encoding which types are valid buffer elements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufElem {
+    F32,
+    I32,
+    U32,
+    Vec2,
+    Vec3,
+    Vec4,
+    IVec2,
+    IVec3,
+    IVec4,
+    UVec2,
+    UVec3,
+    UVec4,
+    Mat2,
+    Mat3,
+    Mat4,
+}
+
+impl BufElem {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "f32" => Some(BufElem::F32),
+            "i32" => Some(BufElem::I32),
+            "u32" => Some(BufElem::U32),
+            "Vec2" => Some(BufElem::Vec2),
+            "Vec3" => Some(BufElem::Vec3),
+            "Vec4" => Some(BufElem::Vec4),
+            "IVec2" => Some(BufElem::IVec2),
+            "IVec3" => Some(BufElem::IVec3),
+            "IVec4" => Some(BufElem::IVec4),
+            "UVec2" => Some(BufElem::UVec2),
+            "UVec3" => Some(BufElem::UVec3),
+            "UVec4" => Some(BufElem::UVec4),
+            "Mat2" => Some(BufElem::Mat2),
+            "Mat3" => Some(BufElem::Mat3),
+            "Mat4" => Some(BufElem::Mat4),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn display(self) -> &'static str {
+        match self {
+            BufElem::F32 => "f32",
+            BufElem::I32 => "i32",
+            BufElem::U32 => "u32",
+            BufElem::Vec2 => "Vec2",
+            BufElem::Vec3 => "Vec3",
+            BufElem::Vec4 => "Vec4",
+            BufElem::IVec2 => "IVec2",
+            BufElem::IVec3 => "IVec3",
+            BufElem::IVec4 => "IVec4",
+            BufElem::UVec2 => "UVec2",
+            BufElem::UVec3 => "UVec3",
+            BufElem::UVec4 => "UVec4",
+            BufElem::Mat2 => "Mat2",
+            BufElem::Mat3 => "Mat3",
+            BufElem::Mat4 => "Mat4",
+        }
+    }
+}
+
 /// Every type a ZSL shader function can use as a parameter or return type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ZslType {
@@ -29,9 +96,9 @@ pub enum ZslType {
     Mat2,
     Mat3,
     Mat4,
-    // Compute storage buffers
-    Buf(Box<ZslType>),
-    BufMut(Box<ZslType>),
+    // Compute storage buffers — element type is a flat BufElem (no Box needed)
+    Buf(BufElem),
+    BufMut(BufElem),
     // Void (unit return type)
     Void,
     // Tuple return: (Vec4, T1, T2, ...) — vertex position + varyings
@@ -72,11 +139,11 @@ impl ZslType {
                     "Buf" | "BufMut" => {
                         let inner =
                             extract_single_generic(&seg.arguments, &name, seg.ident.span())?;
-                        let inner_ty = Box::new(ZslType::from_syn(inner)?);
+                        let elem = parse_buf_elem(inner)?;
                         return Ok(if name == "Buf" {
-                            ZslType::Buf(inner_ty)
+                            ZslType::Buf(elem)
                         } else {
-                            ZslType::BufMut(inner_ty)
+                            ZslType::BufMut(elem)
                         });
                     }
                     _ => {}
@@ -136,28 +203,31 @@ impl ZslType {
             ZslType::Tuple(_) => "(..)",
         }
     }
+}
 
-    /// Whether this type is valid as a compute buffer element.
-    pub fn is_buffer_elem(&self) -> bool {
-        matches!(
-            self,
-            ZslType::F32
-                | ZslType::I32
-                | ZslType::U32
-                | ZslType::Vec2
-                | ZslType::Vec3
-                | ZslType::Vec4
-                | ZslType::IVec2
-                | ZslType::IVec3
-                | ZslType::IVec4
-                | ZslType::UVec2
-                | ZslType::UVec3
-                | ZslType::UVec4
-                | ZslType::Mat2
-                | ZslType::Mat3
-                | ZslType::Mat4
+/// Parse a `syn::Type` as a buffer element type. Returns an error if the type
+/// is not one of the allowed scalar / vector / matrix variants.
+fn parse_buf_elem(ty: &Type) -> Result<BufElem, (Span, String)> {
+    let Type::Path(TypePath { qself: None, path }) = ty else {
+        return Err((
+            Span::call_site(),
+            "buffer element type must be a simple type (f32, Vec4, …)".into(),
+        ));
+    };
+    let seg = path
+        .segments
+        .last()
+        .ok_or_else(|| (Span::call_site(), "empty type path".to_string()))?;
+    let name = seg.ident.to_string();
+    BufElem::from_name(&name).ok_or_else(|| {
+        (
+            seg.ident.span(),
+            format!(
+                "unsupported buffer element type `{name}`. \
+                 Buffer elements must be scalar, vector, or matrix types."
+            ),
         )
-    }
+    })
 }
 
 fn extract_single_generic<'a>(
