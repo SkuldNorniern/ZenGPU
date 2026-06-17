@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprMethodCall, ExprPath,
-    ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp, spanned::Spanned,
+    BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprCall, ExprField, ExprIf, ExprLit,
+    ExprMethodCall, ExprPath, ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -69,6 +69,7 @@ struct GfxCtx<'a> {
     spv: &'a mut SpvBuilder,
     t_f32: Id,
     t_u32: Id,
+    t_bool: Id,
     t_vec2: Id,
     t_vec3: Id,
     t_vec4: Id,
@@ -113,6 +114,7 @@ fn lower_graphics(
     let t_void = spv.type_void();
     let t_f32 = spv.type_float(32);
     let t_u32 = spv.type_int(32, false);
+    let t_bool = spv.type_bool();
     let t_vec2 = spv.type_vector(t_f32, 2);
     let t_vec3 = spv.type_vector(t_f32, 3);
     let t_vec4 = spv.type_vector(t_f32, 4);
@@ -381,6 +383,7 @@ fn lower_graphics(
         spv: &mut spv,
         t_f32,
         t_u32,
+        t_bool,
         t_vec2,
         t_vec3,
         t_vec4,
@@ -506,6 +509,55 @@ fn lower_gfx_stmt(ctx: &mut GfxCtx<'_>, stmt: &Stmt) -> Result<(), (Span, String
         }
         Stmt::Expr(expr, Some(_)) => {
             lower_gfx_expr(ctx, expr)?;
+            Ok(())
+        }
+        // if cond { ... } or if cond { ... } else { ... }
+        // Bare (no semicolon) or with semicolon — both are statements.
+        Stmt::Expr(
+            Expr::If(ExprIf {
+                cond,
+                then_branch,
+                else_branch,
+                ..
+            }),
+            _semi,
+        ) => {
+            let cond_id = lower_gfx_condition(ctx, cond)?;
+            let then_label = ctx.spv.fresh_id();
+            let merge_label = ctx.spv.fresh_id();
+
+            if let Some((_else_tok, else_expr)) = else_branch {
+                let else_label = ctx.spv.fresh_id();
+                ctx.spv.op_selection_merge(merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, then_label, else_label);
+
+                ctx.spv.label_with_id(then_label);
+                lower_gfx_block(ctx, then_branch)?;
+                ctx.spv.op_branch(merge_label);
+
+                ctx.spv.label_with_id(else_label);
+                match else_expr.as_ref() {
+                    Expr::Block(ExprBlock { block, .. }) => lower_gfx_block(ctx, block)?,
+                    other => {
+                        return Err((
+                            other.span(),
+                            "ZSL: else branch must be a block `{ ... }`".into(),
+                        ));
+                    }
+                }
+                ctx.spv.op_branch(merge_label);
+            } else {
+                ctx.spv.op_selection_merge(merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, then_label, merge_label);
+
+                ctx.spv.label_with_id(then_label);
+                lower_gfx_block(ctx, then_branch)?;
+                ctx.spv.op_branch(merge_label);
+            }
+
+            ctx.spv.label_with_id(merge_label);
             Ok(())
         }
         other => Err((
@@ -715,6 +767,30 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
 
         Expr::Paren(ep) => lower_gfx_expr(ctx, &ep.expr),
 
+        // x = expr;  — reassignment to an already-declared local
+        Expr::Assign(ExprAssign { left, right, .. }) => {
+            let ident = match left.as_ref() {
+                Expr::Path(p) => p
+                    .path
+                    .get_ident()
+                    .map(|i| i.to_string())
+                    .ok_or_else(|| (left.span(), "ZSL: assign target must be a local".into()))?,
+                other => return Err((other.span(), "ZSL: assign target must be a local".into())),
+            };
+            let (ptr, gty) = ctx
+                .locals
+                .get(&ident)
+                .map(|l| (l.ptr, l.ty))
+                .ok_or_else(|| (left.span(), format!("ZSL: undeclared local `{ident}`")))?;
+            let val = lower_gfx_expr(ctx, right)?;
+            let coerced = coerce_gfx(ctx, val, gty, right.span())?;
+            ctx.spv.op_store(ptr, coerced);
+            Ok(GVal {
+                id: coerced,
+                ty: gty,
+            })
+        }
+
         other => Err((
             other.span(),
             format!("ZSL: unsupported expression `{}`", quote::quote!(#other)),
@@ -726,27 +802,56 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
 
 fn collect_gfx_locals(block: &Block) -> Result<Vec<(String, GvTy)>, (Span, String)> {
     let mut out = Vec::new();
+    collect_gfx_locals_block(block, &mut out)?;
+    Ok(out)
+}
+
+/// Recursively collect all `let` bindings in a block and any nested `if`
+/// branches. All collected locals are emitted as `OpVariable` at the top of
+/// the function's first basic block (SPIR-V requires this).
+fn collect_gfx_locals_block(
+    block: &Block,
+    out: &mut Vec<(String, GvTy)>,
+) -> Result<(), (Span, String)> {
     for stmt in &block.stmts {
-        if let Stmt::Local(local) = stmt {
-            let ident = gfx_local_ident(local)?;
-            let gty = if let syn::Pat::Type(pt) = &local.pat {
-                let zty = ZslType::from_syn(&pt.ty)?;
-                gv_ty_from_zsl(&zty).ok_or_else(|| {
-                    (
-                        pt.ty.span(),
-                        format!(
-                            "ZSL: unsupported local type `{}`; use f32/u32/Vec2/Vec3/Vec4",
-                            zty.display()
-                        ),
-                    )
-                })?
-            } else {
-                GvTy::F32
-            };
-            out.push((ident, gty));
+        match stmt {
+            Stmt::Local(local) => {
+                let ident = gfx_local_ident(local)?;
+                let gty = if let syn::Pat::Type(pt) = &local.pat {
+                    let zty = ZslType::from_syn(&pt.ty)?;
+                    gv_ty_from_zsl(&zty).ok_or_else(|| {
+                        (
+                            pt.ty.span(),
+                            format!(
+                                "ZSL: unsupported local type `{}`; use f32/u32/Vec2/Vec3/Vec4",
+                                zty.display()
+                            ),
+                        )
+                    })?
+                } else {
+                    GvTy::F32
+                };
+                out.push((ident, gty));
+            }
+            Stmt::Expr(
+                Expr::If(ExprIf {
+                    then_branch,
+                    else_branch,
+                    ..
+                }),
+                _,
+            ) => {
+                collect_gfx_locals_block(then_branch, out)?;
+                if let Some((_, else_expr)) = else_branch {
+                    if let Expr::Block(ExprBlock { block, .. }) = else_expr.as_ref() {
+                        collect_gfx_locals_block(block, out)?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 fn gfx_local_ident(local: &syn::Local) -> Result<String, (Span, String)> {
@@ -764,6 +869,51 @@ fn gfx_local_ident(local: &syn::Local) -> Result<String, (Span, String)> {
             "ZSL: let binding must be a simple identifier".into(),
         )),
     }
+}
+
+// ── Control flow ──────────────────────────────────────────────────────────────
+
+/// Lower a comparison expression to a bool ID for use as a branch condition.
+/// Only `<`, `>`, `<=`, `>=` on f32/u32 are supported.
+fn lower_gfx_condition(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<Id, (Span, String)> {
+    let Expr::Binary(ExprBinary {
+        left, op, right, ..
+    }) = expr
+    else {
+        return Err((
+            expr.span(),
+            "ZSL: `if` condition must be a comparison: a < b, a > b, a <= b, a >= b".into(),
+        ));
+    };
+    let lhs = lower_gfx_expr(ctx, left)?;
+    let rhs = lower_gfx_expr(ctx, right)?;
+    let t_bool = ctx.t_bool;
+    let (lhs, rhs) = gfx_unify_scalars(ctx, lhs, rhs);
+    let id = match (op, lhs.ty) {
+        (BinOp::Lt(_), GvTy::F32) => ctx.spv.op_ford_lt(t_bool, lhs.id, rhs.id),
+        (BinOp::Le(_), GvTy::F32) => ctx.spv.op_ford_le(t_bool, lhs.id, rhs.id),
+        (BinOp::Gt(_), GvTy::F32) => ctx.spv.op_ford_gt(t_bool, lhs.id, rhs.id),
+        (BinOp::Ge(_), GvTy::F32) => ctx.spv.op_ford_ge(t_bool, lhs.id, rhs.id),
+        (BinOp::Lt(_), GvTy::U32) => ctx.spv.op_ult(t_bool, lhs.id, rhs.id),
+        (BinOp::Le(_), GvTy::U32) => ctx.spv.op_ule(t_bool, lhs.id, rhs.id),
+        (BinOp::Gt(_), GvTy::U32) => ctx.spv.op_ugt(t_bool, lhs.id, rhs.id),
+        (BinOp::Ge(_), GvTy::U32) => ctx.spv.op_uge(t_bool, lhs.id, rhs.id),
+        _ => {
+            return Err((
+                op.span(),
+                "ZSL: unsupported comparison; use <, >, <=, >= on f32 or u32".into(),
+            ));
+        }
+    };
+    Ok(id)
+}
+
+/// Lower statements inside an `if` or `else` branch block.
+fn lower_gfx_block(ctx: &mut GfxCtx<'_>, block: &Block) -> Result<(), (Span, String)> {
+    for stmt in &block.stmts {
+        lower_gfx_stmt(ctx, stmt)?;
+    }
+    Ok(())
 }
 
 // ── Arithmetic ────────────────────────────────────────────────────────────────
