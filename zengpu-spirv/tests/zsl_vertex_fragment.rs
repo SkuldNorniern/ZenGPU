@@ -248,6 +248,58 @@ fn fragment_mat4_push_const() {
     assert!(spv_valid(SPV));
 }
 
+// ── If / comparison ───────────────────────────────────────────────────────────
+
+#[test]
+fn fragment_if_clamp_alpha() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_clamp(#[location(0)] color: Vec4, alpha: f32) -> Vec4 {
+            let a: f32 = alpha;
+            if a < 0.0 {
+                a = 0.0;
+            }
+            if a > 1.0 {
+                a = 1.0;
+            }
+            Vec4(color.x, color.y, color.z, a)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_if_else() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_select(#[location(0)] a: Vec4, #[location(1)] b: Vec4, t: f32) -> Vec4 {
+            let r: Vec4 = a;
+            if t >= 0.5 {
+                r = b;
+            } else {
+                r = a;
+            }
+            r
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_if_u32_compare() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_clip(#[location(0)] pos: Vec4, flag: u32) -> Vec4 {
+            let p: Vec4 = pos;
+            if flag > 0 {
+                p = Vec4(0.0, 0.0, 0.0, 1.0);
+            }
+            p
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── Vec-vec arithmetic ────────────────────────────────────────────────────────
 
 #[test]
