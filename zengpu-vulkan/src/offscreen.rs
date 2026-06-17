@@ -127,7 +127,7 @@ impl Drop for OffscreenTarget {
 mod tests {
     use super::*;
     use crate::{VulkanDevice, VulkanInstance};
-    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuDevice, GpuInstance};
+    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
 
     #[test]
     fn offscreen_target_handles_are_valid() {
