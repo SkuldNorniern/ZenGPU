@@ -335,6 +335,37 @@ fn fragment_vec3_mul_scalar_add_vec() {
     assert!(spv_valid(SPV));
 }
 
+// ── dot() built-in ───────────────────────────────────────────────────────────
+
+#[test]
+fn fragment_dot_product() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_dot(#[location(0)] a: Vec3, #[location(1)] b: Vec3) -> Vec4 {
+            let d: f32 = dot(a, b);
+            Vec4(d, d, d, 1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn fragment_diffuse_lighting() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_diffuse(#[location(0)] normal: Vec3, #[location(1)] color: Vec3) -> Vec4 {
+            let lx: f32 = 0.577;
+            let ly: f32 = 0.577;
+            let lz: f32 = 0.577;
+            let light: Vec3 = Vec3(lx, ly, lz);
+            let d: f32 = dot(normal, light);
+            let lit: f32 = d;
+            (color * lit).extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
