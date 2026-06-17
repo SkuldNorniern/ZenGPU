@@ -65,6 +65,7 @@ impl VulkanPipeline {
 pub(crate) struct VulkanRenderTarget {
     pub image: vk::Image,
     pub view: vk::ImageView,
+    #[allow(dead_code)]
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub layout: vk::ImageLayout,

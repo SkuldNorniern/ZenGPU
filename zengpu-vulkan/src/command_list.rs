@@ -159,6 +159,7 @@ const MAX_COLOR_ATTACHMENTS: usize = 4;
 /// slotmaps by `Arc<Mutex<...>>` for handle resolution.
 pub struct VulkanCommandList {
     pub(crate) inner: Arc<VulkanDeviceInner>,
+    #[allow(dead_code)]
     pub(crate) pool: Arc<CmdListPool>,
     pub(crate) cmd: vk::CommandBuffer,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
@@ -205,6 +206,7 @@ impl VulkanCommandList {
 
     /// Return this list's command buffer to its pool once the GPU is done
     /// with it (called by [`crate::surface`] after a fence wait).
+    #[allow(dead_code)]
     pub(crate) fn release(&self) {
         self.pool.release(self.cmd);
     }
