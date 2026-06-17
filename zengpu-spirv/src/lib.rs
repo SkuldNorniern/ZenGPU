@@ -33,23 +33,33 @@ pub use inline_spirv;
 #[doc(hidden)]
 pub use zengpu_zsl;
 
+/// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
+///
+/// Wrap any `mat4` value (glam, nalgebra, hand-rolled) as `ZslMat4(m.to_cols_array())`
+/// before passing it to `to_scalars()`. The 16 floats are laid out column-major,
+/// matching SPIR-V's `ColMajor` decoration.
+#[derive(Debug, Clone, Copy)]
+pub struct ZslMat4(pub [f32; 16]);
+
 /// Private re-exports referenced by code emitted by `#[derive(ZslPushConst)]`.
 /// Semver-exempt; do not use directly.
 #[doc(hidden)]
 pub mod _zsl_priv {
+    pub use super::ZslMat4;
     pub use zengpu_hal::Scalar;
 }
 
 /// Derive `to_scalars()` for a push-constant struct.
 ///
-/// Fields must be `u32`, `i32`, or `f32`. The generated method returns a
-/// fixed-size array of [`zengpu_hal::Scalar`] in field order, ready for
-/// `Bindings::scalars` in a dispatch call.
+/// Fields may be `u32`, `i32`, `f32`, or [`ZslMat4`]. The generated method
+/// returns a fixed-size array of [`zengpu_hal::Scalar`] in field order,
+/// ready for `Bindings::scalars` in a dispatch call. `ZslMat4` expands to
+/// 16 consecutive `Scalar::F32` entries in column-major order.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use zengpu_spirv::ZslPushConst;
+/// use zengpu_spirv::{ZslPushConst, ZslMat4};
 ///
 /// #[derive(ZslPushConst)]
 /// struct ScalePush {
