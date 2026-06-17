@@ -1,7 +1,25 @@
-//! ZSL lowering to SPIR-V for vertex and fragment shaders.
+//! ZSL to SPIR-V for vertex and fragment shaders.
 //!
-//! Supports `#[location(N)]` inputs, push constants (f32/u32/Mat4), Vec2/3/4 constructors and
-//! component access, `dot`, Mat4*Vec4, comparisons, and `if`/`else` with variable reassignment.
+//! Supports `#[location]` inputs (f32, Vec2-4), push constants (f32, u32, Mat4), vector
+//! constructors, swizzles, `extend`, arithmetic, comparisons, `&&`/`||`, `if`/`else`, reassignment,
+//! and GLSL.std.450 math builtins.
+
+/// GLSL.std.450 extended instruction opcodes used by ZSL.
+mod glsl_op {
+    pub const F_ABS: u32 = 4;
+    pub const F_SIGN: u32 = 6;
+    pub const FLOOR: u32 = 8;
+    pub const CEIL: u32 = 9;
+    pub const FRACT: u32 = 10;
+    pub const POW: u32 = 26;
+    pub const SQRT: u32 = 31;
+    pub const F_MIN: u32 = 37;
+    pub const F_MAX: u32 = 40;
+    pub const F_CLAMP: u32 = 43;
+    pub const F_MIX: u32 = 46;
+    pub const LENGTH: u32 = 66;
+    pub const NORMALIZE: u32 = 69;
+}
 
 use std::collections::HashMap;
 
@@ -69,6 +87,7 @@ struct GfxCtx<'a> {
     t_vec3: Id,
     t_vec4: Id,
     t_mat4: Id,
+    glsl_ext: Id,
     inputs: HashMap<String, InputVar>,
     scalar_params: HashMap<String, GfxScalarInfo>,
     pc_var: Option<Id>,
@@ -101,6 +120,7 @@ fn lower_graphics(
     let mut spv = SpvBuilder::new();
 
     spv.capability_shader();
+    let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
     let t_void = spv.type_void();
@@ -365,6 +385,7 @@ fn lower_graphics(
         t_vec3,
         t_vec4,
         t_mat4,
+        glsl_ext,
         inputs: input_vars,
         scalar_params: scalar_param_map,
         pc_var,
@@ -633,62 +654,222 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
             let Expr::Path(p) = &**func else {
                 return Err((
                     func.span(),
-                    "ZSL: unsupported call; expected Vec2/Vec3/Vec4".into(),
+                    "ZSL: unsupported call; expected a built-in or Vec2/Vec3/Vec4".into(),
                 ));
             };
             let Some(ctor) = p.path.get_ident() else {
                 return Err((
                     func.span(),
-                    "ZSL: unsupported call; expected Vec2/Vec3/Vec4".into(),
+                    "ZSL: unsupported call; expected a built-in or Vec2/Vec3/Vec4".into(),
                 ));
             };
-            if ctor == "dot" {
-                if args.len() != 2 {
-                    return Err((func.span(), "ZSL: dot(a, b) takes exactly 2 args".into()));
+            let name = ctor.to_string();
+            match name.as_str() {
+                "dot" => {
+                    if args.len() != 2 {
+                        return Err((func.span(), "ZSL: dot(a, b) takes exactly 2 args".into()));
+                    }
+                    let a = lower_gfx_expr(ctx, &args[0])?;
+                    let b = lower_gfx_expr(ctx, &args[1])?;
+                    if !matches!(a.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((args[0].span(), "ZSL: dot() requires Vec2/Vec3/Vec4".into()));
+                    }
+                    if a.ty != b.ty {
+                        return Err((
+                            args[1].span(),
+                            "ZSL: dot() args must have the same vector type".into(),
+                        ));
+                    }
+                    let t_f32 = ctx.t_f32;
+                    let id = ctx.spv.op_dot(t_f32, a.id, b.id);
+                    Ok(GVal { id, ty: GvTy::F32 })
                 }
-                let a = lower_gfx_expr(ctx, &args[0])?;
-                let b = lower_gfx_expr(ctx, &args[1])?;
-                if !matches!(a.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
-                    return Err((args[0].span(), "ZSL: dot() requires Vec2/Vec3/Vec4".into()));
-                }
-                if a.ty != b.ty {
-                    return Err((
-                        args[1].span(),
-                        "ZSL: dot() args must have the same vector type".into(),
-                    ));
-                }
-                let t_f32 = ctx.t_f32;
-                let id = ctx.spv.op_dot(t_f32, a.id, b.id);
-                return Ok(GVal { id, ty: GvTy::F32 });
-            }
 
-            let (expected, gty, spv_ty) = match ctor.to_string().as_str() {
-                "Vec4" => (4usize, GvTy::Vec4, ctx.t_vec4),
-                "Vec3" => (3, GvTy::Vec3, ctx.t_vec3),
-                "Vec2" => (2, GvTy::Vec2, ctx.t_vec2),
-                other => {
-                    return Err((
-                        ctor.span(),
-                        format!(
-                            "ZSL: unknown function `{other}`; use Vec2/Vec3/Vec4 constructors or dot()"
-                        ),
-                    ));
+                "abs" | "sign" | "sqrt" | "floor" | "ceil" | "fract" => {
+                    if args.len() != 1 {
+                        return Err((func.span(), format!("ZSL: {name}() takes 1 arg")));
+                    }
+                    let v = lower_gfx_expr(ctx, &args[0])?;
+                    if !matches!(v.ty, GvTy::F32 | GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            format!("ZSL: {name}() requires f32/Vec2/Vec3/Vec4"),
+                        ));
+                    }
+                    let opcode = match name.as_str() {
+                        "abs" => glsl_op::F_ABS,
+                        "sign" => glsl_op::F_SIGN,
+                        "sqrt" => glsl_op::SQRT,
+                        "floor" => glsl_op::FLOOR,
+                        "ceil" => glsl_op::CEIL,
+                        "fract" => glsl_op::FRACT,
+                        _ => unreachable!(),
+                    };
+                    let ty_id = ctx.spv_elem_ty(v.ty);
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx.spv.op_ext_inst(ty_id, glsl, opcode, &[v.id]);
+                    Ok(GVal { id, ty: v.ty })
                 }
-            };
-            if args.len() != expected {
-                return Err((
-                    func.span(),
-                    format!("ZSL: {ctor} takes {expected} args, got {}", args.len()),
-                ));
+
+                "normalize" => {
+                    if args.len() != 1 {
+                        return Err((func.span(), "ZSL: normalize() takes 1 arg".into()));
+                    }
+                    let v = lower_gfx_expr(ctx, &args[0])?;
+                    if !matches!(v.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            "ZSL: normalize() requires Vec2/Vec3/Vec4".into(),
+                        ));
+                    }
+                    let ty_id = ctx.spv_elem_ty(v.ty);
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx
+                        .spv
+                        .op_ext_inst(ty_id, glsl, glsl_op::NORMALIZE, &[v.id]);
+                    Ok(GVal { id, ty: v.ty })
+                }
+
+                "length" => {
+                    if args.len() != 1 {
+                        return Err((func.span(), "ZSL: length() takes 1 arg".into()));
+                    }
+                    let v = lower_gfx_expr(ctx, &args[0])?;
+                    if !matches!(v.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            "ZSL: length() requires Vec2/Vec3/Vec4".into(),
+                        ));
+                    }
+                    let t_f32 = ctx.t_f32;
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx.spv.op_ext_inst(t_f32, glsl, glsl_op::LENGTH, &[v.id]);
+                    Ok(GVal { id, ty: GvTy::F32 })
+                }
+
+                "min" | "max" | "pow" => {
+                    if args.len() != 2 {
+                        return Err((func.span(), format!("ZSL: {name}(a, b) takes 2 args")));
+                    }
+                    let a = lower_gfx_expr(ctx, &args[0])?;
+                    let b = lower_gfx_expr(ctx, &args[1])?;
+                    if !matches!(a.ty, GvTy::F32 | GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            format!("ZSL: {name}() requires f32/Vec2/Vec3/Vec4"),
+                        ));
+                    }
+                    if a.ty != b.ty {
+                        return Err((
+                            args[1].span(),
+                            format!("ZSL: {name}() args must be the same type"),
+                        ));
+                    }
+                    let opcode = match name.as_str() {
+                        "min" => glsl_op::F_MIN,
+                        "max" => glsl_op::F_MAX,
+                        "pow" => glsl_op::POW,
+                        _ => unreachable!(),
+                    };
+                    let ty_id = ctx.spv_elem_ty(a.ty);
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx.spv.op_ext_inst(ty_id, glsl, opcode, &[a.id, b.id]);
+                    Ok(GVal { id, ty: a.ty })
+                }
+
+                "clamp" => {
+                    if args.len() != 3 {
+                        return Err((func.span(), "ZSL: clamp(x, lo, hi) takes 3 args".into()));
+                    }
+                    let x = lower_gfx_expr(ctx, &args[0])?;
+                    let lo = lower_gfx_expr(ctx, &args[1])?;
+                    let hi = lower_gfx_expr(ctx, &args[2])?;
+                    if !matches!(x.ty, GvTy::F32 | GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            "ZSL: clamp() requires f32/Vec2/Vec3/Vec4".into(),
+                        ));
+                    }
+                    if x.ty != lo.ty || x.ty != hi.ty {
+                        return Err((
+                            func.span(),
+                            "ZSL: clamp() x, lo, and hi must all be the same type".into(),
+                        ));
+                    }
+                    let ty_id = ctx.spv_elem_ty(x.ty);
+                    let glsl = ctx.glsl_ext;
+                    let id =
+                        ctx.spv
+                            .op_ext_inst(ty_id, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
+                    Ok(GVal { id, ty: x.ty })
+                }
+
+                "mix" => {
+                    if args.len() != 3 {
+                        return Err((func.span(), "ZSL: mix(a, b, t) takes 3 args".into()));
+                    }
+                    let a = lower_gfx_expr(ctx, &args[0])?;
+                    let b = lower_gfx_expr(ctx, &args[1])?;
+                    let t = lower_gfx_expr(ctx, &args[2])?;
+                    if !matches!(a.ty, GvTy::F32 | GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                        return Err((
+                            args[0].span(),
+                            "ZSL: mix() requires f32/Vec2/Vec3/Vec4".into(),
+                        ));
+                    }
+                    if a.ty != b.ty {
+                        return Err((
+                            args[1].span(),
+                            "ZSL: mix() a and b must be the same type".into(),
+                        ));
+                    }
+                    if a.ty != t.ty {
+                        return Err((
+                            args[2].span(),
+                            "ZSL: mix() t must be the same type as a and b; \
+                             for vec mix with scalar t, use `a * (1.0 - t) + b * t`"
+                                .into(),
+                        ));
+                    }
+                    let ty_id = ctx.spv_elem_ty(a.ty);
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx
+                        .spv
+                        .op_ext_inst(ty_id, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
+                    Ok(GVal { id, ty: a.ty })
+                }
+
+                "Vec4" | "Vec3" | "Vec2" => {
+                    let (expected, gty, spv_ty) = match name.as_str() {
+                        "Vec4" => (4usize, GvTy::Vec4, ctx.t_vec4),
+                        "Vec3" => (3, GvTy::Vec3, ctx.t_vec3),
+                        "Vec2" => (2, GvTy::Vec2, ctx.t_vec2),
+                        _ => unreachable!(),
+                    };
+                    if args.len() != expected {
+                        return Err((
+                            func.span(),
+                            format!("ZSL: {name} takes {expected} args, got {}", args.len()),
+                        ));
+                    }
+                    let mut components: Vec<Id> = Vec::with_capacity(expected);
+                    for arg in args {
+                        let v = lower_gfx_expr(ctx, arg)?;
+                        components.push(scalar_to_f32(ctx, v));
+                    }
+                    let id = ctx.spv.op_composite_construct(spv_ty, &components);
+                    Ok(GVal { id, ty: gty })
+                }
+
+                other => Err((
+                    ctor.span(),
+                    format!(
+                        "ZSL: unknown function `{other}`; built-ins: \
+                         dot, abs, sign, sqrt, floor, ceil, fract, normalize, length, \
+                         min, max, pow, clamp, mix; constructors: Vec2, Vec3, Vec4"
+                    ),
+                )),
             }
-            let mut components: Vec<Id> = Vec::with_capacity(expected);
-            for arg in args {
-                let v = lower_gfx_expr(ctx, arg)?;
-                let f32_id = scalar_to_f32(ctx, v);
-                components.push(f32_id);
-            }
-            let id = ctx.spv.op_composite_construct(spv_ty, &components);
-            Ok(GVal { id, ty: gty })
         }
 
         Expr::Unary(ExprUnary { op, expr, .. }) => match op {
@@ -853,7 +1034,8 @@ fn gfx_local_ident(local: &syn::Local) -> Result<String, (Span, String)> {
     }
 }
 
-/// Only `<`, `>`, `<=`, `>=` on f32/u32. Yields a bool ID for a branch.
+/// Returns the bool ID for a branch condition. Comparisons work on f32 and u32. `&&` and `||`
+/// recurse into their operands.
 fn lower_gfx_condition(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<Id, (Span, String)> {
     let Expr::Binary(ExprBinary {
         left, op, right, ..
@@ -861,9 +1043,20 @@ fn lower_gfx_condition(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<Id, (Span, S
     else {
         return Err((
             expr.span(),
-            "ZSL: `if` condition must be a comparison: a < b, a > b, a <= b, a >= b".into(),
+            "ZSL: `if` condition must be a comparison (< > <= >= == !=) or logical (&& ||)".into(),
         ));
     };
+    if matches!(op, BinOp::And(_) | BinOp::Or(_)) {
+        let l = lower_gfx_condition(ctx, left)?;
+        let r = lower_gfx_condition(ctx, right)?;
+        let t_bool = ctx.t_bool;
+        let id = match op {
+            BinOp::And(_) => ctx.spv.op_logical_and(t_bool, l, r),
+            BinOp::Or(_) => ctx.spv.op_logical_or(t_bool, l, r),
+            _ => unreachable!(),
+        };
+        return Ok(id);
+    }
     let lhs = lower_gfx_expr(ctx, left)?;
     let rhs = lower_gfx_expr(ctx, right)?;
     let t_bool = ctx.t_bool;
@@ -873,14 +1066,18 @@ fn lower_gfx_condition(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<Id, (Span, S
         (BinOp::Le(_), GvTy::F32) => ctx.spv.op_ford_le(t_bool, lhs.id, rhs.id),
         (BinOp::Gt(_), GvTy::F32) => ctx.spv.op_ford_gt(t_bool, lhs.id, rhs.id),
         (BinOp::Ge(_), GvTy::F32) => ctx.spv.op_ford_ge(t_bool, lhs.id, rhs.id),
+        (BinOp::Eq(_), GvTy::F32) => ctx.spv.op_ford_eq(t_bool, lhs.id, rhs.id),
+        (BinOp::Ne(_), GvTy::F32) => ctx.spv.op_ford_ne(t_bool, lhs.id, rhs.id),
         (BinOp::Lt(_), GvTy::U32) => ctx.spv.op_ult(t_bool, lhs.id, rhs.id),
         (BinOp::Le(_), GvTy::U32) => ctx.spv.op_ule(t_bool, lhs.id, rhs.id),
         (BinOp::Gt(_), GvTy::U32) => ctx.spv.op_ugt(t_bool, lhs.id, rhs.id),
         (BinOp::Ge(_), GvTy::U32) => ctx.spv.op_uge(t_bool, lhs.id, rhs.id),
+        (BinOp::Eq(_), GvTy::U32) => ctx.spv.op_iequal(t_bool, lhs.id, rhs.id),
+        (BinOp::Ne(_), GvTy::U32) => ctx.spv.op_inot_equal(t_bool, lhs.id, rhs.id),
         _ => {
             return Err((
                 op.span(),
-                "ZSL: unsupported comparison; use <, >, <=, >= on f32 or u32".into(),
+                "ZSL: unsupported comparison; use <, >, <=, >=, ==, != on f32 or u32".into(),
             ));
         }
     };
