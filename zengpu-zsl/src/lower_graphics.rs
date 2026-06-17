@@ -675,6 +675,27 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
                     "ZSL: unsupported call; expected Vec2/Vec3/Vec4".into(),
                 ));
             };
+            // dot(a, b) → OpDot; both args must be the same vector type
+            if ctor == "dot" {
+                if args.len() != 2 {
+                    return Err((func.span(), "ZSL: dot(a, b) takes exactly 2 args".into()));
+                }
+                let a = lower_gfx_expr(ctx, &args[0])?;
+                let b = lower_gfx_expr(ctx, &args[1])?;
+                if !matches!(a.ty, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) {
+                    return Err((args[0].span(), "ZSL: dot() requires Vec2/Vec3/Vec4".into()));
+                }
+                if a.ty != b.ty {
+                    return Err((
+                        args[1].span(),
+                        "ZSL: dot() args must have the same vector type".into(),
+                    ));
+                }
+                let t_f32 = ctx.t_f32;
+                let id = ctx.spv.op_dot(t_f32, a.id, b.id);
+                return Ok(GVal { id, ty: GvTy::F32 });
+            }
+
             let (expected, gty, spv_ty) = match ctor.to_string().as_str() {
                 "Vec4" => (4usize, GvTy::Vec4, ctx.t_vec4),
                 "Vec3" => (3, GvTy::Vec3, ctx.t_vec3),
@@ -682,7 +703,9 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
                 other => {
                     return Err((
                         ctor.span(),
-                        format!("ZSL: unknown function `{other}`; use Vec2/Vec3/Vec4 constructors"),
+                        format!(
+                            "ZSL: unknown function `{other}`; use Vec2/Vec3/Vec4 constructors or dot()"
+                        ),
                     ));
                 }
             };
