@@ -1,7 +1,7 @@
 //! Minimal SPIR-V binary builder.
 //!
-//! Emits word-encoded SPIR-V for the subset used by ZSL compute shaders:
-//! SSBOs, push constants, `u32`/`f32` scalars, and basic arithmetic.
+//! Emits word-encoded SPIR-V for the subset used by ZSL shaders: SSBOs,
+//! push constants, scalars, vectors, matrices, and arithmetic/logic ops.
 
 /// A SPIR-V result ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

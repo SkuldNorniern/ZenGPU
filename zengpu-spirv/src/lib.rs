@@ -1,9 +1,8 @@
-//! ZenGPU shader macro — compile GLSL (and later ZSL/WGSL) to SPIR-V at build
-//! time.
+//! ZenGPU shader macro — compile GLSL and ZSL to SPIR-V at build time.
 //!
-//! # Step 1 — GLSL shim
+//! # GLSL
 //!
-//! `zengpu_spirv!` currently accepts the same syntax as `inline_spirv::inline_spirv!`:
+//! Pass a GLSL source string with a stage token, forwarded to `inline_spirv`:
 //!
 //! ```ignore
 //! use zengpu_spirv::zengpu_spirv;
@@ -18,12 +17,19 @@
 //! );
 //! ```
 //!
-//! # Roadmap
+//! # ZSL
 //!
-//! - Step 3+: ZSL (Rust-flavored) input via `#[vertex]`/`#[fragment]`/`#[compute]`
-//!   function attributes — auto-detected by the macro, compiled through the ZSL
-//!   pipeline rather than shaderc.
-//! - Later: WGSL input via a `wgsl` stage token, routed through `naga`.
+//! Pass a `#[vertex]`, `#[fragment]`, or `#[compute]` annotated Rust function.
+//! ZSL is a Rust-flavored shader language compiled directly to SPIR-V:
+//!
+//! ```ignore
+//! const VERT: &[u32] = zengpu_spirv!(
+//!     #[vertex]
+//!     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
+//!         mvp * in_pos.extend(1.0)
+//!     }
+//! );
+//! ```
 
 /// Re-export so that `$crate::inline_spirv` resolves inside `zengpu_spirv!`.
 #[doc(hidden)]
@@ -77,21 +83,22 @@ pub use zengpu_zsl::ZslPushConst;
 
 /// Compile shader source to SPIR-V at build time.
 ///
-/// # GLSL (current)
+/// # GLSL
 /// Pass a GLSL source string with a stage token, identical to `inline_spirv!`:
 /// ```ignore
 /// const SPV: &[u32] = zengpu_spirv!(r#"#version 450 ..."#, vert, vulkan1_0);
 /// ```
 ///
-/// # ZSL (step 3+)
+/// # ZSL
 /// Pass a Rust-flavored function annotated with a stage attribute:
 /// ```ignore
 /// const SPV: &[u32] = zengpu_spirv!(
 ///     #[vertex]
-///     fn vs_main(in_pos: Vec3) -> Vec4 { ... }
+///     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
+///         mvp * in_pos.extend(1.0)
+///     }
 /// );
 /// ```
-/// ZSL parsing is set up; codegen lands in step 3.
 #[macro_export]
 macro_rules! zengpu_spirv {
     // ZSL path: input starts with an outer attribute (#[vertex/fragment/compute] fn ...)
