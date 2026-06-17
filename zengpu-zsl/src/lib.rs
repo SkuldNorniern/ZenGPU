@@ -157,8 +157,8 @@ fn push_const_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
     let mut exprs: Vec<proc_macro2::TokenStream> = Vec::new();
     for field in &fields.named {
         let fname = field.ident.as_ref().unwrap();
-        let expr = scalar_field_expr(&field.ty, fname)?;
-        exprs.push(expr);
+        let mut field_exprs = scalar_field_exprs(&field.ty, fname)?;
+        exprs.append(&mut field_exprs);
     }
 
     let n = exprs.len();
@@ -171,23 +171,39 @@ fn push_const_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> 
     })
 }
 
-fn scalar_field_expr(ty: &syn::Type, fname: &syn::Ident) -> syn::Result<proc_macro2::TokenStream> {
+/// Builds the `Scalar` values for one field. A `ZslMat4` gives 16 `Scalar::F32` entries in
+/// column-major order.
+fn scalar_field_exprs(
+    ty: &syn::Type,
+    fname: &syn::Ident,
+) -> syn::Result<Vec<proc_macro2::TokenStream>> {
     let syn::Type::Path(tp) = ty else {
         return Err(syn::Error::new_spanned(
             ty,
-            "ZslPushConst fields must be u32, i32, or f32",
+            "ZslPushConst fields must be u32, i32, f32, or ZslMat4",
         ));
     };
     if tp.path.is_ident("u32") {
-        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::U32(self.#fname)))
+        Ok(vec![
+            quote!(::zengpu_spirv::_zsl_priv::Scalar::U32(self.#fname)),
+        ])
     } else if tp.path.is_ident("i32") {
-        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::I32(self.#fname)))
+        Ok(vec![
+            quote!(::zengpu_spirv::_zsl_priv::Scalar::I32(self.#fname)),
+        ])
     } else if tp.path.is_ident("f32") {
-        Ok(quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname)))
+        Ok(vec![
+            quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname)),
+        ])
+    } else if tp.path.is_ident("ZslMat4") {
+        let entries: Vec<proc_macro2::TokenStream> = (0usize..16)
+            .map(|i| quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname.0[#i])))
+            .collect();
+        Ok(entries)
     } else {
         Err(syn::Error::new_spanned(
             ty,
-            "ZslPushConst fields must be u32, i32, or f32",
+            "ZslPushConst fields must be u32, i32, f32, or ZslMat4",
         ))
     }
 }

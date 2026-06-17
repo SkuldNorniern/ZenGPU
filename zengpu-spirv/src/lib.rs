@@ -21,21 +21,28 @@ pub use inline_spirv;
 #[doc(hidden)]
 pub use zengpu_zsl;
 
+/// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
+/// SPIR-V `ColMajor`.
+#[derive(Debug, Clone, Copy)]
+pub struct ZslMat4(pub [f32; 16]);
+
 /// Private re-exports referenced by code emitted by `#[derive(ZslPushConst)]`. Semver-exempt; do
 /// not use directly.
 #[doc(hidden)]
 pub mod _zsl_priv {
+    pub use super::ZslMat4;
     pub use zengpu_hal::Scalar;
 }
 
-/// Derive `to_scalars()` for a push-constant struct. Fields must be `u32`, `i32` or `f32`.
+/// Converts a push-constant struct to scalars, for `Bindings::scalars`.
 ///
-/// Returns [`zengpu_hal::Scalar`]s in field order, for `Bindings::scalars`.
+/// Fields are `u32`, `i32`, `f32` or `ZslMat4`. Returns `[zengpu_hal::Scalar; N]` in field order.
+/// `ZslMat4` is 16 `Scalar::F32` in column-major order.
 ///
 /// # Example
 ///
 /// ```ignore
-/// use zengpu_spirv::ZslPushConst;
+/// use zengpu_spirv::{ZslPushConst, ZslMat4};
 ///
 /// #[derive(ZslPushConst)]
 /// struct ScalePush {
