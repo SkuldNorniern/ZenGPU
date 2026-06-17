@@ -174,6 +174,53 @@ fn vertex_mat4_with_extend() {
     assert!(spv_valid(SPV));
 }
 
+// ── Negation and vector arithmetic ───────────────────────────────────────────
+
+#[test]
+fn vertex_negate_scalar() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_neg(#[location(0)] pos: Vec4) -> Vec4 {
+            let w: f32 = -pos.w;
+            Vec4(pos.x, pos.y, pos.z, w)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_negate_vec() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_neg_vec(#[location(0)] pos: Vec4) -> Vec4 {
+            -pos
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_vec_times_scalar() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_scale(#[location(0)] pos: Vec4, scale: f32) -> Vec4 {
+            pos * scale
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_scalar_times_vec() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_scale2(#[location(0)] pos: Vec3, scale: f32) -> Vec4 {
+            (scale * pos).extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {

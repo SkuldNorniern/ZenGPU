@@ -56,6 +56,20 @@ fn compute_scale_buffer() {
     assert!(spv_valid(SPV));
 }
 
+#[test]
+fn compute_negate() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[compute]
+        fn cs_neg(src: Buf<f32>, dst: BufMut<f32>, len: u32) {
+            let i: u32 = global_id().x;
+            if i < len {
+                dst[i] = -src[i];
+            }
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
