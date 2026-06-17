@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprPath, ExprTuple, Lit,
-    Member, Stmt, spanned::Spanned,
+    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprMethodCall, ExprPath,
+    ExprTuple, Lit, Member, Stmt, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -35,6 +35,7 @@ enum GvTy {
     Vec2,
     Vec3,
     Vec4,
+    Mat4,
 }
 
 struct GVal {
@@ -70,11 +71,14 @@ struct GfxCtx<'a> {
     t_vec2: Id,
     t_vec3: Id,
     t_vec4: Id,
+    t_mat4: Id,
     inputs: HashMap<String, InputVar>,
     scalar_params: HashMap<String, GfxScalarInfo>,
     pc_var: Option<Id>,
     t_ptr_pc_u32: Id,
     t_ptr_pc_f32: Id,
+    t_ptr_pc_mat4: Id,
+    #[allow(dead_code)]
     const_0_u32: Id,
     locals: HashMap<String, GfxLocal>,
 }
@@ -87,6 +91,7 @@ impl GfxCtx<'_> {
             GvTy::Vec2 => self.t_vec2,
             GvTy::Vec3 => self.t_vec3,
             GvTy::Vec4 => self.t_vec4,
+            GvTy::Mat4 => self.t_mat4,
         }
     }
 }
@@ -110,6 +115,7 @@ fn lower_graphics(
     let t_vec2 = spv.type_vector(t_f32, 2);
     let t_vec3 = spv.type_vector(t_f32, 3);
     let t_vec4 = spv.type_vector(t_f32, 4);
+    let t_mat4 = spv.type_matrix(t_vec4, 4);
 
     // ── Return type: parse varyings from tuple ────────────────────────────────
     // Vertex: Vec4 → position only; (Vec4, T…) → position + varyings at loc 0,1,…
@@ -149,7 +155,9 @@ fn lower_graphics(
     let scalar_params: Vec<&ZslParam> = entry
         .params
         .iter()
-        .filter(|p| p.location.is_none() && matches!(p.ty, ZslType::U32 | ZslType::F32))
+        .filter(|p| {
+            p.location.is_none() && matches!(p.ty, ZslType::U32 | ZslType::F32 | ZslType::Mat4)
+        })
         .collect();
 
     // ── Input pointer types ───────────────────────────────────────────────────
@@ -183,6 +191,7 @@ fn lower_graphics(
             GvTy::Vec2 => (t_ptr_in_vec2, t_vec2),
             GvTy::Vec3 => (t_ptr_in_vec3, t_vec3),
             GvTy::Vec4 => (t_ptr_in_vec4, t_vec4),
+            GvTy::Mat4 => unreachable!(), // gv_ty_from_zsl never returns Mat4 for inputs
         };
         let var = spv.global_variable(spv_ptr_ty, sc::INPUT);
         spv.decorate(var, deco::LOCATION, &[loc]);
@@ -227,16 +236,35 @@ fn lower_graphics(
         varying_out_vars.push((var, gty));
     }
 
-    // ── Push-constant block (scalar params without location) ──────────────────
+    // ── Push-constant block (params without location: u32/f32/Mat4) ─────────────
     let pc_var = if !scalar_params.is_empty() {
         let pc_members: Vec<Id> = scalar_params
             .iter()
-            .map(|p| if p.ty == ZslType::U32 { t_u32 } else { t_f32 })
+            .map(|p| match p.ty {
+                ZslType::U32 => t_u32,
+                ZslType::F32 => t_f32,
+                ZslType::Mat4 => t_mat4,
+                _ => unreachable!(),
+            })
             .collect();
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
-        for (i, _) in scalar_params.iter().enumerate() {
-            spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[(i * 4) as u32]);
+        let mut offset: u32 = 0;
+        for (i, p) in scalar_params.iter().enumerate() {
+            match p.ty {
+                ZslType::U32 | ZslType::F32 => {
+                    spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[offset]);
+                    offset += 4;
+                }
+                ZslType::Mat4 => {
+                    offset = (offset + 15) & !15; // align to 16
+                    spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[offset]);
+                    spv.member_decorate(t_pc_struct, i as u32, deco::COL_MAJOR, &[]);
+                    spv.member_decorate(t_pc_struct, i as u32, deco::MATRIX_STRIDE, &[16]);
+                    offset += 64;
+                }
+                _ => unreachable!(),
+            }
         }
         let t_ptr_pc = spv.type_pointer(sc::PUSH_CONSTANT, t_pc_struct);
         Some(spv.global_variable(t_ptr_pc, sc::PUSH_CONSTANT))
@@ -258,15 +286,15 @@ fn lower_graphics(
     // ── Constants ─────────────────────────────────────────────────────────────
     let const_0_u32 = spv.constant_u32(t_u32, 0);
 
-    // ── Scalar param map ──────────────────────────────────────────────────────
+    // ── Scalar/mat param map ──────────────────────────────────────────────────
     let scalar_param_map: HashMap<String, GfxScalarInfo> = scalar_params
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let (ty, gty) = if p.ty == ZslType::U32 {
-                (t_u32, GvTy::U32)
-            } else {
-                (t_f32, GvTy::F32)
+            let (ty, gty) = match p.ty {
+                ZslType::U32 => (t_u32, GvTy::U32),
+                ZslType::Mat4 => (t_mat4, GvTy::Mat4),
+                _ => (t_f32, GvTy::F32),
             };
             (
                 p.ident.to_string(),
@@ -282,6 +310,7 @@ fn lower_graphics(
     // ── Push-constant pointer types ───────────────────────────────────────────
     let mut t_ptr_pc_u32 = Id(0);
     let mut t_ptr_pc_f32 = Id(0);
+    let mut t_ptr_pc_mat4 = Id(0);
     if pc_var.is_some() {
         for p in &scalar_params {
             match p.ty {
@@ -290,6 +319,9 @@ fn lower_graphics(
                 }
                 ZslType::F32 if t_ptr_pc_f32 == Id(0) => {
                     t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
+                }
+                ZslType::Mat4 if t_ptr_pc_mat4 == Id(0) => {
+                    t_ptr_pc_mat4 = spv.type_pointer(sc::PUSH_CONSTANT, t_mat4);
                 }
                 _ => {}
             }
@@ -314,6 +346,12 @@ fn lower_graphics(
             GvTy::Vec2 => t_vec2,
             GvTy::Vec3 => t_vec3,
             GvTy::Vec4 => t_vec4,
+            GvTy::Mat4 => {
+                return Err((
+                    Span::call_site(),
+                    "ZSL: Mat4 local variables are not supported".into(),
+                ));
+            }
         };
         let ptr_ty_slot = match gty {
             GvTy::F32 => &mut t_ptr_func_f32,
@@ -321,6 +359,7 @@ fn lower_graphics(
             GvTy::Vec2 => &mut t_ptr_func_vec2,
             GvTy::Vec3 => &mut t_ptr_func_vec3,
             GvTy::Vec4 => &mut t_ptr_func_vec4,
+            GvTy::Mat4 => unreachable!(),
         };
         if *ptr_ty_slot == Id(0) {
             *ptr_ty_slot = spv.type_pointer(sc::FUNCTION, elem_ty);
@@ -344,11 +383,13 @@ fn lower_graphics(
         t_vec2,
         t_vec3,
         t_vec4,
+        t_mat4,
         inputs: input_vars,
         scalar_params: scalar_param_map,
         pc_var,
         t_ptr_pc_u32,
         t_ptr_pc_f32,
+        t_ptr_pc_mat4,
         const_0_u32,
         locals,
     };
@@ -520,11 +561,13 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
                 let pc_var = ctx
                     .pc_var
                     .ok_or_else(|| (path.span(), "ZSL: no push constant block".into()))?;
-                let is_u32 = info.gty == GvTy::U32;
-                let pc_ptr_ty = if is_u32 {
-                    ctx.t_ptr_pc_u32
-                } else {
-                    ctx.t_ptr_pc_f32
+                let pc_ptr_ty = match info.gty {
+                    GvTy::U32 => ctx.t_ptr_pc_u32,
+                    GvTy::F32 => ctx.t_ptr_pc_f32,
+                    GvTy::Mat4 => ctx.t_ptr_pc_mat4,
+                    _ => {
+                        return Err((path.span(), "ZSL: unsupported push-constant type".into()));
+                    }
                 };
                 if pc_ptr_ty == Id(0) {
                     return Err((
@@ -532,9 +575,8 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
                         "ZSL: push-constant pointer type not allocated".into(),
                     ));
                 }
-                let c0 = ctx.const_0_u32;
                 let pc_idx = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
-                let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[c0, pc_idx]);
+                let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
                 let id = ctx.spv.op_load(info.ty, chain);
                 return Ok(GVal { id, ty: info.gty });
             }
@@ -616,6 +658,43 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
             gfx_binary_arith(ctx, lhs, rhs, op)
         }
 
+        // vec3.extend(f32) → Vec4
+        Expr::MethodCall(ExprMethodCall {
+            receiver,
+            method,
+            args,
+            ..
+        }) => {
+            if method != "extend" {
+                return Err((
+                    method.span(),
+                    format!("ZSL: unknown method `.{method}()`; use `.extend(f32)` on Vec3"),
+                ));
+            }
+            if args.len() != 1 {
+                return Err((
+                    method.span(),
+                    "ZSL: `.extend()` takes exactly one argument".into(),
+                ));
+            }
+            let base = lower_gfx_expr(ctx, receiver)?;
+            if base.ty != GvTy::Vec3 {
+                return Err((
+                    receiver.span(),
+                    "ZSL: `.extend()` requires a Vec3 receiver".into(),
+                ));
+            }
+            let ext = lower_gfx_expr(ctx, &args[0])?;
+            let ext_id = scalar_to_f32(ctx, ext);
+            let t_f32 = ctx.t_f32;
+            let x = ctx.spv.op_composite_extract(t_f32, base.id, &[0]);
+            let y = ctx.spv.op_composite_extract(t_f32, base.id, &[1]);
+            let z = ctx.spv.op_composite_extract(t_f32, base.id, &[2]);
+            let t_vec4 = ctx.t_vec4;
+            let id = ctx.spv.op_composite_construct(t_vec4, &[x, y, z, ext_id]);
+            Ok(GVal { id, ty: GvTy::Vec4 })
+        }
+
         Expr::Paren(ep) => lower_gfx_expr(ctx, &ep.expr),
 
         other => Err((
@@ -677,6 +756,17 @@ fn gfx_binary_arith(
     rhs: GVal,
     op: &BinOp,
 ) -> Result<GVal, (Span, String)> {
+    if lhs.ty == GvTy::Mat4 {
+        if !matches!(op, BinOp::Mul(_)) {
+            return Err((op.span(), "ZSL: Mat4 only supports `*`".into()));
+        }
+        if rhs.ty != GvTy::Vec4 {
+            return Err((op.span(), "ZSL: Mat4 * requires Vec4 on the right".into()));
+        }
+        let t_vec4 = ctx.t_vec4;
+        let id = ctx.spv.op_matrix_times_vector(t_vec4, lhs.id, rhs.id);
+        return Ok(GVal { id, ty: GvTy::Vec4 });
+    }
     if !matches!(lhs.ty, GvTy::F32 | GvTy::U32) {
         return Err((
             op.span(),
@@ -792,5 +882,6 @@ fn gvty_to_spv_id(gty: GvTy, t_f32: Id, t_u32: Id, t_vec2: Id, t_vec3: Id, t_vec
         GvTy::Vec2 => t_vec2,
         GvTy::Vec3 => t_vec3,
         GvTy::Vec4 => t_vec4,
+        GvTy::Mat4 => unreachable!(), // Mat4 is never a vertex varying
     }
 }

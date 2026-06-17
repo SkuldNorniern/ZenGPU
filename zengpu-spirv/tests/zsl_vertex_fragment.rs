@@ -122,6 +122,58 @@ fn vertex_varying_computed() {
     assert!(spv_valid(SPV));
 }
 
+// ── Vec3::extend ─────────────────────────────────────────────────────────────
+
+#[test]
+fn vertex_extend_vec3() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_extend(#[location(0)] pos: Vec3) -> Vec4 {
+            pos.extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_extend_with_expr() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_extend2(#[location(0)] pos: Vec3, #[location(1)] col: Vec3) -> (Vec4, Vec3) {
+            (pos.extend(1.0), col)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+// ── Mat4 push constant ────────────────────────────────────────────────────────
+
+#[test]
+fn vertex_mat4_push_const() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_mvp(#[location(0)] pos: Vec4, mvp: Mat4) -> Vec4 {
+            mvp * pos
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_mat4_with_extend() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_mvp_extend(
+            #[location(0)] pos: Vec3,
+            #[location(1)] col: Vec3,
+            mvp: Mat4,
+        ) -> (Vec4, Vec3) {
+            (mvp * pos.extend(1.0), col)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
