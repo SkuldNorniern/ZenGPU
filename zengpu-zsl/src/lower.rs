@@ -1,11 +1,28 @@
 //! ZSL → SPIR-V lowering for compute shaders.
 //!
-//! Scope: `#[compute]` entry points with `Buf<f32>`, `BufMut<f32>`, and
-//! `u32`/`f32` push-constant params. Body supports: arithmetic, buffer
-//! indexing, `gl_global_id_x()`, and `if`-without-else.
+//! Supports: `#[compute]` entry points with `Buf<f32>`, `BufMut<f32>`, and
+//! `u32`/`f32` push-constant params. Body: arithmetic, buffer indexing,
+//! `global_id().x/y/z`, `if`/`else`, comparison operators (`< > <= >= == !=`),
+//! logical operators (`&&`/`||`), and GLSL.std.450 math builtins (`abs`, `sign`,
+//! `sqrt`, `floor`, `ceil`, `fract`, `min`, `max`, `pow`, `clamp`, `mix`).
 //!
-//! Two-pass approach: all function-scope `OpVariable` declarations are hoisted
-//! to the entry block (SPIR-V requires this), then the statements are lowered.
+//! Two-pass: all `OpVariable` declarations are hoisted to the entry block
+//! (SPIR-V requires this), then statements are lowered.
+
+/// GLSL.std.450 extended instruction opcodes used by ZSL compute builtins.
+mod glsl_op {
+    pub const F_ABS: u32 = 4;
+    pub const F_SIGN: u32 = 6;
+    pub const FLOOR: u32 = 8;
+    pub const CEIL: u32 = 9;
+    pub const FRACT: u32 = 10;
+    pub const POW: u32 = 26;
+    pub const SQRT: u32 = 31;
+    pub const F_MIN: u32 = 37;
+    pub const F_MAX: u32 = 40;
+    pub const F_CLAMP: u32 = 43;
+    pub const F_MIX: u32 = 46;
+}
 
 use std::collections::HashMap;
 
@@ -30,6 +47,7 @@ pub fn lower_compute(
     let mut spv = SpvBuilder::new();
 
     spv.capability_shader();
+    let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
     // ── Core scalar types ────────────────────────────────────────────────────
@@ -190,6 +208,7 @@ pub fn lower_compute(
         t_f32,
         t_uvec3,
         t_ptr_ssbo_f32,
+        glsl_ext,
         buf_params: buf_param_map,
         scalar_params: scalar_param_map,
         pc_var,
@@ -248,6 +267,7 @@ struct LowerCtx<'a> {
     t_f32: Id,
     t_uvec3: Id,
     t_ptr_ssbo_f32: Id,
+    glsl_ext: Id,
     buf_params: HashMap<String, BufInfo>,
     scalar_params: HashMap<String, ScalarInfo>,
     pc_var: Option<Id>,
@@ -406,28 +426,42 @@ fn lower_expr_stmt(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<(), (Span, Str
             Ok(())
         }
 
-        // `if cond { block }` without else
         Expr::If(expr_if) => {
-            if expr_if.else_branch.is_some() {
-                return Err((
-                    expr_if.if_token.span,
-                    "ZSL: `if-else` not yet supported (step 4 handles `if` only)".into(),
-                ));
-            }
             let cond = lower_expr(ctx, &expr_if.cond)?;
             let cond_id = coerce(ctx, cond, ScalarTy::Bool);
-
-            // Pre-allocate both target IDs before emitting branch instructions.
             let true_label = ctx.spv.fresh_id();
             let merge_label = ctx.spv.fresh_id();
 
-            ctx.spv.op_selection_merge(merge_label);
-            ctx.spv
-                .op_branch_conditional(cond_id, true_label, merge_label);
+            if let Some((_, else_expr)) = &expr_if.else_branch {
+                let false_label = ctx.spv.fresh_id();
+                ctx.spv.op_selection_merge(merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, true_label, false_label);
 
-            ctx.spv.label_with_id(true_label);
-            lower_block(ctx, &expr_if.then_branch)?;
-            ctx.spv.op_branch(merge_label);
+                ctx.spv.label_with_id(true_label);
+                lower_block(ctx, &expr_if.then_branch)?;
+                ctx.spv.op_branch(merge_label);
+
+                ctx.spv.label_with_id(false_label);
+                match else_expr.as_ref() {
+                    Expr::Block(eb) => lower_block(ctx, &eb.block)?,
+                    other => {
+                        return Err((
+                            other.span(),
+                            "ZSL: else branch must be a block `{ ... }`".into(),
+                        ));
+                    }
+                }
+                ctx.spv.op_branch(merge_label);
+            } else {
+                ctx.spv.op_selection_merge(merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, true_label, merge_label);
+
+                ctx.spv.label_with_id(true_label);
+                lower_block(ctx, &expr_if.then_branch)?;
+                ctx.spv.op_branch(merge_label);
+            }
 
             ctx.spv.label_with_id(merge_label);
             Ok(())
@@ -569,10 +603,124 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
             Err((base.span(), "ZSL: unsupported field access".into()))
         }
 
-        Expr::Call(ExprCall { func, .. }) => Err((
-            func.span(),
-            "ZSL: unknown function call; use `global_id().x/y/z` for compute built-ins".into(),
-        )),
+        Expr::Call(ExprCall { func, args, .. }) => {
+            let Expr::Path(p) = &**func else {
+                return Err((func.span(), "ZSL: expected a built-in function name".into()));
+            };
+            let Some(ident) = p.path.get_ident() else {
+                return Err((func.span(), "ZSL: expected a simple function name".into()));
+            };
+            let name = ident.to_string();
+            match name.as_str() {
+                "global_id" => Err((
+                    func.span(),
+                    "ZSL: use `global_id().x`, `.y`, or `.z`".into(),
+                )),
+                // Unary GLSL builtins: f32 → f32
+                "abs" | "sign" | "sqrt" | "floor" | "ceil" | "fract" => {
+                    if args.len() != 1 {
+                        return Err((func.span(), format!("ZSL: {name}() takes 1 arg")));
+                    }
+                    let v = lower_expr(ctx, &args[0])?;
+                    if v.ty != ScalarTy::F32 {
+                        return Err((args[0].span(), format!("ZSL: {name}() requires f32")));
+                    }
+                    let opcode = match name.as_str() {
+                        "abs" => glsl_op::F_ABS,
+                        "sign" => glsl_op::F_SIGN,
+                        "sqrt" => glsl_op::SQRT,
+                        "floor" => glsl_op::FLOOR,
+                        "ceil" => glsl_op::CEIL,
+                        "fract" => glsl_op::FRACT,
+                        _ => unreachable!(),
+                    };
+                    let t_f32 = ctx.t_f32;
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[v.id]);
+                    Ok(Val {
+                        id,
+                        ty: ScalarTy::F32,
+                    })
+                }
+                // Binary GLSL builtins: (f32, f32) → f32
+                "min" | "max" | "pow" => {
+                    if args.len() != 2 {
+                        return Err((func.span(), format!("ZSL: {name}(a, b) takes 2 args")));
+                    }
+                    let a = lower_expr(ctx, &args[0])?;
+                    let b = lower_expr(ctx, &args[1])?;
+                    if a.ty != ScalarTy::F32 {
+                        return Err((args[0].span(), format!("ZSL: {name}() requires f32")));
+                    }
+                    if b.ty != ScalarTy::F32 {
+                        return Err((args[1].span(), format!("ZSL: {name}() requires f32")));
+                    }
+                    let opcode = match name.as_str() {
+                        "min" => glsl_op::F_MIN,
+                        "max" => glsl_op::F_MAX,
+                        "pow" => glsl_op::POW,
+                        _ => unreachable!(),
+                    };
+                    let t_f32 = ctx.t_f32;
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[a.id, b.id]);
+                    Ok(Val {
+                        id,
+                        ty: ScalarTy::F32,
+                    })
+                }
+                // clamp(x, lo, hi): (f32, f32, f32) → f32
+                "clamp" => {
+                    if args.len() != 3 {
+                        return Err((func.span(), "ZSL: clamp(x, lo, hi) takes 3 args".into()));
+                    }
+                    let x = lower_expr(ctx, &args[0])?;
+                    let lo = lower_expr(ctx, &args[1])?;
+                    let hi = lower_expr(ctx, &args[2])?;
+                    if x.ty != ScalarTy::F32 || lo.ty != ScalarTy::F32 || hi.ty != ScalarTy::F32 {
+                        return Err((func.span(), "ZSL: clamp() requires f32 args".into()));
+                    }
+                    let t_f32 = ctx.t_f32;
+                    let glsl = ctx.glsl_ext;
+                    let id =
+                        ctx.spv
+                            .op_ext_inst(t_f32, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
+                    Ok(Val {
+                        id,
+                        ty: ScalarTy::F32,
+                    })
+                }
+                // mix(a, b, t): (f32, f32, f32) → f32
+                "mix" => {
+                    if args.len() != 3 {
+                        return Err((func.span(), "ZSL: mix(a, b, t) takes 3 args".into()));
+                    }
+                    let a = lower_expr(ctx, &args[0])?;
+                    let b = lower_expr(ctx, &args[1])?;
+                    let t = lower_expr(ctx, &args[2])?;
+                    if a.ty != ScalarTy::F32 || b.ty != ScalarTy::F32 || t.ty != ScalarTy::F32 {
+                        return Err((func.span(), "ZSL: mix() requires f32 args".into()));
+                    }
+                    let t_f32 = ctx.t_f32;
+                    let glsl = ctx.glsl_ext;
+                    let id = ctx
+                        .spv
+                        .op_ext_inst(t_f32, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
+                    Ok(Val {
+                        id,
+                        ty: ScalarTy::F32,
+                    })
+                }
+                other => Err((
+                    ident.span(),
+                    format!(
+                        "ZSL: unknown function `{other}`; built-ins: \
+                         abs, sign, sqrt, floor, ceil, fract, min, max, pow, clamp, mix; \
+                         or use global_id().x/y/z"
+                    ),
+                )),
+            }
+        }
 
         Expr::Unary(ExprUnary { op, expr, .. }) => match op {
             UnOp::Neg(_) => {
@@ -607,13 +755,62 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
                 BinOp::Div(_) => {
                     binary_arith(ctx, lhs, rhs, SpvBuilder::op_fdiv, SpvBuilder::op_udiv)
                 }
-                BinOp::Lt(_) => {
+                BinOp::Lt(_)
+                | BinOp::Le(_)
+                | BinOp::Gt(_)
+                | BinOp::Ge(_)
+                | BinOp::Eq(_)
+                | BinOp::Ne(_) => {
                     let (lhs, rhs) = unify(ctx, lhs, rhs);
                     let bool_ty = ctx.t_bool;
-                    let id = if lhs.ty == ScalarTy::F32 {
-                        ctx.spv.op_slt(bool_ty, lhs.id, rhs.id)
-                    } else {
-                        ctx.spv.op_ult(bool_ty, lhs.id, rhs.id)
+                    let id = match (op, lhs.ty) {
+                        (BinOp::Lt(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_lt(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Le(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_le(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Gt(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_gt(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Ge(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_ge(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Eq(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_eq(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Ne(_), ScalarTy::F32) => {
+                            ctx.spv.op_ford_ne(bool_ty, lhs.id, rhs.id)
+                        }
+                        (BinOp::Lt(_), ScalarTy::U32) => ctx.spv.op_ult(bool_ty, lhs.id, rhs.id),
+                        (BinOp::Le(_), ScalarTy::U32) => ctx.spv.op_ule(bool_ty, lhs.id, rhs.id),
+                        (BinOp::Gt(_), ScalarTy::U32) => ctx.spv.op_ugt(bool_ty, lhs.id, rhs.id),
+                        (BinOp::Ge(_), ScalarTy::U32) => ctx.spv.op_uge(bool_ty, lhs.id, rhs.id),
+                        (BinOp::Eq(_), ScalarTy::U32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
+                        (BinOp::Ne(_), ScalarTy::U32) => {
+                            ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id)
+                        }
+                        _ => {
+                            return Err((
+                                op.span(),
+                                "ZSL: comparisons not supported on bool".into(),
+                            ));
+                        }
+                    };
+                    Ok(Val {
+                        id,
+                        ty: ScalarTy::Bool,
+                    })
+                }
+                BinOp::And(_) | BinOp::Or(_) => {
+                    if lhs.ty != ScalarTy::Bool || rhs.ty != ScalarTy::Bool {
+                        return Err((op.span(), "ZSL: `&&`/`||` require bool operands".into()));
+                    }
+                    let bool_ty = ctx.t_bool;
+                    let id = match op {
+                        BinOp::And(_) => ctx.spv.op_logical_and(bool_ty, lhs.id, rhs.id),
+                        BinOp::Or(_) => ctx.spv.op_logical_or(bool_ty, lhs.id, rhs.id),
+                        _ => unreachable!(),
                     };
                     Ok(Val {
                         id,
@@ -622,7 +819,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
                 }
                 other => Err((
                     other.span(),
-                    "ZSL: unsupported op (step 4: +, -, *, /, <)".into(),
+                    "ZSL: unsupported op; use +, -, *, /, <, >, <=, >=, ==, !=, &&, ||".into(),
                 )),
             }
         }
