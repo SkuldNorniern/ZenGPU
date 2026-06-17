@@ -69,6 +69,13 @@ mod op {
     pub const TYPE_MATRIX: u32 = 24;
     pub const MATRIX_TIMES_VECTOR: u32 = 144;
     pub const DOT: u32 = 148;
+    pub const LOGICAL_OR: u32 = 166;
+    pub const LOGICAL_AND: u32 = 167;
+    pub const IEQUAL: u32 = 170;
+    pub const INOT_EQUAL: u32 = 171;
+    pub const FORD_EQUAL: u32 = 180;
+    pub const FORD_NOT_EQUAL: u32 = 182;
+    pub const EXT_INST: u32 = 12;
 }
 
 /// SPIR-V decoration constants.
@@ -651,6 +658,77 @@ impl SpvBuilder {
     pub fn op_dot(&mut self, f32_ty: Id, a: Id, b: Id) -> Id {
         let id = self.fresh_id();
         emit(&mut self.functions, op::DOT, &[f32_ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    pub fn op_iequal(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IEQUAL,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_inot_equal(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::INOT_EQUAL,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_eq(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_EQUAL,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_ford_ne(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::FORD_NOT_EQUAL,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_logical_and(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::LOGICAL_AND,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_logical_or(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::LOGICAL_OR,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    /// OpExtInst — call an extended instruction set function (e.g. GLSL.std.450).
+    pub fn op_ext_inst(&mut self, ty: Id, set: Id, opcode: u32, operands: &[Id]) -> Id {
+        let id = self.fresh_id();
+        let mut words = vec![ty.0, id.0, set.0, opcode];
+        for o in operands {
+            words.push(o.0);
+        }
+        emit_raw(&mut self.functions, op::EXT_INST, &words);
         id
     }
 
