@@ -82,6 +82,46 @@ fn fragment_vec3_input() {
     assert!(spv_valid(SPV));
 }
 
+// ── Vertex varyings ───────────────────────────────────────────────────────────
+
+#[test]
+fn vertex_one_varying() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_color(#[location(0)] pos: Vec4, #[location(1)] col: Vec3) -> (Vec4, Vec3) {
+            (pos, col)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_two_varyings() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_uv(
+            #[location(0)] pos: Vec3,
+            #[location(1)] col: Vec3,
+            #[location(2)] uv: Vec2,
+        ) -> (Vec4, Vec3, Vec2) {
+            (Vec4(pos.x, pos.y, pos.z, 1.0), col, uv)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_varying_computed() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_computed(#[location(0)] pos: Vec4, #[location(1)] col: Vec4) -> (Vec4, Vec4) {
+            let r: f32 = col.x + col.y;
+            (pos, Vec4(r, col.y, col.z, col.w))
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
