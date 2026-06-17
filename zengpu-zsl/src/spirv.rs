@@ -56,6 +56,9 @@ mod op {
     pub const CONVERT_F_TO_U: u32 = 109;
     pub const CONVERT_U_TO_F: u32 = 112;
     pub const BITCAST: u32 = 124;
+    pub const SNEGATE: u32 = 126;
+    pub const FNEGATE: u32 = 127;
+    pub const VECTOR_TIMES_SCALAR: u32 = 142;
     pub const TYPE_MATRIX: u32 = 24;
     pub const MATRIX_TIMES_VECTOR: u32 = 144;
 }
@@ -501,6 +504,28 @@ impl SpvBuilder {
     pub fn op_udiv(&mut self, ty: Id, a: Id, b: Id) -> Id {
         let id = self.fresh_id();
         emit(&mut self.functions, op::UDIV, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    pub fn op_fnegate(&mut self, ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::FNEGATE, &[ty.0, id.0, val.0]);
+        id
+    }
+
+    pub fn op_snegate(&mut self, ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::SNEGATE, &[ty.0, id.0, val.0]);
+        id
+    }
+
+    pub fn op_vector_times_scalar(&mut self, vec_ty: Id, vec: Id, scalar: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::VECTOR_TIMES_SCALAR,
+            &[vec_ty.0, id.0, vec.0, scalar.0],
+        );
         id
     }
 
