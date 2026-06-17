@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprPath, Lit, Member, Stmt,
-    spanned::Spanned,
+    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprLit, ExprPath, ExprTuple, Lit,
+    Member, Stmt, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -111,6 +111,35 @@ fn lower_graphics(
     let t_vec3 = spv.type_vector(t_f32, 3);
     let t_vec4 = spv.type_vector(t_f32, 4);
 
+    // ── Return type: parse varyings from tuple ────────────────────────────────
+    // Vertex: Vec4 → position only; (Vec4, T…) → position + varyings at loc 0,1,…
+    // Fragment: always Vec4.
+    let ret_varyings: Vec<ZslType> = if is_fragment {
+        vec![]
+    } else {
+        match &entry.ret {
+            ZslType::Vec4 => vec![],
+            ZslType::Tuple(elems) => {
+                if elems.is_empty() || elems[0] != ZslType::Vec4 {
+                    return Err((
+                        Span::call_site(),
+                        "ZSL: vertex tuple return must start with Vec4 (position)".into(),
+                    ));
+                }
+                elems[1..].to_vec()
+            }
+            other => {
+                return Err((
+                    Span::call_site(),
+                    format!(
+                        "ZSL: vertex return must be Vec4 or (Vec4, …) tuple; got `{}`",
+                        other.display()
+                    ),
+                ));
+            }
+        }
+    };
+
     // ── Classify params ───────────────────────────────────────────────────────
     let loc_params: Vec<&ZslParam> = entry
         .params
@@ -168,7 +197,7 @@ fn lower_graphics(
         );
     }
 
-    // ── Output variable ───────────────────────────────────────────────────────
+    // ── Output variable (position / fragment color) ───────────────────────────
     let t_ptr_out_vec4 = spv.type_pointer(sc::OUTPUT, t_vec4);
     let out_var = spv.global_variable(t_ptr_out_vec4, sc::OUTPUT);
     if is_fragment {
@@ -177,6 +206,26 @@ fn lower_graphics(
         spv.decorate(out_var, deco::BUILT_IN, &[builtin::POSITION]);
     }
     interface.push(out_var);
+
+    // ── Varying output variables (vertex only) ────────────────────────────────
+    let mut varying_out_vars: Vec<(Id, GvTy)> = Vec::new();
+    for (loc, vty) in ret_varyings.iter().enumerate() {
+        let gty = gv_ty_from_zsl(vty).ok_or_else(|| {
+            (
+                Span::call_site(),
+                format!(
+                    "ZSL: unsupported varying type `{}`; use f32/Vec2/Vec3/Vec4",
+                    vty.display()
+                ),
+            )
+        })?;
+        let spv_elem = gvty_to_spv_id(gty, t_f32, t_u32, t_vec2, t_vec3, t_vec4);
+        let t_ptr = spv.type_pointer(sc::OUTPUT, spv_elem);
+        let var = spv.global_variable(t_ptr, sc::OUTPUT);
+        spv.decorate(var, deco::LOCATION, &[loc as u32]);
+        interface.push(var);
+        varying_out_vars.push((var, gty));
+    }
 
     // ── Push-constant block (scalar params without location) ──────────────────
     let pc_var = if !scalar_params.is_empty() {
@@ -304,7 +353,7 @@ fn lower_graphics(
         locals,
     };
 
-    lower_gfx_body(&mut ctx, body, out_var)?;
+    lower_gfx_body(&mut ctx, body, out_var, &varying_out_vars)?;
 
     ctx.spv.op_return();
     ctx.spv.end_function();
@@ -314,7 +363,12 @@ fn lower_graphics(
 
 // ── Body / statement lowering ─────────────────────────────────────────────────
 
-fn lower_gfx_body(ctx: &mut GfxCtx<'_>, body: &Block, out_var: Id) -> Result<(), (Span, String)> {
+fn lower_gfx_body(
+    ctx: &mut GfxCtx<'_>,
+    body: &Block,
+    out_var: Id,
+    varying_outs: &[(Id, GvTy)],
+) -> Result<(), (Span, String)> {
     if body.stmts.is_empty() {
         return Err((
             Span::call_site(),
@@ -327,6 +381,44 @@ fn lower_gfx_body(ctx: &mut GfxCtx<'_>, body: &Block, out_var: Id) -> Result<(),
         lower_gfx_stmt(ctx, stmt)?;
     }
     match &tail[0] {
+        Stmt::Expr(Expr::Tuple(ExprTuple { elems, .. }), None) if !varying_outs.is_empty() => {
+            let expected = 1 + varying_outs.len();
+            if elems.len() != expected {
+                return Err((
+                    Span::call_site(),
+                    format!(
+                        "ZSL: return tuple has {} elements, expected {} (position + {} varyings)",
+                        elems.len(),
+                        expected,
+                        varying_outs.len()
+                    ),
+                ));
+            }
+            // First element → gl_Position
+            let pos = lower_gfx_expr(ctx, &elems[0])?;
+            if pos.ty != GvTy::Vec4 {
+                return Err((
+                    elems[0].span(),
+                    "ZSL: first tuple element (position) must be Vec4".into(),
+                ));
+            }
+            ctx.spv.op_store(out_var, pos.id);
+            // Remaining elements → varying outputs
+            for (i, (var_id, expected_gty)) in varying_outs.iter().enumerate() {
+                let val = lower_gfx_expr(ctx, &elems[i + 1])?;
+                if val.ty != *expected_gty {
+                    return Err((
+                        elems[i + 1].span(),
+                        format!(
+                            "ZSL: varying[{i}] type mismatch: expected {:?}, got {:?}",
+                            expected_gty, val.ty
+                        ),
+                    ));
+                }
+                ctx.spv.op_store(*var_id, val.id);
+            }
+            Ok(())
+        }
         Stmt::Expr(expr, None) => {
             let val = lower_gfx_expr(ctx, expr)?;
             if val.ty != GvTy::Vec4 {
@@ -690,5 +782,15 @@ fn gv_ty_from_zsl(zty: &ZslType) -> Option<GvTy> {
         ZslType::Vec3 => Some(GvTy::Vec3),
         ZslType::Vec4 => Some(GvTy::Vec4),
         _ => None,
+    }
+}
+
+fn gvty_to_spv_id(gty: GvTy, t_f32: Id, t_u32: Id, t_vec2: Id, t_vec3: Id, t_vec4: Id) -> Id {
+    match gty {
+        GvTy::F32 => t_f32,
+        GvTy::U32 => t_u32,
+        GvTy::Vec2 => t_vec2,
+        GvTy::Vec3 => t_vec3,
+        GvTy::Vec4 => t_vec4,
     }
 }
