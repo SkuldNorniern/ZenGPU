@@ -14,6 +14,7 @@ pub enum Stage {
 }
 
 impl Stage {
+    #[allow(dead_code)]
     pub fn name(self) -> &'static str {
         match self {
             Stage::Vertex => "vertex",
