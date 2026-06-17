@@ -68,6 +68,7 @@ mod op {
     pub const VECTOR_TIMES_SCALAR: u32 = 142;
     pub const TYPE_MATRIX: u32 = 24;
     pub const MATRIX_TIMES_VECTOR: u32 = 144;
+    pub const DOT: u32 = 148;
 }
 
 /// SPIR-V decoration constants.
@@ -643,6 +644,13 @@ impl SpvBuilder {
             op::MATRIX_TIMES_VECTOR,
             &[result_ty.0, id.0, mat.0, vec.0],
         );
+        id
+    }
+
+    /// OpDot — dot product of two float vectors; result is a scalar f32.
+    pub fn op_dot(&mut self, f32_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::DOT, &[f32_ty.0, id.0, a.0, b.0]);
         id
     }
 
