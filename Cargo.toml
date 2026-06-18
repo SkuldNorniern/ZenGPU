@@ -1,9 +1,9 @@
-# ZenGPU — native-first GPU runtime (graphics + general compute).
+# ZenGPU native-first GPU runtime (graphics + general compute).
 # Root is the `zengpu` crate and the workspace root; member crates are added as
 # they gain real content rather than as empty placeholders.
 [package]
 name = "zengpu"
-description = "A native-first GPU runtime for Rust — graphics and general compute under one device."
+description = "A native-first GPU runtime for Rust: graphics and general compute under one device."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

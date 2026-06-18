@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-vulkan"
-description = "ZenGPU Vulkan backend — native GPU runtime on Vulkan 1.2+."
+description = "ZenGPU Vulkan backend: native GPU runtime on Vulkan 1.2+."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

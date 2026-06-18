@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-compute"
-description = "ZenGPU compute runtime — DeviceArray, pooled allocation, and elementwise dispatch."
+description = "ZenGPU compute runtime: DeviceArray, pooled allocation, and elementwise dispatch."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
