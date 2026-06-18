@@ -39,7 +39,7 @@ impl OffscreenTarget {
             width,
             height,
             format,
-            usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET,
+            usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET | TextureUsage::TRANSFER_SRC,
             samples: 1,
         })?;
         let target = device.register_color_target(texture).ok_or_else(|| {
