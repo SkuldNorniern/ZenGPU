@@ -311,42 +311,7 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
-        let pool_info = vk::CommandPoolCreateInfo {
-            queue_family_index: self.inner.queue_family,
-            flags: vk::CommandPoolCreateFlags::TRANSIENT,
-            ..Default::default()
-        };
-        let pool = unsafe {
-            self.inner
-                .device
-                .create_command_pool(&pool_info, None)
-                .map_err(|e| GpuError::Backend(format!("vkCreateCommandPool: {e}")))?
-        };
-
-        let alloc_info = vk::CommandBufferAllocateInfo {
-            command_pool: pool,
-            level: vk::CommandBufferLevel::PRIMARY,
-            command_buffer_count: 1,
-            ..Default::default()
-        };
-        let cmd = unsafe {
-            match self.inner.device.allocate_command_buffers(&alloc_info) {
-                Ok(v) => v[0],
-                Err(e) => {
-                    self.inner.device.destroy_command_pool(pool, None);
-                    return Err(GpuError::Backend(format!("vkAllocateCommandBuffers: {e}")));
-                }
-            }
-        };
-
-        let begin_info = vk::CommandBufferBeginInfo {
-            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-            ..Default::default()
-        };
-        if let Err(e) = unsafe { self.inner.device.begin_command_buffer(cmd, &begin_info) } {
-            unsafe { self.inner.device.destroy_command_pool(pool, None) };
-            return Err(GpuError::Backend(format!("vkBeginCommandBuffer: {e}")));
-        }
+        let cmd = self.cmd_list_pool.acquire()?;
 
         let record_result = record(&self.inner.device, cmd);
 
@@ -355,27 +320,45 @@ impl VulkanDevice {
         }
 
         if let Err(e) = record_result {
-            unsafe { self.inner.device.destroy_command_pool(pool, None) };
+            self.cmd_list_pool.release(cmd);
             return Err(e);
         }
 
+        let fence = unsafe {
+            self.inner
+                .device
+                .create_fence(&vk::FenceCreateInfo::default(), None)
+                .map_err(|e| GpuError::Backend(format!("vkCreateFence: {e}")))?
+        };
         let submit_info = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
             ..Default::default()
         };
+        let mut submitted = false;
         let submit_result = unsafe {
             self.inner
                 .device
-                .queue_submit(self.inner.queue, &[submit_info], vk::Fence::null())
+                .queue_submit(self.inner.queue, &[submit_info], fence)
                 .map_err(|e| GpuError::Backend(format!("vkQueueSubmit: {e}")))
         };
+        if submit_result.is_ok() {
+            submitted = true;
+        }
+        let wait_result = submit_result.and_then(|()| unsafe {
+            self.inner
+                .device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| GpuError::Backend(format!("vkWaitForFences: {e}")))
+        });
         unsafe {
-            let _ = self.inner.device.device_wait_idle();
-            self.inner.device.destroy_command_pool(pool, None);
+            self.inner.device.destroy_fence(fence, None);
+        }
+        if !submitted || wait_result.is_ok() {
+            self.cmd_list_pool.release(cmd);
         }
 
-        submit_result
+        wait_result
     }
 
     /// Register a STORAGE buffer in the bindless SSBO table at its slot index.
@@ -1179,6 +1162,12 @@ impl GpuDevice for VulkanDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
+        if grid.contains(&0) {
+            return Err(GpuError::Dispatch(format!(
+                "dispatch grid dimensions must be non-zero, got {grid:?}"
+            )));
+        }
+
         let (vk_pipeline, vk_layout) = {
             let pipelines = self.pipelines.lock().unwrap();
             let p = pipelines
@@ -1194,18 +1183,29 @@ impl GpuDevice for VulkanDevice {
             }
         };
 
-        // Pack push constants: [buffer_indices…, scalars…] each as 4 bytes.
-        let mut pc: Vec<u8> = Vec::new();
+        // Pack push constants: [buffer_indices, scalars], each as 4 bytes.
+        let mut pc = [0u8; 128];
+        let mut pc_len = 0usize;
+        let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
+            if pc_len + 4 > pc.len() {
+                return Err(GpuError::Dispatch(format!(
+                    "push constants exceed {} bytes",
+                    pc.len()
+                )));
+            }
+            pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
+            pc_len += 4;
+            Ok(())
+        };
         for &idx in bindings.buffers {
-            pc.extend_from_slice(&idx.to_ne_bytes());
+            push_pc(idx.to_ne_bytes())?;
         }
         for scalar in bindings.scalars {
-            let b: [u8; 4] = match scalar {
+            push_pc(match scalar {
                 Scalar::U32(v) => v.to_ne_bytes(),
                 Scalar::I32(v) => v.to_ne_bytes(),
                 Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-            };
-            pc.extend_from_slice(&b);
+            })?;
         }
 
         let bindless_set = self.bindless.set;
@@ -1220,8 +1220,14 @@ impl GpuDevice for VulkanDevice {
                     &[bindless_set],
                     &[],
                 );
-                if !pc.is_empty() {
-                    dev.cmd_push_constants(cmd, vk_layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                if pc_len != 0 {
+                    dev.cmd_push_constants(
+                        cmd,
+                        vk_layout,
+                        vk::ShaderStageFlags::COMPUTE,
+                        0,
+                        &pc[..pc_len],
+                    );
                 }
                 dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
             }

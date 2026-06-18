@@ -62,8 +62,8 @@ impl CmdListPool {
     /// Acquire a command buffer — reused from the free list if one is
     /// available, otherwise freshly allocated — and begin recording.
     pub(crate) fn acquire(&self) -> Result<vk::CommandBuffer> {
-        let cmd = match self.free.lock().unwrap().pop() {
-            Some(cmd) => cmd,
+        let (cmd, reused) = match self.free.lock().unwrap().pop() {
+            Some(cmd) => (cmd, true),
             None => {
                 let bufs = unsafe {
                     self.inner
@@ -76,10 +76,16 @@ impl CmdListPool {
                         })
                 }
                 .map_err(|e| GpuError::Backend(format!("allocate command buffer: {e}")))?;
-                bufs[0]
+                (bufs[0], false)
             }
         };
         unsafe {
+            if reused {
+                self.inner
+                    .device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| GpuError::Backend(format!("reset command buffer: {e}")))?;
+            }
             self.inner.device.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo {
@@ -357,11 +363,17 @@ impl VulkanCommandList {
 
 impl RenderCommands for VulkanCommandList {
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
+        assert!(
+            desc.color.len() <= MAX_COLOR_ATTACHMENTS,
+            "render pass has {} color attachments, but ZenGPU currently supports at most {}",
+            desc.color.len(),
+            MAX_COLOR_ATTACHMENTS
+        );
         let mut color_attachments = [vk::RenderingAttachmentInfo::default(); MAX_COLOR_ATTACHMENTS];
         let mut pending_shader_read = [None; MAX_COLOR_ATTACHMENTS];
         let mut extent = vk::Extent2D::default();
-        let count = desc.color.len().min(MAX_COLOR_ATTACHMENTS);
-        for (i, att) in desc.color.iter().take(count).enumerate() {
+        let count = desc.color.len();
+        for (i, att) in desc.color.iter().enumerate() {
             if let Some((info, e)) = self.color_attachment_info(att) {
                 color_attachments[i] = info;
                 extent = e;
