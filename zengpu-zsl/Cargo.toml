@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-zsl"
-description = "ZenGPU shader proc-macro internals — ZSL parsing and SPIR-V lowering."
+description = "ZenGPU shader proc-macro internals: ZSL parsing and SPIR-V lowering."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -2,7 +2,7 @@
 
 All notable changes to ZenGPU are documented here.
 
-## [0.0.1] - 2026-06-15
+## [0.0.1] - 2026-06-18
 
 Initial pre-alpha release.
 
@@ -18,6 +18,10 @@ Initial pre-alpha release.
 - CPU reference backend and CPU-versus-Vulkan conformance tests.
 - Resident device arrays, pooled allocation, `f32` add/ReLU kernels, and
   portable `f32` GEMM.
+- GLSL and ZSL shader input through `zengpu_spirv!`, including compute,
+  vertex, and fragment ZSL coverage for the current test suite.
+- Vulkan command-buffer reuse, fence reuse for synchronous one-shot submits,
+  pipeline-cache use, and size-classed device-array pooling.
 - Root `zengpu` facade with feature-gated Vulkan, CPU, compute, and BLAS APIs.
 
 [0.0.1]: https://github.com/SkuldNorniern/ZenGPU/releases/tag/v0.0.1
