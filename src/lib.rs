@@ -18,6 +18,8 @@
 //! - `cpu` — the CPU reference backend ([`cpu`]): [`CpuDevice`]. This is the
 //!   conformance oracle, not a product fallback — most consumers don't need it.
 
+pub mod log;
+
 /// The backend-independent foundation: types, handles, and errors (always
 /// available).
 pub use zengpu_hal as hal;

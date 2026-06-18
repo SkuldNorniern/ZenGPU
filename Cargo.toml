@@ -39,6 +39,7 @@ zengpu-blas = { path = "zengpu-blas", version = "0.0.1" }
 zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
 zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
 inline-spirv = { version = "0.2", features = ["glsl"] }
+log = "0.4"
 
 [lib]
 name = "zengpu"
@@ -61,6 +62,7 @@ zengpu-vulkan = { workspace = true, optional = true }
 zengpu-compute = { workspace = true, optional = true }
 zengpu-blas = { workspace = true, optional = true }
 zengpu-spirv.workspace = true
+log.workspace = true
 
 [dev-dependencies]
 ash = "0.38"

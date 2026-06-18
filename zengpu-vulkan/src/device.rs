@@ -1449,6 +1449,7 @@ impl VulkanDevice {
         &self,
         desc: GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle> {
+        log::debug!("[zengpu-vulkan] create_graphics_pipeline: resolve shaders");
         let (vert_module, frag_module) = {
             let shaders = self.shaders.lock().unwrap();
             let vert = *shaders.get(desc.vertex_shader).ok_or_else(|| {
@@ -1459,7 +1460,7 @@ impl VulkanDevice {
             })?;
             (vert, frag)
         };
-
+        log::debug!("[zengpu-vulkan] create_graphics_pipeline: build stages");
         let entry = std::ffi::CString::new("main").unwrap();
         let stages = [
             vk::PipelineShaderStageCreateInfo {
@@ -1575,6 +1576,7 @@ impl VulkanDevice {
             ..Default::default()
         };
 
+        log::debug!("[zengpu-vulkan] create_graphics_pipeline: create_pipeline_layout");
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
@@ -1612,11 +1614,13 @@ impl VulkanDevice {
             ..Default::default()
         };
 
+        log::debug!("[zengpu-vulkan] create_graphics_pipeline: vkCreateGraphicsPipelines");
         let result = unsafe {
             self.inner
                 .device
                 .create_graphics_pipelines(self.pipeline_cache, &[create_info], None)
         };
+        log::debug!("[zengpu-vulkan] create_graphics_pipeline: vkCreateGraphicsPipelines returned");
         match result {
             Ok(pipelines) => Ok(self
                 .pipelines
