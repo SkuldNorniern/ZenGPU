@@ -313,6 +313,16 @@ impl VulkanDevice {
         })
     }
 
+    fn memory_type_flags(&self, type_index: u32) -> vk::MemoryPropertyFlags {
+        let mem_props = unsafe {
+            self.inner
+                .shared
+                .instance
+                .get_physical_device_memory_properties(self.inner.physical)
+        };
+        mem_props.memory_types[type_index as usize].property_flags
+    }
+
     /// Submit a one-shot command buffer that records work via `f`, then waits
     /// for completion. Used for staging uploads and layout transitions.
     pub(crate) fn one_shot_submit<F>(&self, record: F) -> Result<()>
@@ -576,17 +586,28 @@ fn buffer_usage_to_vk(usage: BufferUsage) -> vk::BufferUsageFlags {
 fn memory_usage_to_vk(usage: MemoryUsage) -> vk::MemoryPropertyFlags {
     match usage {
         MemoryUsage::GpuOnly | MemoryUsage::Pooled => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        MemoryUsage::Upload
-        | MemoryUsage::CpuToGpu
-        | MemoryUsage::Transient
-        | MemoryUsage::Persistent => {
+        MemoryUsage::Upload | MemoryUsage::Transient | MemoryUsage::Persistent => {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+        }
+        MemoryUsage::CpuToGpu => {
+            vk::MemoryPropertyFlags::DEVICE_LOCAL
+                | vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
         }
         MemoryUsage::Readback => {
             vk::MemoryPropertyFlags::HOST_VISIBLE
                 | vk::MemoryPropertyFlags::HOST_COHERENT
                 | vk::MemoryPropertyFlags::HOST_CACHED
         }
+    }
+}
+
+fn memory_usage_fallback(usage: MemoryUsage) -> Option<vk::MemoryPropertyFlags> {
+    match usage {
+        MemoryUsage::CpuToGpu | MemoryUsage::Readback => {
+            Some(vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)
+        }
+        _ => None,
     }
 }
 
@@ -629,15 +650,8 @@ impl GpuDevice for VulkanDevice {
         let type_index = self
             .find_memory_type(mem_reqs.memory_type_bits, preferred_flags)
             .or_else(|| {
-                if preferred_flags.contains(vk::MemoryPropertyFlags::HOST_CACHED) {
-                    self.find_memory_type(
-                        mem_reqs.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )
-                } else {
-                    None
-                }
+                memory_usage_fallback(desc.memory)
+                    .and_then(|props| self.find_memory_type(mem_reqs.memory_type_bits, props))
             });
 
         let type_index = match type_index {
@@ -672,8 +686,8 @@ impl GpuDevice for VulkanDevice {
             return Err(GpuError::Backend(format!("vkBindBufferMemory: {e}")));
         }
 
-        let is_host_visible = preferred_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE)
-            || matches!(desc.memory, MemoryUsage::Readback);
+        let actual_flags = self.memory_type_flags(type_index);
+        let is_host_visible = actual_flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
 
         let mapped = if is_host_visible {
             match unsafe {
