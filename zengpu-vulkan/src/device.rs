@@ -34,6 +34,56 @@ struct BindlessState {
 unsafe impl Send for BindlessState {}
 unsafe impl Sync for BindlessState {}
 
+struct FencePool {
+    inner: Arc<VulkanDeviceInner>,
+    free: Mutex<Vec<vk::Fence>>,
+}
+
+impl FencePool {
+    fn new(inner: Arc<VulkanDeviceInner>) -> Self {
+        Self {
+            inner,
+            free: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn acquire(&self) -> Result<vk::Fence> {
+        let fence = self.free.lock().unwrap().pop();
+        match fence {
+            Some(fence) => {
+                unsafe {
+                    self.inner
+                        .device
+                        .reset_fences(&[fence])
+                        .map_err(|e| GpuError::Backend(format!("vkResetFences: {e}")))?;
+                }
+                Ok(fence)
+            }
+            None => unsafe {
+                self.inner
+                    .device
+                    .create_fence(&vk::FenceCreateInfo::default(), None)
+                    .map_err(|e| GpuError::Backend(format!("vkCreateFence: {e}")))
+            },
+        }
+    }
+
+    fn release(&self, fence: vk::Fence) {
+        self.free.lock().unwrap().push(fence);
+    }
+}
+
+impl Drop for FencePool {
+    fn drop(&mut self) {
+        let mut free = self.free.lock().unwrap();
+        for fence in free.drain(..) {
+            unsafe {
+                self.inner.device.destroy_fence(fence, None);
+            }
+        }
+    }
+}
+
 /// A compute or graphics pipeline. Both kinds share one [`PipelineHandle`]
 /// slotmap (the HAL has a single `PipelineHandle` type for both).
 pub(crate) enum VulkanPipeline {
@@ -135,6 +185,7 @@ pub struct VulkanDevice {
     bindless: BindlessState,
     pipeline_cache: vk::PipelineCache,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
+    fence_pool: FencePool,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -268,6 +319,7 @@ impl VulkanDevice {
 
         let bindless = create_bindless(&inner.device)?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
+        let fence_pool = FencePool::new(Arc::clone(&inner));
         let pipeline_cache = unsafe {
             inner
                 .device
@@ -286,6 +338,7 @@ impl VulkanDevice {
             bindless,
             pipeline_cache,
             cmd_list_pool,
+            fence_pool,
         })
     }
 
@@ -338,12 +391,7 @@ impl VulkanDevice {
             return Err(e);
         }
 
-        let fence = unsafe {
-            self.inner
-                .device
-                .create_fence(&vk::FenceCreateInfo::default(), None)
-                .map_err(|e| GpuError::Backend(format!("vkCreateFence: {e}")))?
-        };
+        let fence = self.fence_pool.acquire()?;
         let submit_info = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
@@ -365,11 +413,13 @@ impl VulkanDevice {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| GpuError::Backend(format!("vkWaitForFences: {e}")))
         });
-        unsafe {
-            self.inner.device.destroy_fence(fence, None);
-        }
         if !submitted || wait_result.is_ok() {
+            self.fence_pool.release(fence);
             self.cmd_list_pool.release(cmd);
+        } else {
+            unsafe {
+                self.inner.device.destroy_fence(fence, None);
+            }
         }
 
         wait_result
