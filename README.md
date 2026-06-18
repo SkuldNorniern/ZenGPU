@@ -1,26 +1,32 @@
 # ZenGPU
 
-ZenGPU is an experimental native-first GPU runtime for Rust. Version `0.0.1`
-provides Vulkan graphics and compute, a CPU conformance backend, resident device
-arrays, elementwise compute kernels, and a portable `f32` GEMM kernel.
+ZenGPU is an experimental native-first GPU runtime for Rust. It puts graphics
+and general compute under one device model: buffers, textures, shaders, compute
+pipelines, render targets, surfaces, and command recording share the same
+backend foundation.
 
-The project is pre-alpha. APIs are expected to change before `0.1.0`.
+Version `0.0.1` is pre-alpha. APIs are expected to change before `0.1.0`.
 
 ## What 0.0.1 Includes
 
-- Backend-independent resource descriptions, typed generational handles, and
-  the object-safe `GpuDevice` compute interface.
-- Vulkan 1.2 compute with descriptor-indexed storage buffers.
-- Vulkan swapchains, offscreen and depth targets, and a lightweight frame graph
-  with automatic image-layout barriers.
-- Zero-copy sampling of a rendered offscreen image by another renderer on the
-  same logical device.
-- A deterministic CPU compute backend used as the conformance oracle.
+- A backend-independent HAL with typed generational handles, resource
+  descriptors, structured errors, and object-safe compute traits.
+- A split graphics contract for graphics-capable devices: surfaces, frames,
+  render targets, graphics pipelines, and allocation-conscious command lists
+  that record directly into backend command buffers.
+- Vulkan 1.2 graphics and compute through `zengpu-vulkan`.
+- Vulkan swapchains, offscreen targets, depth targets, and a lightweight frame
+  graph with automatic image-layout barriers.
+- Same-device zero-copy handoff from rendered targets to sampled-image slots.
+- A deterministic CPU backend used as the conformance oracle.
 - `DeviceArray`, pooled allocation, `f32` add/ReLU kernels, and portable `f32`
   GEMM.
+- `zengpu_spirv!`, a shader macro that can compile GLSL through `inline-spirv`
+  or ZSL through the local Rust-flavored shader pipeline.
 
 ZenGPU deliberately does not contain scene, ECS, asset, editor, tensor-graph, or
-application types. Those belong in consumer crates.
+application types. Consumer crates own planning and presentation policy; ZenGPU
+owns execution, resources, synchronization, and backend translation.
 
 ## Installation
 
@@ -36,7 +42,7 @@ Feature flags:
 - `vulkan` (default): Vulkan graphics and compute backend.
 - `compute` (default): `DeviceArray`, `BufferPool`, and elementwise kernels.
 - `blas` (default): portable GEMM; implies `compute`.
-- `cpu`: CPU reference backend.
+- `cpu`: CPU reference backend for conformance.
 
 Foundation-only users can disable defaults:
 
@@ -74,45 +80,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-See the repository examples for compute dispatch, graph lowering, and Vulkan
-graphics:
+## Shader Input
 
-```text
+The `zengpu_spirv!` macro accepts either GLSL or ZSL.
+
+```rust,ignore
+use zengpu::zengpu_spirv;
+
+const VERT: &[u32] = zengpu_spirv!(
+    r#"
+    #version 450
+    void main() { gl_Position = vec4(0.0); }
+    "#,
+    vert,
+    vulkan1_0
+);
+```
+
+ZSL is a Rust-flavored shader input compiled directly to SPIR-V by
+`zengpu-zsl`:
+
+```rust,ignore
+const COMPUTE: &[u32] = zengpu_spirv!(
+    #[compute(local_size_x = 64)]
+    fn cs_main(#[global_invocation_id] gid: UVec3) {
+        let i = gid.x;
+    }
+);
+```
+
+The ZSL path currently supports the subset needed by ZenGPU tests and renderer
+experiments: compute, vertex, and fragment entry points; SSBOs; push constants;
+scalars; vectors; matrices; arithmetic; comparisons; and selected control flow.
+It is useful today, but still intentionally small.
+
+## Examples
+
+Run examples from the `ZenGPU` directory:
+
+```bash
 cargo run --example vec_add
 cargo run --example op_graph_lower
 cargo run --example cube
 ```
+
+- `vec_add`: upload buffers, dispatch a bindless compute shader, read results.
+- `op_graph_lower`: sketch how a consumer graph could lower to `DeviceArray`,
+  elementwise kernels, and GEMM.
+- `cube`: create a Vulkan surface and render a windowed graphics workload.
 
 ## Workspace Crates
 
 | Crate | Purpose |
 |---|---|
 | `zengpu` | Main facade and recommended dependency |
-| `zengpu-hal` | Backend-independent types, handles, errors, and traits |
+| `zengpu-hal` | Backend-independent types, handles, traits, descriptors, and errors |
 | `zengpu-vulkan` | Vulkan 1.2 graphics and compute backend |
 | `zengpu-cpu` | CPU reference backend |
 | `zengpu-compute` | Resident arrays, pooling, and elementwise kernels |
 | `zengpu-blas` | Portable GEMM kernel |
 | `zengpu-conformance` | Cross-backend conformance harness |
+| `zengpu-spirv` | Public shader macro and push-constant helpers |
+| `zengpu-zsl` | Proc-macro internals for ZSL parsing and SPIR-V lowering |
+
+Most users should depend on `zengpu`. The subcrates are available for backend
+work, conformance, or macro internals.
+
+## Design Boundaries
+
+- ZenGPU executes work; higher layers decide what work should exist and in what
+  application-level order.
+- Graphics consumers bring their own windows, renderers, painters, scenes, text
+  systems, and asset models.
+- Compute consumers bring their own tensors, graphs, schedulers, and fusion
+  policies.
+- Public APIs stay backend-neutral. Vulkan is the first backend, not the shape
+  every caller must copy.
 
 ## Current Limitations
 
 - Vulkan is the only GPU backend.
 - Dispatch and readback are synchronous.
 - Built-in elementwise and GEMM kernels support `f32` only.
-- Graphics APIs are currently Vulkan-specific rather than exposed through a
-  complete backend-independent graphics trait.
-- Renderers and UI painters are consumer-side layers built on ZenGPU's generic
-  swapchain, target, and synchronization primitives.
+- The CPU backend is a correctness oracle, not a production fallback.
+- ZSL is intentionally small and incomplete; GLSL remains available through
+  `inline-spirv`.
+- Pipeline/shader caching, async readback, deferred destruction, and broader
+  memory-pool policy are optimization roadmap items, not finished behavior.
 - Resource synchronization and lifetime validation are still being expanded.
 - Vulkan requires a Vulkan 1.2-capable driver with descriptor indexing.
-
-## Relationship to Other Projects
-
-[Aurea](https://github.com/SkuldNorniern/aurea) is the first graphics consumer.
-Compute-graph and ML libraries can lower their own operations to ZenGPU
-dispatches and `DeviceArray`s. These consumers do not shape ZenGPU's public
-types.
 
 ## License
 
