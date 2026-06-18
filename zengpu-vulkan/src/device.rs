@@ -122,6 +122,7 @@ pub struct VulkanDevice {
     /// [`VulkanCommandList`](crate::command_list::VulkanCommandList).
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
+    pipeline_cache: vk::PipelineCache,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
 }
 
@@ -244,6 +245,12 @@ impl VulkanDevice {
 
         let bindless = create_bindless(&inner.device)?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
+        let pipeline_cache = unsafe {
+            inner
+                .device
+                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                .map_err(|e| GpuError::Backend(format!("vkCreatePipelineCache: {e}")))?
+        };
 
         Ok(Self {
             inner,
@@ -254,6 +261,7 @@ impl VulkanDevice {
             pipelines: Arc::new(Mutex::new(SlotMap::new())),
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
+            pipeline_cache,
             cmd_list_pool,
         })
     }
@@ -1099,7 +1107,7 @@ impl GpuDevice for VulkanDevice {
         };
         let result = unsafe {
             self.inner.device.create_compute_pipelines(
-                vk::PipelineCache::null(),
+                self.pipeline_cache,
                 &[vk::ComputePipelineCreateInfo {
                     stage,
                     layout,
@@ -1384,11 +1392,9 @@ impl VulkanDevice {
         };
 
         let result = unsafe {
-            self.inner.device.create_graphics_pipelines(
-                vk::PipelineCache::null(),
-                &[create_info],
-                None,
-            )
+            self.inner
+                .device
+                .create_graphics_pipelines(self.pipeline_cache, &[create_info], None)
         };
         match result {
             Ok(pipelines) => Ok(self
@@ -1594,6 +1600,9 @@ impl Drop for VulkanDevice {
             }
         }
         unsafe {
+            self.inner
+                .device
+                .destroy_pipeline_cache(self.pipeline_cache, None);
             self.inner
                 .device
                 .destroy_descriptor_pool(self.bindless.pool, None);
