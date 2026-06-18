@@ -1877,6 +1877,7 @@ name = "zengpu"
 version = "0.0.1"
 dependencies = [
  "ash",
+ "log",
  "winit",
  "zengpu-blas",
  "zengpu-compute",
@@ -1939,13 +1940,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zengpu-spv"
+version = "0.0.1"
+
+[[package]]
 name = "zengpu-vulkan"
 version = "0.0.1"
 dependencies = [
  "ash",
  "inline-spirv",
+ "log",
  "raw-window-handle",
  "zengpu-hal",
+ "zengpu-spv",
 ]
 
 [[package]]
