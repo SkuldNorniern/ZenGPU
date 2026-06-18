@@ -17,17 +17,29 @@ pub struct DeviceArray {
     pub shape: Vec<u32>,
     pub stride: Vec<u32>,
     pub dtype: DType,
+    allocation_size: u64,
 }
 
 impl DeviceArray {
     /// Creates an array with contiguous row-major strides derived from `shape`.
     pub fn new(buffer: BufferHandle, shape: Vec<u32>, dtype: DType) -> Self {
+        let allocation_size = array_size_bytes(&shape, dtype);
+        Self::with_allocation_size(buffer, shape, dtype, allocation_size)
+    }
+
+    pub(crate) fn with_allocation_size(
+        buffer: BufferHandle,
+        shape: Vec<u32>,
+        dtype: DType,
+        allocation_size: u64,
+    ) -> Self {
         let stride = contiguous_strides(&shape);
         Self {
             buffer,
             shape,
             stride,
             dtype,
+            allocation_size,
         }
     }
 
@@ -40,8 +52,17 @@ impl DeviceArray {
     }
 
     pub fn size_bytes(&self) -> u64 {
-        self.len() as u64 * self.dtype.size_bytes() as u64
+        array_size_bytes(&self.shape, self.dtype)
     }
+
+    /// Buffer capacity in bytes. Can exceed [`Self::size_bytes`] when pool-allocated by size class.
+    pub fn allocation_size_bytes(&self) -> u64 {
+        self.allocation_size
+    }
+}
+
+fn array_size_bytes(shape: &[u32], dtype: DType) -> u64 {
+    shape.iter().product::<u32>() as u64 * dtype.size_bytes() as u64
 }
 
 fn contiguous_strides(shape: &[u32]) -> Vec<u32> {
@@ -74,6 +95,14 @@ mod tests {
         let arr = DeviceArray::new(dummy_handle(), vec![2, 3, 4], DType::F32);
         assert_eq!(arr.len(), 24);
         assert_eq!(arr.size_bytes(), 24 * 4);
+        assert_eq!(arr.allocation_size_bytes(), 24 * 4);
         assert_eq!(arr.stride, vec![12, 4, 1]);
+    }
+
+    #[test]
+    fn device_array_can_track_larger_backing_capacity() {
+        let arr = DeviceArray::with_allocation_size(dummy_handle(), vec![3], DType::F32, 64);
+        assert_eq!(arr.size_bytes(), 12);
+        assert_eq!(arr.allocation_size_bytes(), 64);
     }
 }
