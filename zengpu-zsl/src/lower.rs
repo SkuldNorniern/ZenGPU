@@ -99,7 +99,7 @@ pub fn lower_compute(
 
     let t_fn = spv.type_function(t_void, &[]);
     let fn_id = spv.fresh_id();
-    spv.entry_point_glcompute(fn_id, &entry.ident.to_string(), &[gid_var]);
+    spv.entry_point_glcompute(fn_id, "main", &[gid_var]);
     spv.execution_mode_local_size(fn_id, local_size.0, local_size.1, local_size.2);
 
     let const_0_u32 = spv.constant_u32(t_u32, 0);

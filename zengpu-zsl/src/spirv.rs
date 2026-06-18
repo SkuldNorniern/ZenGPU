@@ -1,6 +1,8 @@
 //! SPIR-V binary builder for the ZSL subset: SSBOs, push constants, scalars, vectors,
 //! matrices, arithmetic/logic.
 
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Id(pub u32);
 
@@ -63,7 +65,7 @@ mod op {
     pub const FNEGATE: u32 = 127;
     pub const VECTOR_TIMES_SCALAR: u32 = 142;
     pub const TYPE_MATRIX: u32 = 24;
-    pub const MATRIX_TIMES_VECTOR: u32 = 144;
+    pub const MATRIX_TIMES_VECTOR: u32 = 145;
     pub const DOT: u32 = 148;
     pub const LOGICAL_OR: u32 = 166;
     pub const LOGICAL_AND: u32 = 167;
@@ -128,6 +130,7 @@ pub struct SpvBuilder {
     types: Vec<u32>,
     constants_globals: Vec<u32>,
     functions: Vec<u32>,
+    constant_cache: HashMap<(u32, u32), Id>,
 }
 
 #[allow(dead_code)]
@@ -144,6 +147,7 @@ impl SpvBuilder {
             types: Vec::new(),
             constants_globals: Vec::new(),
             functions: Vec::new(),
+            constant_cache: HashMap::new(),
         }
     }
 
@@ -322,22 +326,25 @@ impl SpvBuilder {
     }
 
     pub fn constant_u32(&mut self, ty: Id, value: u32) -> Id {
-        let id = self.fresh_id();
-        emit(
-            &mut self.constants_globals,
-            op::CONSTANT,
-            &[ty.0, id.0, value],
-        );
-        id
+        self.constant_bits(ty, value)
     }
 
     pub fn constant_f32(&mut self, ty: Id, value: f32) -> Id {
+        self.constant_bits(ty, value.to_bits())
+    }
+
+    /// Emits or reuses an `OpConstant`, deduplicated on `(ty, bits)`.
+    fn constant_bits(&mut self, ty: Id, bits: u32) -> Id {
+        if let Some(&id) = self.constant_cache.get(&(ty.0, bits)) {
+            return id;
+        }
         let id = self.fresh_id();
         emit(
             &mut self.constants_globals,
             op::CONSTANT,
-            &[ty.0, id.0, value.to_bits()],
+            &[ty.0, id.0, bits],
         );
+        self.constant_cache.insert((ty.0, bits), id);
         id
     }
 

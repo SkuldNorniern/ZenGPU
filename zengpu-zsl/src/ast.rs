@@ -37,7 +37,6 @@ pub struct ZslParam {
 pub struct ZslEntryPoint {
     #[allow(dead_code)]
     pub stage: Stage,
-    pub ident: Ident,
     pub params: Vec<ZslParam>,
     pub ret: ZslType,
 }
@@ -111,12 +110,7 @@ impl ZslEntryPoint {
             return Err(errors);
         }
 
-        Ok(ZslEntryPoint {
-            stage,
-            ident: func.sig.ident.clone(),
-            params,
-            ret,
-        })
+        Ok(ZslEntryPoint { stage, params, ret })
     }
 }
 

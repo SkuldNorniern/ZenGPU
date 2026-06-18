@@ -279,12 +279,11 @@ fn lower_graphics(
 
     let t_fn = spv.type_function(t_void, &[]);
     let fn_id = spv.fresh_id();
-    let fn_name = entry.ident.to_string();
     if is_fragment {
-        spv.entry_point_fragment(fn_id, &fn_name, &interface);
+        spv.entry_point_fragment(fn_id, "main", &interface);
         spv.execution_mode_origin_upper_left(fn_id);
     } else {
-        spv.entry_point_vertex(fn_id, &fn_name, &interface);
+        spv.entry_point_vertex(fn_id, "main", &interface);
     }
 
     let const_0_u32 = spv.constant_u32(t_u32, 0);
