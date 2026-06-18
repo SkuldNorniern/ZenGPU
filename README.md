@@ -109,6 +109,50 @@ const COMPUTE: &[u32] = zengpu_spirv!(
 );
 ```
 
+For a fuller compute example, this ZSL kernel scales one buffer into another:
+
+```rust,ignore
+const SCALE_ZSL: &[u32] = zengpu_spirv!(
+    #[compute(local_size_x = 64)]
+    fn cs_scale(src: Buf<f32>, dst: BufMut<f32>, len: u32, scale: f32) {
+        let i: u32 = global_id().x;
+        if i < len {
+            dst[i] = src[i] * scale;
+        }
+    }
+);
+```
+
+The equivalent GLSL uses ZenGPU's bindless storage-buffer table and push
+constants explicitly:
+
+```rust,ignore
+const SCALE_GLSL: &[u32] = zengpu_spirv!(
+    r#"
+    #version 450
+    layout(local_size_x = 64) in;
+
+    layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
+
+    layout(push_constant) uniform Push {
+        uint src;
+        uint dst;
+        uint len;
+        float scale;
+    } pc;
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i < pc.len) {
+            g_bufs[pc.dst].data[i] = g_bufs[pc.src].data[i] * pc.scale;
+        }
+    }
+    "#,
+    comp,
+    vulkan1_0
+);
+```
+
 The ZSL path currently supports the subset needed by ZenGPU tests and renderer
 experiments: compute, vertex, and fragment entry points; SSBOs; push constants;
 scalars; vectors; matrices; arithmetic; comparisons; and selected control flow.
