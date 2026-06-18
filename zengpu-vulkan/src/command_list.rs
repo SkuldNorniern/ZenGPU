@@ -308,9 +308,9 @@ impl VulkanCommandList {
     /// build its `vk::RenderingAttachmentInfo`. Returns `None` for a stale handle.
     fn color_attachment_info(
         &self,
+        targets: &mut SlotMap<marker::RenderTarget, VulkanRenderTarget>,
         att: &ColorAttachment,
     ) -> Option<(vk::RenderingAttachmentInfo<'static>, vk::Extent2D)> {
-        let mut targets = self.render_targets.lock().unwrap();
         let rt = targets.get_mut(att.target)?;
         self.transition_color(
             rt.image,
@@ -336,9 +336,9 @@ impl VulkanCommandList {
     /// build its `vk::RenderingAttachmentInfo`. Returns `None` for a stale handle.
     fn depth_attachment_info(
         &self,
+        targets: &mut SlotMap<marker::RenderTarget, VulkanRenderTarget>,
         att: &DepthAttachment,
     ) -> Option<(vk::RenderingAttachmentInfo<'static>, vk::Extent2D)> {
-        let mut targets = self.render_targets.lock().unwrap();
         let rt = targets.get_mut(att.target)?;
         self.transition_depth(
             rt.image,
@@ -373,8 +373,9 @@ impl RenderCommands for VulkanCommandList {
         let mut pending_shader_read = [None; MAX_COLOR_ATTACHMENTS];
         let mut extent = vk::Extent2D::default();
         let count = desc.color.len();
+        let mut targets = self.render_targets.lock().unwrap();
         for (i, att) in desc.color.iter().enumerate() {
-            if let Some((info, e)) = self.color_attachment_info(att) {
+            if let Some((info, e)) = self.color_attachment_info(&mut targets, att) {
                 color_attachments[i] = info;
                 extent = e;
             }
@@ -384,10 +385,13 @@ impl RenderCommands for VulkanCommandList {
         }
         self.pending_shader_read = pending_shader_read;
 
-        let depth_info = desc.depth.and_then(|d| self.depth_attachment_info(&d));
+        let depth_info = desc
+            .depth
+            .and_then(|d| self.depth_attachment_info(&mut targets, &d));
         if let Some((_, e)) = &depth_info {
             extent = *e;
         }
+        drop(targets);
 
         let rendering_info = vk::RenderingInfo {
             render_area: vk::Rect2D {
@@ -581,12 +585,11 @@ impl RenderCommands for VulkanCommandList {
         }
         let pending =
             std::mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
+        let mut targets = self.render_targets.lock().unwrap();
         for target in pending.into_iter().flatten() {
-            let mut targets = self.render_targets.lock().unwrap();
             if let Some(rt) = targets.get_mut(target) {
                 let image = rt.image;
                 rt.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                drop(targets);
                 self.transition_to_shader_read(image);
             }
         }
