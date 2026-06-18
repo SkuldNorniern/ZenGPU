@@ -69,6 +69,7 @@ pub(crate) struct VulkanDeviceInner {
     pub shared: Arc<VulkanShared>,
     pub device: Device,
     pub physical: vk::PhysicalDevice,
+    pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub queue_family: u32,
     pub queue: vk::Queue,
     pub dual_src_blend: bool,
@@ -232,11 +233,17 @@ impl VulkanDevice {
 
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let dynamic_rendering = khr::dynamic_rendering::Device::new(&shared.instance, &device);
+        let memory_properties = unsafe {
+            shared
+                .instance
+                .get_physical_device_memory_properties(physical)
+        };
 
         let inner = Arc::new(VulkanDeviceInner {
             shared,
             device,
             physical,
+            memory_properties,
             queue_family,
             queue,
             dual_src_blend,
@@ -283,12 +290,7 @@ impl VulkanDevice {
     }
 
     fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
-        let mem_props = unsafe {
-            self.inner
-                .shared
-                .instance
-                .get_physical_device_memory_properties(self.inner.physical)
-        };
+        let mem_props = &self.inner.memory_properties;
         (0..mem_props.memory_type_count).find(|&i| {
             type_bits & (1 << i) != 0
                 && mem_props.memory_types[i as usize]
@@ -298,13 +300,7 @@ impl VulkanDevice {
     }
 
     fn memory_type_flags(&self, type_index: u32) -> vk::MemoryPropertyFlags {
-        let mem_props = unsafe {
-            self.inner
-                .shared
-                .instance
-                .get_physical_device_memory_properties(self.inner.physical)
-        };
-        mem_props.memory_types[type_index as usize].property_flags
+        self.inner.memory_properties.memory_types[type_index as usize].property_flags
     }
 
     /// Records a one-shot command buffer with `f` and waits for it to complete.
