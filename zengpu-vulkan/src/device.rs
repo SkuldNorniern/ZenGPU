@@ -249,10 +249,9 @@ impl VulkanDevice {
         let extent = offscreen.raw_extent();
         let vk_buffer = {
             let buffers = self.buffers.lock().unwrap();
-            buffers
-                .get(buffer)
-                .map(|b| b.buffer)
-                .ok_or_else(|| GpuError::Backend("copy_offscreen_to_buffer: stale buffer handle".to_string()))?
+            buffers.get(buffer).map(|b| b.buffer).ok_or_else(|| {
+                GpuError::Backend("copy_offscreen_to_buffer: stale buffer handle".to_string())
+            })?
         };
         self.one_shot_submit(|dev, cmd| {
             let to_transfer = vk::ImageMemoryBarrier {
@@ -1234,6 +1233,20 @@ impl GpuDevice for VulkanDevice {
             .chunks_exact(4)
             .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
             .collect();
+
+        if let Err(e) = zengpu_spv::validate(&words) {
+            log::warn!("[zengpu-vulkan] SPIR-V structural check reported issues:\n{e}");
+            log::warn!(
+                "[zengpu-vulkan] disassembly:\n{}",
+                zengpu_spv::disassemble(&words)
+            );
+        }
+        log::trace!(
+            "[zengpu-vulkan] shader SPIR-V ({} words):\n{}",
+            words.len(),
+            zengpu_spv::disassemble(&words)
+        );
+
         let module = unsafe {
             self.inner
                 .device
