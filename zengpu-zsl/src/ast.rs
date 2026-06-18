@@ -42,7 +42,6 @@ pub struct ZslEntryPoint {
     // fields are pub and the lint doesn't see cross-module reads in proc-macros.
     #[allow(dead_code)]
     pub stage: Stage,
-    pub ident: Ident,
     pub params: Vec<ZslParam>,
     pub ret: ZslType,
 }
@@ -120,12 +119,7 @@ impl ZslEntryPoint {
             return Err(errors);
         }
 
-        Ok(ZslEntryPoint {
-            stage,
-            ident: func.sig.ident.clone(),
-            params,
-            ret,
-        })
+        Ok(ZslEntryPoint { stage, params, ret })
     }
 }
 
