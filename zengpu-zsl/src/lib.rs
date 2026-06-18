@@ -133,7 +133,7 @@ fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
 /// Derive `to_scalars()` for a push-constant struct.
 ///
 /// Every field must be `u32`, `i32`, or `f32`. The generated method returns a
-/// fixed-size array of [`zengpu_hal::Scalar`] in field-declaration order,
+/// fixed-size array of `zengpu_hal::Scalar` values in field-declaration order,
 /// suitable for passing as `Bindings::scalars` in a dispatch call.
 ///
 /// Import via `use zengpu_spirv::ZslPushConst;`.
