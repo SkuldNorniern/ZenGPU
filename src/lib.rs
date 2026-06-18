@@ -11,6 +11,8 @@
 //! - `blas` (default): [`GemmKernel`].
 //! - `cpu`: [`CpuDevice`]. Conformance oracle, not a product fallback.
 
+pub mod log;
+
 /// Backend-independent types, handles and errors. Always available.
 pub use zengpu_hal as hal;
 
