@@ -208,6 +208,143 @@ impl VulkanDevice {
         }
     }
 
+    /// End and submit a recorded [`VulkanCommandList`], then block until the
+    /// GPU has finished executing it.
+    pub fn submit_and_wait(&self, list: crate::command_list::VulkanCommandList) -> Result<()> {
+        let cmd = list.cmd;
+        let pool = Arc::clone(&list.pool);
+        unsafe {
+            self.inner
+                .device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::Backend(format!("end_command_buffer: {e}")))?;
+        }
+        let fence = self.fence_pool.acquire()?;
+        let submit_info = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        let mut submitted = false;
+        let submit_result = unsafe {
+            self.inner
+                .device
+                .queue_submit(self.inner.queue, &[submit_info], fence)
+                .map_err(|e| GpuError::Backend(format!("vkQueueSubmit: {e}")))
+        };
+        if submit_result.is_ok() {
+            submitted = true;
+        }
+        let wait_result = submit_result.and_then(|()| unsafe {
+            self.inner
+                .device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .map_err(|e| GpuError::Backend(format!("vkWaitForFences: {e}")))
+        });
+        if !submitted || wait_result.is_ok() {
+            self.fence_pool.release(fence);
+            pool.release(cmd);
+        } else {
+            unsafe {
+                self.inner.device.destroy_fence(fence, None);
+            }
+        }
+        wait_result
+    }
+
+    /// Blit the rendered offscreen image into a host-visible readback buffer.
+    ///
+    /// Call this after [`submit_and_wait`](Self::submit_and_wait). The image is
+    /// expected to be in `COLOR_ATTACHMENT_OPTIMAL` (left there by the render
+    /// pass). It is transitioned to `TRANSFER_SRC_OPTIMAL` for the copy, then
+    /// returned to `COLOR_ATTACHMENT_OPTIMAL` so subsequent frames see a
+    /// consistent layout.
+    pub fn copy_offscreen_to_buffer(
+        &self,
+        offscreen: &crate::offscreen::OffscreenTarget,
+        buffer: BufferHandle,
+    ) -> Result<()> {
+        let image = offscreen.image();
+        let extent = offscreen.raw_extent();
+        let vk_buffer = {
+            let buffers = self.buffers.lock().unwrap();
+            buffers
+                .get(buffer)
+                .map(|b| b.buffer)
+                .ok_or_else(|| GpuError::Backend("copy_offscreen_to_buffer: stale buffer handle".to_string()))?
+        };
+        self.one_shot_submit(|dev, cmd| {
+            let to_transfer = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                image,
+                subresource_range: crate::command_list::COLOR_SUBRESOURCE,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                dev.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk_buffer,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                        image_extent: vk::Extent3D {
+                            width: extent.width,
+                            height: extent.height,
+                            depth: 1,
+                        },
+                    }],
+                );
+            }
+            let to_color = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                src_access_mask: vk::AccessFlags::TRANSFER_READ,
+                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                image,
+                subresource_range: crate::command_list::COLOR_SUBRESOURCE,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_color],
+                );
+            }
+            Ok(())
+        })
+    }
+
     pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
