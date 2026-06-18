@@ -124,11 +124,8 @@ fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
         .collect()
 }
 
-/// Derive `to_scalars()` for a push-constant struct. Fields must be `u32`, `i32` or `f32`.
-///
-/// Returns [`zengpu_hal::Scalar`]s in field order, for `Bindings::scalars`.
-///
-/// Import from `zengpu_spirv`.
+/// Derives `to_scalars()` for a push struct: fields `u32`, `i32` or `f32` only, in declaration
+/// order. Result goes to `Bindings::scalars`. Import via `use zengpu_spirv::ZslPushConst;`.
 #[proc_macro_derive(ZslPushConst)]
 pub fn derive_zsl_push_const(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
