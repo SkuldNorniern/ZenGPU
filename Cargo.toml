@@ -1,4 +1,4 @@
-# ZenGPU: native-first GPU runtime (graphics + general compute).
+# ZenGPU native-first GPU runtime (graphics + general compute).
 # Root is the `zengpu` crate and the workspace root; member crates are added as
 # they gain real content rather than as empty placeholders.
 [package]
