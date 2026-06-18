@@ -161,6 +161,7 @@ pub struct VulkanCommandList {
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) bindless_set: vk::DescriptorSet,
+    current_pipeline: Option<PipelineHandle>,
     /// Layout of the bound graphics pipeline. Scopes push constants for `bind`.
     current_layout: Option<vk::PipelineLayout>,
     /// Targets from this pass with `sample_after` set: moved to
@@ -187,6 +188,7 @@ impl VulkanCommandList {
             render_targets,
             buffers,
             bindless_set,
+            current_pipeline: None,
             current_layout: None,
             pending_shader_read: [None; MAX_COLOR_ATTACHMENTS],
         }
@@ -396,6 +398,9 @@ impl RenderCommands for VulkanCommandList {
     }
 
     fn set_pipeline(&mut self, pipeline: PipelineHandle) {
+        if self.current_pipeline == Some(pipeline) {
+            return;
+        }
         let pipelines = self.pipelines.lock().unwrap();
         let Some(VulkanPipeline::Graphics {
             layout,
@@ -421,6 +426,7 @@ impl RenderCommands for VulkanCommandList {
                 &[],
             );
         }
+        self.current_pipeline = Some(pipeline);
         self.current_layout = Some(layout);
     }
 
