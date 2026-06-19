@@ -1,8 +1,7 @@
-//! Vulkan compute smoke test: repeated large GEMMs via `DeviceArray`/`GemmKernel`, sample checked
-//! on CPU.
+//! Heavy GEMM smoke test on the Vulkan backend. Runs repeated large GEMMs through
+//! `DeviceArray`/`GemmKernel` and checks a sample of the output against CPU values.
 //!
-//! Default: 32 `2048x2048 @ 2048x2048` GEMMs. `ZENGPU_HEAVY_DIM` and `ZENGPU_HEAVY_REPS`
-//! scale the workload.
+//! Default: 64 GEMMs of 4096x4096. `ZENGPU_HEAVY_DIM` and `ZENGPU_HEAVY_REPS` scale it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -41,8 +40,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = BufferPool::new(device.clone());
     let gemm = GemmKernel::new(&*device)?;
 
-    let dim = env_u32("ZENGPU_HEAVY_DIM", 2048);
-    let reps = env_u32("ZENGPU_HEAVY_REPS", 32);
+    let dim = env_u32("ZENGPU_HEAVY_DIM", 4096);
+    let reps = env_u32("ZENGPU_HEAVY_REPS", 64);
     let (m, k, n) = (dim, dim, dim);
     let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) * (reps as f64) / 1.0e9;
     eprintln!("running GEMM workload: {reps} x ({m}x{k} @ {k}x{n}) ~= {gflops:.1} GFLOP");
