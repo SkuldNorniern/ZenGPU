@@ -1,4 +1,4 @@
-//! ZenGPU — a native-first GPU runtime for Rust (graphics + general compute).
+//! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
 //!
 //! This is the main crate; it re-exports the public API of the internal
 //! crates so most consumers can depend on just `zengpu` and write
@@ -9,14 +9,14 @@
 //!
 //! # Cargo features
 //!
-//! - `vulkan` (default) — the Vulkan backend ([`vulkan`]): [`VulkanInstance`],
+//! - `vulkan` (default): the Vulkan backend ([`vulkan`]): [`VulkanInstance`],
 //!   [`VulkanDevice`], swapchains, frame-graph.
-//! - `compute` (default) — device arrays, pooled allocation, and elementwise
+//! - `compute` (default): device arrays, pooled allocation, and elementwise
 //!   kernels ([`compute`]): [`DeviceArray`], [`BufferPool`].
-//! - `blas` (default) — GEMM compute kernel on top of `compute` ([`blas`]):
+//! - `blas` (default): GEMM compute kernel on top of `compute` ([`blas`]):
 //!   [`GemmKernel`].
-//! - `cpu` — the CPU reference backend ([`cpu`]): [`CpuDevice`]. This is the
-//!   conformance oracle, not a product fallback — most consumers don't need it.
+//! - `cpu`: the CPU reference backend ([`cpu`]): [`CpuDevice`]. It is intended
+//!   for conformance tests rather than production fallback use.
 
 pub mod log;
 
@@ -24,7 +24,7 @@ pub mod log;
 /// available).
 pub use zengpu_hal as hal;
 
-/// Shader macro — compile GLSL and ZSL to SPIR-V at build time.
+/// Shader macro: compile GLSL and ZSL to SPIR-V at build time.
 /// Re-exports `zengpu_spirv` crate for sub-crate access.
 pub use zengpu_spirv as spirv;
 
@@ -51,7 +51,7 @@ pub use zengpu_hal::{
     VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
-/// The Vulkan backend — graphics + compute on Vulkan 1.2+.
+/// The Vulkan backend: graphics + compute on Vulkan 1.2+.
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan as vulkan;
 #[cfg(feature = "vulkan")]
@@ -61,7 +61,7 @@ pub use zengpu_vulkan::{
     VulkanFrame, VulkanInstance, VulkanSurface,
 };
 
-/// The CPU reference backend — the conformance oracle.
+/// The CPU reference backend for conformance tests.
 #[cfg(feature = "cpu")]
 pub use zengpu_cpu as cpu;
 #[cfg(feature = "cpu")]
@@ -73,13 +73,13 @@ pub use zengpu_compute as compute;
 #[cfg(feature = "compute")]
 pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 
-/// GEMM compute kernel — the portable matmul fallback.
+/// GEMM compute kernel: the portable matmul fallback.
 #[cfg(feature = "blas")]
 pub use zengpu_blas as blas;
 #[cfg(feature = "blas")]
 pub use zengpu_blas::GemmKernel;
 
-// ── Convenience entry points ──────────────────────────────────────────────────
+// Convenience entry points.
 //
 // These bridge instance + adapter selection + device open into single calls so
 // consumers never need to know which subcrate drives each step.
