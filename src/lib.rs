@@ -1,15 +1,14 @@
 //! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
 //!
-//! Re-exports the public API of the internal crates, so most consumers only need `zengpu`.
-//! Sub-crates are reachable under their module names ([`vulkan`], [`compute`], [`blas`], `cpu`)
-//! or as `zengpu-hal`, `zengpu-vulkan`, etc.
+//! The public API of the internal crates, re-exported. Sub-crates are reachable as modules
+//! ([`vulkan`], [`compute`], [`blas`], `cpu`) or as `zengpu-hal`, `zengpu-vulkan`, etc.
 //!
 //! # Cargo features
 //!
 //! - `vulkan` (default): [`VulkanInstance`], [`VulkanDevice`], swapchains, frame-graph.
 //! - `compute` (default): [`DeviceArray`], [`BufferPool`].
 //! - `blas` (default): [`GemmKernel`].
-//! - `cpu`: [`CpuDevice`]. Conformance oracle, not a product fallback.
+//! - `cpu`: [`CpuDevice`], for conformance tests, not production fallback.
 
 pub mod log;
 
@@ -49,7 +48,7 @@ pub use zengpu_vulkan::{
     VulkanFrame, VulkanInstance, VulkanSurface,
 };
 
-/// CPU reference backend. Conformance oracle.
+/// CPU reference backend for conformance tests.
 #[cfg(feature = "cpu")]
 pub use zengpu_cpu as cpu;
 #[cfg(feature = "cpu")]
@@ -61,7 +60,6 @@ pub use zengpu_compute as compute;
 #[cfg(feature = "compute")]
 pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 
-/// Portable GEMM fallback.
 #[cfg(feature = "blas")]
 pub use zengpu_blas as blas;
 #[cfg(feature = "blas")]
