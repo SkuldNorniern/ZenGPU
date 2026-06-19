@@ -1,10 +1,11 @@
 //! Heavier compute smoke test for the Vulkan backend.
 //!
-//! Runs a large GEMM through the public `DeviceArray`/`GemmKernel` path and
-//! validates a sample of output cells against CPU-computed expected values.
+//! Runs repeated large GEMMs through the public `DeviceArray`/`GemmKernel` path
+//! and validates a sample of the final output against CPU-computed expected
+//! values.
 //!
-//! Set `ZENGPU_HEAVY_DIM=2048` (or another square dimension) to scale the
-//! workload beyond the default 1024x1024 GEMM.
+//! Defaults to 32 `2048x2048 @ 2048x2048` GEMMs. Set `ZENGPU_HEAVY_DIM` and
+//! `ZENGPU_HEAVY_REPS` to scale the workload.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,6 +25,14 @@ fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&v| v != 0)
+        .unwrap_or(default)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inst = VulkanInstance::new()?;
     let adapter = inst
@@ -35,13 +44,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = BufferPool::new(device.clone());
     let gemm = GemmKernel::new(&*device)?;
 
-    let dim = std::env::var("ZENGPU_HEAVY_DIM")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&v| v != 0)
-        .unwrap_or(1024);
+    let dim = env_u32("ZENGPU_HEAVY_DIM", 2048);
+    let reps = env_u32("ZENGPU_HEAVY_REPS", 32);
     let (m, k, n) = (dim, dim, dim);
-    eprintln!("running GEMM workload: {m}x{k} @ {k}x{n}");
+    let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) * (reps as f64) / 1.0e9;
+    eprintln!("running GEMM workload: {reps} x ({m}x{k} @ {k}x{n}) ~= {gflops:.1} GFLOP");
 
     let a_data: Vec<f32> = (0..m * k)
         .map(|i| ((i * 17 + 3) % 31) as f32 * 0.125 - 2.0)
@@ -56,7 +63,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     device.write_buffer(b.buffer, 0, as_bytes_f32(&b_data))?;
 
     let start = Instant::now();
-    let c = gemm.gemm(&*device, &pool, &a, &b)?;
+    let mut final_c = None;
+    for rep in 0..reps {
+        if let Some(prev) = final_c.take() {
+            pool.free(prev);
+        }
+        let c = gemm.gemm(&*device, &pool, &a, &b)?;
+        if rep + 1 == reps || rep == 0 || (rep + 1) % 4 == 0 {
+            eprintln!("completed GEMM pass {}/{}", rep + 1, reps);
+        }
+        final_c = Some(c);
+    }
+    let c = final_c.ok_or("no GEMM passes ran")?;
     let out = from_bytes_f32(&device.read_buffer(c.buffer, 0, c.size_bytes())?);
     let elapsed = start.elapsed();
 
@@ -81,7 +99,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    eprintln!("heavy GEMM OK: {m}x{k} @ {k}x{n} -> {m}x{n} in {elapsed:?}");
+    let achieved = gflops / elapsed.as_secs_f64();
+    eprintln!(
+        "heavy GEMM OK: {reps} x ({m}x{k} @ {k}x{n} -> {m}x{n}) in {elapsed:?} ({achieved:.1} GFLOP/s)"
+    );
 
     pool.free(a);
     pool.free(b);
