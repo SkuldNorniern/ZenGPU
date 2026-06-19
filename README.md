@@ -21,6 +21,8 @@ Version `0.0.1` is pre-alpha. APIs are expected to change before `0.1.0`.
 - A deterministic CPU backend used for conformance tests.
 - `DeviceArray`, pooled allocation, `f32` add/ReLU kernels, and portable `f32`
   GEMM.
+- Small SPIR-V tooling for disassembly and structural diagnostics during shader
+  bring-up.
 - `zengpu_spirv!`, a shader macro that can compile GLSL through `inline-spirv`
   or ZSL through the local Rust-flavored shader pipeline.
 
@@ -165,12 +167,15 @@ Run examples from the `ZenGPU` directory:
 ```bash
 cargo run --example vec_add
 cargo run --example op_graph_lower
+cargo run --release --example heavy_compute
 cargo run --example cube
 ```
 
 - `vec_add`: upload buffers, dispatch a bindless compute shader, read results.
 - `op_graph_lower`: shows how a consumer graph could lower to `DeviceArray`,
   elementwise kernels, and GEMM.
+- `heavy_compute`: sustained GEMM workload for checking the compute path under
+  heavier GPU use; tune with `ZENGPU_HEAVY_DIM` and `ZENGPU_HEAVY_REPS`.
 - `cube`: create a Vulkan surface and render a windowed graphics workload.
 
 ## Workspace Crates
@@ -185,7 +190,8 @@ cargo run --example cube
 | `zengpu-blas` | Portable GEMM kernel |
 | `zengpu-conformance` | Cross-backend conformance harness |
 | `zengpu-spirv` | Public shader macro and push-constant helpers |
-| `zengpu-zsl` | Proc-macro internals for ZSL parsing and SPIR-V lowering |
+| `zengpu-spv` | SPIR-V decoding, disassembly, and structural validation |
+| `zengpu-zsl` | ZSL parsing and SPIR-V lowering |
 
 Most users should depend on `zengpu`. The subcrates are available for backend
 work, conformance, or macro internals.
