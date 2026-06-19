@@ -4,7 +4,7 @@
 //! and validates a sample of the final output against CPU-computed expected
 //! values.
 //!
-//! Defaults to 32 `2048x2048 @ 2048x2048` GEMMs. Set `ZENGPU_HEAVY_DIM` and
+//! Defaults to 64 `4096x4096 @ 4096x4096` GEMMs. Set `ZENGPU_HEAVY_DIM` and
 //! `ZENGPU_HEAVY_REPS` to scale the workload.
 
 use std::sync::Arc;
@@ -44,8 +44,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = BufferPool::new(device.clone());
     let gemm = GemmKernel::new(&*device)?;
 
-    let dim = env_u32("ZENGPU_HEAVY_DIM", 2048);
-    let reps = env_u32("ZENGPU_HEAVY_REPS", 32);
+    let dim = env_u32("ZENGPU_HEAVY_DIM", 4096);
+    let reps = env_u32("ZENGPU_HEAVY_REPS", 64);
     let (m, k, n) = (dim, dim, dim);
     let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) * (reps as f64) / 1.0e9;
     eprintln!("running GEMM workload: {reps} x ({m}x{k} @ {k}x{n}) ~= {gflops:.1} GFLOP");
