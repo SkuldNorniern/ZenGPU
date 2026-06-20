@@ -206,7 +206,7 @@ impl Swapchain {
             self.inner
                 .device
                 .wait_for_fences(&[self.in_flight[current]], true, u64::MAX)
-                .map_err(|e| GpuError::Backend(format!("wait_for_fences: {e}")))?;
+                .map_err(|e| map_vk_err("wait_for_fences", e))?;
         }
 
         let mut res = self.resources.lock().unwrap();
@@ -269,7 +269,7 @@ impl Swapchain {
             self.inner
                 .device
                 .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
-                .map_err(|e| GpuError::Backend(format!("queue_submit: {e}")))?;
+                .map_err(|e| map_vk_err("queue_submit", e))?;
         }
 
         let mut res = self.resources.lock().unwrap();
@@ -506,7 +506,7 @@ impl DeviceContext {
                 }],
                 vk::Fence::null(),
             )
-            .map_err(|e| GpuError::Backend(format!("one_shot queue_submit: {e}")))
+            .map_err(|e| map_vk_err("one_shot queue_submit", e))
         };
         unsafe {
             let _ = dev.device_wait_idle();
@@ -519,11 +519,28 @@ impl DeviceContext {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 pub(crate) fn map_surface_err(e: vk::Result) -> GpuError {
-    GpuError::Surface(match e {
-        vk::Result::ERROR_OUT_OF_DATE_KHR => SurfaceError::Outdated,
-        vk::Result::ERROR_SURFACE_LOST_KHR => SurfaceError::Lost,
-        _ => SurfaceError::OutOfMemory,
-    })
+    match e {
+        vk::Result::ERROR_DEVICE_LOST => GpuError::DeviceLost,
+        vk::Result::ERROR_OUT_OF_DATE_KHR => SurfaceError::Outdated.into(),
+        vk::Result::ERROR_SURFACE_LOST_KHR => SurfaceError::Lost.into(),
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            SurfaceError::OutOfMemory.into()
+        }
+        _ => GpuError::Backend(format!("surface error: {e}")),
+    }
+}
+
+pub(crate) fn map_vk_err(op: &str, e: vk::Result) -> GpuError {
+    match e {
+        vk::Result::ERROR_DEVICE_LOST => GpuError::DeviceLost,
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY => {
+            GpuError::OutOfMemory(zengpu_hal::MemoryUsage::Upload)
+        }
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => {
+            GpuError::OutOfMemory(zengpu_hal::MemoryUsage::GpuOnly)
+        }
+        _ => GpuError::Backend(format!("{op}: {e}")),
+    }
 }
 
 fn pick_format(

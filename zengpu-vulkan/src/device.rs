@@ -15,6 +15,7 @@ use zengpu_hal::{
 use crate::command_list::{CmdListPool, VulkanCommandList};
 use crate::instance::VulkanShared;
 use crate::surface::VulkanSurface;
+use crate::swapchain::map_vk_err;
 
 /// Maximum number of storage buffers in the bindless descriptor table.
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
@@ -230,7 +231,7 @@ impl VulkanDevice {
             self.inner
                 .device
                 .queue_submit(self.inner.queue, &[submit_info], fence)
-                .map_err(|e| GpuError::Backend(format!("vkQueueSubmit: {e}")))
+                .map_err(|e| map_vk_err("vkQueueSubmit", e))
         };
         if submit_result.is_ok() {
             submitted = true;
@@ -239,7 +240,7 @@ impl VulkanDevice {
             self.inner
                 .device
                 .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(|e| GpuError::Backend(format!("vkWaitForFences: {e}")))
+                .map_err(|e| map_vk_err("vkWaitForFences", e))
         });
         if !submitted || wait_result.is_ok() {
             self.fence_pool.release(fence);
@@ -546,7 +547,7 @@ impl VulkanDevice {
             self.inner
                 .device
                 .queue_submit(self.inner.queue, &[submit_info], fence)
-                .map_err(|e| GpuError::Backend(format!("vkQueueSubmit: {e}")))
+                .map_err(|e| map_vk_err("vkQueueSubmit", e))
         };
         if submit_result.is_ok() {
             submitted = true;
@@ -555,7 +556,7 @@ impl VulkanDevice {
             self.inner
                 .device
                 .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(|e| GpuError::Backend(format!("vkWaitForFences: {e}")))
+                .map_err(|e| map_vk_err("vkWaitForFences", e))
         });
         if !submitted || wait_result.is_ok() {
             self.fence_pool.release(fence);
