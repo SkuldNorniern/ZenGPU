@@ -15,8 +15,9 @@ use crate::command_list::{COLOR_SUBRESOURCE, CmdListPool, VulkanCommandList};
 use crate::device::{VulkanDevice, VulkanDeviceInner, VulkanRenderTarget};
 use crate::swapchain::{BeginFrame, Swapchain};
 
-/// Frames kept in flight — matches the existing G3/2D surfaces.
-const FRAMES_IN_FLIGHT: usize = 2;
+/// Frames kept in flight. Three slots reduce visible stalls when one frame
+/// takes longer than usual while still keeping latency bounded.
+const FRAMES_IN_FLIGHT: usize = 3;
 
 /// A swapchain image acquired for rendering. Carries its render-target handle
 /// for [`zengpu_hal::ColorAttachment::target`].

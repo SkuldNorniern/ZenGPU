@@ -495,9 +495,9 @@ impl RenderCommands for VulkanCommandList {
         // Pack push constants: [scalars…, texture_indices…, buffer_indices…],
         // each 4 bytes, bindless ABI convention (scalars first so e.g. a
         // `vec2` stays naturally aligned at offset 0). Fixed-size stack
-        // buffer: the 128-byte push-constant range (32 u32 slots) bounds
+        // buffer: the 256-byte push-constant range (64 u32 slots) bounds
         // this, and recording must not allocate.
-        let mut pc = [0u8; 128];
+        let mut pc = [0u8; 256];
         let mut len = 0usize;
         let mut push = |bytes: [u8; 4]| {
             if len + 4 <= pc.len() {
