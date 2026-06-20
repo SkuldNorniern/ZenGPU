@@ -187,7 +187,7 @@ pub fn id_operands(trailing_kind: Trailing, trailing: &[u32]) -> Vec<u32> {
 /// Number of words consumed by the inline name string of an `OpEntryPoint`
 /// (operands: [model, fn, name…]). Returns `None` if the string is unterminated.
 pub fn entry_point_name_words(trailing: &[u32]) -> Option<usize> {
-    string_words(&trailing.get(2..)?.to_vec())
+    string_words(trailing.get(2..)?)
 }
 
 /// Count the words occupied by a null-terminated SPIR-V literal string at the

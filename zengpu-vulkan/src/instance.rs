@@ -92,7 +92,7 @@ impl VulkanInstance {
 
         if want_validation {
             log::debug!("[zengpu-vulkan] enabling VK_LAYER_KHRONOS_validation");
-            layer_names.push(b"VK_LAYER_KHRONOS_validation\0".as_ptr() as *const i8);
+            layer_names.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
             ext_names.push(ext::debug_utils::NAME.as_ptr());
         }
 

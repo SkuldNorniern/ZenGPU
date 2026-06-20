@@ -156,6 +156,7 @@ fn store_op(store: bool) -> vk::AttachmentStoreOp {
 /// Maximum color attachments in a single render pass. Lets [`VulkanCommandList::begin_render_pass`]
 /// build its attachment array on the stack — no per-frame `Vec` allocation.
 const MAX_COLOR_ATTACHMENTS: usize = 4;
+const MAX_VERTEX_BUFFERS: usize = 8;
 
 /// Records draw commands into a pooled `vk::CommandBuffer` via
 /// `VK_KHR_dynamic_rendering`. Implements [`zengpu_hal::RenderCommands`].
@@ -176,6 +177,8 @@ pub struct VulkanCommandList {
     /// Pipeline layout of the currently bound graphics pipeline, used to
     /// scope [`RenderCommands::bind`]'s push constants.
     current_layout: Option<vk::PipelineLayout>,
+    current_vertex_buffers: [Option<BufferHandle>; MAX_VERTEX_BUFFERS],
+    current_index_buffer: Option<BufferHandle>,
     /// Color targets from the current render pass with [`ColorAttachment::sample_after`]
     /// set, transitioned to `SHADER_READ_ONLY_OPTIMAL` by [`Self::end_render_pass`].
     pending_shader_read: [Option<TargetHandle>; MAX_COLOR_ATTACHMENTS],
@@ -203,6 +206,8 @@ impl VulkanCommandList {
             bindless_set,
             current_pipeline: None,
             current_layout: None,
+            current_vertex_buffers: [None; MAX_VERTEX_BUFFERS],
+            current_index_buffer: None,
             pending_shader_read: [None; MAX_COLOR_ATTACHMENTS],
         }
     }
@@ -533,6 +538,11 @@ impl RenderCommands for VulkanCommandList {
     }
 
     fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle) {
+        if let Some(current) = self.current_vertex_buffers.get(slot as usize)
+            && *current == Some(buffer)
+        {
+            return;
+        }
         let buffers = self.buffers.lock().unwrap();
         let Some(buf) = buffers.get(buffer) else {
             return;
@@ -544,9 +554,15 @@ impl RenderCommands for VulkanCommandList {
                 .device
                 .cmd_bind_vertex_buffers(self.cmd, slot, &[vk_buf], &[0]);
         }
+        if let Some(current) = self.current_vertex_buffers.get_mut(slot as usize) {
+            *current = Some(buffer);
+        }
     }
 
     fn set_index_buffer(&mut self, buffer: BufferHandle) {
+        if self.current_index_buffer == Some(buffer) {
+            return;
+        }
         let buffers = self.buffers.lock().unwrap();
         let Some(buf) = buffers.get(buffer) else {
             return;
@@ -558,6 +574,7 @@ impl RenderCommands for VulkanCommandList {
                 .device
                 .cmd_bind_index_buffer(self.cmd, vk_buf, 0, vk::IndexType::UINT32);
         }
+        self.current_index_buffer = Some(buffer);
     }
 
     fn draw(&mut self, vertices: core::ops::Range<u32>, instances: core::ops::Range<u32>) {
