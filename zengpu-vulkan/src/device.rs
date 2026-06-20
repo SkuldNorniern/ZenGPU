@@ -1260,23 +1260,30 @@ impl GpuDevice for VulkanDevice {
                 "SPIR-V byte length must be a multiple of 4".to_string(),
             ));
         }
-        let words: Vec<u32> = desc
-            .spirv
-            .chunks_exact(4)
-            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
-            .collect();
+        let (prefix, aligned_words, suffix) = unsafe { desc.spirv.align_to::<u32>() };
+        let copied_words;
+        let words = if prefix.is_empty() && suffix.is_empty() {
+            aligned_words
+        } else {
+            copied_words = desc
+                .spirv
+                .chunks_exact(4)
+                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            &copied_words
+        };
 
-        if let Err(e) = zengpu_spv::validate(&words) {
+        if let Err(e) = zengpu_spv::validate(words) {
             log::warn!("[zengpu-vulkan] SPIR-V structural check reported issues:\n{e}");
             log::warn!(
                 "[zengpu-vulkan] disassembly:\n{}",
-                zengpu_spv::disassemble(&words)
+                zengpu_spv::disassemble(words)
             );
         }
         log::trace!(
             "[zengpu-vulkan] shader SPIR-V ({} words):\n{}",
             words.len(),
-            zengpu_spv::disassemble(&words)
+            zengpu_spv::disassemble(words)
         );
 
         let module = unsafe {
