@@ -1283,11 +1283,18 @@ impl GpuDevice for VulkanDevice {
                 "SPIR-V byte length must be a multiple of 4".to_string(),
             ));
         }
-        let words: Vec<u32> = desc
-            .spirv
-            .chunks_exact(4)
-            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
-            .collect();
+        let (prefix, aligned_words, suffix) = unsafe { desc.spirv.align_to::<u32>() };
+        let copied_words;
+        let words = if prefix.is_empty() && suffix.is_empty() {
+            aligned_words
+        } else {
+            copied_words = desc
+                .spirv
+                .chunks_exact(4)
+                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            &copied_words
+        };
 
         // Structurally pre-check the SPIR-V before handing it to the driver.
         // Malformed SPIR-V otherwise faults inside the driver with no diagnostic
@@ -1295,17 +1302,17 @@ impl GpuDevice for VulkanDevice {
         // *warns*: it is a heuristic over the opcode subset ZenGPU models, so it
         // can flag valid external SPIR-V it does not understand — it must never
         // block a shader the driver would have accepted.
-        if let Err(e) = zengpu_spv::validate(&words) {
+        if let Err(e) = zengpu_spv::validate(words) {
             log::warn!("[zengpu-vulkan] SPIR-V structural check reported issues:\n{e}");
             log::warn!(
                 "[zengpu-vulkan] disassembly:\n{}",
-                zengpu_spv::disassemble(&words)
+                zengpu_spv::disassemble(words)
             );
         }
         log::trace!(
             "[zengpu-vulkan] shader SPIR-V ({} words):\n{}",
             words.len(),
-            zengpu_spv::disassemble(&words)
+            zengpu_spv::disassemble(words)
         );
 
         let module = unsafe {
