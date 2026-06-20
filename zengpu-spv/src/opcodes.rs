@@ -162,7 +162,7 @@ pub fn id_operands(trailing_kind: Trailing, trailing: &[u32]) -> Vec<u32> {
 
 /// Word count of the inline name of `OpEntryPoint`. `None` if unterminated.
 pub fn entry_point_name_words(trailing: &[u32]) -> Option<usize> {
-    string_words(&trailing.get(2..)?.to_vec())
+    string_words(trailing.get(2..)?)
 }
 
 /// Word count of a null-terminated literal string. The word holding a zero byte ends it.
