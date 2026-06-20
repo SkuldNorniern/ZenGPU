@@ -827,7 +827,7 @@ impl ApplicationHandler for App {
                 format: Format::Bgra8Unorm,
                 width: size.width.max(1),
                 height: size.height.max(1),
-                present_mode: PresentMode::Fifo,
+                present_mode: PresentMode::Mailbox,
             },
             &cube_vertices(),
             &CUBE_INDICES,

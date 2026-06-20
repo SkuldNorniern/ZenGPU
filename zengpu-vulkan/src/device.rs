@@ -374,8 +374,16 @@ impl VulkanDevice {
         }
         extensions.push(khr::dynamic_rendering::NAME.as_ptr());
 
-        let queue_family = compute_queue_family(&shared.instance, physical)
-            .ok_or_else(|| GpuError::Backend("no compute queue family".to_string()))?;
+        let needs_graphics = extra_extensions.contains(&ash::khr::swapchain::NAME.as_ptr());
+        let queue_family =
+            queue_family(&shared.instance, physical, needs_graphics).ok_or_else(|| {
+                let kind = if needs_graphics {
+                    "graphics"
+                } else {
+                    "compute"
+                };
+                GpuError::Backend(format!("no {kind} queue family"))
+            })?;
 
         let queue_priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo {
@@ -723,17 +731,41 @@ pub(crate) fn hal_format_to_vk(format: Format) -> vk::Format {
     }
 }
 
-fn compute_queue_family(instance: &ash::Instance, physical: vk::PhysicalDevice) -> Option<u32> {
-    unsafe { instance.get_physical_device_queue_family_properties(physical) }
-        .into_iter()
-        .enumerate()
-        .find_map(|(i, f)| {
-            if f.queue_flags.contains(vk::QueueFlags::COMPUTE) {
-                Some(i as u32)
-            } else {
-                None
-            }
-        })
+fn queue_family(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    needs_graphics: bool,
+) -> Option<u32> {
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+    let supports = |f: &vk::QueueFamilyProperties, flags| f.queue_flags.contains(flags);
+
+    if needs_graphics {
+        families
+            .iter()
+            .enumerate()
+            .find(|(_, f)| supports(f, vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
+            .or_else(|| {
+                families
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| supports(f, vk::QueueFlags::GRAPHICS))
+            })
+            .map(|(i, _)| i as u32)
+    } else {
+        families
+            .iter()
+            .enumerate()
+            .find(|(_, f)| {
+                supports(f, vk::QueueFlags::COMPUTE) && !supports(f, vk::QueueFlags::GRAPHICS)
+            })
+            .or_else(|| {
+                families
+                    .iter()
+                    .enumerate()
+                    .find(|(_, f)| supports(f, vk::QueueFlags::COMPUTE))
+            })
+            .map(|(i, _)| i as u32)
+    }
 }
 
 fn buffer_usage_to_vk(usage: BufferUsage) -> vk::BufferUsageFlags {
@@ -1312,7 +1344,7 @@ impl GpuDevice for VulkanDevice {
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             offset: 0,
-            size: 128, // 32 u32 slots: buffer indices + scalars
+            size: 256, // 64 u32 slots: scalars + buffer/texture indices
         };
         let layout = unsafe {
             self.inner
@@ -1599,7 +1631,7 @@ impl VulkanDevice {
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
-            size: 128, // 32 u32 slots: buffer indices + scalars
+            size: 256, // 64 u32 slots: scalars + buffer/texture indices
         };
         let layout = unsafe {
             self.inner
