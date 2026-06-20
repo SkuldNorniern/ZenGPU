@@ -13,7 +13,8 @@ use crate::command_list::{COLOR_SUBRESOURCE, CmdListPool, VulkanCommandList};
 use crate::device::{VulkanDevice, VulkanDeviceInner, VulkanRenderTarget};
 use crate::swapchain::{BeginFrame, Swapchain};
 
-const FRAMES_IN_FLIGHT: usize = 2;
+/// Frames in flight. Three slots absorb one slow frame and bound the latency.
+const FRAMES_IN_FLIGHT: usize = 3;
 
 /// Swapchain image acquired for rendering, with its render-target handle.
 pub struct VulkanFrame {

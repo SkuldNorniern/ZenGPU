@@ -472,7 +472,7 @@ impl RenderCommands for VulkanCommandList {
             return;
         };
 
-        let mut pc = [0u8; 128];
+        let mut pc = [0u8; 256];
         let mut len = 0usize;
         let mut push = |bytes: [u8; 4]| {
             if len + 4 <= pc.len() {
