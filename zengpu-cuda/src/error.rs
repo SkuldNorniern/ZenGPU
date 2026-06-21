@@ -1,6 +1,15 @@
 use cuda_oxide::error::ErrorCode;
 use zengpu_hal::{GpuError, MemoryUsage, Result as HalResult};
 
+pub(crate) fn cu(code: u32) -> HalResult<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        let ec = ErrorCode::try_from(code).unwrap_or(ErrorCode::Unknown);
+        from_cuda(Err::<(), _>(ec))
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn from_cuda<T>(r: Result<T, ErrorCode>) -> HalResult<T> {
     r.map_err(|code| match code {

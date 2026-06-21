@@ -17,11 +17,11 @@ use cuda_oxide::{
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance,
-    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
-    SlotMap, TextureDesc, TextureHandle, marker,
+    HalCapabilities, PipelineHandle, Result, Scalar, SamplerDesc, SamplerHandle, ShaderDesc,
+    ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, marker,
 };
 
-use error::from_cuda;
+use error::{cu, from_cuda};
 
 /// CUDA entry point. Calls `cuInit` at construction. Without CUDA (stub library or no driver),
 /// `enumerate_adapters` returns empty.
@@ -106,7 +106,9 @@ impl GpuAdapter for CudaAdapter {
         Ok(Box::new(CudaDevice {
             ctx: UnsafeCell::new(ctx),
             ctx_lock: Mutex::new(()),
-            buffers: Mutex::new(SlotMap::new()),
+            buffers:   Mutex::new(SlotMap::new()),
+            shaders:   Mutex::new(SlotMap::new()),
+            pipelines: Mutex::new(SlotMap::new()),
         }))
     }
 }
@@ -117,17 +119,37 @@ struct CudaBuffer {
     len: u64,
 }
 
-/// An opened CUDA device. Compute only: no textures or render passes.
+struct CudaShader {
+    module: cuda_oxide::sys::CUmodule,
+    _ptx: Vec<u8>,
+}
+
+// SAFETY: CUmodule is opaque; all access goes through ctx_lock.
+unsafe impl Send for CudaShader {}
+unsafe impl Sync for CudaShader {}
+
+#[derive(Clone, Copy)]
+struct CudaPipeline {
+    func:  cuda_oxide::sys::CUfunction,
+    block: [u32; 3],
+}
+
+// SAFETY: CUfunction is opaque; all access goes through ctx_lock.
+unsafe impl Send for CudaPipeline {}
+unsafe impl Sync for CudaPipeline {}
+
+/// An opened CUDA device. Compute only: buffers, shaders and dispatch use the CUDA Driver API.
 ///
 /// # Thread safety
 ///
-/// cuda-oxide's `Context` is `!Send` because `Handle` uses `Rc`. Every call that enters the
-/// context holds `ctx_lock`, so only one thread touches it at a time, and the `Rc<Handle>`
-/// never crosses a thread.
+/// `Context` (cuda-oxide) is `!Send` because `Handle` uses an `Rc`. `ctx_lock` is held across every
+/// operation that enters the context, and the `Rc<Handle>` never crosses a thread.
 pub struct CudaDevice {
-    ctx: UnsafeCell<Context>,
-    ctx_lock: Mutex<()>,
-    buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
+    ctx:       UnsafeCell<Context>,
+    ctx_lock:  Mutex<()>,
+    buffers:   Mutex<SlotMap<marker::Buffer,   CudaBuffer>>,
+    shaders:   Mutex<SlotMap<marker::Shader,   CudaShader>>,
+    pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
 }
 
 // SAFETY: see the CudaDevice doc comment above.
@@ -149,16 +171,23 @@ impl CudaDevice {
 
 impl Drop for CudaDevice {
     fn drop(&mut self) {
-        let buffers: Vec<CudaBuffer> = self.buffers.get_mut().unwrap().drain().collect();
-        if buffers.is_empty() {
+        let buffers:   Vec<CudaBuffer>   = self.buffers.get_mut().unwrap().drain().collect();
+        let shaders:   Vec<CudaShader>   = self.shaders.get_mut().unwrap().drain().collect();
+        let pipelines: Vec<CudaPipeline> = self.pipelines.get_mut().unwrap().drain().collect();
+
+        if buffers.is_empty() && shaders.is_empty() && pipelines.is_empty() {
             return;
         }
         if let Ok(handle) = self.ctx.get_mut().enter() {
             for cb in buffers {
-                // SAFETY: ptr/len from a leaked DeviceBox. Sole owner; context is current.
+                // SAFETY: ptr/len came from a DeviceBox we explicitly leaked.
                 let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
                 let db = unsafe { DeviceBox::from_raw(dp) };
                 drop(db);
+            }
+            let _ = pipelines;
+            for cs in shaders {
+                let _ = unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) };
             }
         }
     }
@@ -269,30 +298,194 @@ impl GpuDevice for CudaDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        let _ = desc;
-        Err(GpuError::Backend(
-            "cuda: shader/PTX loading not yet implemented".into(),
-        ))
+        let ShaderSource::Ptx(ptx) = desc.source else {
+            return Err(GpuError::Backend(
+                "cuda: only PTX shaders are supported".into(),
+            ));
+        };
+        let mut ptx_vec: Vec<u8> = ptx.to_vec();
+        if ptx_vec.last() != Some(&0) {
+            ptx_vec.push(0);
+        }
+        let module = self.with_context(|_handle| {
+            let mut m: cuda_oxide::sys::CUmodule = std::ptr::null_mut();
+            cu(unsafe {
+                cuda_oxide::sys::cuModuleLoadData(
+                    &mut m,
+                    ptx_vec.as_ptr() as *const std::ffi::c_void,
+                )
+            })?;
+            Ok(m)
+        })?;
+        let handle = self
+            .shaders
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .insert(CudaShader { module, _ptx: ptx_vec });
+        Ok(handle)
+    }
+
+    fn destroy_shader(&self, shader: ShaderHandle) {
+        let cs = match self.shaders.lock() {
+            Ok(mut g) => g.remove(shader),
+            Err(_) => return,
+        };
+        if let Some(cs) = cs {
+            let _ = self.with_context(|_handle| {
+                cu(unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) })
+            });
+        }
     }
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
-        let _ = desc;
-        Err(GpuError::Backend(
-            "cuda: compute pipelines not yet implemented".into(),
-        ))
+        let module = self
+            .shaders
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(desc.shader)
+            .map(|s| s.module)
+            .ok_or_else(|| GpuError::Backend("cuda: invalid shader handle".into()))?;
+
+        let entry = std::ffi::CString::new(desc.entry)
+            .map_err(|_| GpuError::Backend("cuda: entry point name contains NUL byte".into()))?;
+
+        let func = self.with_context(|_handle| {
+            let mut f: cuda_oxide::sys::CUfunction = std::ptr::null_mut();
+            cu(unsafe {
+                cuda_oxide::sys::cuModuleGetFunction(&mut f, module, entry.as_ptr())
+            })?;
+            Ok(f)
+        })?;
+
+        let block = if desc.block == [0, 0, 0] { [256, 1, 1] } else { desc.block };
+        let handle = self
+            .pipelines
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .insert(CudaPipeline { func, block });
+        Ok(handle)
+    }
+
+    fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        if let Ok(mut g) = self.pipelines.lock() {
+            g.remove(pipeline);
+        }
     }
 
     fn dispatch(
         &self,
-        _pipeline: PipelineHandle,
-        _bindings: Bindings<'_>,
-        _grid: [u32; 3],
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
     ) -> Result<()> {
-        Err(GpuError::Backend(
-            "cuda: kernel dispatch not yet implemented".into(),
-        ))
+        let cp = self
+            .pipelines
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(pipeline)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid pipeline handle".into()))?;
+
+        let buf_guard = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+        let mut ptrs: Vec<u64> = Vec::with_capacity(bindings.buffers.len());
+        for &slot in bindings.buffers {
+            let cb = buf_guard
+                .get_by_slot_index(slot)
+                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer slot in bindings".into()))?;
+            ptrs.push(cb.ptr);
+        }
+        drop(buf_guard);
+
+        let mut param_storage: Vec<Vec<u8>> = Vec::new();
+        for p in &ptrs {
+            param_storage.push(p.to_le_bytes().to_vec());
+        }
+        for s in bindings.scalars {
+            match s {
+                Scalar::U32(v) => param_storage.push(v.to_le_bytes().to_vec()),
+                Scalar::I32(v) => param_storage.push(v.to_le_bytes().to_vec()),
+                Scalar::F32(v) => param_storage.push(v.to_bits().to_le_bytes().to_vec()),
+            }
+        }
+        let mut kernel_params: Vec<*mut std::ffi::c_void> = param_storage
+            .iter_mut()
+            .map(|v| v.as_mut_ptr() as *mut std::ffi::c_void)
+            .collect();
+
+        self.with_context(|_handle| {
+            let mut stream: cuda_oxide::sys::CUstream = std::ptr::null_mut();
+            cu(unsafe {
+                cuda_oxide::sys::cuStreamCreate(
+                    &mut stream,
+                    cuda_oxide::sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                )
+            })?;
+
+            let launch = cu(unsafe {
+                cuda_oxide::sys::cuLaunchKernel(
+                    cp.func,
+                    grid[0], grid[1], grid[2],
+                    cp.block[0], cp.block[1], cp.block[2],
+                    0,
+                    stream,
+                    kernel_params.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            });
+            let sync = cu(unsafe { cuda_oxide::sys::cuStreamSynchronize(stream) });
+            unsafe { cuda_oxide::sys::cuStreamDestroy_v2(stream) };
+            launch?;
+            sync
+        })
     }
 }
+
+/// Params: `(a: u64, b: u64, c: u64, n: u32)`, device pointers then scalar.
+#[cfg(test)]
+const VEC_ADD_PTX: &[u8] = b"\
+.version 7.0\n\
+.target sm_70\n\
+.address_size 64\n\
+\n\
+.visible .entry vec_add_f32(\n\
+    .param .u64 param_a,\n\
+    .param .u64 param_b,\n\
+    .param .u64 param_c,\n\
+    .param .u32 param_n\n\
+)\n\
+{\n\
+    .reg .pred  %p0;\n\
+    .reg .u32   %r<5>;\n\
+    .reg .u64   %rd<4>;\n\
+    .reg .f32   %f<3>;\n\
+\n\
+    ld.param.u64  %rd0, [param_a];\n\
+    ld.param.u64  %rd1, [param_b];\n\
+    ld.param.u64  %rd2, [param_c];\n\
+    ld.param.u32  %r0,  [param_n];\n\
+\n\
+    mov.u32       %r1, %tid.x;\n\
+    mov.u32       %r2, %ntid.x;\n\
+    mov.u32       %r3, %ctaid.x;\n\
+    mad.lo.u32    %r4, %r3, %r2, %r1;\n\
+\n\
+    setp.ge.u32   %p0, %r4, %r0;\n\
+    @%p0 bra      done;\n\
+\n\
+    cvt.u64.u32   %rd3, %r4;\n\
+    shl.b64       %rd3, %rd3, 2;\n\
+    add.u64       %rd0, %rd0, %rd3;\n\
+    add.u64       %rd1, %rd1, %rd3;\n\
+    add.u64       %rd2, %rd2, %rd3;\n\
+\n\
+    ld.global.f32 %f0, [%rd0];\n\
+    ld.global.f32 %f1, [%rd1];\n\
+    add.f32       %f2, %f0, %f1;\n\
+    st.global.f32 [%rd2], %f2;\n\
+\n\
+done:\n\
+    ret;\n\
+}\n\0";
 
 #[cfg(test)]
 mod tests {
@@ -402,5 +595,53 @@ mod tests {
         let rb = device.read_buffer(buf, 0, SIZE).expect("read 16 MiB");
         assert_eq!(rb, data, "16 MiB round-trip mismatch");
         device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn vec_add_cpu_vs_cuda() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let a: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..N).map(|i| (100 * i) as f32).collect();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+
+        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let buf_a   = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
+        let buf_b   = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
+        let buf_out = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
+
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        device.write_buffer(buf_a, 0, &a_bytes).unwrap();
+        device.write_buffer(buf_b, 0, &b_bytes).unwrap();
+
+        let shader = device.create_shader(ShaderDesc::ptx(VEC_ADD_PTX)).expect("load PTX");
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader,
+            entry: "vec_add_f32",
+            block: [256, 1, 1],
+        }).expect("create pipeline");
+
+        device.dispatch(
+            pipeline,
+            Bindings {
+                buffers:  &[buf_a.index(), buf_b.index(), buf_out.index()],
+                scalars:  &[Scalar::U32(N as u32)],
+                textures: &[],
+            },
+            [(N as u32).div_ceil(256), 1, 1],
+        ).expect("dispatch");
+
+        let raw = device.read_buffer(buf_out, 0, size).unwrap();
+        for i in 0..N {
+            let got = f32::from_le_bytes(raw[i*4..i*4+4].try_into().unwrap());
+            assert!((got - expected[i]).abs() < 1e-4, "out[{i}] = {got}, expected {}", expected[i]);
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_a);
+        device.destroy_buffer(buf_b);
+        device.destroy_buffer(buf_out);
     }
 }
