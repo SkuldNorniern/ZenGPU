@@ -102,10 +102,22 @@ impl GpuAdapter for CudaAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
-        let ctx = from_cuda(Context::new(&self.dev))?;
+        let mut ctx = from_cuda(Context::new(&self.dev))?;
+        let stream = {
+            let _handle = from_cuda(ctx.enter())?;
+            let mut s: cuda_oxide::sys::CUstream = std::ptr::null_mut();
+            cu(unsafe {
+                cuda_oxide::sys::cuStreamCreate(
+                    &mut s,
+                    cuda_oxide::sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                )
+            })?;
+            s
+        };
         Ok(Box::new(CudaDevice {
             ctx: UnsafeCell::new(ctx),
             ctx_lock: Mutex::new(()),
+            stream,
             buffers:   Mutex::new(SlotMap::new()),
             shaders:   Mutex::new(SlotMap::new()),
             pipelines: Mutex::new(SlotMap::new()),
@@ -147,6 +159,9 @@ unsafe impl Sync for CudaPipeline {}
 pub struct CudaDevice {
     ctx:       UnsafeCell<Context>,
     ctx_lock:  Mutex<()>,
+    /// Persistent compute stream, created in `open()` and reused, so kernels skip
+    /// per-dispatch create/destroy.
+    stream:    cuda_oxide::sys::CUstream,
     buffers:   Mutex<SlotMap<marker::Buffer,   CudaBuffer>>,
     shaders:   Mutex<SlotMap<marker::Shader,   CudaShader>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
@@ -175,10 +190,9 @@ impl Drop for CudaDevice {
         let shaders:   Vec<CudaShader>   = self.shaders.get_mut().unwrap().drain().collect();
         let pipelines: Vec<CudaPipeline> = self.pipelines.get_mut().unwrap().drain().collect();
 
-        if buffers.is_empty() && shaders.is_empty() && pipelines.is_empty() {
-            return;
-        }
         if let Ok(handle) = self.ctx.get_mut().enter() {
+            unsafe { cuda_oxide::sys::cuStreamSynchronize(self.stream) };
+            unsafe { cuda_oxide::sys::cuStreamDestroy_v2(self.stream) };
             for cb in buffers {
                 // SAFETY: ptr/len came from a DeviceBox we explicitly leaked.
                 let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
@@ -412,16 +426,9 @@ impl GpuDevice for CudaDevice {
             .map(|v| v.as_mut_ptr() as *mut std::ffi::c_void)
             .collect();
 
+        let stream = self.stream;
         self.with_context(|_handle| {
-            let mut stream: cuda_oxide::sys::CUstream = std::ptr::null_mut();
             cu(unsafe {
-                cuda_oxide::sys::cuStreamCreate(
-                    &mut stream,
-                    cuda_oxide::sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
-                )
-            })?;
-
-            let launch = cu(unsafe {
                 cuda_oxide::sys::cuLaunchKernel(
                     cp.func,
                     grid[0], grid[1], grid[2],
@@ -431,11 +438,8 @@ impl GpuDevice for CudaDevice {
                     kernel_params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 )
-            });
-            let sync = cu(unsafe { cuda_oxide::sys::cuStreamSynchronize(stream) });
-            unsafe { cuda_oxide::sys::cuStreamDestroy_v2(stream) };
-            launch?;
-            sync
+            })?;
+            cu(unsafe { cuda_oxide::sys::cuStreamSynchronize(stream) })
         })
     }
 }
