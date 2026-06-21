@@ -10,6 +10,12 @@ pub enum BackendPreference {
     Cpu,
     /// Compute only.
     Cuda,
+    /// Graphics and compute.
+    Metal,
+    /// Compute only.
+    Hip,
+    /// Graphics and compute.
+    Dx12,
 }
 
 /// Used by `Auto` selection.
