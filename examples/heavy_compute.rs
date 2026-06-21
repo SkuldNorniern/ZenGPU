@@ -29,7 +29,8 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn open_device() -> Result<(String, Arc<dyn GpuDevice>), Box<dyn std::error::Error>> {
+/// Returns `(backend_label, adapter_name, device)`.
+fn open_device() -> Result<(&'static str, String, Arc<dyn GpuDevice>), Box<dyn std::error::Error>> {
     let backend = std::env::var("ZENGPU_BACKEND").unwrap_or_default();
     match backend.to_ascii_lowercase().as_str() {
         #[cfg(feature = "cuda")]
@@ -41,7 +42,7 @@ fn open_device() -> Result<(String, Arc<dyn GpuDevice>), Box<dyn std::error::Err
                 .ok_or("no CUDA adapter found")?;
             let name = adapter.info().name.clone();
             let device: Arc<dyn GpuDevice> = Arc::from(adapter.open(DeviceRequest::default())?);
-            Ok((name, device))
+            Ok(("cuda", name, device))
         }
         _ => {
             #[cfg(not(feature = "vulkan"))]
@@ -55,15 +56,15 @@ fn open_device() -> Result<(String, Arc<dyn GpuDevice>), Box<dyn std::error::Err
                     .ok_or("no Vulkan adapter found")?;
                 let name = adapter.info().name.clone();
                 let device: Arc<dyn GpuDevice> = Arc::from(adapter.open(DeviceRequest::default())?);
-                Ok((name, device))
+                Ok(("vulkan", name, device))
             }
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (adapter_name, device) = open_device()?;
-    eprintln!("ZenGPU heavy compute: {adapter_name}");
+    let (backend, adapter_name, device) = open_device()?;
+    eprintln!("ZenGPU heavy compute [{backend}]: {adapter_name}");
 
     let pool = BufferPool::new(device.clone());
     let gemm = GemmKernel::new(&*device)?;
