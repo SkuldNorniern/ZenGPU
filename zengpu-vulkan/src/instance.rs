@@ -191,6 +191,19 @@ impl VulkanInstance {
         })
     }
 
+    /// Returns `true` if a Vulkan loader (`vulkan-1.dll` / `libvulkan.so`) is
+    /// present on this system without attempting to initialize a full instance.
+    ///
+    /// Useful in headless test environments and CI runners that need to skip
+    /// GPU tests gracefully when no Vulkan driver is installed. Prefer this
+    /// over catching the error from [`VulkanInstance::new`] when you only need
+    /// a presence check and do not intend to use Vulkan immediately.
+    pub fn is_available() -> bool {
+        // SAFETY: Entry::load only loads a shared library; it does not allocate
+        // Vulkan objects and is safe to call without a prior Vulkan setup.
+        unsafe { ash::Entry::load() }.is_ok()
+    }
+
     /// Compute-only instance (no surface/display extensions).
     pub fn new() -> zengpu_hal::Result<Self> {
         Self::create(false)
