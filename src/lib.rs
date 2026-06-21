@@ -1,31 +1,54 @@
 //! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
 //!
-//! This is the main crate; it re-exports the public API of the internal
-//! crates so most consumers can depend on just `zengpu` and write
-//! `zengpu::VulkanInstance`, `zengpu::DeviceArray`, etc. For detailed work
-//! (e.g. backend-internal types), the sub-crates remain available wholesale
-//! under their module names ([`vulkan`], [`compute`], [`blas`], [`cpu`]), or
-//! directly as `zengpu-hal`, `zengpu-vulkan`, etc.
+//! # Quick start
+//!
+//! ```no_run
+//! use zengpu::{Instance, AdapterRequest, DeviceRequest, BufferDesc, BufferUsage, MemoryUsage};
+//!
+//! let instance = Instance::new();
+//! let adapter  = instance.request_adapter(AdapterRequest::default()).expect("no GPU found");
+//! let device   = adapter.open(DeviceRequest::default()).expect("device creation failed");
+//!
+//! let buf = device.create_buffer(BufferDesc {
+//!     size:   1024,
+//!     usage:  BufferUsage::STORAGE,
+//!     memory: MemoryUsage::CpuToGpu,
+//! }).unwrap();
+//! device.write_buffer(buf, 0, &[0u8; 1024]).unwrap();
+//! ```
 //!
 //! # Cargo features
 //!
-//! - `vulkan` (default): the Vulkan backend ([`vulkan`]): [`VulkanInstance`],
-//!   [`VulkanDevice`], swapchains, frame-graph.
-//! - `compute` (default): device arrays, pooled allocation, and elementwise
-//!   kernels ([`compute`]): [`DeviceArray`], [`BufferPool`].
-//! - `blas` (default): GEMM compute kernel on top of `compute` ([`blas`]):
-//!   [`GemmKernel`].
-//! - `cpu`: the CPU reference backend ([`cpu`]): [`CpuDevice`]. It is intended
-//!   for conformance tests rather than production fallback use.
+//! | Feature   | Default | Description |
+//! |-----------|---------|-------------|
+//! | `vulkan`  | yes     | Vulkan 1.2+ backend (graphics + compute). |
+//! | `compute` | yes     | Device arrays, pooled allocation, elementwise kernels. |
+//! | `blas`    | yes     | GEMM kernel on top of `compute`. |
+//! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
+//! | `cpu`     | no      | CPU reference backend for conformance tests. |
+//!
+//! # Backend-specific access
+//!
+//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain / frame-graph
+//! work; [`Device::as_cpu`] gives access to the CPU conformance oracle.
+//! The sub-crates are re-exported under [`vulkan`], [`compute`], [`blas`],
+//! [`cpu`], [`cuda`] for power users who need their full surface.
 
+pub mod adapter;
+pub mod device;
+pub mod instance;
 pub mod log;
 
-/// The backend-independent foundation: types, handles, and errors (always
-/// available).
+pub use adapter::Adapter;
+pub use device::Device;
+pub use instance::Instance;
+
+// ── HAL foundation (always available) ────────────────────────────────────────
+
+/// Backend-independent HAL types and traits.
 pub use zengpu_hal as hal;
 
-/// Shader macro: compile GLSL and ZSL to SPIR-V at build time.
-/// Re-exports `zengpu_spirv` crate for sub-crate access.
+/// Compile GLSL / ZSL to SPIR-V at build time.
 pub use zengpu_spirv as spirv;
 
 /// Compile GLSL or ZSL source to SPIR-V at build time.
@@ -37,8 +60,8 @@ macro_rules! zengpu_spirv {
     };
 }
 
-// Flat re-exports of the most-used foundation items, so downstream code can
-// write `zengpu::BufferHandle` rather than `zengpu::hal::BufferHandle`.
+// Flat re-exports of the shared vocabulary so callers write `zengpu::BufferHandle`
+// rather than `zengpu::hal::BufferHandle`.
 pub use zengpu_hal::{
     Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,
     BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputePipelineDesc, DType,
@@ -51,58 +74,28 @@ pub use zengpu_hal::{
     VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
-/// The Vulkan backend: graphics + compute on Vulkan 1.2+.
+// ── Backend sub-crates (power-user access) ───────────────────────────────────
+
+/// Vulkan backend: graphics + compute on Vulkan 1.2+.
+///
+/// Access concrete types here when you need Vulkan-specific APIs
+/// (swapchains, frame-graph, render passes). For most use cases
+/// [`Device::as_vulkan`] is sufficient.
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan as vulkan;
-#[cfg(feature = "vulkan")]
-pub use zengpu_vulkan::{
-    AttachmentUsage, BeginFrame, DEPTH_FORMAT, DepthTarget, DeviceContext, FrameGraph,
-    OffscreenTarget, ResourceId, Swapchain, VulkanAdapter, VulkanCommandList, VulkanDevice,
-    VulkanFrame, VulkanInstance, VulkanSurface,
-};
 
-/// The CPU reference backend for conformance tests.
+/// CPU reference backend for conformance tests.
 #[cfg(feature = "cpu")]
 pub use zengpu_cpu as cpu;
-#[cfg(feature = "cpu")]
-pub use zengpu_cpu::{CpuAdapter, CpuDevice, CpuInstance};
 
 /// Device arrays, pooled allocation, and elementwise kernels.
 #[cfg(feature = "compute")]
 pub use zengpu_compute as compute;
-#[cfg(feature = "compute")]
-pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 
 /// GEMM compute kernel: the portable matmul fallback.
 #[cfg(feature = "blas")]
 pub use zengpu_blas as blas;
-#[cfg(feature = "blas")]
-pub use zengpu_blas::GemmKernel;
 
-// Convenience entry points.
-//
-// These bridge instance + adapter selection + device open into single calls so
-// consumers never need to know which subcrate drives each step.
-
-/// Open the best available Vulkan device with surface/swapchain support.
-///
-/// Replaces the three-line `VulkanInstance::new_with_surface()` +
-/// `request_vulkan_adapter()` + `open_with_surface()` pattern. Returns a
-/// [`VulkanDevice`] ready for [`Swapchain::new`].
-#[cfg(feature = "vulkan")]
-pub fn open_vulkan_with_surface() -> Result<VulkanDevice> {
-    VulkanInstance::new_with_surface()?
-        .request_vulkan_adapter()
-        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
-        .open_with_surface(DeviceRequest::default())
-}
-
-/// Open the best available Vulkan device without surface support (headless /
-/// compute). For windowed rendering use [`open_vulkan_with_surface`].
-#[cfg(feature = "vulkan")]
-pub fn open_vulkan() -> Result<VulkanDevice> {
-    VulkanInstance::new()?
-        .request_vulkan_adapter()
-        .ok_or_else(|| GpuError::Backend("no Vulkan adapter found".into()))?
-        .open_headless(DeviceRequest::default())
-}
+/// CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
+#[cfg(feature = "cuda")]
+pub use zengpu_cuda as cuda;
