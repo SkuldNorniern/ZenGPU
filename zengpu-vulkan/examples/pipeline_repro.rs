@@ -83,14 +83,10 @@ fn main() {
 
     eprintln!("repro: create shaders (glslang SPIR-V)");
     let vs = device
-        .create_shader(ShaderDesc {
-            spirv: bytemuck_cast(VS),
-        })
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(VS)))
         .expect("vs");
     let fs = device
-        .create_shader(ShaderDesc {
-            spirv: bytemuck_cast(FS),
-        })
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(FS)))
         .expect("fs");
 
     eprintln!("repro: create_graphics_pipeline");
