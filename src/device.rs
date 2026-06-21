@@ -111,5 +111,26 @@ impl Device {
     pub fn as_cpu(&self) -> Option<&zengpu_cpu::CpuDevice> {
         self.inner.as_any().downcast_ref()
     }
+
+    /// Downcast to [`zengpu_metal::MetalDevice`] for Metal-specific work.
+    /// Returns `None` when the underlying backend is not Metal.
+    #[cfg(feature = "metal")]
+    pub fn as_metal(&self) -> Option<&zengpu_metal::MetalDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
+    /// Downcast to [`zengpu_hip::HipDevice`] for HIP-specific work.
+    /// Returns `None` when the underlying backend is not HIP.
+    #[cfg(feature = "hip")]
+    pub fn as_hip(&self) -> Option<&zengpu_hip::HipDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
+    /// Downcast to [`zengpu_dx12::Dx12Device`] for DirectX 12-specific work.
+    /// Returns `None` when the underlying backend is not DX12.
+    #[cfg(feature = "dx12")]
+    pub fn as_dx12(&self) -> Option<&zengpu_dx12::Dx12Device> {
+        self.inner.as_any().downcast_ref()
+    }
 }
 
