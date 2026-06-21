@@ -39,6 +39,12 @@ pub trait GpuDevice: Send + Sync {
 
     fn destroy_sampler(&self, sampler: SamplerHandle);
 
+    /// When `false`, `create_sampler` treats any anisotropy as `1` instead of failing. This is a
+    /// quality setting, not a hard requirement.
+    fn supports_anisotropic_filtering(&self) -> bool {
+        false
+    }
+
     /// The default returns `UnsupportedFeatures`, since there is no compute.
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         let _ = desc;

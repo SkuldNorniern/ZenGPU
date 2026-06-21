@@ -77,11 +77,30 @@ pub enum AddressMode {
     MirrorRepeat,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Border color for clamp-to-border. The three presets need no extra device feature on any backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderColor {
+    #[default]
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerDesc {
     pub min_filter: FilterMode,
     pub mag_filter: FilterMode,
+    pub mip_filter: FilterMode,
     pub address: AddressMode,
+    /// Maximum anisotropic samples. `1` disables it. Clamped to the device maximum, and ignored
+    /// where unsupported.
+    pub anisotropy: u8,
+    pub lod_min: f32,
+    pub lod_max: f32,
+    /// `None` for a normal sampler. Set this for shadow-map PCF.
+    pub compare: Option<CompareFn>,
+    /// Used only by clamp-to-border address modes.
+    pub border: BorderColor,
 }
 
 impl Default for SamplerDesc {
@@ -89,7 +108,13 @@ impl Default for SamplerDesc {
         Self {
             min_filter: FilterMode::Linear,
             mag_filter: FilterMode::Linear,
+            mip_filter: FilterMode::Linear,
             address: AddressMode::ClampToEdge,
+            anisotropy: 1,
+            lod_min: 0.0,
+            lod_max: 1000.0,
+            compare: None,
+            border: BorderColor::TransparentBlack,
         }
     }
 }

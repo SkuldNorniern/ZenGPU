@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use ash::{Device, khr, vk};
 use zengpu_hal::{
-    AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, CompareFn,
-    ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, FilterMode, Format, FrontFace,
-    GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage,
-    PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig, TargetHandle,
-    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
+    AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
+    CompareFn, ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, FilterMode, Format,
+    FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities,
+    MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
+    SurfaceConfig, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -125,6 +126,8 @@ pub(crate) struct VulkanDeviceInner {
     pub queue: vk::Queue,
     pub dual_src_blend: bool,
     pub fill_mode_non_solid: bool,
+    pub sampler_anisotropy: bool,
+    pub max_sampler_anisotropy: f32,
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
@@ -377,6 +380,14 @@ impl VulkanDevice {
         let supported_features = unsafe { shared.instance.get_physical_device_features(physical) };
         let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
         let fill_mode_non_solid = supported_features.fill_mode_non_solid == vk::TRUE;
+        let sampler_anisotropy = supported_features.sampler_anisotropy == vk::TRUE;
+        let max_sampler_anisotropy = unsafe {
+            shared
+                .instance
+                .get_physical_device_properties(physical)
+                .limits
+                .max_sampler_anisotropy
+        };
 
         let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
             shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
@@ -397,6 +408,11 @@ impl VulkanDevice {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
                 dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
                 fill_mode_non_solid: if fill_mode_non_solid {
+                    vk::TRUE
+                } else {
+                    vk::FALSE
+                },
+                sampler_anisotropy: if sampler_anisotropy {
                     vk::TRUE
                 } else {
                     vk::FALSE
@@ -445,6 +461,8 @@ impl VulkanDevice {
             queue,
             dual_src_blend,
             fill_mode_non_solid,
+            sampler_anisotropy,
+            max_sampler_anisotropy,
             dynamic_rendering,
         });
 
@@ -718,6 +736,14 @@ fn address_to_vk(a: AddressMode) -> vk::SamplerAddressMode {
         AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
         AddressMode::MirrorRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+    }
+}
+
+fn border_color_to_vk(b: BorderColor) -> vk::BorderColor {
+    match b {
+        BorderColor::TransparentBlack => vk::BorderColor::FLOAT_TRANSPARENT_BLACK,
+        BorderColor::OpaqueBlack => vk::BorderColor::FLOAT_OPAQUE_BLACK,
+        BorderColor::OpaqueWhite => vk::BorderColor::FLOAT_OPAQUE_WHITE,
     }
 }
 
@@ -1251,14 +1277,30 @@ impl GpuDevice for VulkanDevice {
         let min = filter_to_vk(desc.min_filter);
         let mag = filter_to_vk(desc.mag_filter);
         let addr = address_to_vk(desc.address);
+        let mipmap_mode = match desc.mip_filter {
+            FilterMode::Nearest => vk::SamplerMipmapMode::NEAREST,
+            FilterMode::Linear => vk::SamplerMipmapMode::LINEAR,
+        };
+        let anisotropy_enable = self.inner.sampler_anisotropy && desc.anisotropy > 1;
+        let max_anisotropy = (desc.anisotropy as f32).min(self.inner.max_sampler_anisotropy);
         let info = vk::SamplerCreateInfo {
             mag_filter: mag,
             min_filter: min,
-            mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+            mipmap_mode,
             address_mode_u: addr,
             address_mode_v: addr,
             address_mode_w: addr,
-            max_lod: vk::LOD_CLAMP_NONE,
+            min_lod: desc.lod_min,
+            max_lod: desc.lod_max,
+            anisotropy_enable: if anisotropy_enable { vk::TRUE } else { vk::FALSE },
+            max_anisotropy,
+            compare_enable: if desc.compare.is_some() {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
+            compare_op: compare_fn_to_vk(desc.compare.unwrap_or(CompareFn::Always)),
+            border_color: border_color_to_vk(desc.border),
             ..Default::default()
         };
         let sampler = unsafe {
@@ -1275,6 +1317,10 @@ impl GpuDevice for VulkanDevice {
         if let Some(s) = samplers.remove(sampler) {
             unsafe { self.inner.device.destroy_sampler(s, None) };
         }
+    }
+
+    fn supports_anisotropic_filtering(&self) -> bool {
+        self.inner.sampler_anisotropy
     }
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
@@ -2047,6 +2093,25 @@ mod tests {
         let Some(dev) = try_device() else { return };
         assert!(dev.capabilities().graphics);
         assert!(dev.capabilities().compute);
+    }
+
+    #[test]
+    fn create_sampler_with_full_desc() {
+        let Some(dev) = try_device() else { return };
+        let sampler = dev
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Linear,
+                mag_filter: FilterMode::Linear,
+                mip_filter: FilterMode::Linear,
+                address: AddressMode::Repeat,
+                anisotropy: 16,
+                lod_min: 0.0,
+                lod_max: 4.0,
+                compare: Some(CompareFn::LessEqual),
+                border: BorderColor::OpaqueBlack,
+            })
+            .unwrap();
+        dev.destroy_sampler(sampler);
     }
 
     #[test]
