@@ -5,12 +5,11 @@ use std::sync::{Arc, Mutex};
 use ash::{Device, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, CompareFn,
-    ComputePipelineDesc, DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice,
-    GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result,
-    SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig,
-    TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat,
-    WindowHandles, marker,
+    ComputePipelineDesc, CullMode, DeviceRequest, FilterMode, Format, FrontFace, GpuDevice,
+    GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle,
+    PolygonMode, PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
+    ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig, TargetHandle, TextureDesc,
+    TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -132,6 +131,7 @@ pub(crate) struct VulkanDeviceInner {
     pub queue_family: u32,
     pub queue: vk::Queue,
     pub dual_src_blend: bool,
+    pub fill_mode_non_solid: bool,
     /// `VK_KHR_dynamic_rendering` loader — the unified graphics path (D17/GU)
     /// records render passes via `cmd_begin_rendering`/`cmd_end_rendering`,
     /// with no `vk::RenderPass`/`vk::Framebuffer` objects.
@@ -397,6 +397,7 @@ impl VulkanDevice {
 
         let supported_features = unsafe { shared.instance.get_physical_device_features(physical) };
         let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
+        let fill_mode_non_solid = supported_features.fill_mode_non_solid == vk::TRUE;
 
         // Enable Vulkan 1.2 descriptor-indexing features for bindless resources.
         let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
@@ -417,6 +418,11 @@ impl VulkanDevice {
             features: vk::PhysicalDeviceFeatures {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
                 dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
+                fill_mode_non_solid: if fill_mode_non_solid {
+                    vk::TRUE
+                } else {
+                    vk::FALSE
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -460,6 +466,7 @@ impl VulkanDevice {
             queue_family,
             queue,
             dual_src_blend,
+            fill_mode_non_solid,
             dynamic_rendering,
         });
 
@@ -1527,6 +1534,11 @@ impl VulkanDevice {
         &self,
         desc: GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle> {
+        if desc.raster.polygon != PolygonMode::Fill && !self.inner.fill_mode_non_solid {
+            return Err(GpuError::PipelineCreation(
+                "PolygonMode::Line/Point requires fillModeNonSolid, which this device does not support".to_string(),
+            ));
+        }
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: resolve shaders");
         let (vert_module, frag_module) = {
             let shaders = self.shaders.lock().unwrap();
@@ -1605,9 +1617,9 @@ impl VulkanDevice {
         };
 
         let rasterization = vk::PipelineRasterizationStateCreateInfo {
-            polygon_mode: vk::PolygonMode::FILL,
-            cull_mode: vk::CullModeFlags::NONE,
-            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            polygon_mode: polygon_mode_to_vk(desc.raster.polygon),
+            cull_mode: cull_mode_to_vk(desc.raster.cull),
+            front_face: front_face_to_vk(desc.raster.front_face),
             line_width: 1.0,
             ..Default::default()
         };
@@ -1806,6 +1818,10 @@ impl GraphicsDevice for VulkanDevice {
     fn supports_dual_source_blending(&self) -> bool {
         self.inner.dual_src_blend
     }
+
+    fn supports_non_solid_fill(&self) -> bool {
+        self.inner.fill_mode_non_solid
+    }
 }
 
 fn vertex_format_to_vk(f: VertexFormat) -> vk::Format {
@@ -1861,6 +1877,29 @@ fn blend_mode_to_vk(b: BlendMode) -> vk::PipelineColorBlendAttachmentState {
             alpha_blend_op: vk::BlendOp::ADD,
             color_write_mask: vk::ColorComponentFlags::RGBA,
         },
+    }
+}
+
+fn cull_mode_to_vk(c: CullMode) -> vk::CullModeFlags {
+    match c {
+        CullMode::None => vk::CullModeFlags::NONE,
+        CullMode::Front => vk::CullModeFlags::FRONT,
+        CullMode::Back => vk::CullModeFlags::BACK,
+    }
+}
+
+fn front_face_to_vk(f: FrontFace) -> vk::FrontFace {
+    match f {
+        FrontFace::Ccw => vk::FrontFace::COUNTER_CLOCKWISE,
+        FrontFace::Cw => vk::FrontFace::CLOCKWISE,
+    }
+}
+
+fn polygon_mode_to_vk(p: PolygonMode) -> vk::PolygonMode {
+    match p {
+        PolygonMode::Fill => vk::PolygonMode::FILL,
+        PolygonMode::Line => vk::PolygonMode::LINE,
+        PolygonMode::Point => vk::PolygonMode::POINT,
     }
 }
 

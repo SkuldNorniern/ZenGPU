@@ -187,6 +187,47 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+/// Backface culling mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CullMode {
+    /// Render both front and back faces.
+    #[default]
+    None,
+    Front,
+    Back,
+}
+
+/// Which winding order is considered front-facing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontFace {
+    /// Counter-clockwise winding is front-facing (default).
+    #[default]
+    Ccw,
+    /// Clockwise winding is front-facing.
+    Cw,
+}
+
+/// How rasterized primitives are filled.
+///
+/// `Line` and `Point` require [`GraphicsDevice::supports_non_solid_fill`](crate::graphics::GraphicsDevice::supports_non_solid_fill)
+/// (Vulkan's `fillModeNonSolid`); pipeline creation fails if requested without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolygonMode {
+    #[default]
+    Fill,
+    /// Wireframe rendering — the engine's debug/wireframe path.
+    Line,
+    Point,
+}
+
+/// Rasterizer state: culling, winding, and fill mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RasterState {
+    pub cull: CullMode,
+    pub front_face: FrontFace,
+    pub polygon: PolygonMode,
+}
+
 /// Depth comparison function.
 ///
 /// Selects which fragments pass the depth test. Defaults to [`CompareFn::Less`].
@@ -238,6 +279,7 @@ pub struct GraphicsPipelineDesc<'a> {
     pub depth_format: Option<Format>,
     pub depth: DepthState,
     pub blend: BlendMode,
+    pub raster: RasterState,
     /// MSAA sample count; `1` means no multisampling.
     pub samples: u32,
 }

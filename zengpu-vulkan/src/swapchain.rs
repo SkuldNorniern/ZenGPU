@@ -424,6 +424,12 @@ impl DeviceContext {
         self.inner.dual_src_blend
     }
 
+    /// Whether the selected physical device supports non-solid fill modes
+    /// (`PolygonMode::Line`/`Point`).
+    pub fn supports_non_solid_fill(&self) -> bool {
+        self.inner.fill_mode_non_solid
+    }
+
     /// Physical-device memory properties, for picking a memory type when
     /// allocating buffers/images.
     pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
