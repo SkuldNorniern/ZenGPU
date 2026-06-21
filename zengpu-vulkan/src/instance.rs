@@ -237,6 +237,7 @@ impl VulkanInstance {
             })
             .max_by_key(|(score, _, _, _, _)| *score)
             .map(|(_, phys, props, name, dt)| {
+                log::info!("[zengpu-vulkan] selected adapter: {name} ({dt:?})");
                 VulkanAdapter::new(
                     Arc::clone(&self.shared),
                     phys,
