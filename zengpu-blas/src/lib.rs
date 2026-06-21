@@ -1,120 +1,94 @@
-//! ZenGPU BLAS bridge.
+//! ZenGPU BLAS: a GPU-accelerated BLAS extension for ZenGPU.
 //!
-//! Vendor libraries (cuBLAS, rocBLAS, oneMKL, MPS) are not used. [`GemmKernel::gemm`] is a portable
-//! single-dispatch f32 GEMM over [`DeviceArray`]s.
+//! Dispatches through any ZenGPU-compatible backend (Vulkan, CUDA, Metal, CPU). Not yet: routing to
+//! vendor libraries (cuBLAS, rocBLAS, MPS) when the matching backend is detected. Portable compute
+//! shaders are used otherwise.
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//! use zengpu_blas::Blas;
+//! use zengpu_compute::BufferPool;
+//! use zengpu_hal::{DType, GpuDevice};
+//!
+//! # fn run(device: Arc<dyn GpuDevice>) -> zengpu_hal::Result<()> {
+//! let blas = Blas::new(&*device)?;
+//! let pool = BufferPool::new(device.clone());
+//!
+//! let a = pool.alloc(vec![4, 4], DType::F32)?;
+//! let b = pool.alloc(vec![4, 4], DType::F32)?;
+//!
+//! // C = 2.0 * A @ B
+//! let c = blas.sgemm(&*device, &pool, 2.0, &a, &b)?;
+//! # Ok(()) }
+//! ```
+//!
+//! # Crate features
+//!
+//! Optional extension: add `zengpu-blas` to `Cargo.toml`. It depends only on `zengpu-hal` and
+//! `zengpu-compute`, so it works with any HAL backend.
+
+pub mod level1;
+pub mod level3;
+
+pub use level1::Level1Kernels;
+pub use level3::GemmKernel;
 
 use zengpu_compute::{BufferPool, DeviceArray};
-use zengpu_hal::{
-    Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderDesc, ShaderHandle,
-};
-use zengpu_spirv::zengpu_spirv;
+use zengpu_hal::{GpuDevice, Result};
 
-/// Computes `C[m,n] = sum_k A[m,k] * B[k,n]` in untiled f32.
-const GEMM_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    #extension GL_EXT_nonuniform_qualifier : require
-
-    layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-
-    layout(push_constant) uniform PC {
-        uint a_idx;
-        uint b_idx;
-        uint c_idx;
-        uint m;
-        uint n;
-        uint k;
-    } pc;
-
-    layout(local_size_x = 16, local_size_y = 16) in;
-
-    void main() {
-        uint row = gl_GlobalInvocationID.y;
-        uint col = gl_GlobalInvocationID.x;
-        if (row < pc.m && col < pc.n) {
-            float sum = 0.0;
-            for (uint i = 0; i < pc.k; i++) {
-                sum += g_bufs[pc.a_idx].data[row * pc.k + i]
-                     * g_bufs[pc.b_idx].data[i * pc.n + col];
-            }
-            g_bufs[pc.c_idx].data[row * pc.n + col] = sum;
-        }
-    }
-    "#,
-    comp,
-    vulkan1_2
-);
-
-fn spv_bytes(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
+/// All BLAS pipelines compiled for one device. Create once, reuse across calls. For finer control,
+/// build [`Level1Kernels`] and [`GemmKernel`] separately.
+pub struct Blas {
+    pub level1: Level1Kernels,
+    pub gemm:   GemmKernel,
 }
 
-/// Create once per device, reuse across dispatches.
-pub struct GemmKernel {
-    shader: ShaderHandle,
-    pub pipeline: PipelineHandle,
-}
-
-impl GemmKernel {
-    /// CPU oracle. Also registers a kernel for [`Self::pipeline`] with
-    /// `CpuDevice::register_kernel`.
+impl Blas {
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let shader = device.create_shader(ShaderDesc {
-            spirv: spv_bytes(GEMM_SPV),
-        })?;
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "main",
-        })?;
-        Ok(Self { shader, pipeline })
+        Ok(Self {
+            level1: Level1Kernels::new(device)?,
+            gemm:   GemmKernel::new(device)?,
+        })
     }
 
     pub fn destroy(self, device: &dyn GpuDevice) {
-        device.destroy_pipeline(self.pipeline);
-        device.destroy_shader(self.shader);
+        self.level1.destroy(device);
+        self.gemm.destroy(device);
     }
 
-    /// Computes `C = A @ B` for 2D row-major f32, where `a.shape = [m, k]`, `b.shape = [k, n]` and
-    /// `c.shape = [m, n]`.
-    ///
-    /// Allocates `c` from `pool`. This is one dispatch, with no chaining.
-    pub fn gemm(
+    pub fn sgemm(
         &self,
         device: &dyn GpuDevice,
         pool: &BufferPool,
+        alpha: f32,
         a: &DeviceArray,
         b: &DeviceArray,
     ) -> Result<DeviceArray> {
-        if a.dtype != DType::F32 || b.dtype != DType::F32 {
-            return Err(GpuError::Dispatch(format!(
-                "gemm: only DType::F32 is supported, got {:?} and {:?}",
-                a.dtype, b.dtype
-            )));
-        }
-        let (&[m, k], &[k2, n]) = (a.shape.as_slice(), b.shape.as_slice()) else {
-            return Err(GpuError::Dispatch(format!(
-                "gemm: expected 2D arrays, got shapes {:?} and {:?}",
-                a.shape, b.shape
-            )));
-        };
-        if k != k2 {
-            return Err(GpuError::Dispatch(format!(
-                "gemm: inner dimensions mismatch ({k} vs {k2}) for shapes {:?} and {:?}",
-                a.shape, b.shape
-            )));
-        }
+        self.gemm.sgemm(device, pool, alpha, a, b)
+    }
 
-        let c = pool.alloc(vec![m, n], DType::F32)?;
-        device.dispatch(
-            self.pipeline,
-            Bindings {
-                buffers: &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
-                scalars: &[Scalar::U32(m), Scalar::U32(n), Scalar::U32(k)],
-                textures: &[],
-            },
-            [n.div_ceil(16), m.div_ceil(16), 1],
-        )?;
-        Ok(c)
+    /// `y[i] += alpha * x[i]`, in place, no allocation.
+    pub fn saxpy(
+        &self,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        alpha: f32,
+        x: &DeviceArray,
+        y: &DeviceArray,
+    ) -> Result<()> {
+        self.level1.saxpy(device, pool, alpha, x, y)
+    }
+
+    /// `x[i] *= alpha`, in place, no allocation.
+    pub fn sscal(
+        &self,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        alpha: f32,
+        x: &DeviceArray,
+    ) -> Result<()> {
+        self.level1.sscal(device, pool, alpha, x)
     }
 }
