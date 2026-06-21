@@ -4,9 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use ash::{Device, khr, vk};
 use zengpu_hal::{
-    AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
-    DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
-    HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
+    AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, CompareFn,
+    ComputePipelineDesc, DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice,
+    GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result,
+    SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig,
     TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat,
     WindowHandles, marker,
@@ -1623,7 +1624,7 @@ impl VulkanDevice {
             } else {
                 vk::FALSE
             },
-            depth_compare_op: vk::CompareOp::LESS,
+            depth_compare_op: compare_fn_to_vk(desc.depth.compare),
             ..Default::default()
         };
 
@@ -1860,6 +1861,19 @@ fn blend_mode_to_vk(b: BlendMode) -> vk::PipelineColorBlendAttachmentState {
             alpha_blend_op: vk::BlendOp::ADD,
             color_write_mask: vk::ColorComponentFlags::RGBA,
         },
+    }
+}
+
+fn compare_fn_to_vk(c: CompareFn) -> vk::CompareOp {
+    match c {
+        CompareFn::Never => vk::CompareOp::NEVER,
+        CompareFn::Less => vk::CompareOp::LESS,
+        CompareFn::Equal => vk::CompareOp::EQUAL,
+        CompareFn::LessEqual => vk::CompareOp::LESS_OR_EQUAL,
+        CompareFn::Greater => vk::CompareOp::GREATER,
+        CompareFn::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
+        CompareFn::NotEqual => vk::CompareOp::NOT_EQUAL,
+        CompareFn::Always => vk::CompareOp::ALWAYS,
     }
 }
 
