@@ -392,53 +392,81 @@ impl GpuDevice for CudaDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
-        let cp = self
-            .pipelines
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .get(pipeline)
-            .copied()
-            .ok_or_else(|| GpuError::Backend("cuda: invalid pipeline handle".into()))?;
+        self.dispatch_batch(&[zengpu_hal::DispatchOp {
+            pipeline,
+            bindings,
+            grid,
+        }])
+    }
 
-        let buf_guard = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
-        let mut ptrs: Vec<u64> = Vec::with_capacity(bindings.buffers.len());
-        for &slot in bindings.buffers {
-            let cb = buf_guard
-                .get_by_slot_index(slot)
-                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer slot in bindings".into()))?;
-            ptrs.push(cb.ptr);
+    fn dispatch_batch(&self, ops: &[zengpu_hal::DispatchOp<'_>]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
         }
-        drop(buf_guard);
 
-        let mut param_storage: Vec<Vec<u8>> = Vec::new();
-        for p in &ptrs {
-            param_storage.push(p.to_le_bytes().to_vec());
-        }
-        for s in bindings.scalars {
-            match s {
-                Scalar::U32(v) => param_storage.push(v.to_le_bytes().to_vec()),
-                Scalar::I32(v) => param_storage.push(v.to_le_bytes().to_vec()),
-                Scalar::F32(v) => param_storage.push(v.to_bits().to_le_bytes().to_vec()),
-            }
-        }
-        let mut kernel_params: Vec<*mut std::ffi::c_void> = param_storage
-            .iter_mut()
-            .map(|v| v.as_mut_ptr() as *mut std::ffi::c_void)
-            .collect();
+        const MAX_PARAMS: usize = 32;
 
         let stream = self.stream;
         self.with_context(|_handle| {
-            cu(unsafe {
-                cuda_oxide::sys::cuLaunchKernel(
-                    cp.func,
-                    grid[0], grid[1], grid[2],
-                    cp.block[0], cp.block[1], cp.block[2],
-                    0,
-                    stream,
-                    kernel_params.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            })?;
+            for op in ops {
+                let cp = self
+                    .pipelines
+                    .lock()
+                    .map_err(|_| GpuError::DeviceLost)?
+                    .get(op.pipeline)
+                    .copied()
+                    .ok_or_else(|| GpuError::Backend("cuda: invalid pipeline handle".into()))?;
+
+                let mut storage = [[0u8; 8]; MAX_PARAMS];
+                let mut n_params = 0usize;
+                {
+                    let buf_guard = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+                    for &slot in op.bindings.buffers {
+                        if n_params >= MAX_PARAMS {
+                            return Err(GpuError::Dispatch(format!(
+                                "dispatch: more than {MAX_PARAMS} kernel parameters"
+                            )));
+                        }
+                        let cb = buf_guard.get_by_slot_index(slot).ok_or_else(|| {
+                            GpuError::Backend("cuda: invalid buffer slot in bindings".into())
+                        })?;
+                        storage[n_params] = cb.ptr.to_le_bytes();
+                        n_params += 1;
+                    }
+                }
+                for s in op.bindings.scalars {
+                    if n_params >= MAX_PARAMS {
+                        return Err(GpuError::Dispatch(format!(
+                            "dispatch: more than {MAX_PARAMS} kernel parameters"
+                        )));
+                    }
+                    let bytes4 = match s {
+                        Scalar::U32(v) => v.to_le_bytes(),
+                        Scalar::I32(v) => v.to_le_bytes(),
+                        Scalar::F32(v) => v.to_bits().to_le_bytes(),
+                    };
+                    storage[n_params][..4].copy_from_slice(&bytes4);
+                    n_params += 1;
+                }
+
+                let mut kernel_params: [*mut std::ffi::c_void; MAX_PARAMS] =
+                    [std::ptr::null_mut(); MAX_PARAMS];
+                for (i, slot) in storage.iter_mut().take(n_params).enumerate() {
+                    kernel_params[i] = slot.as_mut_ptr() as *mut std::ffi::c_void;
+                }
+
+                cu(unsafe {
+                    cuda_oxide::sys::cuLaunchKernel(
+                        cp.func,
+                        op.grid[0], op.grid[1], op.grid[2],
+                        cp.block[0], cp.block[1], cp.block[2],
+                        0,
+                        stream,
+                        kernel_params.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    )
+                })?;
+            }
             cu(unsafe { cuda_oxide::sys::cuStreamSynchronize(stream) })
         })
     }
@@ -668,6 +696,73 @@ mod tests {
         device.destroy_shader(shader);
         device.destroy_buffer(buf_a);
         device.destroy_buffer(buf_b);
+        device.destroy_buffer(buf_out);
+    }
+
+    #[test]
+    fn dispatch_batch_chains_ops_on_one_stream_sync() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let a: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..N).map(|i| (10 * i) as f32).collect();
+        let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 2.0 * (x + y)).collect();
+
+        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let gpu = |size| BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let buf_a = device.create_buffer(gpu(size)).unwrap();
+        let buf_b = device.create_buffer(gpu(size)).unwrap();
+        let buf_sum = device.create_buffer(gpu(size)).unwrap();
+        let buf_out = device.create_buffer(gpu(size)).unwrap();
+
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        device.write_buffer(buf_a, 0, &a_bytes).unwrap();
+        device.write_buffer(buf_b, 0, &b_bytes).unwrap();
+
+        let shader = device.create_shader(ShaderDesc::ptx(VEC_ADD_PTX)).expect("load PTX");
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader,
+            entry: "vec_add_f32",
+            block: [256, 1, 1],
+        }).expect("create pipeline");
+
+        let grid = [(N as u32).div_ceil(256), 1, 1];
+        device.dispatch_batch(&[
+            zengpu_hal::DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                grid,
+            },
+            zengpu_hal::DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                grid,
+            },
+        ]).expect("dispatch_batch");
+
+        let raw = device.read_buffer(buf_out, 0, size).unwrap();
+        for i in 0..N {
+            let got = f32::from_le_bytes(raw[i*4..i*4+4].try_into().unwrap());
+            assert!((got - expected[i]).abs() < 1e-3, "out[{i}] = {got}, expected {}", expected[i]);
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_a);
+        device.destroy_buffer(buf_b);
+        device.destroy_buffer(buf_sum);
         device.destroy_buffer(buf_out);
     }
 }
