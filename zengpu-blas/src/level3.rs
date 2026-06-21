@@ -37,12 +37,11 @@ pub struct GemmKernel {
 
 impl GemmKernel {
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let shader = device.create_shader(ShaderDesc {
-            spirv: spv_bytes(GEMM_SPV),
-        })?;
+        let shader = device.create_shader(ShaderDesc::spirv(spv_bytes(GEMM_SPV)))?;
         let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader,
             entry: "main",
+            block: [16, 16, 1],
         })?;
         Ok(Self { shader, pipeline })
     }

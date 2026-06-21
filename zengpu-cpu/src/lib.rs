@@ -22,7 +22,8 @@ use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
     GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, SlotMap, TextureDesc, TextureHandle, UsageError, marker,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, UsageError,
+    marker,
 };
 
 /// Arguments for a CPU kernel. `buffers[i]` is a clone of slot `bindings.buffers[i]`. Modify in
@@ -172,7 +173,10 @@ impl GpuDevice for CpuDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        Ok(self.shaders.lock().unwrap().insert(desc.spirv.to_vec()))
+        let bytes = match desc.source {
+            ShaderSource::Spirv(b) | ShaderSource::Ptx(b) => b,
+        };
+        Ok(self.shaders.lock().unwrap().insert(bytes.to_vec()))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
@@ -461,11 +465,12 @@ mod tests {
         dev.write_buffer(hb, 0, &b_data).unwrap();
 
         let dummy_spv = [0x03, 0x02, 0x23, 0x07u8];
-        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let shader = dev.create_shader(ShaderDesc::spirv(&dummy_spv)).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "main",
+                block: [0, 0, 0],
             })
             .unwrap();
 
@@ -525,11 +530,12 @@ mod tests {
     fn dispatch_stale_pipeline_fails() {
         let dev = CpuDevice::new();
         let dummy_spv = [0u8; 4];
-        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let shader = dev.create_shader(ShaderDesc::spirv(&dummy_spv)).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "main",
+                block: [0, 0, 0],
             })
             .unwrap();
         dev.destroy_pipeline(pipeline);
@@ -543,11 +549,12 @@ mod tests {
     fn dispatch_missing_kernel_fails() {
         let dev = CpuDevice::new();
         let dummy_spv = [0u8; 4];
-        let shader = dev.create_shader(ShaderDesc { spirv: &dummy_spv }).unwrap();
+        let shader = dev.create_shader(ShaderDesc::spirv(&dummy_spv)).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "main",
+                block: [0, 0, 0],
             })
             .unwrap();
         let err = dev

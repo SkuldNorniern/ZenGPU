@@ -91,19 +91,17 @@ impl ElementwiseKernels {
     /// also register kernels for [`Self::add_pipeline`] and [`Self::relu_pipeline`]
     /// with `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let add_shader = device.create_shader(ShaderDesc {
-            spirv: spv_bytes(ADD_SPV),
-        })?;
+        let add_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(ADD_SPV)))?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: add_shader,
             entry: "main",
+            block: [256, 1, 1],
         })?;
-        let relu_shader = device.create_shader(ShaderDesc {
-            spirv: spv_bytes(RELU_SPV),
-        })?;
+        let relu_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(RELU_SPV)))?;
         let relu_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: relu_shader,
             entry: "main",
+            block: [256, 1, 1],
         })?;
         Ok(Self {
             add_shader,
