@@ -71,6 +71,13 @@ impl OffscreenTarget {
         self.texture
     }
 
+    /// Recreate at a new size. Handles from before this call (`texture_handle`, `target_handle`)
+    /// are stale.
+    pub fn resize(&mut self, device: &VulkanDevice, width: u32, height: u32) -> Result<()> {
+        *self = Self::new(device, self.format, width, height)?;
+        Ok(())
+    }
+
     /// Crate-internal: frame-graph barrier tracking.
     pub(crate) fn image(&self) -> vk::Image {
         self.textures
@@ -144,5 +151,26 @@ mod tests {
         assert_eq!(target.extent(), (64, 32));
         let _ = target.texture_handle();
         let _ = target.target_handle();
+    }
+
+    #[test]
+    fn offscreen_target_resize() {
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let Ok(dev) = adapter.open(DeviceRequest::default()) else {
+            return;
+        };
+        let Some(device) = dev.as_any().downcast_ref::<VulkanDevice>() else {
+            return;
+        };
+
+        let mut target = OffscreenTarget::new(device, Format::Rgba8Unorm, 64, 32).unwrap();
+        target.resize(device, 128, 96).unwrap();
+        assert_eq!(target.extent(), (128, 96));
+        assert_eq!(target.format(), Format::Rgba8Unorm);
     }
 }
