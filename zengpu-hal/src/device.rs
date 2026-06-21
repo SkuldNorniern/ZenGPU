@@ -57,6 +57,15 @@ pub trait GpuDevice: Send + Sync {
     /// Destroy a sampler, invalidating its handle.
     fn destroy_sampler(&self, sampler: SamplerHandle);
 
+    /// Whether the device supports anisotropic filtering
+    /// ([`SamplerDesc::anisotropy`] above `1`). When `false`,
+    /// [`create_sampler`](Self::create_sampler) silently treats any requested
+    /// anisotropy as `1` rather than failing, since it is a quality setting,
+    /// not a hard requirement of the sampled output.
+    fn supports_anisotropic_filtering(&self) -> bool {
+        false
+    }
+
     // ── Compute API ───────────────────────────────────────────────────────────
 
     /// Upload a SPIR-V shader module. Returns a handle usable for pipeline

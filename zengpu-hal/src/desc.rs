@@ -92,12 +92,40 @@ pub enum AddressMode {
     MirrorRepeat,
 }
 
+/// Border color sampled when [`AddressMode::ClampToEdge`] would otherwise
+/// sample outside the texture at the very edge texel — used by backends that
+/// support a clamp-to-border mode. The three presets below need no extra
+/// device feature/extension on any backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BorderColor {
+    #[default]
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+}
+
 /// Describes a sampler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerDesc {
     pub min_filter: FilterMode,
     pub mag_filter: FilterMode,
+    /// Filter used between mip levels.
+    pub mip_filter: FilterMode,
     pub address: AddressMode,
+    /// Maximum anisotropic samples; `1` disables anisotropic filtering.
+    /// Clamped to the device's maximum; ignored where the device cannot do
+    /// anisotropic filtering at all.
+    pub anisotropy: u8,
+    /// Minimum clamp for the computed mip LOD.
+    pub lod_min: f32,
+    /// Maximum clamp for the computed mip LOD.
+    pub lod_max: f32,
+    /// Comparison function for a shadow-map PCF sampler; `None` is a normal
+    /// (non-comparison) sampler.
+    pub compare: Option<CompareFn>,
+    /// Border color used by [`AddressMode`] variants that clamp to a border
+    /// rather than the edge texel.
+    pub border: BorderColor,
 }
 
 impl Default for SamplerDesc {
@@ -105,7 +133,13 @@ impl Default for SamplerDesc {
         Self {
             min_filter: FilterMode::Linear,
             mag_filter: FilterMode::Linear,
+            mip_filter: FilterMode::Linear,
             address: AddressMode::ClampToEdge,
+            anisotropy: 1,
+            lod_min: 0.0,
+            lod_max: 1000.0,
+            compare: None,
+            border: BorderColor::TransparentBlack,
         }
     }
 }
