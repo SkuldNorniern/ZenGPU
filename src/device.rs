@@ -4,6 +4,14 @@ use zengpu_hal::{
     TextureHandle,
 };
 
+impl std::fmt::Debug for Device {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Device")
+            .field("capabilities", &self.inner.capabilities())
+            .finish_non_exhaustive()
+    }
+}
+
 /// An opened logical GPU (or CPU) device from any enabled backend. Obtained
 /// from [`crate::Adapter::open`].
 ///
@@ -131,6 +139,77 @@ impl Device {
     #[cfg(feature = "dx12")]
     pub fn as_dx12(&self) -> Option<&zengpu_dx12::Dx12Device> {
         self.inner.as_any().downcast_ref()
+    }
+}
+
+/// Blanket [`GpuDevice`] impl lets `&Device` coerce to `&dyn GpuDevice`.
+/// Inherent methods (same name) still take precedence for direct `.method()`
+/// calls; this impl only activates when the trait is in scope and a trait
+/// object / bound is required.
+impl GpuDevice for Device {
+    fn as_any(&self) -> &dyn core::any::Any {
+        // Delegate into the concrete backend so `downcast_ref::<VulkanDevice>()` works.
+        self.inner.as_any()
+    }
+
+    fn capabilities(&self) -> HalCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
+        self.inner.create_buffer(desc)
+    }
+
+    fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_buffer(buffer, offset, data)
+    }
+
+    fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
+        self.inner.read_buffer(buffer, offset, len)
+    }
+
+    fn destroy_buffer(&self, buffer: BufferHandle) {
+        self.inner.destroy_buffer(buffer)
+    }
+
+    fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+        self.inner.create_texture(desc)
+    }
+
+    fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
+        self.inner.upload_texture_data(texture, data)
+    }
+
+    fn destroy_texture(&self, texture: TextureHandle) {
+        self.inner.destroy_texture(texture)
+    }
+
+    fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle> {
+        self.inner.create_sampler(desc)
+    }
+
+    fn destroy_sampler(&self, sampler: SamplerHandle) {
+        self.inner.destroy_sampler(sampler)
+    }
+
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        self.inner.create_shader(desc)
+    }
+
+    fn destroy_shader(&self, shader: ShaderHandle) {
+        self.inner.destroy_shader(shader)
+    }
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        self.inner.create_compute_pipeline(desc)
+    }
+
+    fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        self.inner.destroy_pipeline(pipeline)
+    }
+
+    fn dispatch(&self, pipeline: PipelineHandle, bindings: Bindings<'_>, grid: [u32; 3]) -> Result<()> {
+        self.inner.dispatch(pipeline, bindings, grid)
     }
 }
 
