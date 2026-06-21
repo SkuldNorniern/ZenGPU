@@ -28,9 +28,32 @@ pub trait GpuDevice: Send + Sync {
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle>;
 
-    /// Uploads tightly packed pixels in the creation format (RGBA8: 4 bytes per pixel) and blocks
-    /// until done.
+    /// Uploads tightly packed pixels in the texture's creation format (RGBA8 is 4 bytes per pixel).
+    /// Blocks until done.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
+
+    /// Uploads `data` to one mip level of one array layer (or cube face). Use this for texture
+    /// arrays, cubemaps and pre-baked mip chains.
+    ///
+    /// [`Self::upload_texture_data`] only targets mip `0` and layer `0`. Backends without an
+    /// implementation return [`GpuError::UnsupportedFeatures`].
+    fn upload_texture_data_region(
+        &self,
+        _texture: TextureHandle,
+        _mip_level: u32,
+        _layer: u32,
+        _data: &[u8],
+    ) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
+
+    /// Fills the mip chain by blitting each level from the previous one at half size. Needs
+    /// `mip_levels > 1` and `TRANSFER_SRC | TRANSFER_DST`.
+    ///
+    /// The default returns `GpuError::UnsupportedFeatures`.
+    fn generate_mipmaps(&self, _texture: TextureHandle) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
 
     /// Nothing may still reference the image, as with `destroy_buffer`. A stale handle is a no-op.
     fn destroy_texture(&self, texture: TextureHandle);

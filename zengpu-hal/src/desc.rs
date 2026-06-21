@@ -11,14 +11,32 @@ pub struct BufferDesc {
     pub memory: MemoryUsage,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TexDim {
+    /// A flat image. `array_layers > 1` makes a 2D array.
+    #[default]
+    D2,
+    /// A volume. `TextureDesc::depth` is the slice count.
+    D3,
+    /// Six square layers (+X, -X, +Y, -Y, +Z, -Z). `array_layers` must be `6`.
+    Cube,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
+    /// Depth slices for [`TexDim::D3`]. Must be `1` for `D2` and `Cube`.
+    pub depth: u32,
     pub format: Format,
     pub usage: TextureUsage,
     /// MSAA sample count. `1` means no multisampling.
     pub samples: u32,
+    pub dimension: TexDim,
+    /// Mip levels, including the base level. `1` means no mip chain.
+    pub mip_levels: u32,
+    /// Array layer count. `1` means a single non-array texture. Must be `6` for [`TexDim::Cube`].
+    pub array_layers: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
