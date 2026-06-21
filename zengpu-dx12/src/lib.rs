@@ -5,6 +5,7 @@
 //! `d3d12` bindings land. All device operations return
 //! `GpuError::Backend("not yet implemented")`.
 
+#[allow(unused_imports)]
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
     DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
