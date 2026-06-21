@@ -27,7 +27,7 @@ pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
 pub use surface::WindowHandles;
 
 pub use desc::{
-    AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,
+    AddressMode, BlendMode, BufferDesc, CompareFn, ComputePipelineDesc, DepthState, FilterMode,
     GraphicsPipelineDesc, PrimitiveTopology, RenderTargetDesc, SamplerDesc, ShaderDesc,
     ShaderSource, StepMode, SurfaceConfig, TextureDesc, VertexAttribute, VertexFormat,
     VertexLayout,

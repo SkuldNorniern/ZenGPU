@@ -158,10 +158,31 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+/// The default is `Less`. For reverse-Z, use `Greater` with a `1.0` depth clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareFn {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    NotEqual,
+    Always,
+}
+
+impl Default for CompareFn {
+    fn default() -> Self {
+        Self::Less
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DepthState {
     pub test: bool,
     pub write: bool,
+    /// Used only when `test` is `true`.
+    pub compare: CompareFn,
 }
 
 #[derive(Debug, Clone, Copy)]
