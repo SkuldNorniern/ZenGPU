@@ -111,6 +111,12 @@ pub trait GraphicsDevice: crate::GpuDevice {
     /// (`dualSrcBlend`). Coverage-based text rendering falls back to
     /// [`BlendMode::AlphaBlend`](crate::desc::BlendMode::AlphaBlend) where this is `false`.
     fn supports_dual_source_blending(&self) -> bool;
+
+    /// Whether the device supports [`PolygonMode::Line`](crate::desc::PolygonMode::Line) /
+    /// [`PolygonMode::Point`](crate::desc::PolygonMode::Point) (`fillModeNonSolid`).
+    /// [`create_graphics_pipeline`](Self::create_graphics_pipeline) fails if a
+    /// non-solid fill mode is requested where this is `false`.
+    fn supports_non_solid_fill(&self) -> bool;
 }
 
 /// An acquired-frame result: a real frame, or skip (minimized window, or the
