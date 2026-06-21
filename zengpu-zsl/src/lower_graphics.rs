@@ -30,7 +30,8 @@ use std::collections::HashMap;
 use proc_macro2::Span;
 use syn::{
     BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprCall, ExprField, ExprIf, ExprLit,
-    ExprMethodCall, ExprPath, ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp, spanned::Spanned,
+    ExprMethodCall, ExprParen, ExprPath, ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp,
+    spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -357,7 +358,28 @@ fn lower_graphics(
     spv.begin_function(t_void, fn_id, t_fn);
     spv.label();
 
-    let local_decls = collect_gfx_locals(body)?;
+    // Build a name→type map from all parameters so collect_gfx_locals can infer
+    // the types of unannotated `let` bindings (e.g. `let v = model * pos.extend(1.0)`).
+    let param_types: HashMap<String, GvTy> = {
+        let mut m = HashMap::new();
+        for p in &entry.params {
+            // Location inputs use gv_ty_from_zsl; scalars/matrices are a superset.
+            let gty = match &p.ty {
+                ZslType::F32  => Some(GvTy::F32),
+                ZslType::U32  => Some(GvTy::U32),
+                ZslType::Vec2 => Some(GvTy::Vec2),
+                ZslType::Vec3 => Some(GvTy::Vec3),
+                ZslType::Vec4 => Some(GvTy::Vec4),
+                ZslType::Mat4 => Some(GvTy::Mat4),
+                _ => None,
+            };
+            if let Some(gty) = gty {
+                m.insert(p.ident.to_string(), gty);
+            }
+        }
+        m
+    };
+    let local_decls = collect_gfx_locals(body, &param_types)?;
     let mut t_ptr_func_f32 = Id(0);
     let mut t_ptr_func_u32 = Id(0);
     let mut t_ptr_func_vec2 = Id(0);
@@ -1013,24 +1035,157 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
 
 // ── Local variable pre-scan ───────────────────────────────────────────────────
 
-fn collect_gfx_locals(block: &Block) -> Result<Vec<(String, GvTy)>, (Span, String)> {
+/// Infer the [`GvTy`] of an expression from its syntax, using `known` as a
+/// map of already-typed names (params + earlier locals in the same block).
+/// Returns `None` when the expression form is too complex to infer statically.
+fn infer_gfx_ty(expr: &Expr, known: &HashMap<String, GvTy>) -> Option<GvTy> {
+    match expr {
+        Expr::Lit(ExprLit { lit: Lit::Float(_), .. }) => Some(GvTy::F32),
+        Expr::Lit(ExprLit { lit: Lit::Int(_), .. }) => Some(GvTy::U32),
+
+        Expr::Path(ExprPath { path, .. }) => {
+            let name = path.get_ident()?.to_string();
+            known.get(&name).copied()
+        }
+
+        Expr::Paren(ExprParen { expr, .. }) => infer_gfx_ty(expr, known),
+
+        Expr::Unary(syn::ExprUnary { expr, .. }) => infer_gfx_ty(expr, known),
+
+        Expr::MethodCall(ExprMethodCall { receiver, method, args, .. }) => {
+            let recv_ty = infer_gfx_ty(receiver, known)?;
+            match method.to_string().as_str() {
+                // VecN.extend(f32) → Vec(N+1)
+                "extend" if args.len() == 1 => match recv_ty {
+                    GvTy::Vec2 => Some(GvTy::Vec3),
+                    GvTy::Vec3 => Some(GvTy::Vec4),
+                    _ => None,
+                },
+                // VecN.truncate() → Vec(N-1)
+                "truncate" if args.is_empty() => match recv_ty {
+                    GvTy::Vec3 => Some(GvTy::Vec2),
+                    GvTy::Vec4 => Some(GvTy::Vec3),
+                    _ => None,
+                },
+                // Swizzle shortcuts
+                "xyz" | "zyx" if args.is_empty() => match recv_ty {
+                    GvTy::Vec4 => Some(GvTy::Vec3),
+                    _ => None,
+                },
+                "xy" | "yx" if args.is_empty() => match recv_ty {
+                    GvTy::Vec3 | GvTy::Vec4 => Some(GvTy::Vec2),
+                    _ => None,
+                },
+                // Functions that preserve the receiver type
+                "normalize" | "abs" | "floor" | "ceil" | "fract" | "sign" | "sqrt"
+                    if args.is_empty() =>
+                {
+                    Some(recv_ty)
+                }
+                // Scalar reductions
+                "length" | "dot" if args.len() <= 1 => Some(GvTy::F32),
+                "cross" if args.len() == 1 => match recv_ty {
+                    GvTy::Vec3 => Some(GvTy::Vec3),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+
+        Expr::Call(ExprCall { func, .. }) => {
+            if let Expr::Path(ExprPath { path, .. }) = func.as_ref() {
+                let name = path.get_ident()?.to_string();
+                match name.as_str() {
+                    "vec2" | "Vec2" => Some(GvTy::Vec2),
+                    "vec3" | "Vec3" => Some(GvTy::Vec3),
+                    "vec4" | "Vec4" => Some(GvTy::Vec4),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+
+        Expr::Binary(ExprBinary { left, op, right, .. }) => {
+            let lty = infer_gfx_ty(left, known);
+            let rty = infer_gfx_ty(right, known);
+            match op {
+                // Comparisons always produce bool — not a GvTy, skip
+                BinOp::Lt(_) | BinOp::Le(_) | BinOp::Gt(_) | BinOp::Ge(_)
+                | BinOp::Eq(_) | BinOp::Ne(_) => None,
+                _ => match (lty, rty) {
+                    // Mat4 * Vec4 → Vec4  (or any VecN for completeness)
+                    (Some(GvTy::Mat4), Some(r))
+                        if matches!(r, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) =>
+                    {
+                        Some(r)
+                    }
+                    // VecN op VecN → VecN
+                    (Some(l), Some(r)) if l == r => Some(l),
+                    // VecN op scalar or scalar op VecN → VecN
+                    (Some(GvTy::F32) | Some(GvTy::U32), Some(r))
+                        if matches!(r, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) =>
+                    {
+                        Some(r)
+                    }
+                    (Some(l), Some(GvTy::F32) | Some(GvTy::U32))
+                        if matches!(l, GvTy::Vec2 | GvTy::Vec3 | GvTy::Vec4) =>
+                    {
+                        Some(l)
+                    }
+                    _ => None,
+                },
+            }
+        }
+
+        // Field access: vec.x / vec.y / … → F32; anything else we can't infer
+        Expr::Field(ExprField { member: Member::Named(m), .. }) => {
+            let name = m.to_string();
+            if name.len() == 1 && "xyzw".contains(name.as_str()) {
+                Some(GvTy::F32)
+            } else {
+                None
+            }
+        }
+
+        _ => None,
+    }
+}
+
+fn collect_gfx_locals(
+    block: &Block,
+    param_types: &HashMap<String, GvTy>,
+) -> Result<Vec<(String, GvTy)>, (Span, String)> {
     let mut out = Vec::new();
-    collect_gfx_locals_block(block, &mut out)?;
+    collect_gfx_locals_block(block, param_types, &mut out)?;
     Ok(out)
 }
 
 /// Recursively collect all `let` bindings in a block and any nested `if`
 /// branches. All collected locals are emitted as `OpVariable` at the top of
 /// the function's first basic block (SPIR-V requires this).
+///
+/// When a binding has no explicit type annotation, the type is inferred from
+/// the initializer expression via [`infer_gfx_ty`]. If inference fails, we
+/// fall back to `F32` (the original behaviour) rather than emitting an error,
+/// since the real type-mismatch error will surface during lowering anyway.
 fn collect_gfx_locals_block(
     block: &Block,
+    param_types: &HashMap<String, GvTy>,
     out: &mut Vec<(String, GvTy)>,
 ) -> Result<(), (Span, String)> {
+    // Running map of names→types visible at this point: params + already-seen locals.
+    let mut known: HashMap<String, GvTy> = param_types.clone();
+    for (name, gty) in out.iter() {
+        known.insert(name.clone(), *gty);
+    }
+
     for stmt in &block.stmts {
         match stmt {
             Stmt::Local(local) => {
                 let ident = gfx_local_ident(local)?;
                 let gty = if let syn::Pat::Type(pt) = &local.pat {
+                    // Explicit type annotation — use it.
                     let zty = ZslType::from_syn(&pt.ty)?;
                     gv_ty_from_zsl(&zty).ok_or_else(|| {
                         (
@@ -1041,9 +1196,13 @@ fn collect_gfx_locals_block(
                             ),
                         )
                     })?
+                } else if let Some(init) = &local.init {
+                    // No annotation — infer from the initializer; fall back to F32.
+                    infer_gfx_ty(&init.expr, &known).unwrap_or(GvTy::F32)
                 } else {
                     GvTy::F32
                 };
+                known.insert(ident.clone(), gty);
                 out.push((ident, gty));
             }
             Stmt::Expr(
@@ -1054,10 +1213,10 @@ fn collect_gfx_locals_block(
                 }),
                 _,
             ) => {
-                collect_gfx_locals_block(then_branch, out)?;
+                collect_gfx_locals_block(then_branch, param_types, out)?;
                 if let Some((_, else_expr)) = else_branch {
                     if let Expr::Block(ExprBlock { block, .. }) = else_expr.as_ref() {
-                        collect_gfx_locals_block(block, out)?;
+                        collect_gfx_locals_block(block, param_types, out)?;
                     }
                 }
             }

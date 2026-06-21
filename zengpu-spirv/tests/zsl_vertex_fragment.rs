@@ -519,6 +519,74 @@ fn fragment_mix_scalar() {
     assert!(spv_valid(SPV));
 }
 
+// ── Type inference for unannotated `let` bindings (§28.1) ────────────────────
+//
+// These shaders previously panicked with "ZSL: cannot coerce Vec4 to F32"
+// because the pre-pass defaulted every unannotated `let` to f32.
+
+#[test]
+fn let_inferred_from_mat4_mul_vec4() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_let_world(
+            #[location(0)] pos: Vec3,
+            #[location(1)] col: Vec3,
+            model: Mat4,
+            view_proj: Mat4,
+        ) -> (Vec4, Vec3) {
+            let world = model * pos.extend(1.0);
+            (view_proj * world, col)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn let_inferred_from_extend() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_let_ext(#[location(0)] pos: Vec3) -> Vec4 {
+            let clip = pos.extend(1.0);
+            clip
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn let_inferred_from_vec_arith() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_let_arith(
+            #[location(0)] a: Vec3,
+            #[location(1)] b: Vec3,
+            t: f32,
+        ) -> Vec4 {
+            let blended = a * t + b * (1.0 - t);
+            blended.extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn let_inferred_chained() {
+    // Earlier inferred locals can feed later inference.
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_let_chain(
+            #[location(0)] pos: Vec3,
+            model: Mat4,
+            view_proj: Mat4,
+        ) -> Vec4 {
+            let world4 = model * pos.extend(1.0);
+            let clip = view_proj * world4;
+            clip
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── SPIR-V header check ───────────────────────────────────────────────────────
 
 fn spv_valid(spv: &[u32]) -> bool {
