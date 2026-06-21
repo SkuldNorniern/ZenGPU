@@ -23,9 +23,9 @@ fn register_cpu_gemm_kernel(cpu: &CpuDevice, pipeline: zengpu_hal::PipelineHandl
     cpu.register_kernel(
         pipeline,
         Box::new(|ctx: &mut CpuKernelCtx| {
-            let (m, n, k) = match ctx.scalars[..] {
-                [Scalar::U32(m), Scalar::U32(n), Scalar::U32(k)] => {
-                    (m as usize, n as usize, k as usize)
+            let (m, n, k, alpha) = match ctx.scalars[..] {
+                [Scalar::U32(m), Scalar::U32(n), Scalar::U32(k), Scalar::F32(alpha)] => {
+                    (m as usize, n as usize, k as usize, alpha)
                 }
                 _ => return,
             };
@@ -42,7 +42,7 @@ fn register_cpu_gemm_kernel(cpu: &CpuDevice, pipeline: zengpu_hal::PipelineHandl
                         sum += read(a, row * k + i) * read(b, i * n + col);
                     }
                     c[(row * n + col) * 4..(row * n + col) * 4 + 4]
-                        .copy_from_slice(&sum.to_le_bytes());
+                        .copy_from_slice(&(alpha * sum).to_le_bytes());
                 }
             }
             ctx.buffers[2] = c;
