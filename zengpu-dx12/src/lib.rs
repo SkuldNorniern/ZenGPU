@@ -1,6 +1,7 @@
 //! DirectX 12 backend for Windows. Adapter enumeration and device creation are not wired yet, so
 //! all device ops return `GpuError::Backend("not yet implemented")`.
 
+#[allow(unused_imports)]
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
     DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,

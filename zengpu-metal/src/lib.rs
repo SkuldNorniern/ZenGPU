@@ -1,14 +1,19 @@
-//! ZenGPU Apple Metal backend. Only instance and platform detection are implemented.
+//! ZenGPU Apple Metal backend: graphics and compute on macOS/iOS.
 //!
-//! Device operations return `GpuError::Backend("not yet implemented")`.
+//! On macOS the instance enumerates all `MTLDevice`s, including eGPUs. Elsewhere it compiles but
+//! returns no adapters.
 
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
-    DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
-    SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
+    AdapterInfo, AdapterRequest, BufferDesc, BufferHandle, DeviceRequest, GpuAdapter, GpuDevice,
+    GpuError, GpuInstance, HalCapabilities, Result, SamplerDesc, SamplerHandle, TextureDesc,
+    TextureHandle,
 };
 
-/// On non-Apple platforms [`enumerate_adapters`] returns empty.
+#[cfg(target_os = "macos")]
+use zengpu_hal::{BackendPreference, DeviceType};
+
+/// Metal backend entry point. On macOS, [`enumerate_adapters`] returns one entry per `MTLDevice`
+/// (integrated and eGPUs). Elsewhere it returns empty.
 ///
 /// [`enumerate_adapters`]: MetalInstance::enumerate_adapters
 pub struct MetalInstance;
@@ -27,19 +32,61 @@ impl Default for MetalInstance {
 
 impl GpuInstance for MetalInstance {
     fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>> {
-        if !cfg!(target_os = "macos") {
-            return Vec::new();
+        #[cfg(target_os = "macos")]
+        {
+            metal::Device::all()
+                .into_iter()
+                .map(|dev| {
+                    let device_type = if dev.is_low_power() {
+                        DeviceType::Integrated
+                    } else {
+                        DeviceType::Discrete
+                    };
+                    let info = AdapterInfo {
+                        name: dev.name().to_string(),
+                        vendor: 0x106b,
+                        device: 0,
+                        device_type,
+                        backend: BackendPreference::Metal,
+                    };
+                    Box::new(MetalAdapter { info }) as Box<dyn GpuAdapter>
+                })
+                .collect()
         }
-        log::debug!("metal: adapter enumeration not yet implemented");
-        Vec::new()
+        #[cfg(not(target_os = "macos"))]
+        {
+            Vec::new()
+        }
     }
 
     fn request_adapter(&self, _req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
-        None
+        #[cfg(target_os = "macos")]
+        {
+            let all = self.enumerate_adapters();
+            metal::Device::system_default().map(|dev| {
+                let device_type = if dev.is_low_power() {
+                    DeviceType::Integrated
+                } else {
+                    DeviceType::Discrete
+                };
+                let info = AdapterInfo {
+                    name: dev.name().to_string(),
+                    vendor: 0x106b,
+                    device: 0,
+                    device_type,
+                    backend: BackendPreference::Metal,
+                };
+                Box::new(MetalAdapter { info }) as Box<dyn GpuAdapter>
+            })
+            .or_else(|| all.into_iter().next())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 }
 
-#[allow(dead_code)]
 pub struct MetalAdapter {
     info: AdapterInfo,
 }
@@ -54,11 +101,12 @@ impl GpuAdapter for MetalAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+        Err(GpuError::Backend(
+            "metal: device open not yet implemented".into(),
+        ))
     }
 }
 
-#[allow(dead_code)]
 pub struct MetalDevice;
 
 impl GpuDevice for MetalDevice {
@@ -109,5 +157,17 @@ mod tests {
     fn instance_constructs_without_panic() {
         let inst = MetalInstance::new();
         let _ = inst.enumerate_adapters();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn enumerates_at_least_one_adapter_on_macos() {
+        let inst = MetalInstance::new();
+        let adapters = inst.enumerate_adapters();
+        assert!(!adapters.is_empty(), "expected at least one Metal adapter on macOS");
+        for a in &adapters {
+            assert!(!a.info().name.is_empty());
+            assert!(a.capabilities().graphics);
+        }
     }
 }
