@@ -21,8 +21,9 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprIndex, ExprLit, ExprPath, ExprUnary,
-    Lit, Member, Stmt, UnOp, spanned::Spanned,
+    BinOp, Block, Expr, ExprBinary, ExprCall, ExprField, ExprForLoop, ExprIndex, ExprLit,
+    ExprPath, ExprRange, ExprUnary, Lit, Member, Pat, RangeLimits, Stmt, UnOp,
+    spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -38,6 +39,7 @@ pub fn lower_compute(
     let mut spv = SpvBuilder::new();
 
     spv.capability_shader();
+    spv.capability_runtime_descriptor_array();
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
@@ -63,28 +65,25 @@ pub fn lower_compute(
     let t_struct_buf_f32 = spv.type_struct(&[t_ra_f32]);
     spv.decorate(t_struct_buf_f32, deco::BLOCK, &[]);
     spv.member_decorate(t_struct_buf_f32, 0, deco::OFFSET, &[0]);
-    let t_ptr_ssbo_struct_f32 = spv.type_pointer(sc::STORAGE_BUFFER, t_struct_buf_f32);
+    let t_ra_struct = spv.type_runtime_array(t_struct_buf_f32);
+    let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
     let t_ptr_ssbo_f32 = spv.type_pointer(sc::STORAGE_BUFFER, t_f32);
 
-    let mut buf_vars: Vec<Id> = Vec::new();
-    for (binding, param) in buf_params.iter().enumerate() {
-        let var = spv.global_variable(t_ptr_ssbo_struct_f32, sc::STORAGE_BUFFER);
-        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
-        spv.decorate(var, deco::BINDING, &[binding as u32]);
-        if matches!(param.ty, ZslType::Buf(_)) {
-            spv.decorate(var, deco::NON_WRITABLE, &[]);
-        }
-        buf_vars.push(var);
-    }
+    let g_bufs_var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
+    spv.decorate(g_bufs_var, deco::DESCRIPTOR_SET, &[0]);
+    spv.decorate(g_bufs_var, deco::BINDING, &[0]);
 
-    let pc_var = if !scalar_params.is_empty() {
-        let pc_members: Vec<Id> = scalar_params
-            .iter()
-            .map(|p| if p.ty == ZslType::U32 { t_u32 } else { t_f32 })
-            .collect();
+    let n_buf_params = buf_params.len() as u32;
+    let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
+        let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
+        pc_members.extend(
+            scalar_params
+                .iter()
+                .map(|p| if p.ty == ZslType::U32 { t_u32 } else { t_f32 }),
+        );
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
-        for (i, _) in scalar_params.iter().enumerate() {
+        for i in 0..pc_members.len() {
             spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[(i * 4) as u32]);
         }
         let t_ptr_pc = spv.type_pointer(sc::PUSH_CONSTANT, t_pc_struct);
@@ -106,12 +105,12 @@ pub fn lower_compute(
 
     let buf_param_map: HashMap<String, BufInfo> = buf_params
         .iter()
-        .zip(buf_vars.iter())
-        .map(|(p, &var)| {
+        .enumerate()
+        .map(|(i, p)| {
             (
                 p.ident.to_string(),
                 BufInfo {
-                    var,
+                    pc_index: i as u32,
                     writable: matches!(p.ty, ZslType::BufMut(_)),
                 },
             )
@@ -166,6 +165,9 @@ pub fn lower_compute(
     let mut t_ptr_pc_u32 = Id(0);
     let mut t_ptr_pc_f32 = Id(0);
     if pc_var.is_some() {
+        if n_buf_params > 0 {
+            t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
+        }
         for p in &scalar_params {
             match p.ty {
                 ZslType::U32 if t_ptr_pc_u32 == Id(0) => {
@@ -185,6 +187,8 @@ pub fn lower_compute(
         t_u32,
         t_f32,
         t_uvec3,
+        g_bufs_var,
+        n_buf_params,
         t_ptr_ssbo_f32,
         glsl_ext,
         buf_params: buf_param_map,
@@ -206,7 +210,7 @@ pub fn lower_compute(
 }
 
 struct BufInfo {
-    var: Id,
+    pc_index: u32,
     writable: bool,
 }
 
@@ -243,9 +247,12 @@ struct LowerCtx<'a> {
     t_f32: Id,
     t_uvec3: Id,
     t_ptr_ssbo_f32: Id,
+    g_bufs_var: Id,
     glsl_ext: Id,
     buf_params: HashMap<String, BufInfo>,
     scalar_params: HashMap<String, ScalarInfo>,
+    /// Number of buffer params. Scalar PC indices are offset by this.
+    n_buf_params: u32,
     pc_var: Option<Id>,
     gid_var: Id,
     const_0_u32: Id,
@@ -291,6 +298,19 @@ fn collect_block_locals(
                         collect_block_locals(&eb.block, out)?;
                     }
                 }
+            }
+            Stmt::Expr(Expr::ForLoop(expr_for), _) => {
+                let loop_var = match expr_for.pat.as_ref() {
+                    Pat::Ident(p) => p.ident.to_string(),
+                    _ => {
+                        return Err((
+                            Span::call_site(),
+                            "ZSL: for-loop pattern must be a simple identifier".into(),
+                        ))
+                    }
+                };
+                out.push((loop_var, ScalarTy::U32));
+                collect_block_locals(&expr_for.body, out)?;
             }
             _ => {}
         }
@@ -361,38 +381,68 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &Stmt) -> Result<(), (Span, String)>
 fn lower_expr_stmt(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<(), (Span, String)> {
     match expr {
         Expr::Assign(assign) => {
-            let Expr::Index(ExprIndex {
-                expr: base, index, ..
-            }) = &*assign.left
-            else {
-                return Err((
-                    assign.left.span(),
-                    "ZSL: assignment target must be `buf[i]`".into(),
-                ));
-            };
-            let name = expr_path_ident(base)?;
-            let (var, writable) = {
-                let info = ctx
-                    .buf_params
-                    .get(&name)
-                    .ok_or_else(|| (base.span(), format!("ZSL: `{name}` is not a buffer param")))?;
-                (info.var, info.writable)
-            };
-            if !writable {
-                return Err((
-                    base.span(),
-                    format!("`{name}` is `Buf<T>` (read-only); use `BufMut<T>` to write"),
-                ));
+            match &*assign.left {
+                Expr::Index(ExprIndex {
+                    expr: base, index, ..
+                }) => {
+                    let name = expr_path_ident(base)?;
+                    let (buf_pc_index, writable, g_bufs) = {
+                        let info = ctx.buf_params.get(&name).ok_or_else(|| {
+                            (base.span(), format!("ZSL: `{name}` is not a buffer param"))
+                        })?;
+                        (info.pc_index, info.writable, ctx.g_bufs_var)
+                    };
+                    if !writable {
+                        return Err((
+                            base.span(),
+                            format!("`{name}` is `Buf<T>` (read-only); use `BufMut<T>` to write"),
+                        ));
+                    }
+                    let pc_var = ctx
+                        .pc_var
+                        .ok_or_else(|| (base.span(), "ZSL: no push constant block".into()))?;
+                    let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
+                    let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
+                    let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
+                    let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
+                    let idx_val = lower_expr(ctx, index)?;
+                    let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
+                    let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
+                    let c0 = ctx.const_0_u32;
+                    let ptr_elem =
+                        ctx.spv.op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+                    let rhs = lower_expr(ctx, &assign.right)?;
+                    let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
+                    ctx.spv.op_store(ptr_elem, rhs_id);
+                    Ok(())
+                }
+                Expr::Path(ExprPath { path, .. }) => {
+                    let ident = path
+                        .get_ident()
+                        .ok_or_else(|| {
+                            (path.span(), "ZSL: assignment target must be a simple name".into())
+                        })?
+                        .to_string();
+                    let (ptr, ty) = ctx
+                        .locals
+                        .get(&ident)
+                        .map(|l| (l.ptr, l.ty))
+                        .ok_or_else(|| {
+                            (
+                                path.span(),
+                                format!("ZSL: `{ident}` is not a declared local variable"),
+                            )
+                        })?;
+                    let rhs = lower_expr(ctx, &assign.right)?;
+                    let rhs_id = coerce(ctx, rhs, ty);
+                    ctx.spv.op_store(ptr, rhs_id);
+                    Ok(())
+                }
+                other => Err((
+                    other.span(),
+                    "ZSL: assignment target must be `buf[i]` or a local variable name".into(),
+                )),
             }
-            let idx_val = lower_expr(ctx, index)?;
-            let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
-            let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
-            let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ptr_ssbo_f32, var, &[c0, idx_id]);
-            let rhs = lower_expr(ctx, &assign.right)?;
-            let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
-            ctx.spv.op_store(ptr_elem, rhs_id);
-            Ok(())
         }
 
         Expr::If(expr_if) => {
@@ -433,6 +483,77 @@ fn lower_expr_stmt(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<(), (Span, Str
             }
 
             ctx.spv.label_with_id(merge_label);
+            Ok(())
+        }
+
+        Expr::ForLoop(ExprForLoop { pat, expr, body, .. }) => {
+            let loop_var = match pat.as_ref() {
+                Pat::Ident(p) => p.ident.to_string(),
+                other => {
+                    return Err((
+                        other.span(),
+                        "ZSL: for-loop pattern must be a simple identifier".into(),
+                    ));
+                }
+            };
+            let Expr::Range(ExprRange {
+                start: Some(lo_expr),
+                limits: RangeLimits::HalfOpen(_),
+                end: Some(hi_expr),
+                ..
+            }) = expr.as_ref()
+            else {
+                return Err((
+                    expr.span(),
+                    "ZSL: for-loop range must be `lo..hi` (exclusive, both bounds required)".into(),
+                ));
+            };
+
+            let lo_val = lower_expr(ctx, lo_expr)?;
+            let lo_id = coerce(ctx, lo_val, ScalarTy::U32);
+            let hi_val = lower_expr(ctx, hi_expr)?;
+            let hi_id = coerce(ctx, hi_val, ScalarTy::U32);
+
+            let loop_ptr = ctx
+                .locals
+                .get(&loop_var)
+                .map(|l| l.ptr)
+                .ok_or_else(|| {
+                    (
+                        pat.span(),
+                        format!("ZSL: for-loop variable `{loop_var}` not declared as a local"),
+                    )
+                })?;
+
+            ctx.spv.op_store(loop_ptr, lo_id);
+
+            let header = ctx.spv.fresh_id();
+            let body_lbl = ctx.spv.fresh_id();
+            let cont = ctx.spv.fresh_id();
+            let merge = ctx.spv.fresh_id();
+
+            ctx.spv.op_branch(header);
+
+            ctx.spv.label_with_id(header);
+            let t_u32 = ctx.t_u32;
+            let t_bool = ctx.t_bool;
+            let i_val = ctx.spv.op_load(t_u32, loop_ptr);
+            let cond = ctx.spv.op_ult(t_bool, i_val, hi_id);
+            ctx.spv.op_loop_merge(merge, cont);
+            ctx.spv.op_branch_conditional(cond, body_lbl, merge);
+
+            ctx.spv.label_with_id(body_lbl);
+            lower_block(ctx, body)?;
+            ctx.spv.op_branch(cont);
+
+            ctx.spv.label_with_id(cont);
+            let i_old = ctx.spv.op_load(t_u32, loop_ptr);
+            let const_1 = ctx.spv.constant_u32(t_u32, 1);
+            let i_new = ctx.spv.op_iadd(t_u32, i_old, const_1);
+            ctx.spv.op_store(loop_ptr, i_new);
+            ctx.spv.op_branch(header);
+
+            ctx.spv.label_with_id(merge);
             Ok(())
         }
 
@@ -501,7 +622,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
                         "ZSL: push-constant pointer type not allocated".into(),
                     ));
                 }
-                let pc_idx = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
+                let actual_idx = ctx.n_buf_params + info.pc_index;
+                let pc_idx = ctx.spv.constant_u32(ctx.t_u32, actual_idx);
                 let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
                 let id = ctx.spv.op_load(info.ty, chain);
                 let ty = if is_u32 { ScalarTy::U32 } else { ScalarTy::F32 };
@@ -515,16 +637,24 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &Expr) -> Result<Val, (Span, String)
             expr: base, index, ..
         }) => {
             let name = expr_path_ident(base)?;
-            let var = ctx
+            let buf_info = ctx
                 .buf_params
                 .get(&name)
-                .ok_or_else(|| (base.span(), format!("ZSL: `{name}` is not a buffer param")))?
-                .var;
+                .ok_or_else(|| (base.span(), format!("ZSL: `{name}` is not a buffer param")))?;
+            let (buf_pc_index, g_bufs) = (buf_info.pc_index, ctx.g_bufs_var);
+            let pc_var = ctx
+                .pc_var
+                .ok_or_else(|| (base.span(), "ZSL: no push constant block".into()))?;
+            let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
+            let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
+            let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
+            let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
             let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ptr_ssbo_f32, var, &[c0, idx_id]);
+            let ptr_elem =
+                ctx.spv.op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let t_f32 = ctx.t_f32;
             let id = ctx.spv.op_load(t_f32, ptr_elem);
             Ok(Val {

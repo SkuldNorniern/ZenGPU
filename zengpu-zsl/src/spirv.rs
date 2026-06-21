@@ -405,6 +405,14 @@ impl SpvBuilder {
         );
     }
 
+    pub fn op_loop_merge(&mut self, merge_label: Id, continue_label: Id) {
+        emit(
+            &mut self.functions,
+            op::LOOP_MERGE,
+            &[merge_label.0, continue_label.0, 0],
+        );
+    }
+
     pub fn op_variable(&mut self, ptr_ty: Id, storage_class: u32) -> Id {
         let id = self.fresh_id();
         emit(
