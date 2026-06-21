@@ -25,7 +25,7 @@ mod surface;
 mod types;
 
 pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
-pub use command::{Bindings, Scalar};
+pub use command::{Bindings, DispatchOp, Scalar};
 pub use device::GpuDevice;
 pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,

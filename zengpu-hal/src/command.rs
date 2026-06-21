@@ -24,6 +24,14 @@ pub struct Bindings<'a> {
     pub scalars: &'a [Scalar],
 }
 
+/// One dispatch within a [`crate::GpuDevice::dispatch_batch`] call.
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchOp<'a> {
+    pub pipeline: crate::handle::PipelineHandle,
+    pub bindings: Bindings<'a>,
+    pub grid: [u32; 3],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
