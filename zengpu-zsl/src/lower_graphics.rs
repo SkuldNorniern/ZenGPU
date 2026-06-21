@@ -25,9 +25,9 @@ use std::collections::HashMap;
 
 use proc_macro2::Span;
 use syn::{
-    BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprCall, ExprField, ExprIf, ExprLit,
-    ExprMethodCall, ExprParen, ExprPath, ExprTuple, ExprUnary, Lit, Member, Stmt, UnOp,
-    spanned::Spanned,
+    BinOp, Block, Expr, ExprAssign, ExprBinary, ExprBlock, ExprCall, ExprField, ExprIf,
+    ExprIndex, ExprLit, ExprMethodCall, ExprParen, ExprPath, ExprTuple, ExprUnary, Lit, Member,
+    Stmt, UnOp, spanned::Spanned,
 };
 
 use crate::ast::{ZslEntryPoint, ZslParam};
@@ -79,6 +79,13 @@ struct GfxLocal {
     ptr_ty: Id,
 }
 
+/// `Buf<f32>` or `BufMut<f32>` parameter. Its index is the push-constant field `pc_index`, after
+/// the earlier buffer indices.
+struct GfxBufInfo {
+    pc_index: u32,
+    writable: bool,
+}
+
 struct GfxCtx<'a> {
     spv: &'a mut SpvBuilder,
     t_f32: Id,
@@ -91,11 +98,18 @@ struct GfxCtx<'a> {
     glsl_ext: Id,
     inputs: HashMap<String, InputVar>,
     scalar_params: HashMap<String, GfxScalarInfo>,
+    buf_params: HashMap<String, GfxBufInfo>,
+    /// Bindless SSBO array; `None` without buf params.
+    g_bufs_var: Option<Id>,
+    /// Number of buffer params. Their u32 indices start the push-constant block.
+    #[allow(dead_code)]
+    n_buf_params: u32,
+    /// StorageBuffer pointer to an f32 element.
+    t_ptr_ssbo_f32: Id,
     pc_var: Option<Id>,
     t_ptr_pc_u32: Id,
     t_ptr_pc_f32: Id,
     t_ptr_pc_mat4: Id,
-    #[allow(dead_code)]
     const_0_u32: Id,
     locals: HashMap<String, GfxLocal>,
 }
@@ -171,6 +185,36 @@ fn lower_graphics(
             p.location.is_none() && matches!(p.ty, ZslType::U32 | ZslType::F32 | ZslType::Mat4)
         })
         .collect();
+    let buf_params: Vec<&ZslParam> = entry
+        .params
+        .iter()
+        .filter(|p| matches!(p.ty, ZslType::Buf(_) | ZslType::BufMut(_)))
+        .collect();
+
+    for p in &buf_params {
+        let elem = match &p.ty {
+            ZslType::Buf(e) | ZslType::BufMut(e) => e,
+            _ => unreachable!(),
+        };
+        if !matches!(elem, crate::types::BufElem::F32) {
+            return Err((
+                Span::call_site(),
+                format!(
+                    "ZSL: `{}`: only `Buf<f32>` / `BufMut<f32>` are supported in \
+                     vertex/fragment shaders; found `Buf<{}>` for `{}`",
+                    p.ident,
+                    elem.display(),
+                    p.ident,
+                ),
+            ));
+        }
+    }
+
+    if !buf_params.is_empty() {
+        spv.capability_runtime_descriptor_array();
+    }
+
+    let n_buf_params = buf_params.len() as u32;
 
     let t_ptr_in_f32 = spv.type_pointer(sc::INPUT, t_f32);
     let t_ptr_in_vec2 = spv.type_pointer(sc::INPUT, t_vec2);
@@ -243,30 +287,51 @@ fn lower_graphics(
         varying_out_vars.push((var, gty));
     }
 
-    let pc_var = if !scalar_params.is_empty() {
-        let pc_members: Vec<Id> = scalar_params
-            .iter()
-            .map(|p| match p.ty {
-                ZslType::U32 => t_u32,
-                ZslType::F32 => t_f32,
-                ZslType::Mat4 => t_mat4,
-                _ => unreachable!(),
-            })
-            .collect();
+    let (g_bufs_var, t_ptr_ssbo_f32) = if !buf_params.is_empty() {
+        let t_ra_f32 = spv.type_runtime_array(t_f32);
+        spv.decorate(t_ra_f32, deco::ARRAY_STRIDE, &[4]);
+        let t_struct_buf = spv.type_struct(&[t_ra_f32]);
+        spv.decorate(t_struct_buf, deco::BLOCK, &[]);
+        spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
+        let t_ra_struct = spv.type_runtime_array(t_struct_buf);
+        let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
+        let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_f32);
+        let var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
+        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+        spv.decorate(var, deco::BINDING, &[0]);
+        (Some(var), t_ptr_elem)
+    } else {
+        (None, Id(0))
+    };
+
+    let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
+        let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
+        pc_members.extend(scalar_params.iter().map(|p| match p.ty {
+            ZslType::U32 => t_u32,
+            ZslType::F32 => t_f32,
+            ZslType::Mat4 => t_mat4,
+            _ => unreachable!(),
+        }));
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
+
         let mut offset: u32 = 0;
+        for i in 0..n_buf_params {
+            spv.member_decorate(t_pc_struct, i, deco::OFFSET, &[offset]);
+            offset += 4;
+        }
         for (i, p) in scalar_params.iter().enumerate() {
+            let member = n_buf_params + i as u32;
             match p.ty {
                 ZslType::U32 | ZslType::F32 => {
-                    spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[offset]);
+                    spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
                     offset += 4;
                 }
                 ZslType::Mat4 => {
                     offset = (offset + 15) & !15;
-                    spv.member_decorate(t_pc_struct, i as u32, deco::OFFSET, &[offset]);
-                    spv.member_decorate(t_pc_struct, i as u32, deco::COL_MAJOR, &[]);
-                    spv.member_decorate(t_pc_struct, i as u32, deco::MATRIX_STRIDE, &[16]);
+                    spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
+                    spv.member_decorate(t_pc_struct, member, deco::COL_MAJOR, &[]);
+                    spv.member_decorate(t_pc_struct, member, deco::MATRIX_STRIDE, &[16]);
                     offset += 64;
                 }
                 _ => unreachable!(),
@@ -301,9 +366,23 @@ fn lower_graphics(
             (
                 p.ident.to_string(),
                 GfxScalarInfo {
-                    pc_index: i as u32,
+                    pc_index: n_buf_params + i as u32,
                     ty,
                     gty,
+                },
+            )
+        })
+        .collect();
+
+    let buf_param_map: HashMap<String, GfxBufInfo> = buf_params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            (
+                p.ident.to_string(),
+                GfxBufInfo {
+                    pc_index: i as u32,
+                    writable: matches!(p.ty, ZslType::BufMut(_)),
                 },
             )
         })
@@ -313,6 +392,9 @@ fn lower_graphics(
     let mut t_ptr_pc_f32 = Id(0);
     let mut t_ptr_pc_mat4 = Id(0);
     if pc_var.is_some() {
+        if n_buf_params > 0 {
+            t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
+        }
         for p in &scalar_params {
             match p.ty {
                 ZslType::U32 if t_ptr_pc_u32 == Id(0) => {
@@ -406,6 +488,10 @@ fn lower_graphics(
         glsl_ext,
         inputs: input_vars,
         scalar_params: scalar_param_map,
+        buf_params: buf_param_map,
+        g_bufs_var,
+        n_buf_params,
+        t_ptr_ssbo_f32,
         pc_var,
         t_ptr_pc_u32,
         t_ptr_pc_f32,
@@ -952,14 +1038,74 @@ fn lower_gfx_expr(ctx: &mut GfxCtx<'_>, expr: &Expr) -> Result<GVal, (Span, Stri
 
         Expr::Paren(ep) => lower_gfx_expr(ctx, &ep.expr),
 
+        Expr::Index(ExprIndex { expr: base, index, .. }) => {
+            if let Expr::Path(ExprPath { path, .. }) = base.as_ref() {
+                if let Some(name) = path.get_ident().map(|i| i.to_string()) {
+                    if let Some(info) = ctx.buf_params.get(&name) {
+                        let pc_index = info.pc_index;
+                        let g_bufs = ctx.g_bufs_var.expect("g_bufs must exist when buf_params is non-empty");
+                        let pc_var = ctx.pc_var.ok_or_else(|| {
+                            (base.span(), "ZSL: internal error: no PC block for buf param".into())
+                        })?;
+                        let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
+                        let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
+                        let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
+                        let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
+                        let idx = lower_gfx_expr(ctx, index)?;
+                        let idx_id = scalar_to_u32(ctx, idx);
+                        let c0 = ctx.const_0_u32;
+                        let t_ptr_elem = ctx.t_ptr_ssbo_f32;
+                        let ptr_elem = ctx.spv.op_access_chain(t_ptr_elem, g_bufs, &[buf_idx, c0, idx_id]);
+                        let t_f32 = ctx.t_f32;
+                        let id = ctx.spv.op_load(t_f32, ptr_elem);
+                        return Ok(GVal { id, ty: GvTy::F32 });
+                    }
+                }
+            }
+            Err((expr.span(), "ZSL: indexing is only supported on Buf<f32> params".into()))
+        }
+
         Expr::Assign(ExprAssign { left, right, .. }) => {
+            if let Expr::Index(ExprIndex { expr: base, index, .. }) = left.as_ref() {
+                if let Expr::Path(ExprPath { path, .. }) = base.as_ref() {
+                    if let Some(name) = path.get_ident().map(|i| i.to_string()) {
+                        if let Some(info) = ctx.buf_params.get(&name) {
+                            if !info.writable {
+                                return Err((
+                                    base.span(),
+                                    format!("`{name}` is `Buf<f32>` (read-only); use `BufMut<f32>` to write"),
+                                ));
+                            }
+                            let pc_index = info.pc_index;
+                            let g_bufs = ctx.g_bufs_var.expect("g_bufs must exist");
+                            let pc_var = ctx.pc_var.ok_or_else(|| {
+                                (base.span(), "ZSL: internal error: no PC block for buf param".into())
+                            })?;
+                            let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
+                            let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
+                            let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
+                            let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
+                            let idx = lower_gfx_expr(ctx, index)?;
+                            let idx_id = scalar_to_u32(ctx, idx);
+                            let c0 = ctx.const_0_u32;
+                            let t_ptr_elem = ctx.t_ptr_ssbo_f32;
+                            let ptr_elem = ctx.spv.op_access_chain(t_ptr_elem, g_bufs, &[buf_idx, c0, idx_id]);
+                            let rhs = lower_gfx_expr(ctx, right)?;
+                            let rhs_id = scalar_to_f32(ctx, rhs);
+                            ctx.spv.op_store(ptr_elem, rhs_id);
+                            return Ok(GVal { id: rhs_id, ty: GvTy::F32 });
+                        }
+                    }
+                }
+            }
+
             let ident = match left.as_ref() {
                 Expr::Path(p) => p
                     .path
                     .get_ident()
                     .map(|i| i.to_string())
                     .ok_or_else(|| (left.span(), "ZSL: assign target must be a local".into()))?,
-                other => return Err((other.span(), "ZSL: assign target must be a local".into())),
+                other => return Err((other.span(), "ZSL: assign target must be a local or buf[i]".into())),
             };
             let (ptr, gty) = ctx
                 .locals
@@ -1348,6 +1494,14 @@ fn scalar_to_f32(ctx: &mut GfxCtx<'_>, val: GVal) -> Id {
     }
     let t = ctx.t_f32;
     ctx.spv.op_convert_u_to_f(t, val.id)
+}
+
+fn scalar_to_u32(ctx: &mut GfxCtx<'_>, val: GVal) -> Id {
+    if val.ty == GvTy::U32 {
+        return val.id;
+    }
+    let t = ctx.t_u32;
+    ctx.spv.op_convert_f_to_u(t, val.id)
 }
 
 fn coerce_gfx(

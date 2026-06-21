@@ -74,17 +74,6 @@ impl ZslEntryPoint {
 
                     let (location, builtin) = parse_param_attrs(&pat_ty.attrs, &mut errors);
 
-                    if matches!(ty, ZslType::Buf(_) | ZslType::BufMut(_)) && stage != Stage::Compute
-                    {
-                        errors.push((
-                            pat_ty.ty.span(),
-                            format!(
-                                "`{name}` is only valid in `#[compute]` entry points",
-                                name = ty.display()
-                            ),
-                        ));
-                    }
-
                     params.push(ZslParam {
                         ident,
                         ty,
