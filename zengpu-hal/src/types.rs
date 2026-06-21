@@ -2,7 +2,7 @@
 //! classes, feature flags, formats, dtypes. No backend types appear here
 //! The public surface carries no consumer- or backend-specific types.
 
-/// Which backend to use. `Auto` selects the best available *native* backend
+/// Which backend to use. `Auto` selects the best available *native* backend.
 /// ZenGPU is native-first; WebGPU is not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackendPreference {
@@ -12,6 +12,8 @@ pub enum BackendPreference {
     /// CPU reference backend — the conformance oracle, not a product
     /// fallback.
     Cpu,
+    /// CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
+    Cuda,
 }
 
 /// Adapter power hint for `Auto` selection.
