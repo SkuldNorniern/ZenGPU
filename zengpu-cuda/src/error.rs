@@ -1,6 +1,16 @@
 use cuda_oxide::error::ErrorCode;
 use zengpu_hal::{GpuError, MemoryUsage, Result as HalResult};
 
+/// Convert a raw `CUresult` u32 into a HAL result directly.
+pub(crate) fn cu(code: u32) -> HalResult<()> {
+    if code == 0 {
+        Ok(())
+    } else {
+        let ec = ErrorCode::try_from(code).unwrap_or(ErrorCode::Unknown);
+        from_cuda(Err::<(), _>(ec))
+    }
+}
+
 /// Convert a `cuda-oxide` result into a ZenGPU HAL result.
 #[allow(dead_code)]
 pub(crate) fn from_cuda<T>(r: Result<T, ErrorCode>) -> HalResult<T> {
