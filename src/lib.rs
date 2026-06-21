@@ -42,11 +42,13 @@
 //! [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`.
 
 pub mod adapter;
+pub mod detect;
 pub mod device;
 pub mod instance;
 pub mod log;
 
 pub use adapter::Adapter;
+pub use detect::{detect_backends, BackendAvailability};
 pub use device::Device;
 pub use instance::Instance;
 
