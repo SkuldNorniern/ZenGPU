@@ -1,11 +1,21 @@
+//! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
+//!
 //! # Quick start
 //!
 //! ```no_run
-//! use zengpu::{Instance, AdapterRequest, DeviceRequest, BufferDesc, BufferUsage, MemoryUsage};
+//! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
 //!
-//! let instance = Instance::new();
-//! let adapter  = instance.request_adapter(AdapterRequest::default()).expect("no GPU found");
-//! let device   = adapter.open(DeviceRequest::default()).expect("device creation failed");
+//! // Explicitly opt in to the backends you need.
+//! let instance = Instance::builder()
+//!     .vulkan_with_surface()          // Err if Vulkan loader absent
+//!     .expect("Vulkan unavailable")
+//!     .build();
+//!
+//! let adapter = instance
+//!     .request_adapter(AdapterRequest::default())
+//!     .expect("no suitable GPU found");
+//!
+//! let device = adapter.open_default().expect("device creation failed");
 //!
 //! let buf = device.create_buffer(BufferDesc {
 //!     size:   1024,
@@ -27,7 +37,7 @@
 //!
 //! # Backend-specific access
 //!
-//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain / frame-graph work.
+//! [`Device::as_vulkan`] gives `&VulkanDevice` for swapchain and frame-graph work.
 //! `Device::as_cpu` gives the CPU conformance oracle. Sub-crates are re-exported under
 //! [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`.
 

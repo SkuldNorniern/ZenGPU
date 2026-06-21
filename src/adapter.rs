@@ -27,4 +27,19 @@ impl Adapter {
     pub fn open(&self, req: DeviceRequest) -> Result<Device> {
         self.inner.open(req).map(|inner| Device { inner })
     }
+
+    /// Shorthand for `open(DeviceRequest::default())`.
+    pub fn open_default(&self) -> Result<Device> {
+        self.open(DeviceRequest::default())
+    }
+}
+
+impl std::fmt::Debug for Adapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let info = self.inner.info();
+        f.debug_struct("Adapter")
+            .field("name", &info.name)
+            .field("backend", &info.backend)
+            .finish()
+    }
 }
