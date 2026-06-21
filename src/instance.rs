@@ -17,7 +17,6 @@ impl Instance {
     /// # use zengpu::Instance;
     /// let instance = Instance::builder()
     ///     .vulkan_with_surface()?   // Err if Vulkan loader absent
-    ///     .cuda()                   // no-op if CUDA absent at runtime
     ///     .build();
     /// # Ok::<(), zengpu::GpuError>(())
     /// ```
@@ -61,10 +60,11 @@ impl Instance {
 /// // Error on Vulkan absence:
 /// let inst = Instance::builder().vulkan_with_surface()?.build();
 ///
-/// // Graceful skip:
-/// let mut b = Instance::builder();
-/// if let Ok(b2) = b.try_vulkan_with_surface() { b = b2; }
-/// let inst = b.cuda().build();
+/// // Graceful skip (try_vulkan_with_surface consumes self either way):
+/// let b = match Instance::builder().try_vulkan_with_surface() {
+///     Ok(b) | Err(b) => b,
+/// };
+/// let inst = b.build();
 /// # Ok::<(), zengpu::GpuError>(())
 /// ```
 pub struct InstanceBuilder {
