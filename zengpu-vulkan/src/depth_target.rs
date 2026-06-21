@@ -113,6 +113,15 @@ impl DepthTarget {
         })
     }
 
+    /// Recreate the depth target at a new size, replacing the existing image.
+    ///
+    /// The `vk::ImageView` returned by [`view`](Self::view) before this call must not be used
+    /// after it returns.
+    pub fn resize(&mut self, ctx: &DeviceContext, width: u32, height: u32) -> Result<()> {
+        *self = Self::new(ctx, width, height)?;
+        Ok(())
+    }
+
     pub fn format(&self) -> zengpu_hal::Format {
         zengpu_hal::Format::Depth32Float
     }
@@ -144,6 +153,29 @@ impl Drop for DepthTarget {
             dev.destroy_image(self.image, None);
             dev.free_memory(self.memory, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{VulkanInstance, swapchain::DeviceContext};
+    use zengpu_hal::DeviceRequest;
+
+    fn make_ctx() -> Option<DeviceContext> {
+        let inst = VulkanInstance::new().ok()?;
+        let adapter = inst.request_vulkan_adapter()?;
+        let dev = adapter.open_with_surface(DeviceRequest::default()).ok()?;
+        Some(dev.context())
+    }
+
+    #[test]
+    fn depth_target_resize() {
+        let Some(ctx) = make_ctx() else { return };
+        let mut depth = DepthTarget::new(&ctx, 64, 32).unwrap();
+        assert_eq!(depth.extent(), (64, 32));
+        depth.resize(&ctx, 128, 96).unwrap();
+        assert_eq!(depth.extent(), (128, 96));
     }
 }
 
