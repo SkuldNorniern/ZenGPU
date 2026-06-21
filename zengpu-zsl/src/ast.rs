@@ -80,18 +80,6 @@ impl ZslEntryPoint {
 
                     let (location, builtin) = parse_param_attrs(&pat_ty.attrs, &mut errors);
 
-                    // Buf<T>/BufMut<T> in vertex/fragment stages is invalid.
-                    if matches!(ty, ZslType::Buf(_) | ZslType::BufMut(_)) && stage != Stage::Compute
-                    {
-                        errors.push((
-                            pat_ty.ty.span(),
-                            format!(
-                                "`{name}` is only valid in `#[compute]` entry points",
-                                name = ty.display()
-                            ),
-                        ));
-                    }
-
                     // Buffer element type validity is enforced by BufElem at parse time.
 
                     params.push(ZslParam {
