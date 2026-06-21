@@ -158,6 +158,38 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CullMode {
+    #[default]
+    None,
+    Front,
+    Back,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrontFace {
+    #[default]
+    Ccw,
+    Cw,
+}
+
+/// `Line` and `Point` need `GraphicsDevice::supports_non_solid_fill` (Vulkan `fillModeNonSolid`).
+/// Pipeline creation fails without it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PolygonMode {
+    #[default]
+    Fill,
+    Line,
+    Point,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RasterState {
+    pub cull: CullMode,
+    pub front_face: FrontFace,
+    pub polygon: PolygonMode,
+}
+
 /// The default is `Less`. For reverse-Z, use `Greater` with a `1.0` depth clear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompareFn {
@@ -198,6 +230,7 @@ pub struct GraphicsPipelineDesc<'a> {
     pub depth_format: Option<Format>,
     pub depth: DepthState,
     pub blend: BlendMode,
+    pub raster: RasterState,
     /// MSAA sample count. `1` means no multisampling.
     pub samples: u32,
 }

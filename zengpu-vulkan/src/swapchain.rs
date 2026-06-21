@@ -393,6 +393,10 @@ impl DeviceContext {
         self.inner.dual_src_blend
     }
 
+    pub fn supports_non_solid_fill(&self) -> bool {
+        self.inner.fill_mode_non_solid
+    }
+
     pub fn memory_properties(&self) -> vk::PhysicalDeviceMemoryProperties {
         unsafe {
             self.inner

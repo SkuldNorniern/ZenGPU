@@ -100,6 +100,7 @@ fn main() {
             ..Default::default()
         },
         blend: BlendMode::Opaque,
+        raster: Default::default(),
         samples: 1,
     });
 

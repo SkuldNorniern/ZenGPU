@@ -81,6 +81,9 @@ pub trait GraphicsDevice: crate::GpuDevice {
 
     /// `dualSrcBlend` support. Text falls back to `AlphaBlend` when `false`.
     fn supports_dual_source_blending(&self) -> bool;
+
+    /// `fillModeNonSolid` support. Pipeline creation fails for a non-solid fill when `false`.
+    fn supports_non_solid_fill(&self) -> bool;
 }
 
 /// The frame was skipped: the window is minimized, or the surface was recreated.
