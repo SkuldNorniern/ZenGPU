@@ -8,6 +8,8 @@ pub enum BackendPreference {
     Vulkan,
     /// Used as a conformance oracle, not as a product fallback.
     Cpu,
+    /// Compute only.
+    Cuda,
 }
 
 /// Used by `Auto` selection.
