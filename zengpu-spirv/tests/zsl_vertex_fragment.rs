@@ -519,6 +519,39 @@ fn fragment_mix_scalar() {
     assert!(spv_valid(SPV));
 }
 
+// ── Buf<f32> / BufMut<f32> in vertex/fragment shaders (§28.2) ────────────────
+
+#[test]
+fn fragment_buf_read() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[fragment]
+        fn fs_buf(
+            #[location(0)] uv: Vec2,
+            data: Buf<f32>,
+            len: u32,
+        ) -> Vec4 {
+            let v = data[0];
+            Vec4(v, v, v, 1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
+#[test]
+fn vertex_buf_read_with_mat4() {
+    const SPV: &[u32] = zengpu_spirv!(
+        #[vertex]
+        fn vs_buf_mvp(
+            #[location(0)] pos: Vec3,
+            positions: Buf<f32>,
+            mvp: Mat4,
+        ) -> Vec4 {
+            mvp * pos.extend(1.0)
+        }
+    );
+    assert!(spv_valid(SPV));
+}
+
 // ── Type inference for unannotated `let` bindings (§28.1) ────────────────────
 //
 // These shaders previously panicked with "ZSL: cannot coerce Vec4 to F32"
