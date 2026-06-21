@@ -95,5 +95,23 @@ impl Device {
     pub fn as_cpu(&self) -> Option<&zengpu_cpu::CpuDevice> {
         self.inner.as_any().downcast_ref()
     }
+
+    /// `MetalDevice`, or `None` if not Metal.
+    #[cfg(feature = "metal")]
+    pub fn as_metal(&self) -> Option<&zengpu_metal::MetalDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
+    /// `HipDevice`, or `None` if not HIP.
+    #[cfg(feature = "hip")]
+    pub fn as_hip(&self) -> Option<&zengpu_hip::HipDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
+    /// `Dx12Device`, or `None` if not DX12.
+    #[cfg(feature = "dx12")]
+    pub fn as_dx12(&self) -> Option<&zengpu_dx12::Dx12Device> {
+        self.inner.as_any().downcast_ref()
+    }
 }
 

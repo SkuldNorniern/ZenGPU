@@ -131,6 +131,28 @@ impl InstanceBuilder {
         self
     }
 
+    /// Add Metal. Never fails here. Yields no adapters off Apple platforms.
+    #[cfg(feature = "metal")]
+    pub fn metal(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_metal::MetalInstance::new()));
+        self
+    }
+
+    /// Adds the ROCm/HIP backend. Never fails, but yields no adapters.
+    #[cfg(feature = "hip")]
+    pub fn hip(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_hip::HipInstance::new()));
+        self
+    }
+
+    /// Adds DX12. Never fails here. Yields no adapters off Windows. DXGI enumeration is not
+    /// yet implemented.
+    #[cfg(feature = "dx12")]
+    pub fn dx12(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_dx12::Dx12Instance::new()));
+        self
+    }
+
     /// Add the CPU reference backend. Never fails.
     #[cfg(feature = "cpu")]
     pub fn cpu(mut self) -> Self {
