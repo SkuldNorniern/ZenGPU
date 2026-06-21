@@ -1,0 +1,16 @@
+[package]
+name = "zengpu-dx12"
+description = "ZenGPU DirectX 12 backend (Windows, graphics + compute) — skeleton."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
+log.workspace = true
