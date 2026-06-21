@@ -1,16 +1,15 @@
 fn main() {
-    // Locate the CUDA toolkit installation for informational purposes.
-    // The crate loads libcuda at runtime via libloading — a missing toolkit is
-    // not a build error; enumerate_adapters just returns empty.
-    let cuda_root = std::env::var("CUDA_PATH").ok().or_else(|| {
-        if cfg!(unix) && std::path::Path::new("/usr/local/cuda").exists() {
-            Some("/usr/local/cuda".into())
-        } else {
-            None
+    // cuda-oxide's build.rs reads CUDA_LIB_PATH to find cuda.lib / libcuda.so.
+    // The NVIDIA installer on Windows sets CUDA_PATH but not CUDA_LIB_PATH, so
+    // derive and emit a link-search path here to cover that case.
+    if std::env::var("CUDA_LIB_PATH").is_err() {
+        if let Ok(root) = std::env::var("CUDA_PATH") {
+            let lib_dir = if cfg!(windows) {
+                format!("{root}\\lib\\x64")
+            } else {
+                format!("{root}/lib64")
+            };
+            println!("cargo:rustc-link-search=native={lib_dir}");
         }
-    });
-
-    if let Some(root) = cuda_root {
-        println!("cargo:rustc-env=ZENGPU_CUDA_TOOLKIT_ROOT={root}");
     }
 }

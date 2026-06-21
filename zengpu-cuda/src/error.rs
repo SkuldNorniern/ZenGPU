@@ -1,20 +1,26 @@
-use crate::api::CUresult;
-use zengpu_hal::{GpuError, MemoryUsage, Result};
+use cuda_oxide::error::ErrorCode;
+use zengpu_hal::{GpuError, MemoryUsage, Result as HalResult};
 
-/// Map a `CUresult` to `GpuError`. Call this after every Driver API operation.
+/// Convert a `cuda-oxide` result into a ZenGPU HAL result.
 #[allow(dead_code)]
-pub(crate) fn cu_check(result: CUresult, op: &'static str) -> Result<()> {
-    if result == 0 {
-        return Ok(());
-    }
-    Err(match result {
-        2 => GpuError::OutOfMemory(MemoryUsage::GpuOnly),
-        // CUDA_ERROR_NOT_INITIALIZED / CUDA_ERROR_DEINITIALIZED / CUDA_ERROR_NO_DEVICE
-        3 | 4 | 100 => GpuError::Backend(format!("cuda: {op}: driver not ready (CUresult={result})")),
-        // CUDA_ERROR_INVALID_DEVICE
-        101 => GpuError::Backend(format!("cuda: {op}: invalid device ordinal")),
-        // CUDA_ERROR_INVALID_CONTEXT / device lost classes
-        201 | 202 | 710 | 719 => GpuError::DeviceLost,
-        _ => GpuError::Backend(format!("cuda: {op} failed (CUresult={result})")),
+pub(crate) fn from_cuda<T>(r: Result<T, ErrorCode>) -> HalResult<T> {
+    r.map_err(|code| match code {
+        ErrorCode::OutOfMemory => GpuError::OutOfMemory(MemoryUsage::GpuOnly),
+        ErrorCode::ContextIsDestroyed | ErrorCode::Deinitialized => GpuError::DeviceLost,
+        ErrorCode::NoDevice => GpuError::Backend("cuda: no device found".into()),
+        ErrorCode::InvalidDevice => GpuError::Backend("cuda: invalid device ordinal".into()),
+        ErrorCode::LaunchFailed
+        | ErrorCode::LaunchOutOfResources
+        | ErrorCode::LaunchTimeout
+        | ErrorCode::CooperativeLaunchTooLarge => {
+            GpuError::Dispatch(format!("cuda: kernel launch error ({code:?})"))
+        }
+        ErrorCode::InvalidPtx
+        | ErrorCode::NoBinaryForGpu
+        | ErrorCode::UnsupportedPtxVersion
+        | ErrorCode::InvalidSource => {
+            GpuError::ShaderCompile(format!("cuda: PTX/module error ({code:?})"))
+        }
+        other => GpuError::Backend(format!("cuda: {other:?}")),
     })
 }

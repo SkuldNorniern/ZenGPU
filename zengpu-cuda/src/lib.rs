@@ -1,45 +1,41 @@
 //! ZenGPU CUDA backend — compute HAL only (no graphics surfaces or render
-//! passes). Loads the Driver API at runtime via libloading; absent CUDA yields
-//! an empty adapter list rather than a build or link error.
+//! passes). Uses cuda-oxide for Driver API access; absent CUDA yields an empty
+//! adapter list rather than a build or link error (the stub library path
+//! returns ErrorCode::StubLibrary from cuInit).
 //!
 //! Commit 1: instance + adapter enumeration. Device memory / dispatch / BLAS
 //! come in subsequent commits as per the bring-up plan.
 
-mod api;
 mod error;
 
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::sync::Arc;
-
+use cuda_oxide::{Cuda, device::Device};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
     DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
     SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
 };
 
-use api::{CUDA_SUCCESS, CUdevice, CudaApi};
+#[allow(unused_imports)]
+use error::from_cuda;
 
 // ── CudaInstance ──────────────────────────────────────────────────────────────
 
-/// Entry-point for the CUDA backend. Holds the loaded Driver API; `None` when
-/// CUDA is absent on the current machine.
+/// Entry-point for the CUDA backend. Calls `cuInit` at construction; if CUDA
+/// is absent (stub library or no driver), `enumerate_adapters` returns empty.
 pub struct CudaInstance {
-    api: Option<Arc<CudaApi>>,
+    initialized: bool,
 }
 
 impl CudaInstance {
     pub fn new() -> Self {
-        let api = CudaApi::load().and_then(|api| {
-            let r = unsafe { (api.cu_init)(0) };
-            if r == CUDA_SUCCESS {
-                Some(api)
-            } else {
-                log::debug!("cuda: cuInit failed (CUresult={r}); no CUDA adapters available");
-                None
+        let initialized = match Cuda::init() {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("cuda: init failed ({e:?}); no CUDA adapters available");
+                false
             }
-        });
-        Self { api }
+        };
+        Self { initialized }
     }
 }
 
@@ -51,50 +47,35 @@ impl Default for CudaInstance {
 
 impl GpuInstance for CudaInstance {
     fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>> {
-        let Some(api) = &self.api else {
-            return Vec::new();
-        };
-
-        let mut count: i32 = 0;
-        let r = unsafe { (api.cu_device_get_count)(&mut count) };
-        if r != CUDA_SUCCESS || count <= 0 {
+        if !self.initialized {
             return Vec::new();
         }
-
-        (0..count)
-            .filter_map(|ordinal| {
-                let mut dev: CUdevice = 0;
-                if unsafe { (api.cu_device_get)(&mut dev, ordinal) } != CUDA_SUCCESS {
-                    return None;
-                }
-
-                let mut name_buf = [0i8; 256];
-                let r = unsafe {
-                    (api.cu_device_get_name)(name_buf.as_mut_ptr() as *mut c_char, 256, dev)
-                };
-                let name = if r == CUDA_SUCCESS {
-                    unsafe { CStr::from_ptr(name_buf.as_ptr() as *const c_char) }
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    format!("CUDA Device {ordinal}")
-                };
-
-                let info = AdapterInfo {
-                    name,
-                    vendor: 0x10de, // NVIDIA PCI vendor ID
-                    device: 0,
-                    device_type: DeviceType::Discrete,
-                    backend: BackendPreference::Cuda,
-                };
-                Some(Box::new(CudaAdapter { api: Arc::clone(api), device: dev, info })
-                    as Box<dyn GpuAdapter>)
-            })
-            .collect()
+        match Cuda::list_devices() {
+            Ok(devices) => devices
+                .into_iter()
+                .map(|dev| {
+                    let name = dev
+                        .name()
+                        .unwrap_or_else(|_| "Unknown CUDA Device".into());
+                    let info = AdapterInfo {
+                        name,
+                        vendor: 0x10de, // NVIDIA PCI vendor ID
+                        device: 0,
+                        device_type: DeviceType::Discrete,
+                        backend: BackendPreference::Cuda,
+                    };
+                    Box::new(CudaAdapter { dev, info }) as Box<dyn GpuAdapter>
+                })
+                .collect(),
+            Err(e) => {
+                log::warn!("cuda: list_devices failed: {e:?}");
+                Vec::new()
+            }
+        }
     }
 
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
-        // Ordinal 0 is the primary GPU; future: honour req.power for multi-GPU.
+        // Ordinal 0 is the primary GPU. Future: honour req.power for multi-GPU.
         let _ = req;
         self.enumerate_adapters().into_iter().next()
     }
@@ -104,11 +85,14 @@ impl GpuInstance for CudaInstance {
 
 pub struct CudaAdapter {
     #[allow(dead_code)]
-    api: Arc<CudaApi>,
-    #[allow(dead_code)]
-    device: CUdevice,
+    dev: Device,
     info: AdapterInfo,
 }
+
+// SAFETY: Device is a newtype over a CUdevice (c_int ordinal); it is safe to
+// send across threads.
+unsafe impl Send for CudaAdapter {}
+unsafe impl Sync for CudaAdapter {}
 
 impl GpuAdapter for CudaAdapter {
     fn info(&self) -> &AdapterInfo {
@@ -128,14 +112,17 @@ impl GpuAdapter for CudaAdapter {
 }
 
 // ── CudaDevice (stub) ─────────────────────────────────────────────────────────
-// Defined here as a skeleton; open() will construct it once context + streams
-// are wired up in the next commit.
+// Skeleton for the next commit; open() will construct it once context + streams
+// are wired up.
 
 #[allow(dead_code)]
 pub(crate) struct CudaDevice {
-    api: Arc<CudaApi>,
-    device: CUdevice,
+    dev: Device,
 }
+
+// SAFETY: CudaDevice wraps a CUdevice ordinal (c_int); safe to send.
+unsafe impl Send for CudaDevice {}
+unsafe impl Sync for CudaDevice {}
 
 impl GpuDevice for CudaDevice {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -185,14 +172,12 @@ mod tests {
 
     #[test]
     fn instance_constructs_without_panic() {
-        // Must not panic on machines without CUDA installed.
         let inst = CudaInstance::new();
-        let _ = inst.enumerate_adapters(); // empty on non-NVIDIA machines; that's fine
+        let _ = inst.enumerate_adapters();
     }
 
     #[test]
     fn adapter_capabilities_are_compute_only() {
-        // If CUDA is present, verify adapters report compute-only.
         let inst = CudaInstance::new();
         for adapter in inst.enumerate_adapters() {
             assert!(adapter.capabilities().compute);
