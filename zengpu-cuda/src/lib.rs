@@ -338,15 +338,16 @@ mod tests {
         }
     }
 
+    /// Create a CUDA device from the first available adapter, or return None to skip.
+    fn cuda_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = CudaInstance::new();
+        let adapter = inst.enumerate_adapters().into_iter().next()?;
+        Some(adapter.open(DeviceRequest::default()).expect("open failed"))
+    }
+
     #[test]
     fn open_and_buffer_round_trip() {
-        let inst = CudaInstance::new();
-        let Some(adapter) = inst.enumerate_adapters().into_iter().next() else {
-            return; // no CUDA device in CI; skip gracefully
-        };
-        let device = adapter
-            .open(DeviceRequest::default())
-            .expect("open failed");
+        let Some(device) = cuda_device() else { return };
         let buf = device
             .create_buffer(BufferDesc {
                 size: 256,
@@ -358,6 +359,76 @@ mod tests {
         device.write_buffer(buf, 0, &data).expect("write failed");
         let read_back = device.read_buffer(buf, 0, 256).expect("read failed");
         assert_eq!(read_back, data);
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn buffer_offset_read_write() {
+        let Some(device) = cuda_device() else { return };
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: 512,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create_buffer");
+        // Write two halves independently.
+        let first: Vec<u8> = (0u8..128).collect();
+        let second: Vec<u8> = (128u8..=255).collect();
+        device.write_buffer(buf, 0, &first).expect("write first");
+        device.write_buffer(buf, 128, &second).expect("write second");
+        // Read back first half and second half separately.
+        let rb_first = device.read_buffer(buf, 0, 128).expect("read first");
+        let rb_second = device.read_buffer(buf, 128, 128).expect("read second");
+        assert_eq!(rb_first, first);
+        assert_eq!(rb_second, second);
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn multiple_independent_buffers() {
+        let Some(device) = cuda_device() else { return };
+        let desc = BufferDesc {
+            size: 128,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let a = device.create_buffer(desc).expect("create a");
+        let b = device.create_buffer(desc).expect("create b");
+        let c = device.create_buffer(desc).expect("create c");
+
+        let da: Vec<u8> = (0..128).map(|i| (i * 3) as u8).collect();
+        let db: Vec<u8> = (0..128).map(|i| (i * 7 + 1) as u8).collect();
+        let dc: Vec<u8> = (0..128).map(|i| (i * 11 + 5) as u8).collect();
+
+        device.write_buffer(a, 0, &da).unwrap();
+        device.write_buffer(b, 0, &db).unwrap();
+        device.write_buffer(c, 0, &dc).unwrap();
+
+        assert_eq!(device.read_buffer(a, 0, 128).unwrap(), da);
+        assert_eq!(device.read_buffer(b, 0, 128).unwrap(), db);
+        assert_eq!(device.read_buffer(c, 0, 128).unwrap(), dc);
+
+        device.destroy_buffer(a);
+        device.destroy_buffer(b);
+        device.destroy_buffer(c);
+    }
+
+    #[test]
+    fn large_buffer_round_trip() {
+        let Some(device) = cuda_device() else { return };
+        const SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: SIZE,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create 16 MiB buffer");
+        let data: Vec<u8> = (0..SIZE as usize).map(|i| (i ^ (i >> 8)) as u8).collect();
+        device.write_buffer(buf, 0, &data).expect("write 16 MiB");
+        let rb = device.read_buffer(buf, 0, SIZE).expect("read 16 MiB");
+        assert_eq!(rb, data, "16 MiB round-trip mismatch");
         device.destroy_buffer(buf);
     }
 }
