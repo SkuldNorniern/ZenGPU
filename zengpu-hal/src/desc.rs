@@ -187,6 +187,28 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+/// Depth comparison function.
+///
+/// Selects which fragments pass the depth test. Defaults to [`CompareFn::Less`].
+/// Use [`CompareFn::Greater`] with a `1.0` depth clear for reverse-Z.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareFn {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    NotEqual,
+    Always,
+}
+
+impl Default for CompareFn {
+    fn default() -> Self {
+        Self::Less
+    }
+}
+
 /// Depth test/write configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DepthState {
@@ -194,6 +216,8 @@ pub struct DepthState {
     pub test: bool,
     /// Whether depth is written.
     pub write: bool,
+    /// Depth comparison function. Only meaningful when `test` is `true`.
+    pub compare: CompareFn,
 }
 
 /// Describes a graphics pipeline with 3D support.

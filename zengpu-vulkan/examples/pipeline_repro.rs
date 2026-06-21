@@ -100,6 +100,7 @@ fn main() {
         depth: DepthState {
             test: true,
             write: true,
+            ..Default::default()
         },
         blend: BlendMode::Opaque,
         samples: 1,
