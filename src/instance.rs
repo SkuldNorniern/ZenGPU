@@ -141,6 +141,36 @@ impl InstanceBuilder {
         self
     }
 
+    // ── Metal ─────────────────────────────────────────────────────────────────
+
+    /// Add the Apple Metal backend. Never fails at construction — returns no
+    /// adapters on non-Apple platforms until device enumeration is implemented.
+    #[cfg(feature = "metal")]
+    pub fn metal(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_metal::MetalInstance::new()));
+        self
+    }
+
+    // ── HIP ───────────────────────────────────────────────────────────────────
+
+    /// Add the AMD ROCm/HIP compute backend. Never fails at construction —
+    /// returns no adapters until HIP runtime bindings are added.
+    #[cfg(feature = "hip")]
+    pub fn hip(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_hip::HipInstance::new()));
+        self
+    }
+
+    // ── DX12 ──────────────────────────────────────────────────────────────────
+
+    /// Add the DirectX 12 backend. Never fails at construction — returns no
+    /// adapters on non-Windows platforms or until DXGI enumeration is added.
+    #[cfg(feature = "dx12")]
+    pub fn dx12(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_dx12::Dx12Instance::new()));
+        self
+    }
+
     // ── CPU ───────────────────────────────────────────────────────────────────
 
     /// Add the CPU reference backend (always available; never fails).

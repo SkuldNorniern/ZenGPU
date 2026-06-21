@@ -17,7 +17,7 @@ categories.workspace = true
 
 [workspace]
 resolver = "2"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12"]
 
 [workspace.package]
 version = "0.0.1"
@@ -40,6 +40,9 @@ zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
 zengpu-spv = { path = "zengpu-spv", version = "0.0.1" }
 zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
 zengpu-cuda = { path = "zengpu-cuda", version = "0.0.1" }
+zengpu-metal = { path = "zengpu-metal", version = "0.0.1" }
+zengpu-hip = { path = "zengpu-hip", version = "0.0.1" }
+zengpu-dx12 = { path = "zengpu-dx12", version = "0.0.1" }
 inline-spirv = { version = "0.2", features = ["glsl"] }
 log = "0.4"
 
@@ -58,6 +61,12 @@ compute = ["zengpu-compute"]
 blas = ["zengpu-blas", "compute"]
 # CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
 cuda = ["zengpu-cuda"]
+# Apple Metal backend (macOS/iOS, graphics + compute).
+metal = ["zengpu-metal"]
+# AMD ROCm/HIP compute backend (compute HAL only).
+hip = ["zengpu-hip"]
+# DirectX 12 backend (Windows, graphics + compute).
+dx12 = ["zengpu-dx12"]
 
 [dependencies]
 zengpu-hal.workspace = true
@@ -66,6 +75,9 @@ zengpu-vulkan = { workspace = true, optional = true }
 zengpu-compute = { workspace = true, optional = true }
 zengpu-blas = { workspace = true, optional = true }
 zengpu-cuda = { workspace = true, optional = true }
+zengpu-metal = { workspace = true, optional = true }
+zengpu-hip = { workspace = true, optional = true }
+zengpu-dx12 = { workspace = true, optional = true }
 zengpu-spirv.workspace = true
 log.workspace = true
 

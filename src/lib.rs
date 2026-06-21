@@ -99,3 +99,15 @@ pub use zengpu_blas as blas;
 /// CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
 #[cfg(feature = "cuda")]
 pub use zengpu_cuda as cuda;
+
+/// Apple Metal backend (macOS/iOS, graphics + compute).
+#[cfg(feature = "metal")]
+pub use zengpu_metal as metal;
+
+/// AMD ROCm/HIP compute backend.
+#[cfg(feature = "hip")]
+pub use zengpu_hip as hip;
+
+/// DirectX 12 backend (Windows, graphics + compute).
+#[cfg(feature = "dx12")]
+pub use zengpu_dx12 as dx12;
