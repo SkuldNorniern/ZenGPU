@@ -3,11 +3,19 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use zengpu::{Instance, AdapterRequest, DeviceRequest, BufferDesc, BufferUsage, MemoryUsage};
+//! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
 //!
-//! let instance = Instance::new();
-//! let adapter  = instance.request_adapter(AdapterRequest::default()).expect("no GPU found");
-//! let device   = adapter.open(DeviceRequest::default()).expect("device creation failed");
+//! // Explicitly opt in to the backends you need.
+//! let instance = Instance::builder()
+//!     .vulkan_with_surface()          // Err if Vulkan loader absent
+//!     .expect("Vulkan unavailable")
+//!     .build();
+//!
+//! let adapter = instance
+//!     .request_adapter(AdapterRequest::default())
+//!     .expect("no suitable GPU found");
+//!
+//! let device = adapter.open_default().expect("device creation failed");
 //!
 //! let buf = device.create_buffer(BufferDesc {
 //!     size:   1024,
