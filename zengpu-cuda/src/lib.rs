@@ -1,40 +1,36 @@
 //! ZenGPU CUDA backend, compute only (no surfaces or render passes).
 //!
-//! Loads the Driver API at runtime via libloading. Absent CUDA gives an empty adapter list, not a
-//! build or link error.
+//! Uses cuda-oxide for Driver API access. Absent CUDA gives an empty adapter list, not a build or
+//! link error (the stub library returns `ErrorCode::StubLibrary` from `cuInit`).
 
-mod api;
 mod error;
 
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::sync::Arc;
-
+use cuda_oxide::{Cuda, device::Device};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
     DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
     SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
 };
 
-use api::{CUDA_SUCCESS, CUdevice, CudaApi};
+#[allow(unused_imports)]
+use error::from_cuda;
 
-/// Holds the loaded Driver API. `None` when CUDA is absent.
+/// CUDA entry point. Calls `cuInit` at construction. Without CUDA (stub library or no driver),
+/// `enumerate_adapters` returns empty.
 pub struct CudaInstance {
-    api: Option<Arc<CudaApi>>,
+    initialized: bool,
 }
 
 impl CudaInstance {
     pub fn new() -> Self {
-        let api = CudaApi::load().and_then(|api| {
-            let r = unsafe { (api.cu_init)(0) };
-            if r == CUDA_SUCCESS {
-                Some(api)
-            } else {
-                log::debug!("cuda: cuInit failed (CUresult={r}); no CUDA adapters available");
-                None
+        let initialized = match Cuda::init() {
+            Ok(()) => true,
+            Err(e) => {
+                log::debug!("cuda: init failed ({e:?}); no CUDA adapters available");
+                false
             }
-        });
-        Self { api }
+        };
+        Self { initialized }
     }
 }
 
@@ -46,46 +42,31 @@ impl Default for CudaInstance {
 
 impl GpuInstance for CudaInstance {
     fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>> {
-        let Some(api) = &self.api else {
-            return Vec::new();
-        };
-
-        let mut count: i32 = 0;
-        let r = unsafe { (api.cu_device_get_count)(&mut count) };
-        if r != CUDA_SUCCESS || count <= 0 {
+        if !self.initialized {
             return Vec::new();
         }
-
-        (0..count)
-            .filter_map(|ordinal| {
-                let mut dev: CUdevice = 0;
-                if unsafe { (api.cu_device_get)(&mut dev, ordinal) } != CUDA_SUCCESS {
-                    return None;
-                }
-
-                let mut name_buf = [0i8; 256];
-                let r = unsafe {
-                    (api.cu_device_get_name)(name_buf.as_mut_ptr() as *mut c_char, 256, dev)
-                };
-                let name = if r == CUDA_SUCCESS {
-                    unsafe { CStr::from_ptr(name_buf.as_ptr() as *const c_char) }
-                        .to_string_lossy()
-                        .into_owned()
-                } else {
-                    format!("CUDA Device {ordinal}")
-                };
-
-                let info = AdapterInfo {
-                    name,
-                    vendor: 0x10de,
-                    device: 0,
-                    device_type: DeviceType::Discrete,
-                    backend: BackendPreference::Cuda,
-                };
-                Some(Box::new(CudaAdapter { api: Arc::clone(api), device: dev, info })
-                    as Box<dyn GpuAdapter>)
-            })
-            .collect()
+        match Cuda::list_devices() {
+            Ok(devices) => devices
+                .into_iter()
+                .map(|dev| {
+                    let name = dev
+                        .name()
+                        .unwrap_or_else(|_| "Unknown CUDA Device".into());
+                    let info = AdapterInfo {
+                        name,
+                        vendor: 0x10de,
+                        device: 0,
+                        device_type: DeviceType::Discrete,
+                        backend: BackendPreference::Cuda,
+                    };
+                    Box::new(CudaAdapter { dev, info }) as Box<dyn GpuAdapter>
+                })
+                .collect(),
+            Err(e) => {
+                log::warn!("cuda: list_devices failed: {e:?}");
+                Vec::new()
+            }
+        }
     }
 
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
@@ -96,11 +77,13 @@ impl GpuInstance for CudaInstance {
 
 pub struct CudaAdapter {
     #[allow(dead_code)]
-    api: Arc<CudaApi>,
-    #[allow(dead_code)]
-    device: CUdevice,
+    dev: Device,
     info: AdapterInfo,
 }
+
+// SAFETY: newtype over a CUdevice (c_int ordinal), safe to send across threads.
+unsafe impl Send for CudaAdapter {}
+unsafe impl Sync for CudaAdapter {}
 
 impl GpuAdapter for CudaAdapter {
     fn info(&self) -> &AdapterInfo {
@@ -120,9 +103,12 @@ impl GpuAdapter for CudaAdapter {
 
 #[allow(dead_code)]
 pub(crate) struct CudaDevice {
-    api: Arc<CudaApi>,
-    device: CUdevice,
+    dev: Device,
 }
+
+// SAFETY: wraps a CUdevice ordinal (c_int), safe to send.
+unsafe impl Send for CudaDevice {}
+unsafe impl Sync for CudaDevice {}
 
 impl GpuDevice for CudaDevice {
     fn as_any(&self) -> &dyn std::any::Any {

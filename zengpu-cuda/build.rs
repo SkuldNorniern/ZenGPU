@@ -1,13 +1,12 @@
 fn main() {
-    let cuda_root = std::env::var("CUDA_PATH").ok().or_else(|| {
-        if cfg!(unix) && std::path::Path::new("/usr/local/cuda").exists() {
-            Some("/usr/local/cuda".into())
-        } else {
-            None
+    if std::env::var("CUDA_LIB_PATH").is_err() {
+        if let Ok(root) = std::env::var("CUDA_PATH") {
+            let lib_dir = if cfg!(windows) {
+                format!("{root}\\lib\\x64")
+            } else {
+                format!("{root}/lib64")
+            };
+            println!("cargo:rustc-link-search=native={lib_dir}");
         }
-    });
-
-    if let Some(root) = cuda_root {
-        println!("cargo:rustc-env=ZENGPU_CUDA_TOOLKIT_ROOT={root}");
     }
 }
