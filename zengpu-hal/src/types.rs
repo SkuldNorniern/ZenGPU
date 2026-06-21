@@ -14,6 +14,12 @@ pub enum BackendPreference {
     Cpu,
     /// CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
     Cuda,
+    /// Apple Metal backend (macOS/iOS, graphics + compute).
+    Metal,
+    /// AMD ROCm/HIP compute backend (compute HAL only).
+    Hip,
+    /// Microsoft DirectX 12 backend (Windows, graphics + compute).
+    Dx12,
 }
 
 /// Adapter power hint for `Auto` selection.
