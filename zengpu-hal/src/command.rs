@@ -18,6 +18,13 @@ pub struct Bindings<'a> {
     pub scalars: &'a [Scalar],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchOp<'a> {
+    pub pipeline: crate::handle::PipelineHandle,
+    pub bindings: Bindings<'a>,
+    pub grid: [u32; 3],
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

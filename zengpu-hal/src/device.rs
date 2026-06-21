@@ -1,7 +1,7 @@
 //! Backend-independent device trait. Object-safe: `Box<dyn GpuDevice>` or `Arc<dyn GpuDevice>`
 //! select at runtime.
 
-use crate::command::Bindings;
+use crate::command::{Bindings, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
@@ -66,5 +66,16 @@ pub trait GpuDevice: Send + Sync {
         _grid: [u32; 3],
     ) -> Result<()> {
         Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    /// Dispatches a batch of ops as one submission that blocks once, instead of one per op. Chained
+    /// kernels (e.g. `relu(add(a, b))`) should use this instead of a `dispatch` loop.
+    ///
+    /// The default calls `dispatch` per op, so unimplemented backends stay correct.
+    fn dispatch_batch(&self, ops: &[DispatchOp<'_>]) -> Result<()> {
+        for op in ops {
+            self.dispatch(op.pipeline, op.bindings, op.grid)?;
+        }
+        Ok(())
     }
 }
