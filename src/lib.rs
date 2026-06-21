@@ -74,6 +74,18 @@ pub use zengpu_hal::{
     VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
+#[cfg(feature = "compute")]
+pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
+
+#[cfg(feature = "blas")]
+pub use zengpu_blas::GemmKernel;
+
+/// Concrete Vulkan types for windowed, backend-aware code. Most code needs only [`Instance`].
+#[cfg(feature = "vulkan")]
+pub use zengpu_vulkan::{
+    BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance,
+};
+
 /// Vulkan backend (1.2+, graphics + compute). Most code: use [`Device::as_vulkan`].
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan as vulkan;
