@@ -95,10 +95,11 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let spv_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(SHADER_SPV.as_ptr() as *const u8, SHADER_SPV.len() * 4)
     };
-    let shader = device.create_shader(ShaderDesc { spirv: spv_bytes })?;
+    let shader = device.create_shader(ShaderDesc::spirv(spv_bytes))?;
     let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,
         entry: "main",
+        block: [256, 1, 1],
     })?;
 
     // ── Dispatch ────────────────────────────────────────────────────────────

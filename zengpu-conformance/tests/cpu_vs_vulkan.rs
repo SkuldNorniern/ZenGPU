@@ -98,27 +98,25 @@ fn cpu_vs_vulkan_vec_add() {
 
     let cpu = CpuDevice::new();
     let cpu_shader = cpu
-        .create_shader(ShaderDesc {
-            spirv: vec_add_spv_bytes(),
-        })
+        .create_shader(ShaderDesc::spirv(vec_add_spv_bytes()))
         .unwrap();
     let cpu_pipeline = cpu
         .create_compute_pipeline(ComputePipelineDesc {
             shader: cpu_shader,
             entry: "main",
+            block: [256, 1, 1],
         })
         .unwrap();
     register_vec_add_kernel(&cpu, cpu_pipeline);
 
     let vk_shader = vk
-        .create_shader(ShaderDesc {
-            spirv: vec_add_spv_bytes(),
-        })
+        .create_shader(ShaderDesc::spirv(vec_add_spv_bytes()))
         .unwrap();
     let vk_pipeline = vk
         .create_compute_pipeline(ComputePipelineDesc {
             shader: vk_shader,
             entry: "main",
+            block: [256, 1, 1],
         })
         .unwrap();
 

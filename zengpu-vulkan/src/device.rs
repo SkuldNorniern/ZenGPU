@@ -7,7 +7,7 @@ use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
     DeviceRequest, FilterMode, Format, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
     HalCapabilities, MemoryUsage, PipelineHandle, PrimitiveTopology, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, SlotMap, StepMode, SurfaceConfig,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig,
     TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat,
     WindowHandles, marker,
 };
@@ -1293,18 +1293,22 @@ impl GpuDevice for VulkanDevice {
     // ── Compute ───────────────────────────────────────────────────────────────
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        if desc.spirv.len() % 4 != 0 {
+        let ShaderSource::Spirv(spirv) = desc.source else {
+            return Err(GpuError::ShaderCompile(
+                "vulkan backend only accepts SPIR-V shaders".to_string(),
+            ));
+        };
+        if spirv.len() % 4 != 0 {
             return Err(GpuError::ShaderCompile(
                 "SPIR-V byte length must be a multiple of 4".to_string(),
             ));
         }
-        let (prefix, aligned_words, suffix) = unsafe { desc.spirv.align_to::<u32>() };
+        let (prefix, aligned_words, suffix) = unsafe { spirv.align_to::<u32>() };
         let copied_words;
         let words = if prefix.is_empty() && suffix.is_empty() {
             aligned_words
         } else {
-            copied_words = desc
-                .spirv
+            copied_words = spirv
                 .chunks_exact(4)
                 .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
                 .collect::<Vec<_>>();
@@ -1335,7 +1339,7 @@ impl GpuDevice for VulkanDevice {
                 .device
                 .create_shader_module(
                     &vk::ShaderModuleCreateInfo {
-                        code_size: desc.spirv.len(),
+                        code_size: spirv.len(),
                         p_code: words.as_ptr(),
                         ..Default::default()
                     },
