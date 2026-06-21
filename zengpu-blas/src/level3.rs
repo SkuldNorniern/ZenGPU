@@ -7,43 +7,22 @@ use zengpu_hal::{
 };
 use zengpu_spirv::zengpu_spirv;
 
-/// `C[m,n] += alpha * sum_k A[m,k] * B[k,n]`
+/// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
 /// Naive (untiled) f32 GEMM. 16×16 local workgroup.
 const GEMM_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    #extension GL_EXT_nonuniform_qualifier : require
-
-    layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-
-    layout(push_constant) uniform PC {
-        uint  a_idx;
-        uint  b_idx;
-        uint  c_idx;
-        uint  m;
-        uint  n;
-        uint  k;
-        float alpha;
-    } pc;
-
-    layout(local_size_x = 16, local_size_y = 16) in;
-
-    void main() {
-        uint row = gl_GlobalInvocationID.y;
-        uint col = gl_GlobalInvocationID.x;
-        if (row < pc.m && col < pc.n) {
-            float sum = 0.0;
-            for (uint i = 0; i < pc.k; i++) {
-                sum += g_bufs[pc.a_idx].data[row * pc.k + i]
-                     * g_bufs[pc.b_idx].data[i  * pc.n + col];
+    #[compute(local_size_x = 16, local_size_y = 16)]
+    fn cs_gemm(a: Buf<f32>, b: Buf<f32>, c: BufMut<f32>, m: u32, n: u32, k: u32, alpha: f32) {
+        let row: u32 = global_id().y;
+        let col: u32 = global_id().x;
+        if row < m && col < n {
+            let sum: f32 = 0.0;
+            for i in 0..k {
+                sum = sum + a[row * k + i] * b[i * n + col];
             }
-            g_bufs[pc.c_idx].data[row * pc.n + col] = pc.alpha * sum;
+            c[row * n + col] = alpha * sum;
         }
     }
-    "#,
-    comp,
-    vulkan1_2
 );
 
 fn spv_bytes(words: &[u32]) -> &[u8] {
@@ -59,8 +38,7 @@ pub struct GemmKernel {
 }
 
 impl GemmKernel {
-    /// Compile the GEMM pipeline on `device`. For the CPU oracle, also
-    /// register a matching kernel via `CpuDevice::register_kernel`.
+    /// Compile the GEMM pipeline on `device`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         let shader = device.create_shader(ShaderDesc {
             spirv: spv_bytes(GEMM_SPV),
