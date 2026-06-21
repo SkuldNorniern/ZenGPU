@@ -350,6 +350,7 @@ impl VulkanDevice {
         physical: vk::PhysicalDevice,
         _req: DeviceRequest,
         extra_extensions: &[*const i8],
+        needs_graphics: bool,
     ) -> Result<Self> {
         let mut extensions = extra_extensions.to_vec();
         let available_extensions = unsafe {
@@ -375,7 +376,6 @@ impl VulkanDevice {
         }
         extensions.push(khr::dynamic_rendering::NAME.as_ptr());
 
-        let needs_graphics = extra_extensions.contains(&ash::khr::swapchain::NAME.as_ptr());
         let queue_family =
             queue_family(&shared.instance, physical, needs_graphics).ok_or_else(|| {
                 let kind = if needs_graphics {
@@ -492,7 +492,15 @@ impl VulkanDevice {
         physical: vk::PhysicalDevice,
         req: DeviceRequest,
     ) -> Result<Self> {
-        Self::create(shared, physical, req, &[])
+        Self::create(shared, physical, req, &[], false)
+    }
+
+    pub(crate) fn new_headless_graphics(
+        shared: Arc<VulkanShared>,
+        physical: vk::PhysicalDevice,
+        req: DeviceRequest,
+    ) -> Result<Self> {
+        Self::create(shared, physical, req, &[], true)
     }
 
     pub(crate) fn new_with_swapchain(
@@ -500,7 +508,13 @@ impl VulkanDevice {
         physical: vk::PhysicalDevice,
         req: DeviceRequest,
     ) -> Result<Self> {
-        Self::create(shared, physical, req, &[ash::khr::swapchain::NAME.as_ptr()])
+        Self::create(
+            shared,
+            physical,
+            req,
+            &[ash::khr::swapchain::NAME.as_ptr()],
+            true,
+        )
     }
 
     fn find_memory_type(&self, type_bits: u32, props: vk::MemoryPropertyFlags) -> Option<u32> {
