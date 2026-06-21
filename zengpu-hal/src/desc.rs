@@ -15,15 +15,37 @@ pub struct BufferDesc {
     pub memory: MemoryUsage,
 }
 
+/// Texture dimensionality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TexDim {
+    /// A flat image, or — with `array_layers > 1` — a 2D array (shadow
+    /// cascades, texture atlases).
+    #[default]
+    D2,
+    /// A volume texture; `TextureDesc::depth` is the number of depth slices.
+    D3,
+    /// Six square layers (+X, -X, +Y, -Y, +Z, -Z) sampled as a cubemap.
+    /// `TextureDesc::array_layers` must be `6`.
+    Cube,
+}
+
 /// Describes a texture to create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
+    /// Depth slices for [`TexDim::D3`]; must be `1` for `D2`/`Cube`.
+    pub depth: u32,
     pub format: Format,
     pub usage: TextureUsage,
     /// MSAA sample count; `1` means no multisampling.
     pub samples: u32,
+    pub dimension: TexDim,
+    /// Mip levels, base level included; `1` means no mip chain.
+    pub mip_levels: u32,
+    /// Array layer count; `1` means a single non-array texture. Must be `6`
+    /// for [`TexDim::Cube`].
+    pub array_layers: u32,
 }
 
 /// Describes an offscreen render target.

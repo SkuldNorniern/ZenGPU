@@ -38,9 +38,13 @@ impl OffscreenTarget {
         let texture = device.create_texture(TextureDesc {
             width,
             height,
+            depth: 1,
             format,
             usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET | TextureUsage::TRANSFER_SRC,
             samples: 1,
+            dimension: zengpu_hal::TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
         })?;
         let target = device.register_color_target(texture).ok_or_else(|| {
             device.destroy_texture(texture);

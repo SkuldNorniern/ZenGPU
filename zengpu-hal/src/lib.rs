@@ -38,7 +38,7 @@ pub use desc::{
     AddressMode, BlendMode, BorderColor, BufferDesc, CompareFn, ComputePipelineDesc, CullMode,
     DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology,
     RasterState, RenderTargetDesc, SamplerDesc, ShaderDesc, ShaderSource, StepMode, SurfaceConfig,
-    TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
+    TexDim, TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{

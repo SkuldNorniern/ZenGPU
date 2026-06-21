@@ -41,10 +41,37 @@ pub trait GpuDevice: Send + Sync {
     /// [`Self::upload_texture_data`].
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle>;
 
-    /// Upload `data` to the texture.  `data` must be tightly packed pixels in
-    /// the format specified at creation (RGBA8 = 4 bytes per pixel).  Blocks
-    /// until the upload is complete; an asynchronous path may be added later.
+    /// Upload `data` to the texture's base mip level, layer `0`. `data` must
+    /// be tightly packed pixels in the format specified at creation (RGBA8 =
+    /// 4 bytes per pixel). Blocks until the upload is complete; an
+    /// asynchronous path may be added later.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
+
+    /// Upload `data` to one mip level of one array layer (or cube face) of
+    /// the texture. Use this for texture arrays, cubemaps, and pre-baked mip
+    /// chains; [`Self::upload_texture_data`] only ever targets mip `0`, layer
+    /// `0`. Default implementation reports
+    /// [`GpuError::UnsupportedFeatures`] on backends that have not
+    /// implemented it.
+    fn upload_texture_data_region(
+        &self,
+        _texture: TextureHandle,
+        _mip_level: u32,
+        _layer: u32,
+        _data: &[u8],
+    ) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
+
+    /// Generate the full mip chain for `texture` from its base level via
+    /// successive blits, each level half the resolution of the last. The
+    /// texture must have been created with `mip_levels > 1` and
+    /// `TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST`. Default
+    /// implementation reports [`GpuError::UnsupportedFeatures`] on backends
+    /// that have not implemented it.
+    fn generate_mipmaps(&self, _texture: TextureHandle) -> Result<()> {
+        Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
 
     /// Destroy a texture, invalidating its handle. A stale handle is a no-op.
     /// The caller must ensure no surface / pipeline is still referencing the
