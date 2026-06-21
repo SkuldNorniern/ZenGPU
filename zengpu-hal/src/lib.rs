@@ -36,8 +36,9 @@ pub use surface::WindowHandles;
 
 pub use desc::{
     AddressMode, BlendMode, BufferDesc, ComputePipelineDesc, DepthState, FilterMode,
-    GraphicsPipelineDesc, PrimitiveTopology, RenderTargetDesc, SamplerDesc, ShaderDesc, StepMode,
-    SurfaceConfig, TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
+    GraphicsPipelineDesc, PrimitiveTopology, RenderTargetDesc, SamplerDesc, ShaderDesc,
+    ShaderSource, StepMode, SurfaceConfig, TextureDesc, VertexAttribute, VertexFormat,
+    VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{
