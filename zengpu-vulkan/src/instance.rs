@@ -188,6 +188,13 @@ impl VulkanInstance {
         })
     }
 
+    /// `true` if a Vulkan loader is present, without creating an instance. For tests and CI that
+    /// skip GPU work when there is no driver.
+    pub fn is_available() -> bool {
+        // SAFETY: `Entry::load` only loads a shared library; no Vulkan objects are allocated.
+        unsafe { ash::Entry::load() }.is_ok()
+    }
+
     /// Compute-only instance (no surface/display extensions).
     pub fn new() -> zengpu_hal::Result<Self> {
         Self::create(false)
