@@ -36,19 +36,43 @@ pub struct RenderTargetDesc {
     pub samples: u32,
 }
 
-/// A shader module's source. SPIR-V to start; other formats may follow.
+/// Shader source bytes, tagged by format.
+#[derive(Debug, Clone, Copy)]
+pub enum ShaderSource<'a> {
+    /// SPIR-V words as raw bytes (length must be a multiple of 4).
+    Spirv(&'a [u8]),
+    /// Null-terminated PTX assembly (CUDA Driver API format).
+    Ptx(&'a [u8]),
+}
+
+/// Describes a shader module to create.
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderDesc<'a> {
-    /// SPIR-V words as raw bytes (length must be a multiple of 4).
-    pub spirv: &'a [u8],
+    pub source: ShaderSource<'a>,
+}
+
+impl<'a> ShaderDesc<'a> {
+    pub fn spirv(bytes: &'a [u8]) -> Self {
+        Self { source: ShaderSource::Spirv(bytes) }
+    }
+    pub fn ptx(bytes: &'a [u8]) -> Self {
+        Self { source: ShaderSource::Ptx(bytes) }
+    }
 }
 
 /// Describes a compute pipeline.
+///
+/// `block` specifies the thread-block dimensions for backends that require
+/// them at pipeline creation time (CUDA, HIP). `[0, 0, 0]` lets the backend
+/// choose a default; Vulkan ignores this field entirely (block size is encoded
+/// in the SPIR-V `LocalSizeX/Y/Z` execution mode).
 #[derive(Debug, Clone, Copy)]
 pub struct ComputePipelineDesc<'a> {
     pub shader: ShaderHandle,
     /// Entry-point name in the shader module.
     pub entry: &'a str,
+    /// Thread-block dimensions; `[0, 0, 0]` = backend default.
+    pub block: [u32; 3],
 }
 
 /// Texture sampling filter.
