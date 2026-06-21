@@ -553,6 +553,29 @@ mod tests {
     }
 
     #[test]
+    fn device_info() {
+        // CudaInstance::new() calls cuInit; without it list_devices returns empty.
+        let inst = CudaInstance::new();
+        if !inst.initialized {
+            println!("no CUDA driver — skip");
+            return;
+        }
+        let devices = Cuda::list_devices().unwrap_or_default();
+        if devices.is_empty() {
+            println!("no CUDA devices — skip");
+            return;
+        }
+        for (i, dev) in devices.iter().enumerate() {
+            let name    = dev.name().unwrap_or_else(|_| "?".into());
+            let vram_mb = dev.memory_size().unwrap_or(0) / (1024 * 1024);
+            let cc      = dev.compute_capability()
+                .map(|v| format!("sm_{}{}", v.major, v.minor))
+                .unwrap_or_else(|_| "?".into());
+            println!("CUDA device {i}: {name}  |  {vram_mb} MiB  |  {cc}");
+        }
+    }
+
+    #[test]
     fn open_and_buffer_round_trip() {
         let Some(device) = cuda_device() else { return };
         let buf = device
