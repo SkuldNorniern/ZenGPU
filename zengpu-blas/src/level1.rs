@@ -7,60 +7,26 @@ use zengpu_hal::{
 };
 use zengpu_spirv::zengpu_spirv;
 
-/// `y[i] += alpha * x[i]`  (BLAS SAXPY)
+/// `y[i] = y[i] + alpha * x[i]`  (BLAS SAXPY, in-place)
 const AXPY_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    #extension GL_EXT_nonuniform_qualifier : require
-
-    layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-
-    layout(push_constant) uniform PC {
-        uint  x_idx;
-        uint  y_idx;
-        uint  n;
-        float alpha;
-    } pc;
-
-    layout(local_size_x = 256) in;
-
-    void main() {
-        uint i = gl_GlobalInvocationID.x;
-        if (i < pc.n) {
-            g_bufs[pc.y_idx].data[i] +=
-                pc.alpha * g_bufs[pc.x_idx].data[i];
+    #[compute(local_size_x = 256)]
+    fn cs_saxpy(x: Buf<f32>, y: BufMut<f32>, n: u32, alpha: f32) {
+        let i: u32 = global_id().x;
+        if i < n {
+            y[i] = y[i] + alpha * x[i];
         }
     }
-    "#,
-    comp,
-    vulkan1_2
 );
 
-/// `x[i] *= alpha`  (BLAS SSCAL)
+/// `x[i] = x[i] * alpha`  (BLAS SSCAL, in-place)
 const SCAL_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    #extension GL_EXT_nonuniform_qualifier : require
-
-    layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-
-    layout(push_constant) uniform PC {
-        uint  x_idx;
-        uint  n;
-        float alpha;
-    } pc;
-
-    layout(local_size_x = 256) in;
-
-    void main() {
-        uint i = gl_GlobalInvocationID.x;
-        if (i < pc.n) {
-            g_bufs[pc.x_idx].data[i] *= pc.alpha;
+    #[compute(local_size_x = 256)]
+    fn cs_sscal(x: BufMut<f32>, n: u32, alpha: f32) {
+        let i: u32 = global_id().x;
+        if i < n {
+            x[i] = x[i] * alpha;
         }
     }
-    "#,
-    comp,
-    vulkan1_2
 );
 
 fn spv_bytes(words: &[u32]) -> &[u8] {
@@ -85,9 +51,9 @@ fn check_f32_shape(a: &DeviceArray, b: &DeviceArray, op: &str) -> Result<u32> {
 
 /// Compiled pipelines for BLAS Level-1 operations. Create once per device.
 pub struct Level1Kernels {
-    axpy_shader:    ShaderHandle,
+    axpy_shader:       ShaderHandle,
     pub axpy_pipeline: PipelineHandle,
-    scal_shader:    ShaderHandle,
+    scal_shader:       ShaderHandle,
     pub scal_pipeline: PipelineHandle,
 }
 
