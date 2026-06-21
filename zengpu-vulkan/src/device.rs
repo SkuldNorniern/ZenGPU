@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 use ash::{Device, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, CompareFn,
-    ComputePipelineDesc, CullMode, DeviceRequest, FilterMode, Format, FrontFace, GpuDevice,
-    GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle,
-    PolygonMode, PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
-    ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig, TargetHandle, TextureDesc,
-    TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
+    ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, FilterMode, Format, FrontFace,
+    GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage,
+    PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode, SurfaceConfig, TargetHandle,
+    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles, marker,
 };
 
 use crate::command_list::{CmdListPool, VulkanCommandList};
@@ -1452,74 +1452,118 @@ impl GpuDevice for VulkanDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
-        if grid.contains(&0) {
-            return Err(GpuError::Dispatch(format!(
-                "dispatch grid dimensions must be non-zero, got {grid:?}"
-            )));
+        self.dispatch_batch(&[DispatchOp {
+            pipeline,
+            bindings,
+            grid,
+        }])
+    }
+
+    fn dispatch_batch(&self, ops: &[DispatchOp<'_>]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
         }
 
-        let (vk_pipeline, vk_layout) = {
+        // Resolve pipeline handles and pack push constants for every op up
+        // front (one descriptor-table lock acquisition for the whole batch).
+        let resolved: Vec<(vk::Pipeline, vk::PipelineLayout, [u8; 128], usize, [u32; 3])> = {
             let pipelines = self.pipelines.lock().unwrap();
-            let p = pipelines
-                .get(pipeline)
-                .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
-            match p {
-                VulkanPipeline::Compute { layout, pipeline } => (*pipeline, *layout),
-                VulkanPipeline::Graphics { .. } => {
-                    return Err(GpuError::Dispatch(
-                        "dispatch called with a graphics pipeline handle".to_string(),
-                    ));
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                if op.grid.contains(&0) {
+                    return Err(GpuError::Dispatch(format!(
+                        "dispatch grid dimensions must be non-zero, got {:?}",
+                        op.grid
+                    )));
                 }
-            }
-        };
+                let p = pipelines
+                    .get(op.pipeline)
+                    .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
+                let (vk_pipeline, vk_layout) = match p {
+                    VulkanPipeline::Compute { layout, pipeline } => (*pipeline, *layout),
+                    VulkanPipeline::Graphics { .. } => {
+                        return Err(GpuError::Dispatch(
+                            "dispatch called with a graphics pipeline handle".to_string(),
+                        ));
+                    }
+                };
 
-        // Pack push constants: [buffer_indices, scalars], each as 4 bytes.
-        let mut pc = [0u8; 128];
-        let mut pc_len = 0usize;
-        let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
-            if pc_len + 4 > pc.len() {
-                return Err(GpuError::Dispatch(format!(
-                    "push constants exceed {} bytes",
-                    pc.len()
-                )));
+                // Pack push constants: [buffer_indices, scalars], each as 4 bytes.
+                let mut pc = [0u8; 128];
+                let mut pc_len = 0usize;
+                let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
+                    if pc_len + 4 > pc.len() {
+                        return Err(GpuError::Dispatch(format!(
+                            "push constants exceed {} bytes",
+                            pc.len()
+                        )));
+                    }
+                    pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
+                    pc_len += 4;
+                    Ok(())
+                };
+                for &idx in op.bindings.buffers {
+                    push_pc(idx.to_ne_bytes())?;
+                }
+                for scalar in op.bindings.scalars {
+                    push_pc(match scalar {
+                        Scalar::U32(v) => v.to_ne_bytes(),
+                        Scalar::I32(v) => v.to_ne_bytes(),
+                        Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+                    })?;
+                }
+
+                out.push((vk_pipeline, vk_layout, pc, pc_len, op.grid));
             }
-            pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
-            pc_len += 4;
-            Ok(())
+            out
         };
-        for &idx in bindings.buffers {
-            push_pc(idx.to_ne_bytes())?;
-        }
-        for scalar in bindings.scalars {
-            push_pc(match scalar {
-                Scalar::U32(v) => v.to_ne_bytes(),
-                Scalar::I32(v) => v.to_ne_bytes(),
-                Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-            })?;
-        }
 
         let bindless_set = self.bindless.set;
+        let last = resolved.len() - 1;
         self.one_shot_submit(move |dev, cmd| {
+            // A later op in the batch may read a buffer an earlier op wrote
+            // (e.g. `relu(add(a, b))`); a barrier between dispatches makes
+            // those writes visible instead of relying on submission order
+            // alone, which Vulkan does not guarantee within one command buffer.
+            let barrier = vk::MemoryBarrier {
+                src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                ..Default::default()
+            };
             unsafe {
-                dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, vk_pipeline);
-                dev.cmd_bind_descriptor_sets(
-                    cmd,
-                    vk::PipelineBindPoint::COMPUTE,
-                    vk_layout,
-                    0,
-                    &[bindless_set],
-                    &[],
-                );
-                if pc_len != 0 {
-                    dev.cmd_push_constants(
+                for (i, (vk_pipeline, vk_layout, pc, pc_len, grid)) in resolved.iter().enumerate()
+                {
+                    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *vk_pipeline);
+                    dev.cmd_bind_descriptor_sets(
                         cmd,
-                        vk_layout,
-                        vk::ShaderStageFlags::COMPUTE,
+                        vk::PipelineBindPoint::COMPUTE,
+                        *vk_layout,
                         0,
-                        &pc[..pc_len],
+                        &[bindless_set],
+                        &[],
                     );
+                    if *pc_len != 0 {
+                        dev.cmd_push_constants(
+                            cmd,
+                            *vk_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &pc[..*pc_len],
+                        );
+                    }
+                    dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
+                    if i != last {
+                        dev.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[barrier],
+                            &[],
+                            &[],
+                        );
+                    }
                 }
-                dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
             }
             Ok(())
         })
@@ -2056,5 +2100,129 @@ mod tests {
         let Some(dev) = try_device() else { return };
         assert!(dev.capabilities().graphics);
         assert!(dev.capabilities().compute);
+    }
+
+    #[test]
+    fn dispatch_batch_chains_ops_with_visible_writes() {
+        use inline_spirv::inline_spirv;
+
+        const ADD_SPV: &[u32] = inline_spirv!(
+            r#"
+            #version 450
+            #extension GL_EXT_nonuniform_qualifier : require
+            layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
+            layout(push_constant) uniform PC { uint a_idx; uint b_idx; uint out_idx; uint len; } pc;
+            layout(local_size_x = 64) in;
+            void main() {
+                uint i = gl_GlobalInvocationID.x;
+                if (i < pc.len) {
+                    g_bufs[pc.out_idx].data[i] = g_bufs[pc.a_idx].data[i] + g_bufs[pc.b_idx].data[i];
+                }
+            }
+            "#,
+            comp,
+            vulkan1_2
+        );
+        const RELU_SPV: &[u32] = inline_spirv!(
+            r#"
+            #version 450
+            #extension GL_EXT_nonuniform_qualifier : require
+            layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
+            layout(push_constant) uniform PC { uint in_idx; uint out_idx; uint len; } pc;
+            layout(local_size_x = 64) in;
+            void main() {
+                uint i = gl_GlobalInvocationID.x;
+                if (i < pc.len) {
+                    g_bufs[pc.out_idx].data[i] = max(g_bufs[pc.in_idx].data[i], 0.0);
+                }
+            }
+            "#,
+            comp,
+            vulkan1_2
+        );
+
+        let Some(dev) = try_device() else { return };
+
+        let to_bytes = |w: &[u32]| -> &[u8] {
+            unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, std::mem::size_of_val(w)) }
+        };
+        let add_shader = dev
+            .create_shader(ShaderDesc::spirv(to_bytes(ADD_SPV)))
+            .unwrap();
+        let add_pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: add_shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let relu_shader = dev
+            .create_shader(ShaderDesc::spirv(to_bytes(RELU_SPV)))
+            .unwrap();
+        let relu_pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: relu_shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+
+        let storage_rw = |size: u64| BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let n: u32 = 8;
+        let a = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        let b = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        let sum = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        let out = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+
+        let a_vals: Vec<f32> = (0..n).map(|i| i as f32 - 4.0).collect();
+        let b_vals: Vec<f32> = (0..n).map(|_| -10.0).collect();
+        dev.write_buffer(a, 0, to_bytes(unsafe {
+            std::slice::from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len())
+        }))
+        .unwrap();
+        dev.write_buffer(b, 0, to_bytes(unsafe {
+            std::slice::from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len())
+        }))
+        .unwrap();
+
+        // sum = a + b (all negative); out = relu(sum) (all zero), batched as
+        // one submission. The implicit barrier between ops must make `sum`'s
+        // write visible to the relu dispatch's read.
+        dev.dispatch_batch(&[
+            DispatchOp {
+                pipeline: add_pipeline,
+                bindings: Bindings {
+                    buffers: &[a.index(), b.index(), sum.index()],
+                    textures: &[],
+                    scalars: &[Scalar::U32(n)],
+                },
+                grid: [n.div_ceil(64), 1, 1],
+            },
+            DispatchOp {
+                pipeline: relu_pipeline,
+                bindings: Bindings {
+                    buffers: &[sum.index(), out.index()],
+                    textures: &[],
+                    scalars: &[Scalar::U32(n)],
+                },
+                grid: [n.div_ceil(64), 1, 1],
+            },
+        ])
+        .unwrap();
+
+        let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
+        let result: &[f32] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n as usize)
+        };
+        assert_eq!(result, &[0.0; 8]);
+
+        dev.destroy_pipeline(add_pipeline);
+        dev.destroy_shader(add_shader);
+        dev.destroy_pipeline(relu_pipeline);
+        dev.destroy_shader(relu_shader);
     }
 }
