@@ -31,15 +31,35 @@ pub struct RenderTargetDesc {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ShaderDesc<'a> {
+pub enum ShaderSource<'a> {
     /// SPIR-V words as raw bytes. The length must be a multiple of 4.
-    pub spirv: &'a [u8],
+    Spirv(&'a [u8]),
+    /// Null-terminated PTX assembly (CUDA Driver API format).
+    Ptx(&'a [u8]),
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ShaderDesc<'a> {
+    pub source: ShaderSource<'a>,
+}
+
+impl<'a> ShaderDesc<'a> {
+    pub fn spirv(bytes: &'a [u8]) -> Self {
+        Self { source: ShaderSource::Spirv(bytes) }
+    }
+    pub fn ptx(bytes: &'a [u8]) -> Self {
+        Self { source: ShaderSource::Ptx(bytes) }
+    }
+}
+
+/// Thread-block dimensions for backends that need them at creation (CUDA, HIP). `[0, 0, 0]` means
+/// the backend default. Vulkan ignores this, since the block size is in SPIR-V `LocalSizeX/Y/Z`.
 #[derive(Debug, Clone, Copy)]
 pub struct ComputePipelineDesc<'a> {
     pub shader: ShaderHandle,
     pub entry: &'a str,
+    /// Thread-block dimensions. `[0, 0, 0]` means the backend default.
+    pub block: [u32; 3],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
