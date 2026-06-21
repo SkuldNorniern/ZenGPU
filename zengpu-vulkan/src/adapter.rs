@@ -55,7 +55,7 @@ impl VulkanAdapter {
     ///
     /// [`open_with_surface`]: VulkanAdapter::open_with_surface
     pub fn open_headless(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
-        VulkanDevice::new(Arc::clone(&self.shared), self.physical, req)
+        VulkanDevice::new_headless_graphics(Arc::clone(&self.shared), self.physical, req)
     }
 
     /// Open a device with the swapchain extension enabled (required for
