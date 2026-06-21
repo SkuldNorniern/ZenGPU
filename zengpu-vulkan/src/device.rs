@@ -9,7 +9,7 @@ use zengpu_hal::{
     FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities,
     MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
-    SurfaceConfig, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
     VertexFormat, WindowHandles, marker,
 };
 
@@ -171,6 +171,10 @@ pub(crate) struct VulkanTexture {
     pub memory: vk::DeviceMemory,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
+    pub depth: u32,
+    pub mip_levels: u32,
+    pub array_layers: u32,
+    pub usage: vk::ImageUsageFlags,
 }
 
 unsafe impl Send for VulkanTexture {}
@@ -1060,6 +1064,19 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+        let mip_levels = desc.mip_levels.max(1);
+        let array_layers = desc.array_layers.max(1);
+        let depth = if desc.dimension == TexDim::D3 {
+            desc.depth.max(1)
+        } else {
+            1
+        };
+        if desc.dimension == TexDim::Cube && array_layers != 6 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                "TexDim::Cube requires array_layers == 6, got {array_layers}"
+            ))));
+        }
+
         let format = hal_format_to_vk(desc.format);
         let mut usage = vk::ImageUsageFlags::empty();
         if desc.usage.contains(TextureUsage::SAMPLED) {
@@ -1080,16 +1097,28 @@ impl GpuDevice for VulkanDevice {
         if desc.usage.contains(TextureUsage::TRANSFER_DST) {
             usage |= vk::ImageUsageFlags::TRANSFER_DST;
         }
+
+        let image_type = match desc.dimension {
+            TexDim::D2 | TexDim::Cube => vk::ImageType::TYPE_2D,
+            TexDim::D3 => vk::ImageType::TYPE_3D,
+        };
+        let flags = if desc.dimension == TexDim::Cube {
+            vk::ImageCreateFlags::CUBE_COMPATIBLE
+        } else {
+            vk::ImageCreateFlags::empty()
+        };
+
         let image_info = vk::ImageCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
+            flags,
+            image_type,
             format,
             extent: vk::Extent3D {
                 width: desc.width,
                 height: desc.height,
-                depth: 1,
+                depth,
             },
-            mip_levels: 1,
-            array_layers: 1,
+            mip_levels,
+            array_layers,
             samples: vk::SampleCountFlags::TYPE_1,
             tiling: vk::ImageTiling::OPTIMAL,
             usage,
@@ -1138,18 +1167,24 @@ impl GpuDevice for VulkanDevice {
             }
             return Err(GpuError::Backend(format!("vkBindImageMemory: {e}")));
         }
+        let view_type = match desc.dimension {
+            TexDim::D2 if array_layers > 1 => vk::ImageViewType::TYPE_2D_ARRAY,
+            TexDim::D2 => vk::ImageViewType::TYPE_2D,
+            TexDim::D3 => vk::ImageViewType::TYPE_3D,
+            TexDim::Cube => vk::ImageViewType::CUBE,
+        };
         let view = unsafe {
             match self.inner.device.create_image_view(
                 &vk::ImageViewCreateInfo {
                     image,
-                    view_type: vk::ImageViewType::TYPE_2D,
+                    view_type,
                     format,
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
-                        level_count: 1,
+                        level_count: mip_levels,
                         base_array_layer: 0,
-                        layer_count: 1,
+                        layer_count: array_layers,
                     },
                     ..Default::default()
                 },
@@ -1172,115 +1207,43 @@ impl GpuDevice for VulkanDevice {
                 width: desc.width,
                 height: desc.height,
             },
+            depth,
+            mip_levels,
+            array_layers,
+            usage,
         }))
     }
 
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
-        let (image, extent) = {
+        self.upload_texture_data_impl(texture, 0, 0, data)
+    }
+
+    fn upload_texture_data_region(
+        &self,
+        texture: TextureHandle,
+        mip_level: u32,
+        layer: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        self.upload_texture_data_impl(texture, mip_level, layer, data)
+    }
+
+    fn generate_mipmaps(&self, texture: TextureHandle) -> Result<()> {
+        let usage = {
             let textures = self.textures.lock().unwrap();
             let tex = textures.get(texture).ok_or_else(|| {
-                GpuError::Backend("upload_texture_data: stale texture handle".to_string())
+                GpuError::Backend("generate_mipmaps: stale texture handle".to_string())
             })?;
-            (tex.image, tex.extent)
+            tex.usage
         };
-
-        let staging = self.create_buffer(zengpu_hal::BufferDesc {
-            size: data.len() as u64,
-            usage: zengpu_hal::BufferUsage::TRANSFER_SRC,
-            memory: MemoryUsage::Upload,
-        })?;
-        self.write_buffer(staging, 0, data)?;
-
-        let staging_vk = {
-            let buffers = self.buffers.lock().unwrap();
-            buffers.get(staging).map(|b| b.buffer).unwrap()
-        };
-
-        self.one_shot_submit(|dev, cmd| {
-            let to_transfer = vk::ImageMemoryBarrier {
-                old_layout: vk::ImageLayout::UNDEFINED,
-                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::empty(),
-                dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                ..Default::default()
-            };
-            unsafe {
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_transfer],
-                );
-                dev.cmd_copy_buffer_to_image(
-                    cmd,
-                    staging_vk,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy {
-                        buffer_offset: 0,
-                        buffer_row_length: 0,
-                        buffer_image_height: 0,
-                        image_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        image_offset: vk::Offset3D::default(),
-                        image_extent: vk::Extent3D {
-                            width: extent.width,
-                            height: extent.height,
-                            depth: 1,
-                        },
-                    }],
-                );
-            }
-            let to_shader = vk::ImageMemoryBarrier {
-                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ,
-                ..Default::default()
-            };
-            unsafe {
-                dev.cmd_pipeline_barrier(
-                    cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_shader],
-                );
-            }
-            Ok(())
-        })?;
-
-        self.destroy_buffer(staging);
-        Ok(())
+        let needed = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if !usage.contains(needed) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "texture",
+                needed: "TRANSFER_SRC | TRANSFER_DST",
+            }));
+        }
+        self.generate_mipmaps_impl(texture)
     }
 
     fn destroy_texture(&self, texture: TextureHandle) {
@@ -1617,6 +1580,301 @@ impl GpuDevice for VulkanDevice {
 }
 
 impl VulkanDevice {
+    /// Shared upload path for [`GpuDevice::upload_texture_data`] (mip `0`,
+    /// layer `0`) and [`GpuDevice::upload_texture_data_region`] (any mip/layer).
+    fn upload_texture_data_impl(
+        &self,
+        texture: TextureHandle,
+        mip_level: u32,
+        layer: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        let (image, extent, depth) = {
+            let textures = self.textures.lock().unwrap();
+            let tex = textures.get(texture).ok_or_else(|| {
+                GpuError::Backend("upload_texture_data: stale texture handle".to_string())
+            })?;
+            (tex.image, tex.extent, tex.depth)
+        };
+        let mip_width = (extent.width >> mip_level).max(1);
+        let mip_height = (extent.height >> mip_level).max(1);
+        let mip_depth = (depth >> mip_level).max(1);
+
+        let staging = self.create_buffer(zengpu_hal::BufferDesc {
+            size: data.len() as u64,
+            usage: zengpu_hal::BufferUsage::TRANSFER_SRC,
+            memory: MemoryUsage::Upload,
+        })?;
+        self.write_buffer(staging, 0, data)?;
+
+        let staging_vk = {
+            let buffers = self.buffers.lock().unwrap();
+            buffers.get(staging).map(|b| b.buffer).unwrap()
+        };
+
+        self.one_shot_submit(|dev, cmd| {
+            let to_transfer = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_level,
+                    level_count: 1,
+                    base_array_layer: layer,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                dev.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging_vk,
+                    image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        buffer_offset: 0,
+                        buffer_row_length: 0,
+                        buffer_image_height: 0,
+                        image_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level,
+                            base_array_layer: layer,
+                            layer_count: 1,
+                        },
+                        image_offset: vk::Offset3D::default(),
+                        image_extent: vk::Extent3D {
+                            width: mip_width,
+                            height: mip_height,
+                            depth: mip_depth,
+                        },
+                    }],
+                );
+            }
+            let to_shader = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_level,
+                    level_count: 1,
+                    base_array_layer: layer,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_shader],
+                );
+            }
+            Ok(())
+        })?;
+
+        self.destroy_buffer(staging);
+        Ok(())
+    }
+
+    /// Generate `texture`'s mip chain from its base level via sequential
+    /// blits (level `i` → level `i+1`, each half the resolution); see
+    /// [`zengpu_hal::GpuDevice::generate_mipmaps`].
+    pub(crate) fn generate_mipmaps_impl(&self, texture: TextureHandle) -> Result<()> {
+        let (image, extent, depth, mip_levels, array_layers) = {
+            let textures = self.textures.lock().unwrap();
+            let tex = textures.get(texture).ok_or_else(|| {
+                GpuError::Backend("generate_mipmaps: stale texture handle".to_string())
+            })?;
+            (tex.image, tex.extent, tex.depth, tex.mip_levels, tex.array_layers)
+        };
+        if mip_levels < 2 {
+            return Ok(());
+        }
+
+        self.one_shot_submit(|dev, cmd| {
+            let mut mip_width = extent.width as i32;
+            let mut mip_height = extent.height as i32;
+            let mut mip_depth = depth as i32;
+
+            for level in 0..mip_levels - 1 {
+                let next_width = (mip_width / 2).max(1);
+                let next_height = (mip_height / 2).max(1);
+                let next_depth = (mip_depth / 2).max(1);
+
+                let to_src = vk::ImageMemoryBarrier {
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: array_layers,
+                    },
+                    src_access_mask: vk::AccessFlags::empty(),
+                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    ..Default::default()
+                };
+                let dst_to_transfer = vk::ImageMemoryBarrier {
+                    old_layout: vk::ImageLayout::UNDEFINED,
+                    new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level + 1,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: array_layers,
+                    },
+                    src_access_mask: vk::AccessFlags::empty(),
+                    dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                    ..Default::default()
+                };
+                unsafe {
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_src, dst_to_transfer],
+                    );
+                    dev.cmd_blit_image(
+                        cmd,
+                        image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[vk::ImageBlit {
+                            src_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: level,
+                                base_array_layer: 0,
+                                layer_count: array_layers,
+                            },
+                            src_offsets: [
+                                vk::Offset3D::default(),
+                                vk::Offset3D {
+                                    x: mip_width,
+                                    y: mip_height,
+                                    z: mip_depth,
+                                },
+                            ],
+                            dst_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: level + 1,
+                                base_array_layer: 0,
+                                layer_count: array_layers,
+                            },
+                            dst_offsets: [
+                                vk::Offset3D::default(),
+                                vk::Offset3D {
+                                    x: next_width,
+                                    y: next_height,
+                                    z: next_depth,
+                                },
+                            ],
+                        }],
+                        vk::Filter::LINEAR,
+                    );
+                }
+                let src_to_shader = vk::ImageMemoryBarrier {
+                    old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: array_layers,
+                    },
+                    src_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    dst_access_mask: vk::AccessFlags::SHADER_READ,
+                    ..Default::default()
+                };
+                unsafe {
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[src_to_shader],
+                    );
+                }
+
+                mip_width = next_width;
+                mip_height = next_height;
+                mip_depth = next_depth;
+            }
+
+            // The last level was a blit destination, never a blit source;
+            // transition it to shader-readable on its own.
+            let last_to_shader = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: mip_levels - 1,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: array_layers,
+                },
+                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[last_to_shader],
+                );
+            }
+            Ok(())
+        })
+    }
+
     /// Create a graphics pipeline via `VK_KHR_dynamic_rendering` — no
     /// `vk::RenderPass`/`vk::Framebuffer` objects. Part of the unified
     /// graphics API (D17/GU); see [`zengpu_hal::GraphicsDevice::create_graphics_pipeline`].
@@ -2165,6 +2423,121 @@ mod tests {
             })
             .unwrap();
         dev.destroy_sampler(sampler);
+    }
+
+    fn tex_desc(dimension: zengpu_hal::TexDim) -> TextureDesc {
+        TextureDesc {
+            width: 8,
+            height: 8,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            samples: 1,
+            dimension,
+            mip_levels: 1,
+            array_layers: 1,
+        }
+    }
+
+    #[test]
+    fn create_texture_2d_array() {
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                array_layers: 4,
+                ..tex_desc(zengpu_hal::TexDim::D2)
+            })
+            .unwrap();
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn create_texture_3d() {
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                depth: 4,
+                ..tex_desc(zengpu_hal::TexDim::D3)
+            })
+            .unwrap();
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn create_texture_cube_requires_six_layers() {
+        let Some(dev) = try_device() else { return };
+        let err = dev
+            .create_texture(TextureDesc {
+                array_layers: 3,
+                ..tex_desc(zengpu_hal::TexDim::Cube)
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::BindingMismatch(_))
+        ));
+
+        let tex = dev
+            .create_texture(TextureDesc {
+                array_layers: 6,
+                ..tex_desc(zengpu_hal::TexDim::Cube)
+            })
+            .unwrap();
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn upload_texture_data_region_targets_specific_mip() {
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                mip_levels: 2,
+                ..tex_desc(zengpu_hal::TexDim::D2)
+            })
+            .unwrap();
+        // Mip 0 is 8x8, mip 1 is 4x4.
+        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4]).unwrap();
+        dev.upload_texture_data_region(tex, 1, 0, &vec![0x80u8; 4 * 4 * 4])
+            .unwrap();
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn generate_mipmaps_without_transfer_usage_fails() {
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                mip_levels: 4,
+                usage: TextureUsage::SAMPLED,
+                ..tex_desc(zengpu_hal::TexDim::D2)
+            })
+            .unwrap();
+        let err = dev.generate_mipmaps(tex).unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "TRANSFER_SRC | TRANSFER_DST",
+                ..
+            })
+        ));
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn generate_mipmaps_builds_full_chain() {
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                mip_levels: 4,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                ..tex_desc(zengpu_hal::TexDim::D2)
+            })
+            .unwrap();
+        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4]).unwrap();
+        dev.generate_mipmaps(tex).unwrap();
+        dev.destroy_texture(tex);
     }
 
     #[test]
