@@ -1,18 +1,26 @@
-//! ZenGPU CUDA backend, compute only (no surfaces or render passes).
-//!
-//! Uses cuda-oxide for Driver API access. Absent CUDA gives an empty adapter list, not a build or
-//! link error (the stub library returns `ErrorCode::StubLibrary` from `cuInit`).
+//! CUDA backend: compute HAL only, no graphics. Uses cuda-oxide for the Driver API. Without CUDA
+//! the adapter list is empty, not a build or link error (the stub library returns
+//! `ErrorCode::StubLibrary` from `cuInit`).
 
 mod error;
 
-use cuda_oxide::{Cuda, device::Device};
+use std::cell::UnsafeCell;
+use std::rc::Rc;
+use std::sync::Mutex;
+
+use cuda_oxide::{
+    Cuda,
+    context::{Context, Handle},
+    device::Device,
+    mem::{DeviceBox, DevicePtr},
+};
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
-    DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
-    SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
+    AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
+    ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance,
+    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
+    SlotMap, TextureDesc, TextureHandle, marker,
 };
 
-#[allow(unused_imports)]
 use error::from_cuda;
 
 /// CUDA entry point. Calls `cuInit` at construction. Without CUDA (stub library or no driver),
@@ -76,12 +84,11 @@ impl GpuInstance for CudaInstance {
 }
 
 pub struct CudaAdapter {
-    #[allow(dead_code)]
     dev: Device,
     info: AdapterInfo,
 }
 
-// SAFETY: newtype over a CUdevice (c_int ordinal), safe to send across threads.
+// SAFETY: `Device` wraps a CUdevice (c_int ordinal), safe across threads.
 unsafe impl Send for CudaAdapter {}
 unsafe impl Sync for CudaAdapter {}
 
@@ -95,20 +102,67 @@ impl GpuAdapter for CudaAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
-        Err(GpuError::Backend(
-            "cuda: device not yet implemented; adapter enumeration only".into(),
-        ))
+        let ctx = from_cuda(Context::new(&self.dev))?;
+        Ok(Box::new(CudaDevice {
+            ctx: UnsafeCell::new(ctx),
+            ctx_lock: Mutex::new(()),
+            buffers: Mutex::new(SlotMap::new()),
+        }))
     }
 }
 
-#[allow(dead_code)]
-pub(crate) struct CudaDevice {
-    dev: Device,
+#[derive(Clone, Copy)]
+struct CudaBuffer {
+    ptr: u64,
+    len: u64,
 }
 
-// SAFETY: wraps a CUdevice ordinal (c_int), safe to send.
+/// An opened CUDA device. Compute only: no textures or render passes.
+///
+/// # Thread safety
+///
+/// cuda-oxide's `Context` is `!Send` because `Handle` uses `Rc`. Every call that enters the
+/// context holds `ctx_lock`, so only one thread touches it at a time, and the `Rc<Handle>`
+/// never crosses a thread.
+pub struct CudaDevice {
+    ctx: UnsafeCell<Context>,
+    ctx_lock: Mutex<()>,
+    buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
+}
+
+// SAFETY: see the CudaDevice doc comment above.
 unsafe impl Send for CudaDevice {}
 unsafe impl Sync for CudaDevice {}
+
+impl CudaDevice {
+    /// Runs `f` inside the CUDA context. `ctx_lock` must be held for the duration of `f`.
+    fn with_context<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'h> FnOnce(Rc<Handle<'h>>) -> Result<T>,
+    {
+        let _guard = self.ctx_lock.lock().map_err(|_| GpuError::DeviceLost)?;
+        // SAFETY: `ctx_lock` is held; no other thread can reach this point.
+        let handle = from_cuda(unsafe { &mut *self.ctx.get() }.enter())?;
+        f(handle)
+    }
+}
+
+impl Drop for CudaDevice {
+    fn drop(&mut self) {
+        let buffers: Vec<CudaBuffer> = self.buffers.get_mut().unwrap().drain().collect();
+        if buffers.is_empty() {
+            return;
+        }
+        if let Ok(handle) = self.ctx.get_mut().enter() {
+            for cb in buffers {
+                // SAFETY: ptr/len from a leaked DeviceBox. Sole owner; context is current.
+                let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
+                let db = unsafe { DeviceBox::from_raw(dp) };
+                drop(db);
+            }
+        }
+    }
+}
 
 impl GpuDevice for CudaDevice {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -119,35 +173,125 @@ impl GpuDevice for CudaDevice {
         HalCapabilities::compute_only()
     }
 
-    fn create_buffer(&self, _desc: BufferDesc) -> Result<BufferHandle> {
-        Err(GpuError::Backend("cuda: not yet implemented".into()))
+    fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
+        self.with_context(|handle| {
+            let db = from_cuda(DeviceBox::alloc(&handle, desc.size))?;
+            let ptr = db.as_raw();
+            let len = db.len();
+            db.leak();
+            let bh = self
+                .buffers
+                .lock()
+                .map_err(|_| GpuError::DeviceLost)?
+                .insert(CudaBuffer { ptr, len });
+            Ok(bh)
+        })
     }
 
-    fn write_buffer(&self, _buffer: BufferHandle, _offset: u64, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("cuda: not yet implemented".into()))
+    fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
+        let cb = self
+            .buffers
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(buffer)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+
+        if offset + data.len() as u64 > cb.len {
+            return Err(GpuError::Backend("cuda: write out of bounds".into()));
+        }
+
+        self.with_context(|handle| {
+            // SAFETY: ptr/len from our buffer table; context is current.
+            let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
+            let view = dp.subslice(offset, offset + data.len() as u64);
+            from_cuda(view.store(data))
+        })
     }
 
-    fn read_buffer(&self, _buffer: BufferHandle, _offset: u64, _len: u64) -> Result<Vec<u8>> {
-        Err(GpuError::Backend("cuda: not yet implemented".into()))
+    fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let cb = self
+            .buffers
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(buffer)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+
+        if offset + len > cb.len {
+            return Err(GpuError::Backend("cuda: read out of bounds".into()));
+        }
+
+        self.with_context(|handle| {
+            // SAFETY: ptr/len from our buffer table; context is current.
+            let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
+            let view = dp.subslice(offset, offset + len);
+            from_cuda(view.load())
+        })
     }
 
-    fn destroy_buffer(&self, _buffer: BufferHandle) {}
+    fn destroy_buffer(&self, buffer: BufferHandle) {
+        let cb = match self.buffers.lock() {
+            Ok(mut g) => g.remove(buffer),
+            Err(_) => return,
+        };
+        if let Some(cb) = cb {
+            let _ = self.with_context(|handle| {
+                // SAFETY: ptr/len from our buffer table; context is current.
+                let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
+                let db = unsafe { DeviceBox::from_raw(dp) };
+                drop(db);
+                Ok(())
+            });
+        }
+    }
 
     fn create_texture(&self, _desc: TextureDesc) -> Result<TextureHandle> {
-        Err(GpuError::Backend("cuda: compute-only; no texture support".into()))
+        Err(GpuError::Backend(
+            "cuda: compute-only; no texture support".into(),
+        ))
     }
 
     fn upload_texture_data(&self, _texture: TextureHandle, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("cuda: compute-only; no texture support".into()))
+        Err(GpuError::Backend(
+            "cuda: compute-only; no texture support".into(),
+        ))
     }
 
     fn destroy_texture(&self, _texture: TextureHandle) {}
 
     fn create_sampler(&self, _desc: SamplerDesc) -> Result<SamplerHandle> {
-        Err(GpuError::Backend("cuda: compute-only; no sampler support".into()))
+        Err(GpuError::Backend(
+            "cuda: compute-only; no sampler support".into(),
+        ))
     }
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
+
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        let _ = desc;
+        Err(GpuError::Backend(
+            "cuda: shader/PTX loading not yet implemented".into(),
+        ))
+    }
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        let _ = desc;
+        Err(GpuError::Backend(
+            "cuda: compute pipelines not yet implemented".into(),
+        ))
+    }
+
+    fn dispatch(
+        &self,
+        _pipeline: PipelineHandle,
+        _bindings: Bindings<'_>,
+        _grid: [u32; 3],
+    ) -> Result<()> {
+        Err(GpuError::Backend(
+            "cuda: kernel dispatch not yet implemented".into(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +311,28 @@ mod tests {
             assert!(adapter.capabilities().compute);
             assert!(!adapter.capabilities().graphics);
         }
+    }
+
+    #[test]
+    fn open_and_buffer_round_trip() {
+        let inst = CudaInstance::new();
+        let Some(adapter) = inst.enumerate_adapters().into_iter().next() else {
+            return;
+        };
+        let device = adapter
+            .open(DeviceRequest::default())
+            .expect("open failed");
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: 256,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create_buffer failed");
+        let data: Vec<u8> = (0u8..=255).collect();
+        device.write_buffer(buf, 0, &data).expect("write failed");
+        let read_back = device.read_buffer(buf, 0, 256).expect("read failed");
+        assert_eq!(read_back, data);
+        device.destroy_buffer(buf);
     }
 }
