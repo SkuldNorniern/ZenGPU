@@ -82,6 +82,26 @@ pub use zengpu_hal::{
     VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
+// ── Flat re-exports for the most commonly used extension types ────────────────
+// These let callers write `zengpu::BufferPool` instead of
+// `zengpu::compute::BufferPool`, matching the pattern for HAL types above.
+
+/// Flat re-export: `DeviceArray`, `BufferPool`, and `ElementwiseKernels` from
+/// the compute extension.
+#[cfg(feature = "compute")]
+pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
+
+/// Flat re-export: `GemmKernel` from the BLAS extension.
+#[cfg(feature = "blas")]
+pub use zengpu_blas::GemmKernel;
+
+/// Flat re-export: concrete Vulkan types required by windowed / backend-aware
+/// code. For most use cases the [`Instance`] builder is sufficient.
+#[cfg(feature = "vulkan")]
+pub use zengpu_vulkan::{
+    BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance,
+};
+
 // ── Backend sub-crates (power-user access) ───────────────────────────────────
 
 /// Vulkan backend: graphics + compute on Vulkan 1.2+.

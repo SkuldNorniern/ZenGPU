@@ -50,7 +50,7 @@ log = "0.4"
 name = "zengpu"
 
 [features]
-default = ["vulkan", "compute", "blas"]
+default = ["vulkan", "compute"]
 # Vulkan backend (graphics + compute). The only GPU backend so far.
 vulkan = ["zengpu-vulkan"]
 # CPU reference backend: the conformance oracle, not a product fallback.
@@ -84,6 +84,24 @@ log.workspace = true
 [dev-dependencies]
 ash = "0.38"
 winit = "0.30"
+
+# Gate examples on the features they actually need so `cargo test` skips them
+# when those features are not enabled (blas is opt-in, not a default).
+[[example]]
+name = "vec_add"
+required-features = ["vulkan"]
+
+[[example]]
+name = "heavy_compute"
+required-features = ["vulkan", "blas"]
+
+[[example]]
+name = "op_graph_lower"
+required-features = ["vulkan", "blas"]
+
+[[example]]
+name = "cube"
+required-features = ["vulkan"]
 
 [package.metadata.docs.rs]
 all-features = true
