@@ -2,66 +2,30 @@ use zengpu_hal::{AdapterRequest, GpuInstance};
 
 use crate::adapter::Adapter;
 
-/// Holds a backend instance for every enabled feature and collects their adapters. Same role
-/// as `wgpu::Instance`.
-///
-/// Open a [`crate::Device`] from an adapter via [`enumerate_adapters`] or [`request_adapter`].
-///
-/// [`enumerate_adapters`]: Instance::enumerate_adapters [`request_adapter`]:
-/// Instance::request_adapter
+/// Entry point. Holds the backends registered via [`InstanceBuilder`]. Start with
+/// [`Instance::builder()`].
 pub struct Instance {
     backends: Vec<Box<dyn GpuInstance>>,
 }
 
 impl Instance {
-    /// Vulkan: loads surface extensions. Falls back to headless (no display server) so compute
-    /// still works.
-    pub fn new() -> Self {
-        let mut backends: Vec<Box<dyn GpuInstance>> = Vec::new();
-
-        #[cfg(feature = "vulkan")]
-        {
-            let vk = zengpu_vulkan::VulkanInstance::new_with_surface()
-                .or_else(|_| zengpu_vulkan::VulkanInstance::new());
-            match vk {
-                Ok(inst) => backends.push(Box::new(inst)),
-                Err(e) => log::warn!("zengpu: Vulkan instance unavailable: {e}"),
-            }
-        }
-
-        #[cfg(feature = "cuda")]
-        {
-            backends.push(Box::new(zengpu_cuda::CudaInstance::new()));
-        }
-
-        #[cfg(feature = "cpu")]
-        backends.push(Box::new(zengpu_cpu::CpuInstance));
-
-        Self { backends }
-    }
-
-    /// Like [`new`], but skips surface extension loading. For headless or CI use.
+    /// Adds backends with the `with_*` methods. Call [`InstanceBuilder::build`] to finish.
     ///
-    /// [`new`]: Instance::new
-    pub fn headless() -> Self {
-        let mut backends: Vec<Box<dyn GpuInstance>> = Vec::new();
-
-        #[cfg(feature = "vulkan")]
-        match zengpu_vulkan::VulkanInstance::new() {
-            Ok(inst) => backends.push(Box::new(inst)),
-            Err(e) => log::warn!("zengpu: Vulkan instance unavailable: {e}"),
+    /// ```no_run
+    /// # use zengpu::Instance;
+    /// let instance = Instance::builder()
+    ///     .vulkan_with_surface()?   // Err if Vulkan loader absent
+    ///     .cuda()                   // no-op if CUDA absent at runtime
+    ///     .build();
+    /// # Ok::<(), zengpu::GpuError>(())
+    /// ```
+    pub fn builder() -> InstanceBuilder {
+        InstanceBuilder {
+            backends: Vec::new(),
         }
-
-        #[cfg(feature = "cuda")]
-        backends.push(Box::new(zengpu_cuda::CudaInstance::new()));
-
-        #[cfg(feature = "cpu")]
-        backends.push(Box::new(zengpu_cpu::CpuInstance));
-
-        Self { backends }
     }
 
-    /// Adapters from all enabled backends, in priority order: Vulkan, CUDA, CPU.
+    /// Adapters from all backends, in registration order.
     pub fn enumerate_adapters(&self) -> Vec<Adapter> {
         self.backends
             .iter()
@@ -70,6 +34,7 @@ impl Instance {
             .collect()
     }
 
+    /// Best adapter matching `req` across all backends, or `None`.
     pub fn request_adapter(&self, req: AdapterRequest) -> Option<Adapter> {
         for backend in &self.backends {
             if let Some(inner) = backend.request_adapter(req) {
@@ -80,8 +45,102 @@ impl Instance {
     }
 }
 
-impl Default for Instance {
-    fn default() -> Self {
-        Self::new()
+/// Fallible methods (Vulkan) return `Result<Self>`, so the caller decides whether a missing backend
+/// is an error or is skipped.
+///
+/// ```no_run
+/// # use zengpu::Instance;
+/// // Error on Vulkan absence:
+/// let inst = Instance::builder().vulkan_with_surface()?.build();
+///
+/// // Graceful skip:
+/// let mut b = Instance::builder();
+/// if let Ok(b2) = b.try_vulkan_with_surface() { b = b2; }
+/// let inst = b.cuda().build();
+/// # Ok::<(), zengpu::GpuError>(())
+/// ```
+pub struct InstanceBuilder {
+    backends: Vec<Box<dyn GpuInstance>>,
+}
+
+impl InstanceBuilder {
+    /// Adds Vulkan with surface and swapchain extensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Vulkan loader or an extension is missing.
+    ///
+    /// For windowed apps. Headless compute uses [`vulkan`].
+    ///
+    /// [`vulkan`]: InstanceBuilder::vulkan
+    #[cfg(feature = "vulkan")]
+    pub fn vulkan_with_surface(mut self) -> zengpu_hal::Result<Self> {
+        let inst = zengpu_vulkan::VulkanInstance::new_with_surface()?;
+        self.backends.push(Box::new(inst));
+        Ok(self)
+    }
+
+    /// Adds headless Vulkan (no surface extensions).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Vulkan loader is absent.
+    #[cfg(feature = "vulkan")]
+    pub fn vulkan(mut self) -> zengpu_hal::Result<Self> {
+        let inst = zengpu_vulkan::VulkanInstance::new()?;
+        self.backends.push(Box::new(inst));
+        Ok(self)
+    }
+
+    /// Vulkan with surface extensions if available, otherwise `self` unchanged.
+    #[cfg(feature = "vulkan")]
+    pub fn try_vulkan_with_surface(self) -> Result<Self, Self> {
+        match zengpu_vulkan::VulkanInstance::new_with_surface() {
+            Ok(inst) => {
+                let mut s = self;
+                s.backends.push(Box::new(inst));
+                Ok(s)
+            }
+            Err(e) => {
+                log::debug!("zengpu: Vulkan (with surface) unavailable: {e}");
+                Err(self)
+            }
+        }
+    }
+
+    /// Headless Vulkan if available, otherwise `self` unchanged.
+    #[cfg(feature = "vulkan")]
+    pub fn try_vulkan(self) -> Result<Self, Self> {
+        match zengpu_vulkan::VulkanInstance::new() {
+            Ok(inst) => {
+                let mut s = self;
+                s.backends.push(Box::new(inst));
+                Ok(s)
+            }
+            Err(e) => {
+                log::debug!("zengpu: Vulkan unavailable: {e}");
+                Err(self)
+            }
+        }
+    }
+
+    /// Add CUDA. Never fails here. Without CUDA at runtime it yields no adapters.
+    #[cfg(feature = "cuda")]
+    pub fn cuda(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_cuda::CudaInstance::new()));
+        self
+    }
+
+    /// Add the CPU reference backend. Never fails.
+    #[cfg(feature = "cpu")]
+    pub fn cpu(mut self) -> Self {
+        self.backends.push(Box::new(zengpu_cpu::CpuInstance));
+        self
+    }
+
+    pub fn build(self) -> Instance {
+        Instance {
+            backends: self.backends,
+        }
     }
 }
