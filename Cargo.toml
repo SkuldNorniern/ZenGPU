@@ -93,7 +93,7 @@ required-features = ["vulkan"]
 
 [[example]]
 name = "heavy_compute"
-required-features = ["vulkan", "blas"]
+required-features = ["blas"]
 
 [[example]]
 name = "op_graph_lower"

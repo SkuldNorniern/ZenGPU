@@ -1,15 +1,12 @@
-//! Heavy GEMM smoke test on the Vulkan backend. Runs repeated large GEMMs through
-//! `DeviceArray`/`GemmKernel` and checks a sample of the output against CPU values.
+//! Heavy GEMM smoke test: repeated large GEMMs, output checked.
 //!
-//! Default: 64 GEMMs of 4096x4096. `ZENGPU_HEAVY_DIM` and `ZENGPU_HEAVY_REPS` scale it.
+//! Default: 64 GEMMs of 4096x4096. `ZENGPU_HEAVY_DIM` / `ZENGPU_HEAVY_REPS` scale it.
+//! `ZENGPU_BACKEND=cuda` selects CUDA (needs the `cuda` feature). Default is Vulkan.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use zengpu::{
-    AdapterRequest, BufferPool, DType, DeviceRequest, GemmKernel, GpuDevice, GpuInstance,
-    VulkanInstance,
-};
+use zengpu::{AdapterRequest, BufferPool, DType, DeviceRequest, GemmKernel, GpuDevice, GpuInstance};
 
 fn as_bytes_f32(s: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
@@ -29,18 +26,46 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let inst = VulkanInstance::new()?;
-    let adapter = inst
-        .request_adapter(AdapterRequest::default())
-        .ok_or("no Vulkan adapter")?;
-    eprintln!("ZenGPU heavy compute: {}", adapter.info().name);
+fn open_device() -> Result<(String, Arc<dyn GpuDevice>), Box<dyn std::error::Error>> {
+    let backend = std::env::var("ZENGPU_BACKEND").unwrap_or_default();
+    match backend.to_ascii_lowercase().as_str() {
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            use zengpu::cuda::CudaInstance;
+            let inst = CudaInstance::new();
+            let adapter = inst
+                .request_adapter(AdapterRequest::default())
+                .ok_or("no CUDA adapter found")?;
+            let name = adapter.info().name.clone();
+            let device: Arc<dyn GpuDevice> = Arc::from(adapter.open(DeviceRequest::default())?);
+            Ok((name, device))
+        }
+        _ => {
+            #[cfg(not(feature = "vulkan"))]
+            return Err("vulkan feature not enabled; set ZENGPU_BACKEND=cuda".into());
+            #[cfg(feature = "vulkan")]
+            {
+                use zengpu::VulkanInstance;
+                let inst = VulkanInstance::new()?;
+                let adapter = inst
+                    .request_adapter(AdapterRequest::default())
+                    .ok_or("no Vulkan adapter found")?;
+                let name = adapter.info().name.clone();
+                let device: Arc<dyn GpuDevice> = Arc::from(adapter.open(DeviceRequest::default())?);
+                Ok((name, device))
+            }
+        }
+    }
+}
 
-    let device: Arc<dyn GpuDevice> = Arc::from(adapter.open(DeviceRequest::default())?);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (adapter_name, device) = open_device()?;
+    eprintln!("ZenGPU heavy compute: {adapter_name}");
+
     let pool = BufferPool::new(device.clone());
     let gemm = GemmKernel::new(&*device)?;
 
-    let dim = env_u32("ZENGPU_HEAVY_DIM", 4096);
+    let dim  = env_u32("ZENGPU_HEAVY_DIM", 4096);
     let reps = env_u32("ZENGPU_HEAVY_REPS", 64);
     let (m, k, n) = (dim, dim, dim);
     let gflops = 2.0 * (m as f64) * (n as f64) * (k as f64) * (reps as f64) / 1.0e9;
@@ -97,7 +122,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let achieved = gflops / elapsed.as_secs_f64();
     eprintln!(
-        "heavy GEMM OK: {reps} x ({m}x{k} @ {k}x{n} -> {m}x{n}) in {elapsed:?} ({achieved:.1} GFLOP/s)"
+        "heavy GEMM OK: {reps} x ({m}x{k} @ {k}x{n}) in {elapsed:?} ({achieved:.1} GFLOP/s)"
     );
 
     pool.free(a);
