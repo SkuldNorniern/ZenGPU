@@ -787,11 +787,11 @@ pub(crate) fn create_platform_surface(
     shared: &VulkanShared,
     handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
-    use raw_window_handle::RawWindowHandle;
+    use zen_window_handle::WindowHandle;
 
     let win32_loader = khr::win32_surface::Instance::new(&shared.entry, &shared.instance);
 
-    let RawWindowHandle::Win32(win32) = handles.window else {
+    let WindowHandle::Win32(win32) = handles.window else {
         return Err(GpuError::Backend(
             "expected Win32 window handle on Windows".to_string(),
         ));
@@ -818,10 +818,10 @@ pub(crate) fn create_platform_surface(
     shared: &VulkanShared,
     handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
-    use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+    use zen_window_handle::{DisplayHandle, WindowHandle};
 
     match (handles.window, handles.display) {
-        (RawWindowHandle::Xcb(window), RawDisplayHandle::Xcb(display)) => {
+        (WindowHandle::Xcb(window), DisplayHandle::Xcb(display)) => {
             let connection = display.connection.ok_or_else(|| {
                 GpuError::Backend("XCB display handle has no connection".to_string())
             })?;
@@ -837,7 +837,7 @@ pub(crate) fn create_platform_surface(
                     .map_err(|e| GpuError::Backend(format!("vkCreateXcbSurfaceKHR: {e}")))
             }
         }
-        (RawWindowHandle::Wayland(window), RawDisplayHandle::Wayland(display)) => {
+        (WindowHandle::Wayland(window), DisplayHandle::Wayland(display)) => {
             let loader = khr::wayland_surface::Instance::new(&shared.entry, &shared.instance);
             let create_info = vk::WaylandSurfaceCreateInfoKHR {
                 display: display.display.as_ptr(),
@@ -861,9 +861,9 @@ pub(crate) fn create_platform_surface(
     shared: &VulkanShared,
     handles: &zengpu_hal::WindowHandles,
 ) -> Result<vk::SurfaceKHR> {
-    use raw_window_handle::RawWindowHandle;
+    use zen_window_handle::WindowHandle;
 
-    let RawWindowHandle::AppKit(appkit) = handles.window else {
+    let WindowHandle::AppKit(appkit) = handles.window else {
         return Err(GpuError::Backend(
             "expected AppKit window handle on macOS".to_string(),
         ));
