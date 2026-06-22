@@ -12,7 +12,7 @@ use zengpu_hal::{
 };
 
 #[cfg(target_os = "macos")]
-use zengpu_hal::{BackendPreference, DeviceType};
+use zengpu_hal::{BackendPreference, DeviceType, SlotMap, marker};
 
 // ── MetalInstance ─────────────────────────────────────────────────────────────
 
@@ -113,16 +113,60 @@ impl GpuAdapter for MetalAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
-        // MTLCommandQueue + MTLBuffer setup — next commit.
-        Err(GpuError::Backend(
-            "metal: device open not yet implemented".into(),
-        ))
+        #[cfg(target_os = "macos")]
+        {
+            let device = metal::Device::system_default()
+                .ok_or_else(|| GpuError::Backend("metal: no MTLDevice available".into()))?;
+            let queue = device.new_command_queue();
+            Ok(Box::new(MetalDevice {
+                inner: MacDevice {
+                    device,
+                    queue,
+                    buffers: std::sync::Mutex::new(SlotMap::default()),
+                },
+            }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(GpuError::Backend(
+                "metal: unavailable on this platform".into(),
+            ))
+        }
     }
 }
 
 // ── MetalDevice ───────────────────────────────────────────────────────────────
 
-pub struct MetalDevice;
+/// A GPU-resident buffer. On Apple Silicon, `Shared` storage is host-visible and
+/// device-visible (unified memory), so reads/writes are plain `memcpy`.
+#[cfg(target_os = "macos")]
+struct MetalBuffer {
+    buf: metal::Buffer,
+    size: u64,
+}
+
+#[cfg(target_os = "macos")]
+struct MacDevice {
+    device: metal::Device,
+    #[allow(dead_code)] // used once compute/graphics submission lands
+    queue: metal::CommandQueue,
+    buffers: std::sync::Mutex<SlotMap<marker::Buffer, MetalBuffer>>,
+}
+
+/// An opened Metal device. Buffers today; compute/graphics submission and the
+/// ZSL→MSL shader path follow.
+pub struct MetalDevice {
+    #[cfg(target_os = "macos")]
+    inner: MacDevice,
+}
+
+// SAFETY: the contained Metal objects are reference-counted Obj-C handles; all
+// mutable state (the buffer slot map) is guarded by a Mutex, and no raw pointer
+// is shared across threads.
+#[cfg(target_os = "macos")]
+unsafe impl Send for MetalDevice {}
+#[cfg(target_os = "macos")]
+unsafe impl Sync for MetalDevice {}
 
 impl GpuDevice for MetalDevice {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -133,32 +177,100 @@ impl GpuDevice for MetalDevice {
         HalCapabilities::all()
     }
 
-    fn create_buffer(&self, _desc: BufferDesc) -> Result<BufferHandle> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+    fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
+        #[cfg(target_os = "macos")]
+        {
+            // Metal rejects zero-length buffers; round up to 1 byte.
+            let len = desc.size.max(1);
+            let buf = self
+                .inner
+                .device
+                .new_buffer(len, metal::MTLResourceOptions::StorageModeShared);
+            let mut buffers = self.inner.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            Ok(buffers.insert(MetalBuffer { buf, size: desc.size }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = desc;
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
     }
 
-    fn write_buffer(&self, _buffer: BufferHandle, _offset: u64, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+    fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            let buffers = self.inner.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let b = buffers
+                .get(buffer)
+                .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))?;
+            if offset + data.len() as u64 > b.size {
+                return Err(GpuError::Backend("metal: write out of bounds".into()));
+            }
+            // SAFETY: Shared-storage contents() is a valid host pointer for `size`
+            // bytes; the bounds check above keeps the copy in range.
+            unsafe {
+                let ptr = (b.buf.contents() as *mut u8).add(offset as usize);
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (buffer, offset, data);
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
     }
 
-    fn read_buffer(&self, _buffer: BufferHandle, _offset: u64, _len: u64) -> Result<Vec<u8>> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+    fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
+        #[cfg(target_os = "macos")]
+        {
+            let buffers = self.inner.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let b = buffers
+                .get(buffer)
+                .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))?;
+            if offset + len > b.size {
+                return Err(GpuError::Backend("metal: read out of bounds".into()));
+            }
+            let mut out = vec![0u8; len as usize];
+            // SAFETY: as above; the bounds check keeps the copy within `size`.
+            unsafe {
+                let ptr = (b.buf.contents() as *const u8).add(offset as usize);
+                std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), len as usize);
+            }
+            Ok(out)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (buffer, offset, len);
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
     }
 
-    fn destroy_buffer(&self, _buffer: BufferHandle) {}
+    fn destroy_buffer(&self, buffer: BufferHandle) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut buffers) = self.inner.buffers.lock() {
+                buffers.remove(buffer);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = buffer;
+        }
+    }
 
     fn create_texture(&self, _desc: TextureDesc) -> Result<TextureHandle> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+        Err(GpuError::Backend("metal: textures not yet implemented".into()))
     }
 
     fn upload_texture_data(&self, _texture: TextureHandle, _data: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+        Err(GpuError::Backend("metal: textures not yet implemented".into()))
     }
 
     fn destroy_texture(&self, _texture: TextureHandle) {}
 
     fn create_sampler(&self, _desc: SamplerDesc) -> Result<SamplerHandle> {
-        Err(GpuError::Backend("metal: not yet implemented".into()))
+        Err(GpuError::Backend("metal: samplers not yet implemented".into()))
     }
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
@@ -186,5 +298,38 @@ mod tests {
             assert!(!a.info().name.is_empty());
             assert!(a.capabilities().graphics);
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn buffer_write_read_round_trip() {
+        let inst = MetalInstance::new();
+        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+            return; // no Metal device in this environment
+        };
+        let device = adapter.open(DeviceRequest::default()).expect("open MTLDevice");
+
+        let data: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+        let bytes = bytemuck_cast(&data);
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: bytes.len() as u64,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::Upload,
+            })
+            .expect("create buffer");
+        device.write_buffer(buf, 0, bytes).expect("write");
+        let out = device.read_buffer(buf, 0, bytes.len() as u64).expect("read");
+        assert_eq!(out, bytes);
+
+        // Out-of-bounds write is rejected.
+        assert!(device.write_buffer(buf, bytes.len() as u64, &[0u8; 4]).is_err());
+        device.destroy_buffer(buf);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bytemuck_cast(data: &[f32]) -> &[u8] {
+        // SAFETY: f32 has no padding/invalid bit patterns; viewing as bytes is sound.
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
     }
 }
