@@ -508,6 +508,15 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
             let rhs = lower_expr(ctx, rhs)?;
             lower_binary(ctx, *op, lhs, rhs)
         }
+
+        IrExpr::Input(_)
+        | IrExpr::FieldAccess { .. }
+        | IrExpr::VecConstruct { .. }
+        | IrExpr::Extend { .. }
+        | IrExpr::Dot { .. } => Err((
+            Span::call_site(),
+            "ZSL: vector/graphics expression not supported in compute shaders".into(),
+        )),
     }
 }
 
@@ -650,24 +659,11 @@ fn lower_builtin(
                 .op_ext_inst(t_f32, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
             Ok(Val { id, ty: ScalarTy::F32 })
         }
-    }
-}
 
-impl BuiltinFn {
-    fn name(self) -> &'static str {
-        match self {
-            BuiltinFn::Abs => "abs",
-            BuiltinFn::Sign => "sign",
-            BuiltinFn::Sqrt => "sqrt",
-            BuiltinFn::Floor => "floor",
-            BuiltinFn::Ceil => "ceil",
-            BuiltinFn::Fract => "fract",
-            BuiltinFn::Min => "min",
-            BuiltinFn::Max => "max",
-            BuiltinFn::Pow => "pow",
-            BuiltinFn::Clamp => "clamp",
-            BuiltinFn::Mix => "mix",
-        }
+        BuiltinFn::Normalize | BuiltinFn::Length => Err((
+            Span::call_site(),
+            format!("ZSL: {name}() is not supported in compute shaders"),
+        )),
     }
 }
 

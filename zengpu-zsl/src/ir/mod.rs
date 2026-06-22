@@ -4,7 +4,7 @@
 pub mod build;
 pub mod node;
 
-use node::IrStmt;
+use node::{IrExpr, IrStmt};
 
 use crate::frontend::types::BufElem;
 
@@ -61,4 +61,48 @@ pub struct Entry {
 #[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GfxTy {
+    F32,
+    U32,
+    Vec2,
+    Vec3,
+    Vec4,
+    Mat4,
+}
+
+#[derive(Debug)]
+pub struct GfxInput {
+    pub name: String,
+    pub location: u32,
+    pub ty: GfxTy,
+}
+
+#[derive(Debug)]
+pub struct GfxScalar {
+    pub name: String,
+    pub ty: GfxTy,
+}
+
+#[derive(Debug)]
+pub struct GraphicsEntry {
+    pub is_fragment: bool,
+    /// `@location` inputs. The backend sorts them by location.
+    pub inputs: Vec<GfxInput>,
+    pub scalar_params: Vec<GfxScalar>,
+    /// Names of the `buffer<f32>` params. The parser checks writability.
+    pub buf_params: Vec<String>,
+    /// Vertex varying output types. Empty for fragment and position-only vertex stages.
+    pub varyings: Vec<GfxTy>,
+    pub locals: Vec<(String, GfxTy)>,
+    pub body: Vec<IrStmt>,
+    /// Vertex: `[position, varyings…]`. Fragment: `[color]`.
+    pub ret: Vec<IrExpr>,
+}
+
+#[derive(Debug)]
+pub struct GraphicsModule {
+    pub entry: GraphicsEntry,
 }

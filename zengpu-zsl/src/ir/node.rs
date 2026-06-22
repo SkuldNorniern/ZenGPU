@@ -10,8 +10,16 @@ pub enum IrExpr {
     Local(String),
     ScalarParam(String),
     BufferLoad { buf: String, index: Box<IrExpr> },
-    /// `global_id().{x|y|z}` maps to component `0`, `1` or `2`.
+    /// Component 0, 1 or 2. Compute only.
     GlobalId(u32),
+    Input(String),
+    FieldAccess { base: Box<IrExpr>, component: u32 },
+    /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
+    VecConstruct { dim: u8, args: Vec<IrExpr> },
+    /// `vec3.extend(scalar)` returns an `f32x4`.
+    Extend { base: Box<IrExpr>, scalar: Box<IrExpr> },
+    /// `dot(a, b)` returns a scalar.
+    Dot { a: Box<IrExpr>, b: Box<IrExpr> },
     /// A built-in math call, such as `abs`, `min` or `clamp`.
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     Neg(Box<IrExpr>),
@@ -61,6 +69,28 @@ pub enum BuiltinFn {
     Pow,
     Clamp,
     Mix,
+    Normalize,
+    Length,
+}
+
+impl BuiltinFn {
+    pub fn name(self) -> &'static str {
+        match self {
+            BuiltinFn::Abs => "abs",
+            BuiltinFn::Sign => "sign",
+            BuiltinFn::Sqrt => "sqrt",
+            BuiltinFn::Floor => "floor",
+            BuiltinFn::Ceil => "ceil",
+            BuiltinFn::Fract => "fract",
+            BuiltinFn::Min => "min",
+            BuiltinFn::Max => "max",
+            BuiltinFn::Pow => "pow",
+            BuiltinFn::Clamp => "clamp",
+            BuiltinFn::Mix => "mix",
+            BuiltinFn::Normalize => "normalize",
+            BuiltinFn::Length => "length",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
