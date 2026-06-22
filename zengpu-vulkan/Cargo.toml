@@ -15,7 +15,7 @@ categories.workspace = true
 zengpu-hal.workspace = true
 zengpu-spv.workspace = true
 ash = "0.38"
-raw-window-handle = "0.6"
+zen-window-handle.workspace = true
 log.workspace = true
 
 # Native ZSL shaders for the in-crate tests and the pipeline_repro example.
