@@ -6,13 +6,14 @@
 //! next commit once the surface extension story is settled.
 
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BufferDesc, BufferHandle, DeviceRequest, GpuAdapter, GpuDevice,
-    GpuError, GpuInstance, HalCapabilities, Result, SamplerDesc, SamplerHandle, TextureDesc,
+    AdapterInfo, AdapterRequest, Bindings, BufferDesc, BufferHandle, ComputePipelineDesc,
+    DeviceRequest, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, PipelineHandle,
+    Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, ShaderSource, TextureDesc,
     TextureHandle,
 };
 
 #[cfg(target_os = "macos")]
-use zengpu_hal::{BackendPreference, DeviceType, SlotMap, marker};
+use zengpu_hal::{BackendPreference, DeviceType, Scalar, SlotMap, marker};
 
 // ── MetalInstance ─────────────────────────────────────────────────────────────
 
@@ -123,6 +124,8 @@ impl GpuAdapter for MetalAdapter {
                     device,
                     queue,
                     buffers: std::sync::Mutex::new(SlotMap::default()),
+                    shaders: std::sync::Mutex::new(SlotMap::default()),
+                    pipelines: std::sync::Mutex::new(SlotMap::default()),
                 },
             }))
         }
@@ -146,11 +149,24 @@ struct MetalBuffer {
 }
 
 #[cfg(target_os = "macos")]
+struct MetalShader {
+    library: metal::Library,
+}
+
+#[cfg(target_os = "macos")]
+struct MetalPipeline {
+    state: metal::ComputePipelineState,
+    /// Threadgroup size (`@workgroup_size`), used as threads-per-threadgroup.
+    block: [u32; 3],
+}
+
+#[cfg(target_os = "macos")]
 struct MacDevice {
     device: metal::Device,
-    #[allow(dead_code)] // used once compute/graphics submission lands
     queue: metal::CommandQueue,
     buffers: std::sync::Mutex<SlotMap<marker::Buffer, MetalBuffer>>,
+    shaders: std::sync::Mutex<SlotMap<marker::Shader, MetalShader>>,
+    pipelines: std::sync::Mutex<SlotMap<marker::Pipeline, MetalPipeline>>,
 }
 
 /// An opened Metal device. Buffers today; compute/graphics submission and the
@@ -274,6 +290,177 @@ impl GpuDevice for MetalDevice {
     }
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
+
+    // ── Compute ─────────────────────────────────────────────────────────────
+
+    fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        #[cfg(target_os = "macos")]
+        {
+            let ShaderSource::Msl(bytes) = desc.source else {
+                return Err(GpuError::Backend(
+                    "metal: only ShaderSource::Msl is supported (use zsl_msl!)".into(),
+                ));
+            };
+            let source = std::str::from_utf8(bytes)
+                .map_err(|_| GpuError::Backend("metal: MSL source is not valid UTF-8".into()))?;
+            let library = self
+                .inner
+                .device
+                .new_library_with_source(source, &metal::CompileOptions::new())
+                .map_err(|e| GpuError::Backend(format!("metal: MSL compile failed: {e}")))?;
+            let mut shaders = self.inner.shaders.lock().map_err(|_| GpuError::DeviceLost)?;
+            Ok(shaders.insert(MetalShader { library }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = desc;
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
+    }
+
+    fn destroy_shader(&self, shader: ShaderHandle) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut shaders) = self.inner.shaders.lock() {
+                shaders.remove(shader);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = shader;
+        }
+    }
+
+    fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        #[cfg(target_os = "macos")]
+        {
+            let function = {
+                let shaders = self.inner.shaders.lock().map_err(|_| GpuError::DeviceLost)?;
+                let shader = shaders
+                    .get(desc.shader)
+                    .ok_or_else(|| GpuError::Backend("metal: invalid shader handle".into()))?;
+                shader
+                    .library
+                    .get_function(desc.entry, None)
+                    .map_err(|e| GpuError::Backend(format!("metal: function `{}`: {e}", desc.entry)))?
+            };
+            let state = self
+                .inner
+                .device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| GpuError::Backend(format!("metal: pipeline: {e}")))?;
+            let mut pipelines = self.inner.pipelines.lock().map_err(|_| GpuError::DeviceLost)?;
+            Ok(pipelines.insert(MetalPipeline { state, block: desc.block }))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = desc;
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
+    }
+
+    fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(mut pipelines) = self.inner.pipelines.lock() {
+                pipelines.remove(pipeline);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pipeline;
+        }
+    }
+
+    fn dispatch(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
+        #[cfg(target_os = "macos")]
+        {
+            self.dispatch_one(pipeline, bindings, grid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (pipeline, bindings, grid);
+            Err(GpuError::Backend("metal: unavailable".into()))
+        }
+    }
+}
+
+// ── Compute dispatch (macOS) ────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+impl MetalDevice {
+    /// Encode + submit one compute dispatch, blocking until completion. Buffers
+    /// in `bindings.buffers` (slot indices) bind to `[[buffer(0..n)]]`; scalars
+    /// pack into a `Push` struct at `[[buffer(n)]]`; `grid` is the threadgroup
+    /// count and the pipeline's `block` is threads-per-threadgroup.
+    fn dispatch_one(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
+        let pipelines = self.inner.pipelines.lock().map_err(|_| GpuError::DeviceLost)?;
+        let pipe = pipelines
+            .get(pipeline)
+            .ok_or_else(|| GpuError::Backend("metal: invalid pipeline handle".into()))?;
+        let buffers = self.inner.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+
+        let cmd = self.inner.queue.new_command_buffer();
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&pipe.state);
+
+        for (i, &slot) in bindings.buffers.iter().enumerate() {
+            let b = buffers
+                .get_by_slot_index(slot)
+                .ok_or_else(|| GpuError::Backend("metal: invalid buffer slot in bindings".into()))?;
+            enc.set_buffer(i as u64, Some(&b.buf), 0);
+        }
+
+        if !bindings.scalars.is_empty() {
+            let packed = pack_scalars(bindings.scalars);
+            enc.set_bytes(
+                bindings.buffers.len() as u64,
+                packed.len() as u64,
+                packed.as_ptr() as *const std::ffi::c_void,
+            );
+        }
+
+        let tg = metal::MTLSize {
+            width: grid[0] as u64,
+            height: grid[1] as u64,
+            depth: grid[2] as u64,
+        };
+        let tptg = metal::MTLSize {
+            width: pipe.block[0] as u64,
+            height: pipe.block[1] as u64,
+            depth: pipe.block[2] as u64,
+        };
+        enc.dispatch_thread_groups(tg, tptg);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+        Ok(())
+    }
+}
+
+/// Pack inline scalars into a tightly-laid-out `Push` struct (4 bytes each,
+/// matching the MSL `struct Push` field order the ZSL→MSL backend emits).
+#[cfg(target_os = "macos")]
+fn pack_scalars(scalars: &[Scalar]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(scalars.len() * 4);
+    for s in scalars {
+        match s {
+            Scalar::U32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Scalar::I32(v) => out.extend_from_slice(&v.to_le_bytes()),
+            Scalar::F32(v) => out.extend_from_slice(&v.to_le_bytes()),
+        }
+    }
+    out
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -331,5 +518,77 @@ mod tests {
     fn bytemuck_cast(data: &[f32]) -> &[u8] {
         // SAFETY: f32 has no padding/invalid bit patterns; viewing as bytes is sound.
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn vec_add_compute_on_metal() {
+        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
+        use zengpu_spirv::zsl_msl;
+
+        const MSL: &str = zsl_msl!(
+            push P { n: u32 }
+            @workgroup_size(256)
+            kernel add(
+                a: device buffer<f32>,
+                b: device buffer<f32>,
+                out: device mut buffer<f32>,
+                p: P,
+                id: global_id,
+            ) {
+                let i = id.x
+                if i < p.n {
+                    out[i] = a[i] + b[i]
+                }
+            }
+        );
+
+        let inst = MetalInstance::new();
+        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let device = adapter.open(DeviceRequest::default()).expect("open");
+
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [10.0f32, 20.0, 30.0, 40.0];
+        let n = a.len();
+        let bytes = (n * 4) as u64;
+
+        let mk = |usage| {
+            device
+                .create_buffer(BufferDesc { size: bytes, usage, memory: MemoryUsage::Upload })
+                .expect("buffer")
+        };
+        let ba = mk(BufferUsage::STORAGE);
+        let bb = mk(BufferUsage::STORAGE);
+        let bout = mk(BufferUsage::STORAGE | BufferUsage::READBACK);
+        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+
+        let shader = device.create_shader(ShaderDesc::msl(MSL)).expect("shader");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [256, 1, 1],
+            })
+            .expect("pipeline");
+
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[ba.index(), bb.index(), bout.index()],
+                    textures: &[],
+                    scalars: &[Scalar::U32(n as u32)],
+                },
+                [1, 1, 1],
+            )
+            .expect("dispatch");
+
+        let out = device.read_buffer(bout, 0, bytes).expect("read");
+        let result: &[f32] =
+            unsafe { std::slice::from_raw_parts(out.as_ptr() as *const f32, n) };
+        assert_eq!(result, &[11.0, 22.0, 33.0, 44.0]);
     }
 }
