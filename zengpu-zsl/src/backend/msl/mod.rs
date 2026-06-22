@@ -10,8 +10,10 @@
 //! thread id is `[[thread_position_in_grid]]`.
 
 pub mod compute;
+pub mod graphics;
 
 pub use compute::lower_compute;
+pub use graphics::lower_graphics;
 
 /// Emitted MSL plus the metadata the Metal backend needs to bind and dispatch.
 pub struct MslShader {
