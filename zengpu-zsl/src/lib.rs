@@ -2,11 +2,10 @@
 
 extern crate proc_macro;
 
-mod ast;
+mod frontend;
 mod lower;
 mod lower_graphics;
 mod spirv;
-mod types;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span};
@@ -16,7 +15,7 @@ use syn::{
     spanned::Spanned,
 };
 
-use ast::{Stage, ZslEntryPoint};
+use frontend::ast::{Stage, ZslEntryPoint};
 
 /// ZSL input: outer attributes and a fn item.
 struct ZslInput {
