@@ -1,48 +1,25 @@
 //! Window-handle bridge for presentable surfaces.
 //!
-//! [`WindowHandles`] bridges any `raw-window-handle`-capable window (aurea,
-//! winit, etc.) to ZenGPU without pulling consumer types into the public API
-//! Surfaces themselves are concrete per-feature backend types
-//! (for example a UI painter or 3D renderer) built on top of this — a
-//! generic `GpuSurface`/`Surface` HAL trait is deferred until a second graphics
-//! backend exists to shape it.
+//! [`WindowHandles`] carries the platform-native window + display handles a GPU
+//! backend needs to create a presentable surface, using the dependency-free
+//! [`zen_window_handle`] types (no `raw-window-handle` in the library). A
+//! windowing library (winit today, an in-house one later) produces these; the
+//! caller must guarantee the underlying window outlives any surface built from
+//! them.
 
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+pub use zen_window_handle::{DisplayHandle, WindowHandle};
 
-/// Platform window and display handles extracted from any window that
-/// implements [`raw_window_handle::HasWindowHandle`] +
-/// [`raw_window_handle::HasDisplayHandle`].
-///
-/// Holds raw (lifetime-erased) handles; the caller must guarantee the
-/// underlying window outlives any surface created from these handles.
+/// Platform window and display handles for presentable-surface creation.
 #[derive(Clone, Copy)]
 pub struct WindowHandles {
-    pub window: RawWindowHandle,
-    pub display: RawDisplayHandle,
+    pub window: WindowHandle,
+    pub display: DisplayHandle,
 }
 
-// raw-window-handle 0.6 marks RawWindowHandle and RawDisplayHandle as
-// Send + Sync, so WindowHandles inherits those impls automatically.
-
 impl WindowHandles {
-    /// Extract raw handles from any window.
-    ///
-    /// # Errors
-    /// Returns the `HandleError` from `raw-window-handle` if the window is
-    /// not backed by a real OS handle (e.g. a headless mock).
-    pub fn from_window<W>(window: &W) -> core::result::Result<Self, raw_window_handle::HandleError>
-    where
-        W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
-    {
-        Ok(Self {
-            window: window.window_handle()?.as_raw(),
-            display: window.display_handle()?.as_raw(),
-        })
-    }
-
-    /// Construct directly from raw handles.  The caller must ensure the
+    /// Construct directly from platform handles. The caller must ensure the
     /// underlying window outlives any surface created from these handles.
-    pub fn from_raw(window: RawWindowHandle, display: RawDisplayHandle) -> Self {
+    pub fn from_raw(window: WindowHandle, display: DisplayHandle) -> Self {
         Self { window, display }
     }
 }
