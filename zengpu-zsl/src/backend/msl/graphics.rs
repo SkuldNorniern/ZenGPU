@@ -12,6 +12,10 @@ use crate::backend::msl::{ENTRY, MslShader};
 use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
 use crate::ir::{GfxTy, GraphicsModule};
 
+/// Push-constant buffer index for graphics shaders. High so it never overlaps vertex buffers; the
+/// Metal HAL binds to this same index.
+pub const PUSH_BUFFER_INDEX: u32 = 16;
+
 pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
     let e = &module.entry;
     let locals: HashMap<&str, GfxTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
@@ -45,7 +49,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
         s.push_str("};\n\n");
     }
 
-    let push_arg = |slot: u32| format!("constant Push& pc [[buffer({slot})]]");
+    let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
 
     if e.is_fragment {
         let _ = writeln!(s, "fragment float4 {ENTRY}(");
@@ -54,7 +58,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
         if has_push {
-            args.push(format!("    {}", push_arg(0)));
+            args.push(format!("    {push_arg}"));
         }
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
@@ -77,7 +81,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
         if has_push {
-            args.push(format!("    {}", push_arg(0)));
+            args.push(format!("    {push_arg}"));
         }
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
