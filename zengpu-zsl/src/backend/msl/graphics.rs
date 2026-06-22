@@ -14,6 +14,11 @@ use crate::backend::msl::{ENTRY, MslShader};
 use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
 use crate::ir::{GfxTy, GraphicsModule};
 
+/// Buffer index for the push-constant block in graphics shaders. Kept high so it
+/// never overlaps vertex geometry buffers bound for `[[stage_in]]`. The Metal
+/// HAL backend binds the push constant to this same index.
+pub const PUSH_BUFFER_INDEX: u32 = 16;
+
 /// Lower a graphics [`GraphicsModule`] to MSL.
 pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
     let e = &module.entry;
@@ -50,7 +55,10 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
         s.push_str("};\n\n");
     }
 
-    let push_arg = |slot: u32| format!("constant Push& pc [[buffer({slot})]]");
+    // The push constant binds at a high, fixed buffer index so it never
+    // collides with vertex geometry buffers (which occupy `[[buffer(0..)]]` via
+    // the `[[stage_in]]` vertex descriptor). The Metal backend binds to match.
+    let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
 
     if e.is_fragment {
         // fragment <ret> zsl_main(StageIn in [[stage_in]], ...)
@@ -60,7 +68,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
         if has_push {
-            args.push(format!("    {}", push_arg(0)));
+            args.push(format!("    {push_arg}"));
         }
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
@@ -84,7 +92,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
         if has_push {
-            args.push(format!("    {}", push_arg(0)));
+            args.push(format!("    {push_arg}"));
         }
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
