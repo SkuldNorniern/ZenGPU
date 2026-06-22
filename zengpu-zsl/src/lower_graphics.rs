@@ -34,9 +34,9 @@ use syn::{
     Stmt, UnOp, spanned::Spanned,
 };
 
-use crate::ast::{ZslEntryPoint, ZslParam};
+use crate::frontend::ast::{ZslEntryPoint, ZslParam};
+use crate::frontend::types::ZslType;
 use crate::spirv::{Id, SpvBuilder, builtin, deco, sc};
-use crate::types::ZslType;
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
@@ -215,7 +215,7 @@ fn lower_graphics(
             ZslType::Buf(e) | ZslType::BufMut(e) => e,
             _ => unreachable!(),
         };
-        if !matches!(elem, crate::types::BufElem::F32) {
+        if !matches!(elem, crate::frontend::types::BufElem::F32) {
             return Err((
                 Span::call_site(),
                 format!(
