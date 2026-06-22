@@ -168,7 +168,7 @@ fn compile_native_zsl_msl(src: &str) -> Result<String, String> {
     use frontend::parser::Shader;
     match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
         Shader::Compute(m) => Ok(backend::msl::lower_compute(&m).source),
-        Shader::Graphics(_) => Err("ZSL→MSL: graphics shaders not yet supported".to_string()),
+        Shader::Graphics(m) => Ok(backend::msl::lower_graphics(&m).source),
     }
 }
 
