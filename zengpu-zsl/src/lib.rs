@@ -215,9 +215,11 @@ pub fn zsl(input: TokenStream) -> TokenStream {
 }
 
 fn compile_native_zsl(src: &str) -> Result<Vec<u32>, String> {
-    let module = frontend::parser::parse_compute(src)
-        .map_err(|e| format!("ZSL parse error: {}", e.msg))?;
-    backend::spirv::lower_compute(&module).map_err(|(_, msg)| msg)
+    use frontend::parser::Shader;
+    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
+        Shader::Compute(m) => backend::spirv::lower_compute(&m).map_err(|(_, msg)| msg),
+        Shader::Graphics(m) => backend::spirv::graphics_ir::lower_graphics(&m),
+    }
 }
 
 /// Build the `&[u32]` literal token stream without `quote`.

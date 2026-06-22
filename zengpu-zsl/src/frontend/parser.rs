@@ -23,7 +23,10 @@ use std::collections::HashMap;
 
 use crate::frontend::lex::{Tok, Token, lex};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{Entry, EntryKind, Module, Mutability, Param, ParamKind, ScalarTy};
+use crate::ir::{
+    Entry, EntryKind, GfxInput, GfxScalar, GfxTy, GraphicsEntry, GraphicsModule, Module, Mutability,
+    Param, ParamKind, ScalarTy,
+};
 
 /// A parse error: a message and the byte offset where it occurred (if known).
 #[derive(Debug, Clone, PartialEq)]
@@ -32,24 +35,45 @@ pub struct ParseError {
     pub at: Option<usize>,
 }
 
-/// Parse native ZSL compute source into a [`Module`].
-pub fn parse_compute(src: &str) -> Result<Module, ParseError> {
+/// A parsed shader: a compute kernel or a graphics (vertex/fragment) entry.
+pub enum Shader {
+    Compute(Module),
+    Graphics(GraphicsModule),
+}
+
+/// Parse native ZSL source, dispatching on the entry keyword
+/// (`kernel`/`vertex`/`fragment`).
+pub fn parse_zsl(src: &str) -> Result<Shader, ParseError> {
     let toks = lex(src).map_err(|e| ParseError {
         msg: e.msg,
         at: Some(e.at),
     })?;
     let mut p = Parser::new(&toks);
-    p.parse_module()
+    p.parse_shader()
+}
+
+/// Parse native ZSL compute source into a [`Module`]. Convenience wrapper over
+/// [`parse_zsl`] used by tests; the macro shell dispatches via [`parse_zsl`].
+#[allow(dead_code)]
+pub fn parse_compute(src: &str) -> Result<Module, ParseError> {
+    match parse_zsl(src)? {
+        Shader::Compute(m) => Ok(m),
+        Shader::Graphics(_) => Err(ParseError {
+            msg: "expected a compute `kernel`, found a graphics entry".into(),
+            at: None,
+        }),
+    }
 }
 
 struct Parser<'a> {
     toks: &'a [Token],
     pos: usize,
-    /// Push-block definitions: struct name → ordered (field, type).
-    pushes: HashMap<String, Vec<(String, ScalarTy)>>,
+    /// Push-block definitions: struct name → ordered (field, type). Stored as
+    /// the graphics-superset [`GfxTy`]; compute narrows to scalar fields.
+    pushes: HashMap<String, Vec<(String, GfxTy)>>,
 }
 
-/// Resolved symbol tables for the body being parsed.
+/// Resolved symbol tables for the compute body being parsed.
 struct Ctx {
     buffers: HashMap<String, bool>,       // name → writable
     scalars: HashMap<String, ScalarTy>,   // push-field name → type
@@ -57,6 +81,16 @@ struct Ctx {
     id_param: Option<String>,             // the `id: global_id` param name
     locals: HashMap<String, ScalarTy>,    // name → type (accumulated)
     locals_order: Vec<(String, ScalarTy)>,
+}
+
+/// Resolved symbol tables for a graphics (vertex/fragment) body.
+struct GfxCtx {
+    inputs: HashMap<String, GfxTy>,    // @location input name → type
+    scalars: HashMap<String, GfxTy>,   // push-field name → type
+    push_param: Option<String>,        // the push param name
+    buffers: HashMap<String, bool>,    // name → writable
+    locals: HashMap<String, GfxTy>,
+    locals_order: Vec<(String, GfxTy)>,
 }
 
 impl<'a> Parser<'a> {
@@ -130,7 +164,7 @@ impl<'a> Parser<'a> {
 
     // ── Module ───────────────────────────────────────────────────────────────
 
-    fn parse_module(&mut self) -> Result<Module, ParseError> {
+    fn parse_shader(&mut self) -> Result<Shader, ParseError> {
         // Optional `module dotted.path`.
         if self.eat_kw("module") {
             self.ident()?;
@@ -144,7 +178,7 @@ impl<'a> Parser<'a> {
             self.parse_push_block()?;
         }
 
-        // Attributes (only @workgroup_size today).
+        // Attributes (only @workgroup_size today, for compute).
         let mut local_size = [1u32, 1, 1];
         while self.eat(&Tok::At) {
             let name = self.ident()?;
@@ -156,11 +190,21 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "`)`")?;
         }
 
-        if !self.eat_kw("kernel") {
-            return self.err("expected `kernel`");
+        if self.eat_kw("kernel") {
+            let _name = self.ident()?;
+            Ok(Shader::Compute(self.parse_kernel_rest(local_size)?))
+        } else if self.eat_kw("vertex") {
+            let _name = self.ident()?;
+            Ok(Shader::Graphics(self.parse_graphics_rest(false)?))
+        } else if self.eat_kw("fragment") {
+            let _name = self.ident()?;
+            Ok(Shader::Graphics(self.parse_graphics_rest(true)?))
+        } else {
+            self.err("expected `kernel`, `vertex`, or `fragment`")
         }
-        let _name = self.ident()?;
+    }
 
+    fn parse_kernel_rest(&mut self, local_size: [u32; 3]) -> Result<Module, ParseError> {
         let mut ctx = Ctx {
             buffers: HashMap::new(),
             scalars: HashMap::new(),
@@ -215,7 +259,7 @@ impl<'a> Parser<'a> {
         while !self.eat(&Tok::RBrace) {
             let field = self.ident()?;
             self.expect(&Tok::Colon, "`:` after field name")?;
-            let ty = self.parse_scalar_type()?;
+            let ty = self.parse_any_type()?;
             fields.push((field, ty));
             self.eat(&Tok::Comma); // optional separator
             if self.peek().is_none() {
@@ -233,6 +277,31 @@ impl<'a> Parser<'a> {
             "f32" => Ok(ScalarTy::F32),
             "bool" => Ok(ScalarTy::Bool),
             other => self.err(format!("unsupported scalar type `{other}`; use u32, f32, or bool")),
+        }
+    }
+
+    /// Parse any value type (scalar/vector/matrix), used for push fields and
+    /// graphics declarations: `f32`, `u32`, `f32x2/3/4`, `mat4x4<f32>`.
+    fn parse_any_type(&mut self) -> Result<GfxTy, ParseError> {
+        let name = self.ident()?;
+        match name.as_str() {
+            "f32" => Ok(GfxTy::F32),
+            "u32" => Ok(GfxTy::U32),
+            "f32x2" => Ok(GfxTy::Vec2),
+            "f32x3" => Ok(GfxTy::Vec3),
+            "f32x4" => Ok(GfxTy::Vec4),
+            "mat4x4" => {
+                self.expect(&Tok::Lt, "`<` in mat4x4<…>")?;
+                let elem = self.ident()?;
+                if elem != "f32" {
+                    return self.err("only mat4x4<f32> is supported");
+                }
+                self.expect(&Tok::Gt, "`>` in mat4x4<…>")?;
+                Ok(GfxTy::Mat4)
+            }
+            other => self.err(format!(
+                "unsupported type `{other}`; use f32/u32/f32x2/f32x3/f32x4/mat4x4<f32>"
+            )),
         }
     }
 
@@ -306,7 +375,15 @@ impl<'a> Parser<'a> {
                 return self.err("only one push parameter is supported");
             }
             ctx.push_param = Some(name.to_string());
-            for (field, ty) in fields {
+            for (field, gty) in fields {
+                let ty = match gty {
+                    GfxTy::U32 => ScalarTy::U32,
+                    GfxTy::F32 => ScalarTy::F32,
+                    _ => {
+                        return self
+                            .err(format!("compute push field `{field}` must be u32 or f32"));
+                    }
+                };
                 ctx.scalars.insert(field.clone(), ty);
                 params.push(Param {
                     name: field,
@@ -569,6 +646,486 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| ParseError { msg: format!("unknown function `{name}`"), at: self.span() })?;
         Ok(IrExpr::Builtin { func, args })
     }
+
+    // ── Graphics (vertex/fragment) ─────────────────────────────────────────────
+
+    fn parse_graphics_rest(&mut self, is_fragment: bool) -> Result<GraphicsModule, ParseError> {
+        let mut ctx = GfxCtx {
+            inputs: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            buffers: HashMap::new(),
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+        };
+        let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx)?;
+
+        self.expect(&Tok::Arrow, "`->` return type")?;
+        let ret_types = self.parse_ret_types()?;
+        if ret_types[0] != GfxTy::Vec4 {
+            return self.err("first return type must be f32x4 (position/color)");
+        }
+        let varyings: Vec<GfxTy> = if is_fragment {
+            Vec::new()
+        } else {
+            ret_types[1..].to_vec()
+        };
+
+        let (body, ret) = self.parse_gfx_body(&mut ctx, &varyings)?;
+        if self.pos != self.toks.len() {
+            return self.err("unexpected trailing tokens after entry point");
+        }
+        Ok(GraphicsModule {
+            entry: GraphicsEntry {
+                is_fragment,
+                inputs,
+                scalar_params,
+                buf_params,
+                varyings,
+                locals: ctx.locals_order,
+                body,
+                ret,
+            },
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parse_gfx_params(
+        &mut self,
+        ctx: &mut GfxCtx,
+    ) -> Result<(Vec<GfxInput>, Vec<GfxScalar>, Vec<String>), ParseError> {
+        self.expect(&Tok::LParen, "`(` after entry name")?;
+        let mut inputs = Vec::new();
+        let mut scalar_params = Vec::new();
+        let mut buf_params = Vec::new();
+        while !self.eat(&Tok::RParen) {
+            // Optional @location(N).
+            let mut location = None;
+            if self.eat(&Tok::At) {
+                let a = self.ident()?;
+                if a != "location" {
+                    return self.err("only @location is supported on parameters");
+                }
+                self.expect(&Tok::LParen, "`(`")?;
+                location = Some(match self.peek() {
+                    Some(Tok::Int(v)) => {
+                        let v = *v as u32;
+                        self.pos += 1;
+                        v
+                    }
+                    _ => return self.err("expected location index"),
+                });
+                self.expect(&Tok::RParen, "`)`")?;
+            }
+            let name = self.ident()?;
+            self.expect(&Tok::Colon, "`:` after param name")?;
+            if let Some(loc) = location {
+                let ty = self.parse_any_type()?;
+                if matches!(ty, GfxTy::Mat4) {
+                    return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
+                }
+                ctx.inputs.insert(name.clone(), ty);
+                inputs.push(GfxInput { name, location: loc, ty });
+            } else if self.eat_kw("device") {
+                let writable = self.eat_kw("mut");
+                if !self.eat_kw("buffer") {
+                    return self.err("expected `buffer`");
+                }
+                self.expect(&Tok::Lt, "`<`")?;
+                let elem = self.parse_any_type()?;
+                self.expect(&Tok::Gt, "`>`")?;
+                if elem != GfxTy::F32 {
+                    return self.err("only buffer<f32> is supported");
+                }
+                ctx.buffers.insert(name.clone(), writable);
+                buf_params.push(name);
+            } else {
+                let struct_name = self.ident()?;
+                let fields = self.pushes.get(&struct_name).cloned().ok_or_else(|| ParseError {
+                    msg: format!("unknown type `{struct_name}` (no matching push block)"),
+                    at: self.span(),
+                })?;
+                if ctx.push_param.is_some() {
+                    return self.err("only one push parameter is supported");
+                }
+                ctx.push_param = Some(name);
+                for (field, gty) in fields {
+                    if !matches!(gty, GfxTy::F32 | GfxTy::U32 | GfxTy::Mat4) {
+                        return self
+                            .err(format!("graphics push field `{field}` must be f32/u32/mat4x4"));
+                    }
+                    ctx.scalars.insert(field.clone(), gty);
+                    scalar_params.push(GfxScalar { name: field, ty: gty });
+                }
+            }
+            self.eat(&Tok::Comma);
+            if self.peek().is_none() {
+                return self.err("unterminated parameter list");
+            }
+        }
+        Ok((inputs, scalar_params, buf_params))
+    }
+
+    /// Parse a return type: `type` or `( type, type, … )`, each optionally
+    /// prefixed by an attribute (`@location(0)` / `@builtin(position)`).
+    fn parse_ret_types(&mut self) -> Result<Vec<GfxTy>, ParseError> {
+        if self.eat(&Tok::LParen) {
+            let mut v = vec![self.parse_ret_one()?];
+            while self.eat(&Tok::Comma) {
+                if self.peek() == Some(&Tok::RParen) {
+                    break;
+                }
+                v.push(self.parse_ret_one()?);
+            }
+            self.expect(&Tok::RParen, "`)`")?;
+            Ok(v)
+        } else {
+            Ok(vec![self.parse_ret_one()?])
+        }
+    }
+
+    fn parse_ret_one(&mut self) -> Result<GfxTy, ParseError> {
+        if self.eat(&Tok::At) {
+            let _attr = self.ident()?;
+            self.expect(&Tok::LParen, "`(`")?;
+            while !self.eat(&Tok::RParen) {
+                if self.peek().is_none() {
+                    return self.err("unterminated attribute");
+                }
+                self.pos += 1;
+            }
+        }
+        self.parse_any_type()
+    }
+
+    fn parse_gfx_body(
+        &mut self,
+        ctx: &mut GfxCtx,
+        varyings: &[GfxTy],
+    ) -> Result<(Vec<IrStmt>, Vec<IrExpr>), ParseError> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut body = Vec::new();
+        let expected = 1 + varyings.len();
+        loop {
+            match self.peek() {
+                None => return self.err("unterminated block"),
+                Some(Tok::RBrace) => {
+                    return self.err("vertex/fragment body needs a tail expression");
+                }
+                _ => {}
+            }
+            if self.eat_kw("let") {
+                body.push(self.parse_gfx_let(ctx)?);
+                continue;
+            }
+            if self.eat_kw("if") {
+                body.push(self.parse_gfx_if(ctx)?);
+                continue;
+            }
+            // Tuple tail `(a, b, …)` (or a parenthesized single expression).
+            let tail = if self.peek() == Some(&Tok::LParen) {
+                self.parse_gfx_tail(ctx)?
+            } else {
+                let e = self.parse_g_expr(ctx)?;
+                if self.eat(&Tok::Eq) {
+                    let rhs = self.parse_g_expr(ctx)?;
+                    body.push(self.gfx_assign(ctx, e, rhs)?);
+                    continue;
+                }
+                vec![e]
+            };
+            self.expect(&Tok::RBrace, "`}` after tail expression")?;
+            if tail.len() != expected {
+                return self.err(format!(
+                    "return has {} value(s), expected {} (position + {} varyings)",
+                    tail.len(),
+                    expected,
+                    varyings.len()
+                ));
+            }
+            return Ok((body, tail));
+        }
+    }
+
+    fn parse_gfx_tail(&mut self, ctx: &GfxCtx) -> Result<Vec<IrExpr>, ParseError> {
+        let save = self.pos;
+        self.pos += 1; // consume `(`
+        let first = self.parse_g_expr(ctx)?;
+        if self.peek() == Some(&Tok::Comma) {
+            let mut elems = vec![first];
+            while self.eat(&Tok::Comma) {
+                if self.peek() == Some(&Tok::RParen) {
+                    break;
+                }
+                elems.push(self.parse_g_expr(ctx)?);
+            }
+            self.expect(&Tok::RParen, "`)`")?;
+            Ok(elems)
+        } else {
+            // Parenthesized single expression — backtrack and parse normally.
+            self.pos = save;
+            Ok(vec![self.parse_g_expr(ctx)?])
+        }
+    }
+
+    fn parse_gfx_stmts(&mut self, ctx: &mut GfxCtx) -> Result<Vec<IrStmt>, ParseError> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut stmts = Vec::new();
+        loop {
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            if self.peek().is_none() {
+                return self.err("unterminated block");
+            }
+            if self.eat_kw("let") {
+                stmts.push(self.parse_gfx_let(ctx)?);
+                continue;
+            }
+            if self.eat_kw("if") {
+                stmts.push(self.parse_gfx_if(ctx)?);
+                continue;
+            }
+            let e = self.parse_g_expr(ctx)?;
+            self.expect(&Tok::Eq, "`=` (block statements must be assignments)")?;
+            let rhs = self.parse_g_expr(ctx)?;
+            stmts.push(self.gfx_assign(ctx, e, rhs)?);
+        }
+        Ok(stmts)
+    }
+
+    fn parse_gfx_let(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
+        let name = self.ident()?;
+        let annot = if self.eat(&Tok::Colon) {
+            Some(self.parse_any_type()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::Eq, "`=` in let binding")?;
+        let init = self.parse_g_expr(ctx)?;
+        let ty = annot.unwrap_or_else(|| infer_gfx_ty(&init, ctx));
+        ctx.locals.insert(name.clone(), ty);
+        ctx.locals_order.push((name.clone(), ty));
+        Ok(IrStmt::Let { name, init })
+    }
+
+    fn parse_gfx_if(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
+        let cond = self.parse_g_expr(ctx)?;
+        let then = self.parse_gfx_stmts(ctx)?;
+        let else_ = if self.eat_kw("else") {
+            Some(self.parse_gfx_stmts(ctx)?)
+        } else {
+            None
+        };
+        Ok(IrStmt::If { cond, then, else_ })
+    }
+
+    fn gfx_assign(&self, ctx: &GfxCtx, lhs: IrExpr, rhs: IrExpr) -> Result<IrStmt, ParseError> {
+        match lhs {
+            IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
+            IrExpr::BufferLoad { buf, index } => {
+                if !*ctx.buffers.get(&buf).unwrap_or(&false) {
+                    return self.err(format!("`{buf}` is read-only; declare it `device mut buffer`"));
+                }
+                Ok(IrStmt::AssignBuffer { buf, index: *index, value: rhs })
+            }
+            _ => self.err("invalid assignment target; use a local or buf[i]"),
+        }
+    }
+
+    // Graphics expression grammar (same precedence as compute, richer primaries).
+
+    fn parse_g_expr(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        self.parse_g_or(ctx)
+    }
+
+    fn parse_g_or(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_and(ctx)?;
+        while self.eat(&Tok::OrOr) {
+            let rhs = self.parse_g_and(ctx)?;
+            lhs = bin(IrBinOp::Or, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_g_and(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_cmp(ctx)?;
+        while self.eat(&Tok::AndAnd) {
+            let rhs = self.parse_g_cmp(ctx)?;
+            lhs = bin(IrBinOp::And, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_g_cmp(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let lhs = self.parse_g_add(ctx)?;
+        let op = match self.peek() {
+            Some(Tok::Lt) => IrBinOp::Lt,
+            Some(Tok::Le) => IrBinOp::Le,
+            Some(Tok::Gt) => IrBinOp::Gt,
+            Some(Tok::Ge) => IrBinOp::Ge,
+            Some(Tok::EqEq) => IrBinOp::Eq,
+            Some(Tok::Ne) => IrBinOp::Ne,
+            _ => return Ok(lhs),
+        };
+        self.pos += 1;
+        let rhs = self.parse_g_add(ctx)?;
+        Ok(bin(op, lhs, rhs))
+    }
+
+    fn parse_g_add(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_mul(ctx)?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => IrBinOp::Add,
+                Some(Tok::Minus) => IrBinOp::Sub,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_g_mul(ctx)?;
+            lhs = bin(op, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_g_mul(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_unary(ctx)?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => IrBinOp::Mul,
+                Some(Tok::Slash) => IrBinOp::Div,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_g_unary(ctx)?;
+            lhs = bin(op, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_g_unary(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        if self.eat(&Tok::Minus) {
+            return Ok(IrExpr::Neg(Box::new(self.parse_g_unary(ctx)?)));
+        }
+        self.parse_g_primary(ctx)
+    }
+
+    fn parse_g_primary(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        match self.peek() {
+            Some(Tok::Int(v)) => {
+                let v = *v as u32;
+                self.pos += 1;
+                self.parse_g_postfix(ctx, IrExpr::LitU32(v))
+            }
+            Some(Tok::Float(v)) => {
+                let v = *v as f32;
+                self.pos += 1;
+                self.parse_g_postfix(ctx, IrExpr::LitF32(v))
+            }
+            Some(Tok::LParen) => {
+                self.pos += 1;
+                let e = self.parse_g_expr(ctx)?;
+                self.expect(&Tok::RParen, "`)`")?;
+                self.parse_g_postfix(ctx, e)
+            }
+            Some(Tok::Ident(_)) => {
+                let name = self.ident()?;
+                if self.peek() == Some(&Tok::LParen) {
+                    let call = self.parse_g_call(ctx, &name)?;
+                    return self.parse_g_postfix(ctx, call);
+                }
+                // push.field
+                if ctx.push_param.as_deref() == Some(name.as_str()) {
+                    self.expect(&Tok::Dot, "`.field` on push parameter")?;
+                    let field = self.ident()?;
+                    if !ctx.scalars.contains_key(&field) {
+                        return self.err(format!("push struct has no field `{field}`"));
+                    }
+                    return Ok(IrExpr::ScalarParam(field));
+                }
+                // buf[i]
+                if ctx.buffers.contains_key(&name) {
+                    self.expect(&Tok::LBracket, "`[` to index a buffer")?;
+                    let index = self.parse_g_expr(ctx)?;
+                    self.expect(&Tok::RBracket, "`]`")?;
+                    return Ok(IrExpr::BufferLoad { buf: name, index: Box::new(index) });
+                }
+                let base = if ctx.inputs.contains_key(&name) {
+                    IrExpr::Input(name)
+                } else if ctx.locals.contains_key(&name) {
+                    IrExpr::Local(name)
+                } else {
+                    return self.err(format!("unknown identifier `{name}`"));
+                };
+                self.parse_g_postfix(ctx, base)
+            }
+            _ => self.err("expected an expression"),
+        }
+    }
+
+    fn parse_g_postfix(&mut self, ctx: &GfxCtx, mut base: IrExpr) -> Result<IrExpr, ParseError> {
+        while self.eat(&Tok::Dot) {
+            let field = self.ident()?;
+            if self.peek() == Some(&Tok::LParen) {
+                if field != "extend" {
+                    return self.err(format!("unknown method `.{field}()`; use `.extend()`"));
+                }
+                self.expect(&Tok::LParen, "`(`")?;
+                let arg = self.parse_g_expr(ctx)?;
+                self.expect(&Tok::RParen, "`)`")?;
+                base = IrExpr::Extend { base: Box::new(base), scalar: Box::new(arg) };
+            } else {
+                let component = match field.as_str() {
+                    "x" => 0u32,
+                    "y" => 1,
+                    "z" => 2,
+                    "w" => 3,
+                    other => return self.err(format!("unknown field `.{other}`; use .x/.y/.z/.w")),
+                };
+                base = IrExpr::FieldAccess { base: Box::new(base), component };
+            }
+        }
+        Ok(base)
+    }
+
+    fn parse_g_call(&mut self, ctx: &GfxCtx, name: &str) -> Result<IrExpr, ParseError> {
+        self.expect(&Tok::LParen, "`(`")?;
+        let mut args = Vec::new();
+        while !self.eat(&Tok::RParen) {
+            args.push(self.parse_g_expr(ctx)?);
+            self.eat(&Tok::Comma);
+            if self.peek().is_none() {
+                return self.err("unterminated call arguments");
+            }
+        }
+        match name {
+            "dot" => {
+                if args.len() != 2 {
+                    return self.err("dot(a, b) takes exactly 2 args");
+                }
+                let mut it = args.into_iter();
+                Ok(IrExpr::Dot {
+                    a: Box::new(it.next().unwrap()),
+                    b: Box::new(it.next().unwrap()),
+                })
+            }
+            "f32x2" | "f32x3" | "f32x4" => {
+                let dim = match name {
+                    "f32x2" => 2u8,
+                    "f32x3" => 3,
+                    _ => 4,
+                };
+                Ok(IrExpr::VecConstruct { dim, args })
+            }
+            _ => {
+                let func = gfx_builtin_from_name(name).ok_or_else(|| ParseError {
+                    msg: format!("unknown function `{name}`"),
+                    at: self.span(),
+                })?;
+                Ok(IrExpr::Builtin { func, args })
+            }
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -620,6 +1177,77 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
                     ScalarTy::F32
                 } else {
                     ScalarTy::U32
+                }
+            }
+        },
+        // Graphics-only IR nodes are never produced by the compute parser.
+        _ => ScalarTy::U32,
+    }
+}
+
+fn gfx_builtin_from_name(name: &str) -> Option<BuiltinFn> {
+    Some(match name {
+        "abs" => BuiltinFn::Abs,
+        "sign" => BuiltinFn::Sign,
+        "sqrt" => BuiltinFn::Sqrt,
+        "floor" => BuiltinFn::Floor,
+        "ceil" => BuiltinFn::Ceil,
+        "fract" => BuiltinFn::Fract,
+        "min" => BuiltinFn::Min,
+        "max" => BuiltinFn::Max,
+        "pow" => BuiltinFn::Pow,
+        "clamp" => BuiltinFn::Clamp,
+        "mix" => BuiltinFn::Mix,
+        "normalize" => BuiltinFn::Normalize,
+        "length" => BuiltinFn::Length,
+        _ => return None,
+    })
+}
+
+fn is_gfx_vec(t: GfxTy) -> bool {
+    matches!(t, GfxTy::Vec2 | GfxTy::Vec3 | GfxTy::Vec4)
+}
+
+/// Infer a graphics expression's type, mirroring the SPIR-V backend's `GVal`
+/// inference so a `let`'s declared type matches what the backend computes.
+fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
+    match expr {
+        IrExpr::LitU32(_) => GfxTy::U32,
+        IrExpr::LitF32(_) => GfxTy::F32,
+        IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(GfxTy::F32),
+        IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(GfxTy::F32),
+        IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(GfxTy::F32),
+        IrExpr::FieldAccess { .. } => GfxTy::F32,
+        IrExpr::VecConstruct { dim, .. } => match dim {
+            2 => GfxTy::Vec2,
+            3 => GfxTy::Vec3,
+            _ => GfxTy::Vec4,
+        },
+        IrExpr::Extend { base, .. } => match infer_gfx_ty(base, ctx) {
+            GfxTy::Vec2 => GfxTy::Vec3,
+            _ => GfxTy::Vec4,
+        },
+        IrExpr::Dot { .. } => GfxTy::F32,
+        IrExpr::BufferLoad { .. } => GfxTy::F32,
+        IrExpr::GlobalId(_) => GfxTy::U32,
+        IrExpr::Builtin { func, args } => match func {
+            BuiltinFn::Length => GfxTy::F32,
+            _ => args.first().map(|a| infer_gfx_ty(a, ctx)).unwrap_or(GfxTy::F32),
+        },
+        IrExpr::Neg(e) => infer_gfx_ty(e, ctx),
+        IrExpr::Binary { op, lhs, rhs } => match op {
+            IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne
+            | IrBinOp::And | IrBinOp::Or => GfxTy::F32, // invalid in value position; fallback
+            _ => {
+                let l = infer_gfx_ty(lhs, ctx);
+                let r = infer_gfx_ty(rhs, ctx);
+                match (l, r) {
+                    (GfxTy::Mat4, x) if is_gfx_vec(x) => x,
+                    (a, b) if a == b => a,
+                    (GfxTy::F32 | GfxTy::U32, x) if is_gfx_vec(x) => x,
+                    (x, GfxTy::F32 | GfxTy::U32) if is_gfx_vec(x) => x,
+                    _ if l == GfxTy::F32 || r == GfxTy::F32 => GfxTy::F32,
+                    _ => GfxTy::U32,
                 }
             }
         },
