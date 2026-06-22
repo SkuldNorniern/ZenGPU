@@ -199,7 +199,7 @@ impl GpuDevice for CpuDevice {
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         let bytes = match desc.source {
-            ShaderSource::Spirv(b) | ShaderSource::Ptx(b) => b,
+            ShaderSource::Spirv(b) | ShaderSource::Ptx(b) | ShaderSource::Msl(b) => b,
         };
         Ok(self.shaders.lock().unwrap().insert(bytes.to_vec()))
     }
