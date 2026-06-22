@@ -469,10 +469,133 @@ fn pack_scalars(scalars: &[Scalar]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn open_metal() -> Option<Box<dyn GpuDevice>> {
+        let inst = MetalInstance::new();
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        adapter.open(DeviceRequest::default()).ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_f32(device: &dyn GpuDevice, data: &[f32], readback: bool) -> BufferHandle {
+        use zengpu_hal::{BufferUsage, MemoryUsage};
+        let usage = if readback {
+            BufferUsage::STORAGE | BufferUsage::READBACK
+        } else {
+            BufferUsage::STORAGE
+        };
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: (data.len() * 4) as u64,
+                usage,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        device.write_buffer(buf, 0, bytemuck_cast(data)).unwrap();
+        buf
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_f32(device: &dyn GpuDevice, buf: BufferHandle, n: usize) -> Vec<f32> {
+        let bytes = device.read_buffer(buf, 0, (n * 4) as u64).unwrap();
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
     #[test]
     fn instance_constructs_without_panic() {
         let inst = MetalInstance::new();
         let _ = inst.enumerate_adapters();
+    }
+
+    /// saxpy: `y = y + alpha*x` — exercises 2 buffers + a 2-field push struct
+    /// (`n`, `alpha`) and the scalar push param actually being used in the kernel.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_saxpy() {
+        use zengpu_hal::{Bindings, ComputePipelineDesc};
+        use zengpu_spirv::zsl_msl;
+
+        const MSL: &str = zsl_msl!(
+            push P { n: u32, alpha: f32 }
+            @workgroup_size(64)
+            kernel saxpy(x: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.n { y[i] = y[i] + p.alpha * x[i] }
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let n = 10usize;
+        let x: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let y: Vec<f32> = (0..n).map(|i| (i * 10) as f32).collect();
+        let bx = make_f32(&*dev, &x, false);
+        let by = make_f32(&*dev, &y, true);
+        let sh = dev.create_shader(ShaderDesc::msl(MSL)).unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc { shader: sh, entry: "zsl_main", block: [64, 1, 1] })
+            .unwrap();
+        let groups = n.div_ceil(64) as u32;
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[bx.index(), by.index()],
+                textures: &[],
+                scalars: &[Scalar::U32(n as u32), Scalar::F32(2.0)],
+            },
+            [groups, 1, 1],
+        )
+        .unwrap();
+        let out = read_f32(&*dev, by, n);
+        let expect: Vec<f32> = (0..n).map(|i| (i * 10) as f32 + 2.0 * i as f32).collect();
+        assert_eq!(out, expect);
+    }
+
+    /// Large `vec_add` over 4 threadgroups — exercises the threadgroup-count math
+    /// and the `i < n` bounds guard on the tail group. `a[i]+b[i] = i+(n-i) = n`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn metal_vec_add_multi_threadgroup() {
+        use zengpu_hal::{Bindings, ComputePipelineDesc};
+        use zengpu_spirv::zsl_msl;
+
+        const MSL: &str = zsl_msl!(
+            push P { n: u32 }
+            @workgroup_size(256)
+            kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.n { out[i] = a[i] + b[i] }
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let n = 1000usize; // not a multiple of 256 → tail group hits the guard
+        let a: Vec<f32> = (0..n).map(|i| i as f32).collect();
+        let b: Vec<f32> = (0..n).map(|i| (n - i) as f32).collect();
+        let ba = make_f32(&*dev, &a, false);
+        let bb = make_f32(&*dev, &b, false);
+        let bout = make_f32(&*dev, &vec![-1.0f32; n], true);
+        let sh = dev.create_shader(ShaderDesc::msl(MSL)).unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc { shader: sh, entry: "zsl_main", block: [256, 1, 1] })
+            .unwrap();
+        let groups = n.div_ceil(256) as u32; // 4
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[ba.index(), bb.index(), bout.index()],
+                textures: &[],
+                scalars: &[Scalar::U32(n as u32)],
+            },
+            [groups, 1, 1],
+        )
+        .unwrap();
+        let out = read_f32(&*dev, bout, n);
+        assert!(
+            out.iter().all(|&v| (v - n as f32).abs() < 1e-3),
+            "every element should equal n={n}; got e.g. {}",
+            out[0]
+        );
     }
 
     #[test]
