@@ -1,0 +1,13 @@
+[package]
+name = "zen-window-handle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Minimal, dependency-free window/display handle types for the Zen ecosystem (ZenGPU, aurea, and a future winit)."
+repository = "https://github.com/SkuldNorniern/ZenGPU"
+authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
+keywords = ["window", "handle", "gpu", "ffi"]
+categories = ["os", "rendering"]
+
+[dependencies]
