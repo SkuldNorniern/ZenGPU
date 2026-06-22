@@ -1,4 +1,5 @@
-//! ZSL lowering backends: each turns the parsed entry point into one target. They consume the
-//! shared front end and do not define the language.
+//! ZSL lowering backends. Each consumes the shared front-end IR; none defines the language.
 
+#[allow(dead_code, unused_imports)]
+pub mod msl;
 pub mod spirv;
