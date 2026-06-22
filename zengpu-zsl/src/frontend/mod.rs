@@ -3,3 +3,6 @@
 pub mod ast;
 pub mod parse;
 pub mod types;
+
+#[allow(dead_code)]
+pub mod lex;
