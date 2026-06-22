@@ -2542,41 +2542,23 @@ mod tests {
 
     #[test]
     fn dispatch_batch_chains_ops_with_visible_writes() {
-        use inline_spirv::inline_spirv;
+        use zengpu_spirv::zsl;
 
-        const ADD_SPV: &[u32] = inline_spirv!(
-            r#"
-            #version 450
-            #extension GL_EXT_nonuniform_qualifier : require
-            layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-            layout(push_constant) uniform PC { uint a_idx; uint b_idx; uint out_idx; uint len; } pc;
-            layout(local_size_x = 64) in;
-            void main() {
-                uint i = gl_GlobalInvocationID.x;
-                if (i < pc.len) {
-                    g_bufs[pc.out_idx].data[i] = g_bufs[pc.a_idx].data[i] + g_bufs[pc.b_idx].data[i];
-                }
+        const ADD_SPV: &[u32] = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len { out[i] = a[i] + b[i] }
             }
-            "#,
-            comp,
-            vulkan1_2
         );
-        const RELU_SPV: &[u32] = inline_spirv!(
-            r#"
-            #version 450
-            #extension GL_EXT_nonuniform_qualifier : require
-            layout(set = 0, binding = 0) buffer Buf { float data[]; } g_bufs[];
-            layout(push_constant) uniform PC { uint in_idx; uint out_idx; uint len; } pc;
-            layout(local_size_x = 64) in;
-            void main() {
-                uint i = gl_GlobalInvocationID.x;
-                if (i < pc.len) {
-                    g_bufs[pc.out_idx].data[i] = max(g_bufs[pc.in_idx].data[i], 0.0);
-                }
+        const RELU_SPV: &[u32] = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel relu(inp: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len { out[i] = max(inp[i], 0.0) }
             }
-            "#,
-            comp,
-            vulkan1_2
         );
 
         let Some(dev) = try_device() else { return };

@@ -1,43 +1,19 @@
-//! ZenGPU shader macro — compile GLSL and ZSL to SPIR-V at build time.
+//! ZenGPU shader macro — compile native ZSL to SPIR-V at build time.
 //!
-//! # GLSL
-//!
-//! Pass a GLSL source string with a stage token, forwarded to `inline_spirv`:
-//!
-//! ```ignore
-//! use zengpu_spirv::zengpu_spirv;
-//!
-//! const VERT: &[u32] = zengpu_spirv!(
-//!     r#"
-//!     #version 450
-//!     void main() { gl_Position = vec4(0.0); }
-//!     "#,
-//!     vert,
-//!     vulkan1_0
-//! );
-//! ```
-//!
-//! # ZSL
-//!
-//! Pass a `#[vertex]`, `#[fragment]`, or `#[compute]` annotated Rust function.
-//! ZSL is a Rust-flavored shader language compiled directly to SPIR-V:
+//! ZSL is ZenGPU's own shader language with its own lexer/parser/lowerer (no
+//! `syn`/`quote`/`inline-spirv`). Use [`zsl!`] for compute and vertex/fragment:
 //!
 //! ```ignore
-//! const VERT: &[u32] = zengpu_spirv!(
-//!     #[vertex]
-//!     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
-//!         mvp * in_pos.extend(1.0)
+//! const VS: &[u32] = zengpu_spirv::zsl!(
+//!     push P { mvp: mat4x4<f32> }
+//!     vertex vs(@location(0) pos: f32x3, p: P) -> f32x4 {
+//!         p.mvp * pos.extend(1.0)
 //!     }
 //! );
 //! ```
 
-/// Re-export so that `$crate::inline_spirv` resolves inside `zengpu_spirv!`.
-#[doc(hidden)]
-pub use inline_spirv;
-
 /// Compile **native ZSL** source to SPIR-V (`&[u32]`) — ZenGPU's own
-/// lexer/parser/lowerer, no `syn`/`quote`. Compute + vertex/fragment. See
-/// [`zengpu_zsl::zsl`] for syntax.
+/// lexer/parser/lowerer. Compute + vertex/fragment. See [`zengpu_zsl::zsl`].
 pub use zengpu_zsl::zsl;
 
 /// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
@@ -81,30 +57,3 @@ pub mod _zsl_priv {
 /// }, [16, 1, 1])?;
 /// ```
 pub use zengpu_zsl::ZslPushConst;
-
-/// Compile shader source to SPIR-V at build time.
-///
-/// # GLSL
-/// Pass a GLSL source string with a stage token, identical to `inline_spirv!`:
-/// ```ignore
-/// const SPV: &[u32] = zengpu_spirv!(r#"#version 450 ..."#, vert, vulkan1_0);
-/// ```
-///
-/// # ZSL
-/// Pass a Rust-flavored function annotated with a stage attribute:
-/// ```ignore
-/// const SPV: &[u32] = zengpu_spirv!(
-///     #[vertex]
-///     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
-///         mvp * in_pos.extend(1.0)
-///     }
-/// );
-/// ```
-#[macro_export]
-macro_rules! zengpu_spirv {
-    // GLSL path: string literal + stage token (forwarded to inline_spirv).
-    // ZSL now has its own native macro, [`zsl!`]; this GLSL path is transitional.
-    ($($tt:tt)*) => {
-        $crate::inline_spirv::inline_spirv!($($tt)*)
-    };
-}
