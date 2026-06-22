@@ -39,6 +39,11 @@ pub use inline_spirv;
 #[doc(hidden)]
 pub use zengpu_zsl;
 
+/// Compile **native ZSL** source to SPIR-V (`&[u32]`) — ZenGPU's own
+/// lexer/parser/lowerer, no `syn`/`quote`. Compute kernels today. See
+/// [`zengpu_zsl::zsl`] for syntax.
+pub use zengpu_zsl::zsl;
+
 /// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
 ///
 /// Wrap any `mat4` value (glam, nalgebra, hand-rolled) as `ZslMat4(m.to_cols_array())`

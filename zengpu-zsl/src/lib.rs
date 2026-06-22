@@ -186,3 +186,59 @@ pub fn zsl_spirv(input: TokenStream) -> TokenStream {
         }
     }
 }
+
+// ── Native ZSL macro (no syn/quote) ────────────────────────────────────────────
+
+/// Compile **native ZSL** source to a SPIR-V word slice (`&[u32]`).
+///
+/// Unlike [`zsl_spirv`] (the Rust-shaped transitional form), this uses ZenGPU's
+/// own lexer/parser/lowerer with no `syn`/`quote` — only the built-in
+/// `proc_macro` shell. Currently supports compute kernels:
+///
+/// ```ignore
+/// const SPV: &[u32] = zengpu_spirv::zsl!(
+///     push Push { n: u32, scale: f32 }
+///     @workgroup_size(64)
+///     kernel scale(p: Push, src: device buffer<f32>, dst: device mut buffer<f32>, id: global_id) {
+///         let i = id.x
+///         if i < p.n { dst[i] = src[i] * p.scale }
+///     }
+/// );
+/// ```
+#[proc_macro]
+pub fn zsl(input: TokenStream) -> TokenStream {
+    let src = input.to_string();
+    match compile_native_zsl(&src) {
+        Ok(words) => words_to_slice_tokens(&words),
+        Err(msg) => compile_error_tokens(&msg),
+    }
+}
+
+fn compile_native_zsl(src: &str) -> Result<Vec<u32>, String> {
+    let module = frontend::parser::parse_compute(src)
+        .map_err(|e| format!("ZSL parse error: {}", e.msg))?;
+    backend::spirv::lower_compute(&module).map_err(|(_, msg)| msg)
+}
+
+/// Build the `&[u32]` literal token stream without `quote`.
+fn words_to_slice_tokens(words: &[u32]) -> TokenStream {
+    let mut s = String::with_capacity(words.len() * 12 + 4);
+    s.push_str("&[");
+    for (i, w) in words.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&w.to_string());
+        s.push_str("u32");
+    }
+    s.push(']');
+    s.parse().expect("generated &[u32] literal must parse")
+}
+
+/// Build a `compile_error!` invocation token stream without `quote`.
+fn compile_error_tokens(msg: &str) -> TokenStream {
+    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("::core::compile_error!{{\"{escaped}\"}}")
+        .parse()
+        .expect("compile_error invocation must parse")
+}

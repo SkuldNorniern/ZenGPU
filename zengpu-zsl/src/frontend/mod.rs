@@ -8,9 +8,6 @@ pub mod ast;
 pub mod parse;
 pub mod types;
 
-// Native ZSL frontend (no syn/quote). Wired into the macro shell as the parser
-// lands; `allow(dead_code)` until then.
-#[allow(dead_code)]
+// Native ZSL frontend (no syn/quote): lexer + parser feeding the IR.
 pub mod lex;
-#[allow(dead_code)]
 pub mod parser;
