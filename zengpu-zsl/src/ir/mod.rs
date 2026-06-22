@@ -22,11 +22,13 @@ pub enum Mutability {
     ReadWrite,
 }
 
+#[derive(Debug)]
 pub struct Param {
     pub name: String,
     pub kind: ParamKind,
 }
 
+#[derive(Debug)]
 pub enum ParamKind {
     /// Bindless storage buffer (`device buffer<elem>`).
     ///
@@ -42,10 +44,12 @@ pub enum ParamKind {
     Scalar(ScalarTy),
 }
 
+#[derive(Debug)]
 pub enum EntryKind {
     Compute { local_size: [u32; 3] },
 }
 
+#[derive(Debug)]
 pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
@@ -54,6 +58,7 @@ pub struct Entry {
     pub body: Vec<IrStmt>,
 }
 
+#[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
 }

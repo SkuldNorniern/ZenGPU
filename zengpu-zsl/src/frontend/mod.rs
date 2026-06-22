@@ -6,3 +6,5 @@ pub mod types;
 
 #[allow(dead_code)]
 pub mod lex;
+#[allow(dead_code)]
+pub mod parser;

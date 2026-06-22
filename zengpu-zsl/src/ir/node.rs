@@ -1,6 +1,7 @@
 //! Backend-neutral, symbol-resolved nodes. Identifiers are classified (local, scalar param, buffer)
 //! and structure is checked in `build`. Type inference and conversions are per backend.
 
+#[derive(Debug)]
 pub enum IrExpr {
     /// Typed as `u32`.
     LitU32(u32),
@@ -21,6 +22,7 @@ pub enum IrExpr {
     },
 }
 
+#[derive(Debug)]
 pub enum IrStmt {
     /// `name` is pre-declared in `Entry::locals`.
     Let { name: String, init: IrExpr },
@@ -46,7 +48,7 @@ pub enum IrStmt {
 }
 
 /// Maps to GLSL.std.450 and the Metal stdlib.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     Abs,
     Sign,
@@ -61,7 +63,7 @@ pub enum BuiltinFn {
     Mix,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrBinOp {
     Add,
     Sub,
