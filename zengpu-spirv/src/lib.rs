@@ -16,6 +16,10 @@
 /// lexer/parser/lowerer. Compute + vertex/fragment. See [`zengpu_zsl::zsl`].
 pub use zengpu_zsl::zsl;
 
+/// Compile **native ZSL** source to Metal Shading Language (`&str`) for the
+/// Metal backend (`ShaderDesc::msl`). Compute kernels today. See [`zengpu_zsl::zsl_msl`].
+pub use zengpu_zsl::zsl_msl;
+
 /// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
 ///
 /// Wrap any `mat4` value (glam, nalgebra, hand-rolled) as `ZslMat4(m.to_cols_array())`
