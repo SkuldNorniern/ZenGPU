@@ -36,7 +36,7 @@ use syn::{
 
 use crate::frontend::ast::{ZslEntryPoint, ZslParam};
 use crate::frontend::types::ZslType;
-use crate::spirv::{Id, SpvBuilder, builtin, deco, sc};
+use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
