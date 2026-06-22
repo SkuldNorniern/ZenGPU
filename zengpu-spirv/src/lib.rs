@@ -37,6 +37,9 @@ pub use inline_spirv;
 #[doc(hidden)]
 pub use zengpu_zsl;
 
+/// /// Native ZSL to SPIR-V words (compute kernels). See [`zengpu_zsl::zsl`] for syntax.
+pub use zengpu_zsl::zsl;
+
 /// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
 /// SPIR-V `ColMajor`.
 #[derive(Debug, Clone, Copy)]
