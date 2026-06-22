@@ -14,7 +14,6 @@ categories.workspace = true
 [lib]
 proc-macro = true
 
+# No external parser deps: ZSL has its own lexer/parser/lowerer over the builtin
+# `proc_macro` token stream. (No syn / quote / proc-macro2.)
 [dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full"] }

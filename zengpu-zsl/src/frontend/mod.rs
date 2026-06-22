@@ -1,8 +1,6 @@
-//! ZSL front-end: AST and types. Backend-neutral. Lowering lives in `crate::backend`.
-
-pub mod ast;
-pub mod parse;
-pub mod types;
+//! ZSL front-end: native lexer and parser.
+//!
+//! Produces the backend-neutral IR (`crate::ir`). Lowering lives in `crate::backend`.
 
 pub mod lex;
 pub mod parser;

@@ -34,10 +34,7 @@
 #[doc(hidden)]
 pub use inline_spirv;
 
-#[doc(hidden)]
-pub use zengpu_zsl;
-
-/// /// Native ZSL to SPIR-V words (compute kernels). See [`zengpu_zsl::zsl`] for syntax.
+/// Native ZSL to SPIR-V words (compute and vertex/fragment). See [`zengpu_zsl::zsl`] for syntax.
 pub use zengpu_zsl::zsl;
 
 /// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
@@ -97,9 +94,6 @@ pub use zengpu_zsl::ZslPushConst;
 /// ```
 #[macro_export]
 macro_rules! zengpu_spirv {
-    (#[$attr:meta] $($rest:tt)*) => {
-        $crate::zengpu_zsl::zsl_spirv!(#[$attr] $($rest)*)
-    };
     ($($tt:tt)*) => {
         $crate::inline_spirv::inline_spirv!($($tt)*)
     };

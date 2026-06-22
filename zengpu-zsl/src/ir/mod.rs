@@ -1,12 +1,25 @@
 //! Backend-neutral ZSL IR. Built once from the AST, consumed by each backend. Covers compute and
 //! graphics entries.
 
-pub mod build;
 pub mod node;
 
 use node::{IrExpr, IrStmt};
 
-use crate::frontend::types::BufElem;
+/// Element type of `buffer<T>`. Backends support only `F32`. The other variants are reserved for
+/// wider element types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BufElem {
+    F32,
+    I32,
+    U32,
+    Vec2,
+    Vec3,
+    Vec4,
+    Mat2,
+    Mat3,
+    Mat4,
+}
 
 /// Scalar value / declaration type. Compute values are scalar only.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

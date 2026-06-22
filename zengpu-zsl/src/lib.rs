@@ -7,33 +7,6 @@ mod frontend;
 mod ir;
 
 use proc_macro::TokenStream;
-use proc_macro2::{Literal, Span};
-use quote::quote;
-use syn::{Attribute, ItemFn, parse::Parse, parse::ParseStream, parse_macro_input};
-
-use frontend::ast::{Stage, ZslEntryPoint};
-
-/// ZSL input: outer attributes and a fn item.
-struct ZslInput {
-    attrs: Vec<Attribute>,
-    func: ItemFn,
-}
-
-impl Parse for ZslInput {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let attrs = input.call(Attribute::parse_outer)?;
-        let mut func: ItemFn = input.parse()?;
-        func.attrs.splice(0..0, attrs.clone());
-        Ok(ZslInput { attrs, func })
-    }
-}
-
-fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
-    errors
-        .into_iter()
-        .map(|(span, msg)| syn::Error::new(span, msg).to_compile_error())
-        .collect()
-}
 
 /// Derives `to_scalars()` for a push struct: fields `u32`, `i32` or `f32` only, in declaration
 /// order. Result goes to `Bindings::scalars`. Import via `use zengpu_spirv::ZslPushConst;`.
@@ -129,66 +102,6 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
         .map_err(|_| "ZslPushConst: generated code failed to parse".to_string())
 }
 
-/// Internal proc-macro invoked by `zengpu_spirv!` when ZSL input is detected.
-#[proc_macro]
-pub fn zsl_spirv(input: TokenStream) -> TokenStream {
-    let parsed = parse_macro_input!(input as ZslInput);
-
-    let stage = match frontend::parse::stage_from_attrs(&parsed.attrs) {
-        Ok(s) => s,
-        Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-    };
-
-    let entry = match ZslEntryPoint::from_fn(stage, &parsed.func) {
-        Ok(e) => e,
-        Err(errs) => return errors_to_ts(errs).into(),
-    };
-
-    match stage {
-        Stage::Compute => {
-            let local_size = match frontend::parse::parse_local_size(&parsed.attrs) {
-                Ok(ls) => ls,
-                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-            };
-            let module = match ir::build::build_compute(&entry, &parsed.func.block, local_size) {
-                Ok(m) => m,
-                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-            };
-            let words = match backend::spirv::lower_compute(&module) {
-                Ok(w) => w,
-                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-            };
-            let words_lit = words.iter().map(|&w| {
-                let lit = Literal::u32_suffixed(w);
-                quote!(#lit)
-            });
-            quote! { &[#(#words_lit),*] }.into()
-        }
-        Stage::Vertex => {
-            let words = match backend::spirv::lower_vertex(&entry, &parsed.func.block) {
-                Ok(w) => w,
-                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-            };
-            let words_lit = words.iter().map(|&w| {
-                let lit = Literal::u32_suffixed(w);
-                quote!(#lit)
-            });
-            quote! { &[#(#words_lit),*] }.into()
-        }
-        Stage::Fragment => {
-            let words = match backend::spirv::lower_fragment(&entry, &parsed.func.block) {
-                Ok(w) => w,
-                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
-            };
-            let words_lit = words.iter().map(|&w| {
-                let lit = Literal::u32_suffixed(w);
-                quote!(#lit)
-            });
-            quote! { &[#(#words_lit),*] }.into()
-        }
-    }
-}
-
 /// Native ZSL to a SPIR-V word slice (`&[u32]`). Unlike [`zsl_spirv`] (Rust-shaped syntax), this
 /// uses ZenGPU's own front end without `syn` or `quote`. Compute kernels only:
 ///
@@ -214,8 +127,8 @@ pub fn zsl(input: TokenStream) -> TokenStream {
 fn compile_native_zsl(src: &str) -> Result<Vec<u32>, String> {
     use frontend::parser::Shader;
     match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
-        Shader::Compute(m) => backend::spirv::lower_compute(&m).map_err(|(_, msg)| msg),
-        Shader::Graphics(m) => backend::spirv::graphics_ir::lower_graphics(&m),
+        Shader::Compute(m) => backend::spirv::lower_compute(&m),
+        Shader::Graphics(m) => backend::spirv::lower_graphics(&m),
     }
 }
 
