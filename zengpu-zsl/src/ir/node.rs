@@ -18,8 +18,18 @@ pub enum IrExpr {
     ScalarParam(String),
     /// `buf[index]` — a bindless storage-buffer element load.
     BufferLoad { buf: String, index: Box<IrExpr> },
-    /// `global_id().{x|y|z}` → component `0`/`1`/`2`.
+    /// `global_id().{x|y|z}` → component `0`/`1`/`2` (compute only).
     GlobalId(u32),
+    /// A graphics `@location` vertex/fragment input.
+    Input(String),
+    /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
+    FieldAccess { base: Box<IrExpr>, component: u32 },
+    /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
+    VecConstruct { dim: u8, args: Vec<IrExpr> },
+    /// `vec3.extend(scalar)` → `f32x4`.
+    Extend { base: Box<IrExpr>, scalar: Box<IrExpr> },
+    /// `dot(a, b)` → scalar.
+    Dot { a: Box<IrExpr>, b: Box<IrExpr> },
     /// A built-in math call (`abs`, `min`, `clamp`, …).
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     /// Unary negation.
@@ -76,6 +86,29 @@ pub enum BuiltinFn {
     Pow,
     Clamp,
     Mix,
+    Normalize,
+    Length,
+}
+
+impl BuiltinFn {
+    /// The ZSL source spelling, used in diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            BuiltinFn::Abs => "abs",
+            BuiltinFn::Sign => "sign",
+            BuiltinFn::Sqrt => "sqrt",
+            BuiltinFn::Floor => "floor",
+            BuiltinFn::Ceil => "ceil",
+            BuiltinFn::Fract => "fract",
+            BuiltinFn::Min => "min",
+            BuiltinFn::Max => "max",
+            BuiltinFn::Pow => "pow",
+            BuiltinFn::Clamp => "clamp",
+            BuiltinFn::Mix => "mix",
+            BuiltinFn::Normalize => "normalize",
+            BuiltinFn::Length => "length",
+        }
+    }
 }
 
 /// Binary operators.
