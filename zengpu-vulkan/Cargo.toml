@@ -15,6 +15,9 @@ categories.workspace = true
 zengpu-hal.workspace = true
 zengpu-spv.workspace = true
 ash = "0.38"
-inline-spirv = { version = "0.2", features = ["glsl"] }
 raw-window-handle = "0.6"
 log.workspace = true
+
+# Native ZSL shaders for the in-crate tests and the pipeline_repro example.
+[dev-dependencies]
+zengpu-spirv.workspace = true

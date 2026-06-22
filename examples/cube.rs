@@ -16,7 +16,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use zengpu::{
     BeginFrame, DeviceContext, DeviceRequest, Format, GpuError, PresentMode, Result, SurfaceConfig,
-    Swapchain, VulkanDevice, VulkanInstance, WindowHandles, zengpu_spirv,
+    Swapchain, VulkanDevice, VulkanInstance, WindowHandles, zsl,
 };
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
@@ -125,31 +125,17 @@ fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
 
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
-const VERT_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    layout(location = 0) in vec3 in_pos;
-    layout(location = 1) in vec3 in_color;
-    layout(push_constant) uniform PC { mat4 mvp; } pc;
-    layout(location = 0) out vec3 v_color;
-    void main() {
-        gl_Position = pc.mvp * vec4(in_pos, 1.0);
-        v_color = in_color;
+const VERT_SPV: &[u32] = zsl!(
+    push P { mvp: mat4x4<f32> }
+    vertex vs(@location(0) in_pos: f32x3, @location(1) in_color: f32x3, p: P) -> (f32x4, f32x3) {
+        (p.mvp * in_pos.extend(1.0), in_color)
     }
-    "#,
-    vert,
-    vulkan1_0
 );
 
-const FRAG_SPV: &[u32] = zengpu_spirv!(
-    r#"
-    #version 450
-    layout(location = 0) in vec3 v_color;
-    layout(location = 0) out vec4 o_color;
-    void main() { o_color = vec4(v_color, 1.0); }
-    "#,
-    frag,
-    vulkan1_0
+const FRAG_SPV: &[u32] = zsl!(
+    fragment fs(@location(0) v_color: f32x3) -> f32x4 {
+        v_color.extend(1.0)
+    }
 );
 
 const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT;
