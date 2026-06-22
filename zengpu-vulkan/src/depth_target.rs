@@ -156,6 +156,21 @@ impl Drop for DepthTarget {
     }
 }
 
+fn find_memory_type(
+    props: &vk::PhysicalDeviceMemoryProperties,
+    type_filter: u32,
+    required: vk::MemoryPropertyFlags,
+) -> Result<u32> {
+    (0..props.memory_type_count)
+        .find(|&i| {
+            (type_filter & (1 << i)) != 0
+                && props.memory_types[i as usize]
+                    .property_flags
+                    .contains(required)
+        })
+        .ok_or_else(|| GpuError::Backend("no device-local memory type for depth".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,19 +192,4 @@ mod tests {
         depth.resize(&ctx, 128, 96).unwrap();
         assert_eq!(depth.extent(), (128, 96));
     }
-}
-
-fn find_memory_type(
-    props: &vk::PhysicalDeviceMemoryProperties,
-    type_filter: u32,
-    required: vk::MemoryPropertyFlags,
-) -> Result<u32> {
-    (0..props.memory_type_count)
-        .find(|&i| {
-            (type_filter & (1 << i)) != 0
-                && props.memory_types[i as usize]
-                    .property_flags
-                    .contains(required)
-        })
-        .ok_or_else(|| GpuError::Backend("no device-local memory type for depth".to_string()))
 }

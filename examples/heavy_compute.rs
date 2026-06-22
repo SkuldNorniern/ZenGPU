@@ -30,6 +30,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 /// Returns `(backend_label, adapter_name, device)`.
+#[allow(clippy::type_complexity)]
 fn open_device() -> Result<(&'static str, String, Arc<dyn GpuDevice>), Box<dyn std::error::Error>> {
     let backend = std::env::var("ZENGPU_BACKEND").unwrap_or_default();
     match backend.to_ascii_lowercase().as_str() {

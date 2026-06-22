@@ -295,8 +295,10 @@ pub struct RasterState {
 /// Selects which fragments pass the depth test. Defaults to [`CompareFn::Less`].
 /// Use [`CompareFn::Greater`] with a `1.0` depth clear for reverse-Z.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompareFn {
     Never,
+    #[default]
     Less,
     Equal,
     LessEqual,
@@ -306,11 +308,6 @@ pub enum CompareFn {
     Always,
 }
 
-impl Default for CompareFn {
-    fn default() -> Self {
-        Self::Less
-    }
-}
 
 /// Depth test/write configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -781,7 +781,7 @@ mod tests {
         attr.set_offset(0);
         attr.set_buffer_index(0);
         vd.layouts().object_at(0).unwrap().set_stride(16);
-        pdesc.set_vertex_descriptor(Some(&vd));
+        pdesc.set_vertex_descriptor(Some(vd));
 
         let pso = device.new_render_pipeline_state(&pdesc).expect("render pipeline");
 
