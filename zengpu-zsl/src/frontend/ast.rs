@@ -1,7 +1,8 @@
 //! ZSL AST — parsed representation of a ZSL shader entry point.
+//!
+//! Data structures only; the `syn` → AST parsing lives in `parse.rs`.
 
-use proc_macro2::Span;
-use syn::{FnArg, Ident, ItemFn, Meta, ReturnType, spanned::Spanned};
+use syn::Ident;
 
 use crate::frontend::types::ZslType;
 
@@ -35,7 +36,7 @@ pub struct ZslParam {
     pub builtin: Option<String>,
 }
 
-/// The fully-parsed ZSL entry point — ready for SPIR-V lowering (step 4).
+/// The fully-parsed ZSL entry point — ready for lowering.
 #[derive(Debug)]
 pub struct ZslEntryPoint {
     // stage/ret read by the lib.rs dispatch; dead_code lint fires because the
@@ -44,114 +45,4 @@ pub struct ZslEntryPoint {
     pub stage: Stage,
     pub params: Vec<ZslParam>,
     pub ret: ZslType,
-}
-
-impl ZslEntryPoint {
-    /// Parse a [`ItemFn`] that has already been annotated with a stage
-    /// attribute. Returns errors with spans attached.
-    pub fn from_fn(stage: Stage, func: &ItemFn) -> Result<Self, Vec<(Span, String)>> {
-        let mut errors: Vec<(Span, String)> = Vec::new();
-        let mut params: Vec<ZslParam> = Vec::new();
-
-        for arg in &func.sig.inputs {
-            match arg {
-                FnArg::Receiver(r) => {
-                    errors.push((r.span(), "ZSL entry points cannot take `self`".to_string()));
-                }
-                FnArg::Typed(pat_ty) => {
-                    let ident = match &*pat_ty.pat {
-                        syn::Pat::Ident(p) => p.ident.clone(),
-                        other => {
-                            errors.push((
-                                other.span(),
-                                "ZSL parameter must be a simple identifier".to_string(),
-                            ));
-                            continue;
-                        }
-                    };
-
-                    let ty = match ZslType::from_syn(&pat_ty.ty) {
-                        Ok(t) => t,
-                        Err((span, msg)) => {
-                            errors.push((span, msg));
-                            continue;
-                        }
-                    };
-
-                    let (location, builtin) = parse_param_attrs(&pat_ty.attrs, &mut errors);
-
-                    // Buffer element type validity is enforced by BufElem at parse time.
-
-                    params.push(ZslParam {
-                        ident,
-                        ty,
-                        location,
-                        builtin,
-                    });
-                }
-            }
-        }
-
-        let ret = match &func.sig.output {
-            ReturnType::Default => ZslType::Void,
-            ReturnType::Type(_, ty) => match ZslType::from_syn(ty) {
-                Ok(t) => t,
-                Err((span, msg)) => {
-                    errors.push((span, msg));
-                    ZslType::Void
-                }
-            },
-        };
-
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-
-        Ok(ZslEntryPoint { stage, params, ret })
-    }
-}
-
-/// Extract `#[location(N)]` and `#[builtin(name)]` from parameter attributes.
-fn parse_param_attrs(
-    attrs: &[syn::Attribute],
-    errors: &mut Vec<(Span, String)>,
-) -> (Option<u32>, Option<String>) {
-    let mut location = None;
-    let mut builtin = None;
-
-    for attr in attrs {
-        if attr.path().is_ident("location") {
-            match attr.parse_args::<syn::LitInt>() {
-                Ok(lit) => match lit.base10_parse::<u32>() {
-                    Ok(n) => location = Some(n),
-                    Err(_) => errors.push((lit.span(), "location index must be a u32".to_string())),
-                },
-                Err(_) => errors.push((
-                    attr.span(),
-                    "#[location(N)] expects a u32 literal".to_string(),
-                )),
-            }
-        } else if attr.path().is_ident("builtin") {
-            match &attr.meta {
-                Meta::List(list) => {
-                    let tokens = list.tokens.to_string();
-                    let name = tokens.trim().to_string();
-                    if name.is_empty() {
-                        errors.push((
-                            attr.span(),
-                            "#[builtin(name)] expects a built-in name".to_string(),
-                        ));
-                    } else {
-                        builtin = Some(name);
-                    }
-                }
-                _ => errors.push((
-                    attr.span(),
-                    "#[builtin(name)] expects a built-in name".to_string(),
-                )),
-            }
-        }
-    }
-
-    (location, builtin)
 }
