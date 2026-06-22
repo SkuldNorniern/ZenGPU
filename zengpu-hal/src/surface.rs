@@ -1,37 +1,17 @@
-//! Window-handle bridge for presentable surfaces.
-//!
-//! [`WindowHandles`] wraps any `raw-window-handle` window (such as winit) without exposing its
-//! types. There is no generic surface trait: a second graphics backend is needed to shape one.
+//! Window handles for presentable surfaces, from the dependency-free [`zen_window_handle`] crate.
+//! The caller must keep the window alive for any surface built from them.
 
-use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+pub use zen_window_handle::{DisplayHandle, WindowHandle};
 
-/// Window and display handles from any window implementing [`raw_window_handle::HasWindowHandle`]
-/// and [`raw_window_handle::HasDisplayHandle`].
-///
-/// Handles are lifetime-erased. The window must outlive every surface made from them.
 #[derive(Clone, Copy)]
 pub struct WindowHandles {
-    pub window: RawWindowHandle,
-    pub display: RawDisplayHandle,
+    pub window: WindowHandle,
+    pub display: DisplayHandle,
 }
 
 impl WindowHandles {
-    /// Extracts the raw window and display handles.
-    ///
-    /// # Errors
-    /// Returns `HandleError` if the window has no OS handle, such as a headless mock.
-    pub fn from_window<W>(window: &W) -> core::result::Result<Self, raw_window_handle::HandleError>
-    where
-        W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
-    {
-        Ok(Self {
-            window: window.window_handle()?.as_raw(),
-            display: window.display_handle()?.as_raw(),
-        })
-    }
-
-    /// Wraps raw handles. The window must outlive any surface made from them.
-    pub fn from_raw(window: RawWindowHandle, display: RawDisplayHandle) -> Self {
+    /// The window must outlive any surface created from these handles.
+    pub fn from_raw(window: WindowHandle, display: DisplayHandle) -> Self {
         Self { window, display }
     }
 }

@@ -1817,12 +1817,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
+name = "zen-window-handle"
+version = "0.1.0"
+
+[[package]]
 name = "zengpu"
 version = "0.0.1"
 dependencies = [
  "ash",
  "log",
+ "raw-window-handle",
  "winit",
+ "zen-window-handle",
  "zengpu-blas",
  "zengpu-compute",
  "zengpu-cpu",
@@ -1892,7 +1898,7 @@ dependencies = [
 name = "zengpu-hal"
 version = "0.0.1"
 dependencies = [
- "raw-window-handle",
+ "zen-window-handle",
 ]
 
 [[package]]
@@ -1910,6 +1916,7 @@ dependencies = [
  "log",
  "metal",
  "zengpu-hal",
+ "zengpu-spirv",
 ]
 
 [[package]]
@@ -1930,7 +1937,7 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "log",
- "raw-window-handle",
+ "zen-window-handle",
  "zengpu-hal",
  "zengpu-spirv",
  "zengpu-spv",

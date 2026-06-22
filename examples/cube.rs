@@ -18,6 +18,34 @@ use zengpu::{
     Swapchain, VulkanDevice, VulkanInstance, WindowHandles, zsl,
 };
 
+/// Converts a winit window to `zen-window-handle` types. Libraries depend only on that crate.
+fn zen_handles<W>(win: &W) -> WindowHandles
+where
+    W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+{
+    use raw_window_handle::{RawDisplayHandle as D, RawWindowHandle as R};
+    use zen_window_handle as z;
+
+    let window = match win.window_handle().expect("window handle").as_raw() {
+        R::AppKit(h) => z::WindowHandle::AppKit(z::AppKitWindowHandle { ns_view: h.ns_view }),
+        R::Win32(h) => z::WindowHandle::Win32(z::Win32WindowHandle {
+            hwnd: h.hwnd,
+            hinstance: h.hinstance,
+        }),
+        R::Xcb(h) => z::WindowHandle::Xcb(z::XcbWindowHandle { window: h.window }),
+        R::Wayland(h) => z::WindowHandle::Wayland(z::WaylandWindowHandle { surface: h.surface }),
+        other => panic!("unsupported window handle: {other:?}"),
+    };
+    let display = match win.display_handle().expect("display handle").as_raw() {
+        D::AppKit(_) => z::DisplayHandle::AppKit,
+        D::Windows(_) => z::DisplayHandle::Windows,
+        D::Xcb(h) => z::DisplayHandle::Xcb(z::XcbDisplayHandle { connection: h.connection }),
+        D::Wayland(h) => z::DisplayHandle::Wayland(z::WaylandDisplayHandle { display: h.display }),
+        other => panic!("unsupported display handle: {other:?}"),
+    };
+    WindowHandles::from_raw(window, display)
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct Vertex3d {
@@ -785,7 +813,7 @@ impl ApplicationHandler for App {
         let device = adapter
             .open_with_surface(DeviceRequest::default())
             .expect("open device");
-        let handles = WindowHandles::from_window(&window).expect("window handles");
+        let handles = zen_handles(&window);
         let surface = CubeSurface::new(
             &device,
             &handles,
