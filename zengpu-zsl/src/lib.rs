@@ -12,9 +12,7 @@ mod ir;
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span};
 use quote::quote;
-use syn::{
-    Attribute, DeriveInput, ItemFn, parse::Parse, parse::ParseStream, parse_macro_input,
-};
+use syn::{Attribute, ItemFn, parse::Parse, parse::ParseStream, parse_macro_input};
 
 use frontend::ast::{Stage, ZslEntryPoint};
 
@@ -49,82 +47,98 @@ fn errors_to_ts(errors: Vec<(Span, String)>) -> proc_macro2::TokenStream {
 /// Import via `use zengpu_spirv::ZslPushConst;`.
 #[proc_macro_derive(ZslPushConst)]
 pub fn derive_zsl_push_const(input: TokenStream) -> TokenStream {
-    let input = parse_macro_input!(input as DeriveInput);
-    push_const_impl(input)
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
+    match push_const_impl(input) {
+        Ok(ts) => ts,
+        Err(msg) => compile_error_tokens(&msg),
+    }
 }
 
-fn push_const_impl(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
-    let name = &input.ident;
+/// Hand-rolled `#[derive(ZslPushConst)]` over the builtin `proc_macro` token
+/// trees — no `syn`/`quote`. Generates `to_scalars()` returning a fixed array of
+/// `Scalar` in field order; `ZslMat4` expands to 16 column-major `Scalar::F32`.
+fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
+    use proc_macro::{Delimiter, TokenTree};
 
-    let syn::Data::Struct(data) = &input.data else {
-        return Err(syn::Error::new_spanned(
-            &input.ident,
-            "#[derive(ZslPushConst)] only supports structs",
-        ));
-    };
+    // Find `struct <Name> { <fields> }`, skipping attributes/visibility/generics.
+    let mut it = input.into_iter();
+    let mut name: Option<String> = None;
+    let mut fields: Option<proc_macro::Group> = None;
+    while let Some(tt) = it.next() {
+        if let TokenTree::Ident(id) = &tt {
+            if id.to_string() == "struct" {
+                match it.next() {
+                    Some(TokenTree::Ident(n)) => name = Some(n.to_string()),
+                    _ => return Err("ZslPushConst: expected a struct name".into()),
+                }
+                for tt2 in it.by_ref() {
+                    if let TokenTree::Group(g) = tt2 {
+                        if g.delimiter() == Delimiter::Brace {
+                            fields = Some(g);
+                        }
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    let name = name.ok_or("ZslPushConst only supports structs")?;
+    let fields = fields.ok_or("ZslPushConst requires a struct with named fields")?;
 
-    let syn::Fields::Named(fields) = &data.fields else {
-        return Err(syn::Error::new_spanned(
-            &input.ident,
-            "#[derive(ZslPushConst)] requires named fields",
-        ));
-    };
-
-    let mut exprs: Vec<proc_macro2::TokenStream> = Vec::new();
-    for field in &fields.named {
-        let fname = field.ident.as_ref().unwrap();
-        let mut field_exprs = scalar_field_exprs(&field.ty, fname)?;
-        exprs.append(&mut field_exprs);
+    // Parse `name : type ,` repeated. Only the type's leading ident is needed.
+    let mut exprs: Vec<String> = Vec::new();
+    let mut toks = fields.stream().into_iter().peekable();
+    loop {
+        let fname = match toks.next() {
+            Some(TokenTree::Ident(id)) => id.to_string(),
+            Some(_) => return Err("ZslPushConst: expected a field name".into()),
+            None => break,
+        };
+        match toks.next() {
+            Some(TokenTree::Punct(p)) if p.as_char() == ':' => {}
+            _ => return Err("ZslPushConst: expected `:` after field name".into()),
+        }
+        let mut type_name = String::new();
+        while let Some(tt) = toks.peek() {
+            if matches!(tt, TokenTree::Punct(p) if p.as_char() == ',') {
+                toks.next();
+                break;
+            }
+            let tt = toks.next().unwrap();
+            if type_name.is_empty() {
+                if let TokenTree::Ident(id) = &tt {
+                    type_name = id.to_string();
+                }
+            }
+        }
+        match type_name.as_str() {
+            "u32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::U32(self.{fname})")),
+            "i32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::I32(self.{fname})")),
+            "f32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname})")),
+            "ZslMat4" => {
+                for i in 0..16 {
+                    exprs.push(format!(
+                        "::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname}.0[{i}])"
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "ZslPushConst fields must be u32, i32, f32, or ZslMat4; got `{other}`"
+                ));
+            }
+        }
     }
 
     let n = exprs.len();
-    Ok(quote! {
-        impl #name {
-            pub fn to_scalars(&self) -> [::zengpu_spirv::_zsl_priv::Scalar; #n] {
-                [#(#exprs),*]
-            }
-        }
-    })
-}
-
-/// Returns one or more `Scalar` constructor expressions for a single field.
-/// `ZslMat4` expands to 16 `Scalar::F32` entries (column-major).
-fn scalar_field_exprs(
-    ty: &syn::Type,
-    fname: &syn::Ident,
-) -> syn::Result<Vec<proc_macro2::TokenStream>> {
-    let syn::Type::Path(tp) = ty else {
-        return Err(syn::Error::new_spanned(
-            ty,
-            "ZslPushConst fields must be u32, i32, f32, or ZslMat4",
-        ));
-    };
-    if tp.path.is_ident("u32") {
-        Ok(vec![
-            quote!(::zengpu_spirv::_zsl_priv::Scalar::U32(self.#fname)),
-        ])
-    } else if tp.path.is_ident("i32") {
-        Ok(vec![
-            quote!(::zengpu_spirv::_zsl_priv::Scalar::I32(self.#fname)),
-        ])
-    } else if tp.path.is_ident("f32") {
-        Ok(vec![
-            quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname)),
-        ])
-    } else if tp.path.is_ident("ZslMat4") {
-        // Column-major flat [f32; 16] stored inside ZslMat4(pub [f32; 16])
-        let entries: Vec<proc_macro2::TokenStream> = (0usize..16)
-            .map(|i| quote!(::zengpu_spirv::_zsl_priv::Scalar::F32(self.#fname.0[#i])))
-            .collect();
-        Ok(entries)
-    } else {
-        Err(syn::Error::new_spanned(
-            ty,
-            "ZslPushConst fields must be u32, i32, f32, or ZslMat4",
-        ))
-    }
+    let body = exprs.join(", ");
+    let code = format!(
+        "impl {name} {{ \
+            pub fn to_scalars(&self) -> [::zengpu_spirv::_zsl_priv::Scalar; {n}] {{ [{body}] }} \
+        }}"
+    );
+    code.parse()
+        .map_err(|_| "ZslPushConst: generated code failed to parse".to_string())
 }
 
 /// Internal proc-macro invoked by `zengpu_spirv!` when ZSL input is detected.
