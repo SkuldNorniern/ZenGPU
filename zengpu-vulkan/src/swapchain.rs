@@ -85,35 +85,22 @@ impl Swapchain {
         }
         .map_err(|e| GpuError::Backend(format!("surface support query: {e}")))?;
         if !supports_present {
-            let n = unsafe {
-                shared
-                    .instance
-                    .get_physical_device_queue_family_properties(inner.physical)
+            #[cfg(target_os = "macos")]
+            {
+                log::warn!(
+                    "[zengpu-vulkan] queue family {} reports no present support \
+                     (MoltenVK query is unreliable); proceeding with swapchain creation",
+                    inner.queue_family
+                );
             }
-            .len();
-            let mut report = String::new();
-            let mut any_present = None;
-            for fam in 0..n as u32 {
-                let p = unsafe {
-                    surface_loader
-                        .get_physical_device_surface_support(inner.physical, fam, surface)
-                        .unwrap_or(false)
-                };
-                if p && any_present.is_none() {
-                    any_present = Some(fam);
-                }
-                report.push_str(&format!(" family {fam}: present={p};"));
+            #[cfg(not(target_os = "macos"))]
+            {
+                unsafe { surface_loader.destroy_surface(surface, None) };
+                return Err(GpuError::Backend(format!(
+                    "selected queue family {} cannot present to this surface",
+                    inner.queue_family
+                )));
             }
-            unsafe { surface_loader.destroy_surface(surface, None) };
-            return Err(GpuError::Backend(format!(
-                "selected queue family {} cannot present to this surface. \
-                 Families:{report} {}",
-                inner.queue_family,
-                match any_present {
-                    Some(f) => format!("(family {f} can present: device opened with the wrong family)"),
-                    None => "(no family can present: likely a surface/MoltenVK issue)".to_string(),
-                }
-            )));
         }
 
         let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
