@@ -7,6 +7,7 @@ extern crate proc_macro;
 
 mod backend;
 mod frontend;
+mod ir;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Literal, Span};
@@ -147,7 +148,11 @@ pub fn zsl_spirv(input: TokenStream) -> TokenStream {
                 Ok(ls) => ls,
                 Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
             };
-            let words = match backend::spirv::lower_compute(&entry, &parsed.func.block, local_size) {
+            let module = match ir::build::build_compute(&entry, &parsed.func.block, local_size) {
+                Ok(m) => m,
+                Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
+            };
+            let words = match backend::spirv::lower_compute(&module) {
                 Ok(w) => w,
                 Err((span, msg)) => return syn::Error::new(span, msg).to_compile_error().into(),
             };
