@@ -8,41 +8,29 @@
 //!
 //! Run: cargo run -p zengpu-vulkan --example pipeline_repro
 
-use inline_spirv::inline_spirv;
 use zengpu_hal::{
     BlendMode, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc,
     PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat, VertexLayout,
 };
+use zengpu_spirv::zsl;
 use zengpu_vulkan::{DepthTarget, OffscreenTarget, VulkanInstance};
 
-const VS: &[u32] = inline_spirv!(
-    r#"
-    #version 450
-    layout(location = 0) in vec3 pos;
-    layout(location = 1) in vec3 col;
-    layout(location = 2) in vec3 nrm;
-    layout(location = 0) out vec3 v_col;
-    layout(push_constant) uniform PC { mat4 model; mat4 view_proj; } pc;
-    void main() {
-        gl_Position = pc.view_proj * (pc.model * vec4(pos, 1.0));
-        v_col = col;
+const VS: &[u32] = zsl!(
+    push P { model: mat4x4<f32>, view_proj: mat4x4<f32> }
+    vertex vs(
+        @location(0) pos: f32x3,
+        @location(1) col: f32x3,
+        @location(2) nrm: f32x3,
+        p: P,
+    ) -> (f32x4, f32x3) {
+        (p.view_proj * (p.model * pos.extend(1.0)), col)
     }
-    "#,
-    vert,
-    glsl,
-    vulkan1_2
 );
 
-const FS: &[u32] = inline_spirv!(
-    r#"
-    #version 450
-    layout(location = 0) in vec3 v_col;
-    layout(location = 0) out vec4 o_col;
-    void main() { o_col = vec4(v_col, 1.0); }
-    "#,
-    frag,
-    glsl,
-    vulkan1_2
+const FS: &[u32] = zsl!(
+    fragment fs(@location(0) v_col: f32x3) -> f32x4 {
+        v_col.extend(1.0)
+    }
 );
 
 const ATTRS: &[VertexAttribute] = &[

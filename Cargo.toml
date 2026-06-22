@@ -43,7 +43,6 @@ zengpu-cuda = { path = "zengpu-cuda", version = "0.0.1" }
 zengpu-metal = { path = "zengpu-metal", version = "0.0.1" }
 zengpu-hip = { path = "zengpu-hip", version = "0.0.1" }
 zengpu-dx12 = { path = "zengpu-dx12", version = "0.0.1" }
-inline-spirv = { version = "0.2", features = ["glsl"] }
 log = "0.4"
 
 [lib]
