@@ -52,6 +52,26 @@ Foundation-only users can disable defaults:
 zengpu = { version = "0.0.1", default-features = false }
 ```
 
+### macOS
+
+Vulkan runs on macOS through [MoltenVK](https://github.com/KhronosGroup/MoltenVK):
+
+```sh
+brew install vulkan-loader molten-vk
+# Put the loader on macOS's default dylib search path (one-time, no sudo):
+ln -sf /opt/homebrew/lib/libvulkan.dylib   /usr/local/lib/libvulkan.dylib
+ln -sf /opt/homebrew/lib/libvulkan.1.dylib /usr/local/lib/libvulkan.1.dylib
+```
+
+After that, examples and tests run with no extra env (the Homebrew loader
+auto-discovers the MoltenVK ICD):
+
+```sh
+cargo run --release --example cube
+```
+
+The native Apple Metal backend (`metal` feature) needs no setup.
+
 ## Minimal Vulkan Compute
 
 This round-trips a host-visible buffer through the backend-independent device
