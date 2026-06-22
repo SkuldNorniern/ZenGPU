@@ -5,22 +5,23 @@ use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
     ShaderDesc, ShaderHandle,
 };
-use zengpu_spirv::zengpu_spirv;
+use zengpu_spirv::zsl;
 
 /// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
 /// Naive (untiled) f32 GEMM. 16×16 local workgroup.
-const GEMM_SPV: &[u32] = zengpu_spirv!(
-    #[compute(local_size_x = 16, local_size_y = 16)]
-    fn cs_gemm(a: Buf<f32>, b: Buf<f32>, c: BufMut<f32>, m: u32, n: u32, k: u32, alpha: f32) {
-        let row: u32 = global_id().y;
-        let col: u32 = global_id().x;
-        if row < m && col < n {
-            let sum: f32 = 0.0;
-            for i in 0..k {
-                sum = sum + a[row * k + i] * b[i * n + col];
+const GEMM_SPV: &[u32] = zsl!(
+    push P { m: u32, n: u32, k: u32, alpha: f32 }
+    @workgroup_size(16, 16)
+    kernel cs_gemm(a: device buffer<f32>, b: device buffer<f32>, c: device mut buffer<f32>, p: P, id: global_id) {
+        let row = id.y
+        let col = id.x
+        if row < p.m && col < p.n {
+            let sum: f32 = 0.0
+            for i in 0..p.k {
+                sum = sum + a[row * p.k + i] * b[i * p.n + col]
             }
-            c[row * n + col] = alpha * sum;
+            c[row * p.n + col] = p.alpha * sum
         }
     }
 );

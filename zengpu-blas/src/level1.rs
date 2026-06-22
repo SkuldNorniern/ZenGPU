@@ -5,26 +5,28 @@ use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
     ShaderDesc, ShaderHandle,
 };
-use zengpu_spirv::zengpu_spirv;
+use zengpu_spirv::zsl;
 
 /// `y[i] = y[i] + alpha * x[i]`  (BLAS SAXPY, in-place)
-const AXPY_SPV: &[u32] = zengpu_spirv!(
-    #[compute(local_size_x = 256)]
-    fn cs_saxpy(x: Buf<f32>, y: BufMut<f32>, n: u32, alpha: f32) {
-        let i: u32 = global_id().x;
-        if i < n {
-            y[i] = y[i] + alpha * x[i];
+const AXPY_SPV: &[u32] = zsl!(
+    push P { n: u32, alpha: f32 }
+    @workgroup_size(256)
+    kernel cs_saxpy(x: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            y[i] = y[i] + p.alpha * x[i]
         }
     }
 );
 
 /// `x[i] = x[i] * alpha`  (BLAS SSCAL, in-place)
-const SCAL_SPV: &[u32] = zengpu_spirv!(
-    #[compute(local_size_x = 256)]
-    fn cs_sscal(x: BufMut<f32>, n: u32, alpha: f32) {
-        let i: u32 = global_id().x;
-        if i < n {
-            x[i] = x[i] * alpha;
+const SCAL_SPV: &[u32] = zsl!(
+    push P { n: u32, alpha: f32 }
+    @workgroup_size(256)
+    kernel cs_sscal(x: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            x[i] = x[i] * p.alpha
         }
     }
 );
