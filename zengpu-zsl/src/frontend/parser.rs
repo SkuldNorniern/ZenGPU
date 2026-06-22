@@ -80,14 +80,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn bump(&mut self) -> Option<&'a Token> {
-        let t = self.toks.get(self.pos);
-        if t.is_some() {
-            self.pos += 1;
-        }
-        t
-    }
-
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
         Err(ParseError {
             msg: msg.into(),
