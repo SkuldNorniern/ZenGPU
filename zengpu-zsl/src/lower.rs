@@ -33,9 +33,9 @@ use syn::{
     spanned::Spanned,
 };
 
-use crate::ast::{ZslEntryPoint, ZslParam};
+use crate::frontend::ast::{ZslEntryPoint, ZslParam};
+use crate::frontend::types::ZslType;
 use crate::spirv::{Id, SpvBuilder, builtin, deco, sc};
-use crate::types::ZslType;
 
 // ── Public entry ─────────────────────────────────────────────────────────────
 

@@ -3,7 +3,7 @@
 use proc_macro2::Span;
 use syn::{FnArg, Ident, ItemFn, Meta, ReturnType, spanned::Spanned};
 
-use crate::types::ZslType;
+use crate::frontend::types::ZslType;
 
 /// Shader stage of a ZSL entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
