@@ -591,4 +591,101 @@ mod tests {
             unsafe { std::slice::from_raw_parts(out.as_ptr() as *const f32, n) };
         assert_eq!(result, &[11.0, 22.0, 33.0, 44.0]);
     }
+
+    /// Render a full-target triangle (ZSL→MSL vertex/fragment) to an offscreen
+    /// RGBA8 texture and read it back — validates the Metal graphics path on the
+    /// GPU without a window.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn offscreen_triangle_render_on_metal() {
+        use zengpu_spirv::zsl_msl;
+
+        const VS: &str = zsl_msl!(
+            vertex vs(@location(0) pos: f32x4) -> f32x4 { pos }
+        );
+        const FS: &str = zsl_msl!(
+            fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
+        );
+
+        let Some(device) = metal::Device::system_default() else { return };
+        let queue = device.new_command_queue();
+
+        // Oversized triangle covering the whole NDC viewport, in clip space.
+        let verts: [f32; 12] = [
+            -1.0, -1.0, 0.0, 1.0, //
+            3.0, -1.0, 0.0, 1.0, //
+            -1.0, 3.0, 0.0, 1.0, //
+        ];
+        let vbuf = device.new_buffer_with_data(
+            verts.as_ptr() as *const std::ffi::c_void,
+            std::mem::size_of_val(&verts) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        let opts = metal::CompileOptions::new();
+        let vs_fn = device
+            .new_library_with_source(VS, &opts)
+            .unwrap()
+            .get_function("zsl_main", None)
+            .unwrap();
+        let fs_fn = device
+            .new_library_with_source(FS, &opts)
+            .unwrap()
+            .get_function("zsl_main", None)
+            .unwrap();
+
+        const W: u64 = 4;
+        let tex_desc = metal::TextureDescriptor::new();
+        tex_desc.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+        tex_desc.set_width(W);
+        tex_desc.set_height(W);
+        tex_desc.set_usage(metal::MTLTextureUsage::RenderTarget);
+        tex_desc.set_storage_mode(metal::MTLStorageMode::Shared);
+        let tex = device.new_texture(&tex_desc);
+
+        let pdesc = metal::RenderPipelineDescriptor::new();
+        pdesc.set_vertex_function(Some(&vs_fn));
+        pdesc.set_fragment_function(Some(&fs_fn));
+        pdesc
+            .color_attachments()
+            .object_at(0)
+            .unwrap()
+            .set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+
+        let vd = metal::VertexDescriptor::new();
+        let attr = vd.attributes().object_at(0).unwrap();
+        attr.set_format(metal::MTLVertexFormat::Float4);
+        attr.set_offset(0);
+        attr.set_buffer_index(0);
+        vd.layouts().object_at(0).unwrap().set_stride(16);
+        pdesc.set_vertex_descriptor(Some(&vd));
+
+        let pso = device.new_render_pipeline_state(&pdesc).expect("render pipeline");
+
+        let rpd = metal::RenderPassDescriptor::new();
+        let ca = rpd.color_attachments().object_at(0).unwrap();
+        ca.set_texture(Some(&tex));
+        ca.set_load_action(metal::MTLLoadAction::Clear);
+        ca.set_clear_color(metal::MTLClearColor::new(0.0, 0.0, 0.0, 1.0));
+        ca.set_store_action(metal::MTLStoreAction::Store);
+
+        let cmd = queue.new_command_buffer();
+        let enc = cmd.new_render_command_encoder(rpd);
+        enc.set_render_pipeline_state(&pso);
+        enc.set_vertex_buffer(0, Some(&vbuf), 0);
+        enc.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 3);
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let mut px = vec![0u8; (W * W * 4) as usize];
+        tex.get_bytes(
+            px.as_mut_ptr() as *mut std::ffi::c_void,
+            W * 4,
+            metal::MTLRegion::new_2d(0, 0, W, W),
+            0,
+        );
+        // The triangle covers the whole target → every texel is opaque red.
+        assert_eq!(&px[0..4], &[255, 0, 0, 255], "expected red texel, got {:?}", &px[0..4]);
+    }
 }
