@@ -343,7 +343,7 @@ impl<'a> Parser<'a> {
             params.push(Param {
                 name: name.to_string(),
                 kind: ParamKind::Buffer {
-                    elem: crate::frontend::types::BufElem::F32,
+                    elem: crate::ir::BufElem::F32,
                     mutability: if writable {
                         Mutability::ReadWrite
                     } else {

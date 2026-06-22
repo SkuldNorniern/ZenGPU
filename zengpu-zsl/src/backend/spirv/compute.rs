@@ -24,7 +24,6 @@ mod glsl_op {
 
 use std::collections::HashMap;
 
-use proc_macro2::Span;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
@@ -33,7 +32,7 @@ use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
 // ── Public entry ─────────────────────────────────────────────────────────────
 
 /// Lower a compute [`Module`] to SPIR-V words.
-pub fn lower_compute(module: &Module) -> Result<Vec<u32>, (Span, String)> {
+pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let entry = &module.entry;
     let EntryKind::Compute { local_size } = entry.kind;
 
@@ -280,14 +279,14 @@ impl LowerCtx<'_> {
 
 // ── Statement lowering ─────────────────────────────────────────────────────────
 
-fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), (Span, String)> {
+fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), String> {
     for stmt in stmts {
         lower_stmt(ctx, stmt)?;
     }
     Ok(())
 }
 
-fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String)> {
+fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     match stmt {
         IrStmt::Let { name, init } => {
             let sty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ScalarTy::U32);
@@ -295,7 +294,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String
             let ptr = ctx
                 .locals
                 .get(name)
-                .ok_or_else(|| (Span::call_site(), format!("ZSL: undeclared local `{name}`")))?
+                .ok_or_else(|| format!("ZSL: undeclared local `{name}`"))?
                 .ptr;
             let val_id = coerce(ctx, val, sty);
             ctx.spv.op_store(ptr, val_id);
@@ -307,12 +306,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String
                 .locals
                 .get(name)
                 .map(|l| (l.ptr, l.ty))
-                .ok_or_else(|| {
-                    (
-                        Span::call_site(),
-                        format!("ZSL: `{name}` is not a declared local variable"),
-                    )
-                })?;
+                .ok_or_else(|| format!("ZSL: `{name}` is not a declared local variable"))?;
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, ty);
             ctx.spv.op_store(ptr, rhs_id);
@@ -323,12 +317,12 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String
             let buf_pc_index = ctx
                 .buf_params
                 .get(buf)
-                .ok_or_else(|| (Span::call_site(), format!("ZSL: `{buf}` is not a buffer param")))?
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
                 .pc_index;
             let g_bufs = ctx.g_bufs_var;
             let pc_var = ctx
                 .pc_var
-                .ok_or_else(|| (Span::call_site(), "ZSL: no push constant block".into()))?;
+                .ok_or_else(|| "ZSL: no push constant block".to_string())?;
             let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
             let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
             let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
@@ -387,12 +381,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String
                 .locals
                 .get(var)
                 .map(|l| l.ptr)
-                .ok_or_else(|| {
-                    (
-                        Span::call_site(),
-                        format!("ZSL: for-loop variable `{var}` not declared as a local"),
-                    )
-                })?;
+                .ok_or_else(|| format!("ZSL: for-loop variable `{var}` not declared as a local"))?;
 
             ctx.spv.op_store(loop_ptr, lo_id);
 
@@ -439,7 +428,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), (Span, String
 
 // ── Expression lowering ───────────────────────────────────────────────────────
 
-fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, String)> {
+fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     match expr {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
@@ -455,7 +444,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
             let local = ctx
                 .locals
                 .get(name)
-                .ok_or_else(|| (Span::call_site(), format!("ZSL: unknown identifier `{name}`")))?;
+                .ok_or_else(|| format!("ZSL: unknown identifier `{name}`"))?;
             let (ty, ptr) = (local.ty, local.ptr);
             let spv_ty = ctx.spv_ty(ty);
             let id = ctx.spv.op_load(spv_ty, ptr);
@@ -466,10 +455,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
             let info = *ctx
                 .scalar_params
                 .get(name)
-                .ok_or_else(|| (Span::call_site(), format!("ZSL: unknown identifier `{name}`")))?;
+                .ok_or_else(|| format!("ZSL: unknown identifier `{name}`"))?;
             let pc_var = ctx
                 .pc_var
-                .ok_or_else(|| (Span::call_site(), "ZSL: no push constant block".into()))?;
+                .ok_or_else(|| "ZSL: no push constant block".to_string())?;
             let is_u32 = info.ty == ctx.t_u32;
             let pc_ptr_ty = if is_u32 {
                 ctx.t_ptr_pc_u32
@@ -477,10 +466,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
                 ctx.t_ptr_pc_f32
             };
             if pc_ptr_ty == Id(0) {
-                return Err((
-                    Span::call_site(),
-                    "ZSL: push-constant pointer type not allocated".into(),
-                ));
+                return Err("ZSL: push-constant pointer type not allocated".to_string());
             }
             // Buffer index fields come first; scalar fields start at offset n_buf_params.
             let actual_idx = ctx.n_buf_params + info.pc_index;
@@ -495,12 +481,12 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
             let buf_pc_index = ctx
                 .buf_params
                 .get(buf)
-                .ok_or_else(|| (Span::call_site(), format!("ZSL: `{buf}` is not a buffer param")))?
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
                 .pc_index;
             let g_bufs = ctx.g_bufs_var;
             let pc_var = ctx
                 .pc_var
-                .ok_or_else(|| (Span::call_site(), "ZSL: no push constant block".into()))?;
+                .ok_or_else(|| "ZSL: no push constant block".to_string())?;
             // Load the buffer's slot index from the push-constant block.
             let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
             let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
@@ -550,10 +536,9 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, (Span, Strin
         | IrExpr::FieldAccess { .. }
         | IrExpr::VecConstruct { .. }
         | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => Err((
-            Span::call_site(),
-            "ZSL: vector/graphics expression not supported in compute shaders".into(),
-        )),
+        | IrExpr::Dot { .. } => {
+            Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
+        }
     }
 }
 
@@ -562,7 +547,7 @@ fn lower_binary(
     op: IrBinOp,
     lhs: Val,
     rhs: Val,
-) -> Result<Val, (Span, String)> {
+) -> Result<Val, String> {
     match op {
         IrBinOp::Add => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fadd, SpvBuilder::op_iadd),
         IrBinOp::Sub => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fsub, SpvBuilder::op_isub),
@@ -585,14 +570,14 @@ fn lower_binary(
                 (IrBinOp::Eq, ScalarTy::U32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
                 (IrBinOp::Ne, ScalarTy::U32) => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
                 _ => {
-                    return Err((Span::call_site(), "ZSL: comparisons not supported on bool".into()));
+                    return Err("ZSL: comparisons not supported on bool".into());
                 }
             };
             Ok(Val { id, ty: ScalarTy::Bool })
         }
         IrBinOp::And | IrBinOp::Or => {
             if lhs.ty != ScalarTy::Bool || rhs.ty != ScalarTy::Bool {
-                return Err((Span::call_site(), "ZSL: `&&`/`||` require bool operands".into()));
+                return Err("ZSL: `&&`/`||` require bool operands".into());
             }
             let bool_ty = ctx.t_bool;
             let id = match op {
@@ -609,7 +594,7 @@ fn lower_builtin(
     ctx: &mut LowerCtx<'_>,
     func: BuiltinFn,
     args: &[IrExpr],
-) -> Result<Val, (Span, String)> {
+) -> Result<Val, String> {
     let name = func.name();
     match func {
         // Unary GLSL builtins: f32 → f32
@@ -620,11 +605,11 @@ fn lower_builtin(
         | BuiltinFn::Ceil
         | BuiltinFn::Fract => {
             if args.len() != 1 {
-                return Err((Span::call_site(), format!("ZSL: {name}() takes 1 arg")));
+                return Err(format!("ZSL: {name}() takes 1 arg"));
             }
             let v = lower_expr(ctx, &args[0])?;
             if v.ty != ScalarTy::F32 {
-                return Err((Span::call_site(), format!("ZSL: {name}() requires f32")));
+                return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
                 BuiltinFn::Abs => glsl_op::F_ABS,
@@ -643,15 +628,15 @@ fn lower_builtin(
         // Binary GLSL builtins: (f32, f32) → f32
         BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
             if args.len() != 2 {
-                return Err((Span::call_site(), format!("ZSL: {name}(a, b) takes 2 args")));
+                return Err(format!("ZSL: {name}(a, b) takes 2 args"));
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
             if a.ty != ScalarTy::F32 {
-                return Err((Span::call_site(), format!("ZSL: {name}() requires f32")));
+                return Err(format!("ZSL: {name}() requires f32"));
             }
             if b.ty != ScalarTy::F32 {
-                return Err((Span::call_site(), format!("ZSL: {name}() requires f32")));
+                return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
                 BuiltinFn::Min => glsl_op::F_MIN,
@@ -667,13 +652,13 @@ fn lower_builtin(
         // clamp(x, lo, hi): (f32, f32, f32) → f32
         BuiltinFn::Clamp => {
             if args.len() != 3 {
-                return Err((Span::call_site(), "ZSL: clamp(x, lo, hi) takes 3 args".into()));
+                return Err("ZSL: clamp(x, lo, hi) takes 3 args".into());
             }
             let x = lower_expr(ctx, &args[0])?;
             let lo = lower_expr(ctx, &args[1])?;
             let hi = lower_expr(ctx, &args[2])?;
             if x.ty != ScalarTy::F32 || lo.ty != ScalarTy::F32 || hi.ty != ScalarTy::F32 {
-                return Err((Span::call_site(), "ZSL: clamp() requires f32 args".into()));
+                return Err("ZSL: clamp() requires f32 args".into());
             }
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
@@ -685,13 +670,13 @@ fn lower_builtin(
         // mix(a, b, t): (f32, f32, f32) → f32
         BuiltinFn::Mix => {
             if args.len() != 3 {
-                return Err((Span::call_site(), "ZSL: mix(a, b, t) takes 3 args".into()));
+                return Err("ZSL: mix(a, b, t) takes 3 args".into());
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
             let t = lower_expr(ctx, &args[2])?;
             if a.ty != ScalarTy::F32 || b.ty != ScalarTy::F32 || t.ty != ScalarTy::F32 {
-                return Err((Span::call_site(), "ZSL: mix() requires f32 args".into()));
+                return Err("ZSL: mix() requires f32 args".into());
             }
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
@@ -702,10 +687,9 @@ fn lower_builtin(
         }
 
         // Vector-only builtins never appear in a compute module.
-        BuiltinFn::Normalize | BuiltinFn::Length => Err((
-            Span::call_site(),
-            format!("ZSL: {name}() is not supported in compute shaders"),
-        )),
+        BuiltinFn::Normalize | BuiltinFn::Length => {
+            Err(format!("ZSL: {name}() is not supported in compute shaders"))
+        }
     }
 }
 
@@ -755,7 +739,7 @@ fn binary_arith(
     rhs: Val,
     float_op: fn(&mut SpvBuilder, Id, Id, Id) -> Id,
     int_op: fn(&mut SpvBuilder, Id, Id, Id) -> Id,
-) -> Result<Val, (Span, String)> {
+) -> Result<Val, String> {
     let (lhs, rhs) = unify(ctx, lhs, rhs);
     let ty = ctx.spv_ty(lhs.ty);
     let id = if lhs.ty == ScalarTy::F32 {
