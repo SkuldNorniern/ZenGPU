@@ -132,6 +132,27 @@ fn compile_native_zsl(src: &str) -> Result<Vec<u32>, String> {
     }
 }
 
+/// Native ZSL to MSL source (`&str`), with the same syntax as [`zsl`]. Compute kernels only.
+///
+/// The kernel is named `zsl_main`. Buffers bind at `[[buffer(0..n)]]`, push scalars at
+/// `[[buffer(n)]]`, and the thread id at `[[thread_position_in_grid]]`.
+#[proc_macro]
+pub fn zsl_msl(input: TokenStream) -> TokenStream {
+    let src = input.to_string();
+    match compile_native_zsl_msl(&src) {
+        Ok(msl) => format!("{msl:?}").parse().expect("string literal must parse"),
+        Err(msg) => compile_error_tokens(&msg),
+    }
+}
+
+fn compile_native_zsl_msl(src: &str) -> Result<String, String> {
+    use frontend::parser::Shader;
+    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
+        Shader::Compute(m) => Ok(backend::msl::lower_compute(&m).source),
+        Shader::Graphics(_) => Err("ZSL→MSL: graphics shaders not yet supported".to_string()),
+    }
+}
+
 fn words_to_slice_tokens(words: &[u32]) -> TokenStream {
     let mut s = String::with_capacity(words.len() * 12 + 4);
     s.push_str("&[");

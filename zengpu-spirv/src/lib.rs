@@ -15,6 +15,12 @@
 /// Native ZSL to SPIR-V words (compute and vertex/fragment). See [`zengpu_zsl::zsl`].
 pub use zengpu_zsl::zsl;
 
+/// Native ZSL to MSL source (`&str`), with the same syntax as [`zsl`]. Compute kernels only.
+///
+/// The kernel is named `zsl_main`. Buffers bind at `[[buffer(0..n)]]`, push scalars at
+/// `[[buffer(n)]]`, and the thread id at `[[thread_position_in_grid]]`.
+pub use zengpu_zsl::zsl_msl;
+
 /// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
 /// SPIR-V `ColMajor`.
 #[derive(Debug, Clone, Copy)]
