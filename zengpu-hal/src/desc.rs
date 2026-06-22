@@ -65,6 +65,8 @@ pub enum ShaderSource<'a> {
     Spirv(&'a [u8]),
     /// Null-terminated PTX assembly (CUDA Driver API format).
     Ptx(&'a [u8]),
+    /// Metal Shading Language source as UTF-8 bytes.
+    Msl(&'a [u8]),
 }
 
 /// Describes a shader module to create.
@@ -79,6 +81,10 @@ impl<'a> ShaderDesc<'a> {
     }
     pub fn ptx(bytes: &'a [u8]) -> Self {
         Self { source: ShaderSource::Ptx(bytes) }
+    }
+    /// Metal Shading Language source.
+    pub fn msl(source: &'a str) -> Self {
+        Self { source: ShaderSource::Msl(source.as_bytes()) }
     }
 }
 
