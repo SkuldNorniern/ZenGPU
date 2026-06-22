@@ -240,8 +240,10 @@ pub struct RasterState {
 
 /// The default is `Less`. For reverse-Z, use `Greater` with a `1.0` depth clear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CompareFn {
     Never,
+    #[default]
     Less,
     Equal,
     LessEqual,
@@ -249,12 +251,6 @@ pub enum CompareFn {
     GreaterEqual,
     NotEqual,
     Always,
-}
-
-impl Default for CompareFn {
-    fn default() -> Self {
-        Self::Less
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -1444,6 +1444,7 @@ impl GpuDevice for VulkanDevice {
             return Ok(());
         }
 
+        #[allow(clippy::type_complexity)]
         let resolved: Vec<(vk::Pipeline, vk::PipelineLayout, [u8; 128], usize, [u32; 3])> = {
             let pipelines = self.pipelines.lock().unwrap();
             let mut out = Vec::with_capacity(ops.len());
@@ -2438,7 +2439,7 @@ mod tests {
             })
             .unwrap();
         dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4]).unwrap();
-        dev.upload_texture_data_region(tex, 1, 0, &vec![0x80u8; 4 * 4 * 4])
+        dev.upload_texture_data_region(tex, 1, 0, &[0x80u8; 4 * 4 * 4])
             .unwrap();
         dev.destroy_texture(tex);
     }
