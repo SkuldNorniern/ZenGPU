@@ -12,3 +12,5 @@ pub mod types;
 // lands; `allow(dead_code)` until then.
 #[allow(dead_code)]
 pub mod lex;
+#[allow(dead_code)]
+pub mod parser;

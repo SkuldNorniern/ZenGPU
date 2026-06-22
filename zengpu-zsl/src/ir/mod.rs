@@ -30,12 +30,14 @@ pub enum Mutability {
 }
 
 /// A resolved entry-point parameter, in source declaration order.
+#[derive(Debug)]
 pub struct Param {
     pub name: String,
     pub kind: ParamKind,
 }
 
 /// What an entry-point parameter binds to.
+#[derive(Debug)]
 pub enum ParamKind {
     /// `device buffer<elem>` — a bindless storage buffer. `elem`/`mutability`
     /// are carried for reflection and the MSL backend; the SPIR-V backend only
@@ -51,11 +53,13 @@ pub enum ParamKind {
 }
 
 /// The kind of entry point, plus stage-specific facts.
+#[derive(Debug)]
 pub enum EntryKind {
     Compute { local_size: [u32; 3] },
 }
 
 /// A parsed, resolved entry point ready for any backend.
+#[derive(Debug)]
 pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
@@ -65,6 +69,7 @@ pub struct Entry {
 }
 
 /// A ZSL module — one entry point for now.
+#[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
 }
