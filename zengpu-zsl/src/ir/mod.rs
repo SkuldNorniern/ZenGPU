@@ -7,12 +7,25 @@
 //! This slice models the compute entry point. Graphics (vertex/fragment,
 //! varyings, vertex input/output structs) extends `EntryKind`/`Param` next.
 
-pub mod build;
 pub mod node;
 
 use node::{IrExpr, IrStmt};
 
-use crate::frontend::types::BufElem;
+/// Element type of a `buffer<T>`. The current backends only handle `F32`; the
+/// remaining variants exist for the `zen.md` type model and future widening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum BufElem {
+    F32,
+    I32,
+    U32,
+    Vec2,
+    Vec3,
+    Vec4,
+    Mat2,
+    Mat3,
+    Mat4,
+}
 
 /// Scalar value / declaration type. Compute values are scalar today.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

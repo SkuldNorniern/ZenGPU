@@ -35,12 +35,8 @@
 #[doc(hidden)]
 pub use inline_spirv;
 
-/// Re-export so that `$crate::zengpu_zsl` resolves inside `zengpu_spirv!`.
-#[doc(hidden)]
-pub use zengpu_zsl;
-
 /// Compile **native ZSL** source to SPIR-V (`&[u32]`) — ZenGPU's own
-/// lexer/parser/lowerer, no `syn`/`quote`. Compute kernels today. See
+/// lexer/parser/lowerer, no `syn`/`quote`. Compute + vertex/fragment. See
 /// [`zengpu_zsl::zsl`] for syntax.
 pub use zengpu_zsl::zsl;
 
@@ -106,11 +102,8 @@ pub use zengpu_zsl::ZslPushConst;
 /// ```
 #[macro_export]
 macro_rules! zengpu_spirv {
-    // ZSL path: input starts with an outer attribute (#[vertex/fragment/compute] fn ...)
-    (#[$attr:meta] $($rest:tt)*) => {
-        $crate::zengpu_zsl::zsl_spirv!(#[$attr] $($rest)*)
-    };
-    // GLSL path: string literal + stage token (existing inline_spirv behaviour)
+    // GLSL path: string literal + stage token (forwarded to inline_spirv).
+    // ZSL now has its own native macro, [`zsl!`]; this GLSL path is transitional.
     ($($tt:tt)*) => {
         $crate::inline_spirv::inline_spirv!($($tt)*)
     };
