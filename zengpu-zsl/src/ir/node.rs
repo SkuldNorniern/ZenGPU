@@ -6,6 +6,7 @@
 //! emission of conversions are left to each backend.
 
 /// A ZSL expression.
+#[derive(Debug)]
 pub enum IrExpr {
     /// Integer literal (`u32`-typed).
     LitU32(u32),
@@ -32,6 +33,7 @@ pub enum IrExpr {
 }
 
 /// A ZSL statement.
+#[derive(Debug)]
 pub enum IrStmt {
     /// `let name = init;` — `name` is pre-declared in `Entry::locals`.
     Let { name: String, init: IrExpr },
@@ -61,7 +63,7 @@ pub enum IrStmt {
 }
 
 /// Built-in math functions (map to GLSL.std.450 / Metal stdlib).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     Abs,
     Sign,
@@ -77,7 +79,7 @@ pub enum BuiltinFn {
 }
 
 /// Binary operators.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrBinOp {
     Add,
     Sub,
