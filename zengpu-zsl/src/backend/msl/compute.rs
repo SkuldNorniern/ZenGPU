@@ -210,8 +210,11 @@ mod tests {
     /// Compile MSL with the real Metal toolchain if present; skip otherwise.
     /// Returns `false` when `xcrun metal` is unavailable.
     fn metal_compiles(source: &str) -> Option<bool> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
-        let src = dir.join(format!("zsl_msl_{}.metal", std::process::id()));
+        let uniq = N.fetch_add(1, Ordering::Relaxed);
+        let src = dir.join(format!("zsl_msl_{}_{}.metal", std::process::id(), uniq));
         if std::fs::write(&src, source).is_err() {
             return None;
         }
