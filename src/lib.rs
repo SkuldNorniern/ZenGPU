@@ -56,13 +56,8 @@ pub use zengpu_hal as hal;
 
 pub use zengpu_spirv as spirv;
 
-/// GLSL or ZSL to SPIR-V at build time. See [`zengpu_spirv::zengpu_spirv`].
-#[macro_export]
-macro_rules! zengpu_spirv {
-    ($($tt:tt)*) => {
-        ::zengpu_spirv::zengpu_spirv!($($tt)*)
-    };
-}
+/// Native ZSL to SPIR-V at build time (compute and vertex/fragment). See [`zengpu_spirv::zsl`].
+pub use zengpu_spirv::zsl;
 
 pub use zengpu_hal::{
     Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,

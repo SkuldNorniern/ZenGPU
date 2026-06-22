@@ -12,6 +12,5 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-inline-spirv.workspace = true
 zengpu-zsl = { path = "../zengpu-zsl", version = "0.0.1" }
 zengpu-hal.workspace = true

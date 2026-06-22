@@ -1,40 +1,18 @@
-//! Shader macro that compiles GLSL or ZSL to SPIR-V at build time.
+//! Shader macro that compiles native ZSL to SPIR-V at build time.
 //!
-//! # GLSL
-//!
-//! A GLSL string with a stage token, forwarded to `inline_spirv`:
-//!
-//! ```ignore
-//! use zengpu_spirv::zengpu_spirv;
-//!
-//! const VERT: &[u32] = zengpu_spirv!(
-//!     r#"
-//!     #version 450
-//!     void main() { gl_Position = vec4(0.0); }
-//!     "#,
-//!     vert,
-//!     vulkan1_0
-//! );
-//! ```
-//!
-//! # ZSL
-//!
-//! A `#[vertex]`, `#[fragment]` or `#[compute]` annotated Rust function, lowered directly to
-//! SPIR-V:
+//! Has its own lexer, parser and lowerer, with no `syn`, `quote` or `inline-spirv`. [`zsl!`]
+//! handles compute and vertex/fragment shaders:
 //!
 //! ```ignore
-//! const VERT: &[u32] = zengpu_spirv!(
-//!     #[vertex]
-//!     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
-//!         mvp * in_pos.extend(1.0)
+//! const VS: &[u32] = zengpu_spirv::zsl!(
+//!     push P { mvp: mat4x4<f32> }
+//!     vertex vs(@location(0) pos: f32x3, p: P) -> f32x4 {
+//!         p.mvp * pos.extend(1.0)
 //!     }
 //! );
 //! ```
 
-#[doc(hidden)]
-pub use inline_spirv;
-
-/// Native ZSL to SPIR-V words (compute and vertex/fragment). See [`zengpu_zsl::zsl`] for syntax.
+/// Native ZSL to SPIR-V words (compute and vertex/fragment). See [`zengpu_zsl::zsl`].
 pub use zengpu_zsl::zsl;
 
 /// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
@@ -73,28 +51,3 @@ pub mod _zsl_priv {
 /// }, [16, 1, 1])?;
 /// ```
 pub use zengpu_zsl::ZslPushConst;
-
-/// Compile shader source to SPIR-V at build time.
-///
-/// # GLSL
-/// Same as `inline_spirv!`:
-/// ```ignore
-/// const SPV: &[u32] = zengpu_spirv!(r#"#version 450 ..."#, vert, vulkan1_0);
-/// ```
-///
-/// # ZSL
-/// A stage-attributed Rust function:
-/// ```ignore
-/// const SPV: &[u32] = zengpu_spirv!(
-///     #[vertex]
-///     fn vs_main(#[location(0)] in_pos: Vec3, mvp: Mat4) -> Vec4 {
-///         mvp * in_pos.extend(1.0)
-///     }
-/// );
-/// ```
-#[macro_export]
-macro_rules! zengpu_spirv {
-    ($($tt:tt)*) => {
-        $crate::inline_spirv::inline_spirv!($($tt)*)
-    };
-}
