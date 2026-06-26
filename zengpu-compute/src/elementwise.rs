@@ -7,14 +7,14 @@
 
 use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderDesc, ShaderHandle,
+    ShaderHandle,
 };
-use zengpu_spirv::zsl;
+use zengpu_spirv::{ZslShader, zsl};
 
 use crate::{BufferPool, DeviceArray};
 
 /// `out[i] = a[i] + b[i]` (matches `ZenGPU/examples/vec_add.rs`).
-const ADD_SPV: &[u32] = zsl!(
+const ADD_ZSL: ZslShader = zsl!(
     push P { len: u32 }
     @workgroup_size(256)
     kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -26,7 +26,7 @@ const ADD_SPV: &[u32] = zsl!(
 );
 
 /// `out[i] = max(a[i], 0)`.
-const RELU_SPV: &[u32] = zsl!(
+const RELU_ZSL: ZslShader = zsl!(
     push P { len: u32 }
     @workgroup_size(256)
     kernel relu(inp: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -36,10 +36,6 @@ const RELU_SPV: &[u32] = zsl!(
         }
     }
 );
-
-fn spv_bytes(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
-}
 
 fn check_f32(dtype: DType, op: &str) -> Result<()> {
     if dtype != DType::F32 {
@@ -65,13 +61,13 @@ impl ElementwiseKernels {
     /// matching kernels for [`Self::add_pipeline`]/[`Self::relu_pipeline`]
     /// via `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let add_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(ADD_SPV)))?;
+        let add_shader = device.create_shader(ADD_ZSL.spirv_desc())?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: add_shader,
             entry: "main",
             block: [256, 1, 1],
         })?;
-        let relu_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(RELU_SPV)))?;
+        let relu_shader = device.create_shader(RELU_ZSL.spirv_desc())?;
         let relu_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: relu_shader,
             entry: "main",

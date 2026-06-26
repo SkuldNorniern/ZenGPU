@@ -3,14 +3,14 @@
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderDesc, ShaderHandle,
+    ShaderHandle,
 };
-use zengpu_spirv::zsl;
+use zengpu_spirv::{ZslShader, zsl};
 
 /// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
 /// Naive (untiled) f32 GEMM. 16×16 local workgroup.
-const GEMM_SPV: &[u32] = zsl!(
+const GEMM_ZSL: ZslShader = zsl!(
     push P { m: u32, n: u32, k: u32, alpha: f32 }
     @workgroup_size(16, 16)
     kernel cs_gemm(a: device buffer<f32>, b: device buffer<f32>, c: device mut buffer<f32>, p: P, id: global_id) {
@@ -89,14 +89,10 @@ done:\n\
     ret;\n\
 }\n\0";
 
-fn spv_bytes(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
-}
-
 fn create_gemm_shader(device: &dyn GpuDevice) -> Result<ShaderHandle> {
     device
-        .create_shader(ShaderDesc::spirv(spv_bytes(GEMM_SPV)))
-        .or_else(|_| device.create_shader(ShaderDesc::ptx(GEMM_PTX)))
+        .create_shader(GEMM_ZSL.spirv_desc())
+        .or_else(|_| device.create_shader(zengpu_hal::ShaderDesc::ptx(GEMM_PTX)))
 }
 
 /// Compiled GEMM pipeline. Create once per device, reuse across dispatches.

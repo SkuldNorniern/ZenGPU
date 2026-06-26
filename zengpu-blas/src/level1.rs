@@ -3,12 +3,12 @@
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
     Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderDesc, ShaderHandle,
+    ShaderHandle,
 };
-use zengpu_spirv::zsl;
+use zengpu_spirv::{ZslShader, zsl};
 
 /// `y[i] = y[i] + alpha * x[i]`  (BLAS SAXPY, in-place)
-const AXPY_SPV: &[u32] = zsl!(
+const AXPY_ZSL: ZslShader = zsl!(
     push P { n: u32, alpha: f32 }
     @workgroup_size(256)
     kernel cs_saxpy(x: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
@@ -20,7 +20,7 @@ const AXPY_SPV: &[u32] = zsl!(
 );
 
 /// `x[i] = x[i] * alpha`  (BLAS SSCAL, in-place)
-const SCAL_SPV: &[u32] = zsl!(
+const SCAL_ZSL: ZslShader = zsl!(
     push P { n: u32, alpha: f32 }
     @workgroup_size(256)
     kernel cs_sscal(x: device mut buffer<f32>, p: P, id: global_id) {
@@ -30,10 +30,6 @@ const SCAL_SPV: &[u32] = zsl!(
         }
     }
 );
-
-fn spv_bytes(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
-}
 
 fn check_f32_shape(a: &DeviceArray, b: &DeviceArray, op: &str) -> Result<u32> {
     if a.dtype != DType::F32 || b.dtype != DType::F32 {
@@ -62,13 +58,13 @@ pub struct Level1Kernels {
 impl Level1Kernels {
     /// Compile SAXPY and SSCAL pipelines on `device`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let axpy_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(AXPY_SPV)))?;
+        let axpy_shader = device.create_shader(AXPY_ZSL.spirv_desc())?;
         let axpy_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: axpy_shader,
             entry:  "main",
             block:  [256, 1, 1],
         })?;
-        let scal_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(SCAL_SPV)))?;
+        let scal_shader = device.create_shader(SCAL_ZSL.spirv_desc())?;
         let scal_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: scal_shader,
             entry:  "main",

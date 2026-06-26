@@ -1421,15 +1421,14 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
 
     // ── ZSL → HIP integration test ────────────────────────────────────────────
 
-    /// Verify the `zsl_hip!` proc-macro emits valid HIP C++ that hipRTC accepts.
+    /// Verify that ZSL compiles to valid HIP C++ that hipRTC accepts.
     #[test]
     fn zsl_hip_vec_scale() {
         let Some(inst) = try_instance() else { return };
         let device = adapters_or_skip(&inst);
 
-        // ZSL → HIP C++ at compile time via the proc-macro.
-        // ZSL scalars go in a push block; the push struct is passed as a param.
-        const SCALE_SRC: &str = zengpu_spirv::zsl_hip!(
+        // ZSL → all backends at compile time; select HIP C++ at runtime.
+        const SCALE: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
             push Consts { n: u32 }
             @workgroup_size(256)
             kernel scale(
@@ -1444,6 +1443,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                 }
             }
         );
+        let scale_src = SCALE.hip;
 
         const N: usize = 1 << 20;
         let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
@@ -1454,8 +1454,8 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let dst = device.create_buffer(BufferDesc { size: bytes, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
         device.write_buffer(src, 0, bytemuck_cast(&data)).unwrap();
 
-        // Compile the ZSL-emitted HIP C++ via hipRTC at runtime.
-        let shader   = device.create_shader(ShaderDesc::hip(SCALE_SRC)).unwrap();
+        // Compile ZSL's HIP C++ form via hipRTC at runtime.
+        let shader   = device.create_shader(ShaderDesc::hip(scale_src)).unwrap();
         let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader, entry: "zsl_kernel", block: [256, 1, 1],
         }).unwrap();
@@ -1473,7 +1473,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!((out[0] - 0.0f32).abs() < 1e-5, "out[0]={}", out[0]);
         assert!((out[1] - 2.0f32).abs() < 1e-5, "out[1]={}", out[1]);
         assert!((out[2] - 4.0f32).abs() < 1e-5, "out[2]={}", out[2]);
-        println!("zsl_hip! → hipRTC: vec_scale OK  out[0..3]={} {} {}", out[0], out[1], out[2]);
+        println!("zsl! → hipRTC: vec_scale OK  out[0..3]={} {} {}", out[0], out[1], out[2]);
 
         device.destroy_pipeline(pipeline); device.destroy_shader(shader);
         device.destroy_buffer(src); device.destroy_buffer(dst);
