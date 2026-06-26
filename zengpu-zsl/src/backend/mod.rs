@@ -3,3 +3,6 @@
 #[allow(dead_code, unused_imports)]
 pub mod msl;
 pub mod spirv;
+
+#[allow(dead_code, unused_imports)]
+pub mod hip;

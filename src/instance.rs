@@ -141,11 +141,32 @@ impl InstanceBuilder {
         self
     }
 
-    /// Adds the ROCm/HIP backend. Never fails, but yields no adapters.
+    /// Adds HIP (ROCm).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HIP runtime is absent or fails to initialize.
     #[cfg(feature = "hip")]
-    pub fn hip(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_hip::HipInstance::new()));
-        self
+    pub fn hip(mut self) -> zengpu_hal::Result<Self> {
+        let inst = zengpu_hip::HipInstance::new()?;
+        self.backends.push(Box::new(inst));
+        Ok(self)
+    }
+
+    /// Add HIP if available, otherwise `self` unchanged.
+    #[cfg(feature = "hip")]
+    pub fn try_hip(self) -> Result<Self, Self> {
+        match zengpu_hip::HipInstance::new() {
+            Ok(inst) => {
+                let mut s = self;
+                s.backends.push(Box::new(inst));
+                Ok(s)
+            }
+            Err(e) => {
+                log::debug!("zengpu: HIP unavailable: {e}");
+                Err(self)
+            }
+        }
     }
 
     /// Adds DX12. Never fails here. Yields no adapters off Windows. DXGI enumeration is not

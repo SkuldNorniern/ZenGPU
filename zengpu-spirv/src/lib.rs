@@ -21,6 +21,10 @@ pub use zengpu_zsl::zsl;
 /// `[[buffer(n)]]`, and the thread id at `[[thread_position_in_grid]]`.
 pub use zengpu_zsl::zsl_msl;
 
+/// Native ZSL to HIP C++ (`&str`) for `ShaderDesc::hip`. Compute kernels only.
+/// See [`zengpu_zsl::zsl_hip`].
+pub use zengpu_zsl::zsl_hip;
+
 /// Column-major 4x4 for `#[derive(ZslPushConst)]`. Wrap as `ZslMat4(m.to_cols_array())`. Matches
 /// SPIR-V `ColMajor`.
 #[derive(Debug, Clone, Copy)]
