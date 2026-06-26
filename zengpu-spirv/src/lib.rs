@@ -1,28 +1,66 @@
-//! ZenGPU shader macro — compile native ZSL to SPIR-V at build time.
+//! ZenGPU shader macro — compile native ZSL to all backends at build time.
 //!
-//! ZSL is ZenGPU's own shader language with its own lexer/parser/lowerer (no
-//! `syn`/`quote`/`inline-spirv`). Use [`zsl!`] for compute and vertex/fragment:
+//! Use [`zsl!`] to produce a [`ZslShader`] containing SPIR-V (Vulkan), HIP C++
+//! (ROCm), MSL (Metal), and CUDA C++ (NVIDIA), all compiled at build time from
+//! the same ZSL source. At runtime, select the right form with
+//! [`ZslShader::for_backend`].
 //!
 //! ```ignore
-//! const VS: &[u32] = zengpu_spirv::zsl!(
-//!     push P { mvp: mat4x4<f32> }
-//!     vertex vs(@location(0) pos: f32x3, p: P) -> f32x4 {
-//!         p.mvp * pos.extend(1.0)
+//! use zengpu_spirv::{zsl, ZslShader};
+//!
+//! const KERNEL: ZslShader = zsl!(
+//!     push P { n: u32, scale: f32 }
+//!     @workgroup_size(64)
+//!     kernel scale(src: device buffer<f32>, dst: device mut buffer<f32>, p: P, id: global_id) {
+//!         let i = id.x
+//!         if i < p.n { dst[i] = src[i] * p.scale }
 //!     }
 //! );
 //! ```
 
-/// Compile **native ZSL** source to SPIR-V (`&[u32]`) — ZenGPU's own
-/// lexer/parser/lowerer. Compute + vertex/fragment. See [`zengpu_zsl::zsl`].
+use zengpu_hal::{BackendPreference, ShaderDesc};
+
+/// All-backend compiled form of a ZSL shader.
+///
+/// Produced by [`zsl!`] at build time. Each field holds the compiled output for
+/// one target; use [`for_backend`](ZslShader::for_backend) to pick the right one
+/// at runtime.
+pub struct ZslShader {
+    /// SPIR-V words for Vulkan (and any other SPIR-V consumer).
+    pub spv: &'static [u32],
+    /// HIP C++ source for AMD ROCm (compiled at runtime via hipRTC).
+    pub hip: &'static str,
+    /// Metal Shading Language source for Apple Metal.
+    pub msl: &'static str,
+    /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
+    pub cuda: &'static str,
+}
+
+impl ZslShader {
+    /// Return the right [`ShaderDesc`] and entry-point name for `backend`.
+    ///
+    /// Falls back to SPIR-V for any backend that is not HIP, Metal, or CUDA.
+    pub fn for_backend(&self, backend: BackendPreference) -> (ShaderDesc<'_>, &'static str) {
+        match backend {
+            BackendPreference::Hip => (ShaderDesc::hip(self.hip), "zsl_kernel"),
+            BackendPreference::Metal => (ShaderDesc::msl(self.msl), "zsl_main"),
+            BackendPreference::Cuda => (ShaderDesc::cuda_src(self.cuda), "zsl_kernel"),
+            _ => (self.spirv_desc(), "main"),
+        }
+    }
+
+    /// Convenience: SPIR-V [`ShaderDesc`] for Vulkan-only callers.
+    pub fn spirv_desc(&self) -> ShaderDesc<'_> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4)
+        };
+        ShaderDesc::spirv(bytes)
+    }
+}
+
+/// Compile **native ZSL** source to a [`ZslShader`] — all backends built at
+/// compile time. See the crate-level docs for usage.
 pub use zengpu_zsl::zsl;
-
-/// Compile **native ZSL** source to Metal Shading Language (`&str`) for the
-/// Metal backend (`ShaderDesc::msl`). Compute kernels today. See [`zengpu_zsl::zsl_msl`].
-pub use zengpu_zsl::zsl_msl;
-
-/// Compile **native ZSL** source to HIP C++ (`&str`) for the AMD ROCm backend
-/// (`ShaderDesc::hip`). Compute kernels only. See [`zengpu_zsl::zsl_hip`].
-pub use zengpu_zsl::zsl_hip;
 
 /// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
 ///
