@@ -1,14 +1,197 @@
-fn main() {
-    // Find ROCm installation.
-    let rocm_path = std::env::var("ROCM_PATH")
-        .unwrap_or_else(|_| "/opt/rocm".to_string());
+/// Build script for zengpu-hip.
+///
+/// 1. Locates the ROCm installation (ROCM_PATH env → /opt/rocm scan).
+/// 2. Emits link flags for libamdhip64 and libhiprtc.
+/// 3. Probes `hip_version.h` → emits `cfg(rocm_major="N")` / `cfg(rocm_minor="N")`
+///    so the crate can gate features on ROCm version at compile time.
+/// 4. Compiles a tiny C probe to measure `hipDeviceProp_t` field offsets,
+///    which shifted between major ROCm releases.  Falls back to ROCm 6/7
+///    x86-64 defaults when cross-compiling or when no AMD compiler is present.
 
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    let rocm_path = std::env::var("ROCM_PATH")
+        .unwrap_or_else(|_| find_rocm());
+
+    // ── Link flags ────────────────────────────────────────────────────────────
     println!("cargo:rustc-link-search=native={rocm_path}/lib");
-    // HIP runtime — provides hipMalloc, hipMemcpy, hipModuleLaunch*, etc.
     println!("cargo:rustc-link-lib=amdhip64");
-    // hipRTC — runtime kernel compilation.
     println!("cargo:rustc-link-lib=hiprtc");
 
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed=build.rs");
+
+    // ── ROCm version detection ────────────────────────────────────────────────
+    let (major, minor) = detect_rocm_version(&rocm_path);
+    println!("cargo:rustc-cfg=rocm_major=\"{major}\"");
+    println!("cargo:rustc-cfg=rocm_minor=\"{minor}\"");
+    // Also emit numeric cfg for range comparisons via build-time const.
+    // The generated file `hip_layout.rs` carries ROCM_VERSION_MAJOR/MINOR.
+
+    // ── hipDeviceProp_t layout probe ─────────────────────────────────────────
+    emit_hip_layout(&rocm_path, major, minor);
+}
+
+// ── ROCm finder ──────────────────────────────────────────────────────────────
+
+fn find_rocm() -> String {
+    // Prefer versioned symlink (e.g. /opt/rocm-7.2.1 → /opt/rocm).
+    for candidate in &["/opt/rocm", "/usr/local/rocm", "/usr"] {
+        if PathBuf::from(format!("{candidate}/lib/libamdhip64.so")).exists()
+            || PathBuf::from(format!("{candidate}/lib64/libamdhip64.so")).exists()
+        {
+            return candidate.to_string();
+        }
+    }
+    "/opt/rocm".to_string()
+}
+
+// ── Version detection ─────────────────────────────────────────────────────────
+
+fn detect_rocm_version(rocm_path: &str) -> (u32, u32) {
+    // Primary: parse hip_version.h (works offline, no compilation needed).
+    let version_h = format!("{rocm_path}/include/hip/hip_version.h");
+    if let Ok(text) = std::fs::read_to_string(&version_h) {
+        let major = parse_define(&text, "HIP_VERSION_MAJOR");
+        let minor = parse_define(&text, "HIP_VERSION_MINOR");
+        if let (Some(maj), Some(min)) = (major, minor) {
+            println!("cargo:warning=zengpu-hip: detected ROCm {maj}.{min} from {version_h}");
+            return (maj, min);
+        }
+    }
+
+    // Secondary: `hipconfig --version` → "HIP version: 7.2.53211"
+    if let Ok(out) = Command::new(format!("{rocm_path}/bin/hipconfig"))
+        .arg("--version")
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(ver) = s.split("HIP version:").nth(1) {
+            let parts: Vec<&str> = ver.trim().splitn(3, '.').collect();
+            if parts.len() >= 2 {
+                if let (Ok(maj), Ok(min)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+                    println!("cargo:warning=zengpu-hip: detected ROCm {maj}.{min} via hipconfig");
+                    return (maj, min);
+                }
+            }
+        }
+    }
+
+    println!("cargo:warning=zengpu-hip: ROCm version unknown; assuming 6.0");
+    (6, 0)
+}
+
+fn parse_define(text: &str, name: &str) -> Option<u32> {
+    text.lines()
+        .find(|l| l.contains(&format!("#define {name} ")))?
+        .split_whitespace()
+        .last()?
+        .parse()
+        .ok()
+}
+
+// ── hipDeviceProp_t layout probe ──────────────────────────────────────────────
+
+fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let layout_rs = out_dir.join("hip_layout.rs");
+
+    let result = probe_layout(rocm_path);
+
+    // Fall-back constants by ROCm major version (x86-64 measurements).
+    // ROCm 4.x: struct was smaller; gcnArchName at offset ~944.
+    // ROCm 5.x: offset ~1096.
+    // ROCm 6.x / 7.x: offset 1160, total size 1472.
+    let defaults = match rocm_major {
+        ..=4   => (1184, 944,  288, 388, 348),
+        5      => (1344, 1096, 288, 388, 348),
+        _      => (1472, 1160, 288, 388, 348), // 6.x / 7.x
+    };
+
+    let (prop_size, gcn_off, mem_off, cu_off, clk_off) = match result {
+        Ok(layout) => layout,
+        Err(e)     => {
+            println!(
+                "cargo:warning=zengpu-hip: layout probe failed ({e}); \
+                 using ROCm {rocm_major}.{rocm_minor} defaults"
+            );
+            defaults
+        }
+    };
+
+    let content = format!(
+        "// Auto-generated by zengpu-hip build.rs — do not edit.\n\
+         pub const ROCM_VERSION_MAJOR:      u32   = {rocm_major};\n\
+         pub const ROCM_VERSION_MINOR:      u32   = {rocm_minor};\n\
+         pub const HIP_PROP_SIZE:           usize = {prop_size};\n\
+         pub const HIP_PROP_GCN_ARCH_OFF:   usize = {gcn_off};\n\
+         #[allow(dead_code)]\n\
+         pub const HIP_PROP_TOTAL_MEM_OFF:  usize = {mem_off};\n\
+         pub const HIP_PROP_CU_COUNT_OFF:   usize = {cu_off};\n\
+         pub const HIP_PROP_CLOCK_OFF:      usize = {clk_off};\n\
+         pub const HIP_PROP_GCN_ARCH_LEN:   usize = 256;\n",
+    );
+    std::fs::write(&layout_rs, content).expect("write hip_layout.rs");
+}
+
+fn probe_layout(rocm_path: &str) -> Result<(usize, usize, usize, usize, usize), String> {
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let src = out_dir.join("hip_probe.cpp");
+    let bin = out_dir.join("hip_probe");
+
+    std::fs::write(&src, r#"
+#define __HIP_PLATFORM_AMD__
+#include <hip/hip_runtime_api.h>
+#include <stdio.h>
+#include <stddef.h>
+int main(void) {
+    printf("%zu %zu %zu %zu %zu\n",
+        sizeof(hipDeviceProp_t),
+        offsetof(hipDeviceProp_t, gcnArchName),
+        offsetof(hipDeviceProp_t, totalGlobalMem),
+        offsetof(hipDeviceProp_t, multiProcessorCount),
+        offsetof(hipDeviceProp_t, clockRate));
+    return 0;
+}
+"#).map_err(|e| e.to_string())?;
+
+    let compilers = [
+        format!("{rocm_path}/bin/hipcc"),
+        format!("{rocm_path}/lib/llvm/bin/clang++"),
+        "clang++".to_string(),
+        "g++".to_string(),
+    ];
+
+    for compiler in &compilers {
+        if !PathBuf::from(compiler).exists()
+            && compiler != "clang++"
+            && compiler != "g++"
+        {
+            continue;
+        }
+        let mut cmd = Command::new(compiler);
+        cmd.arg(&src).arg("-o").arg(&bin);
+        if compiler.contains("clang++") && !compiler.contains("hipcc") {
+            cmd.arg(format!("-I{rocm_path}/include"))
+               .arg("-D__HIP_PLATFORM_AMD__");
+        }
+        if let Ok(o) = cmd.output() {
+            if o.status.success() {
+                if let Ok(run) = Command::new(&bin).output() {
+                    if run.status.success() {
+                        let s = String::from_utf8_lossy(&run.stdout);
+                        let n: Vec<usize> = s.split_whitespace()
+                            .filter_map(|t| t.parse().ok())
+                            .collect();
+                        if n.len() == 5 {
+                            return Ok((n[0], n[1], n[2], n[3], n[4]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("no suitable compiler found".into())
 }
