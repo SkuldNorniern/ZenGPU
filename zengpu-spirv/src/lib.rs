@@ -20,6 +20,10 @@ pub use zengpu_zsl::zsl;
 /// Metal backend (`ShaderDesc::msl`). Compute kernels today. See [`zengpu_zsl::zsl_msl`].
 pub use zengpu_zsl::zsl_msl;
 
+/// Compile **native ZSL** source to HIP C++ (`&str`) for the AMD ROCm backend
+/// (`ShaderDesc::hip`). Compute kernels only. See [`zengpu_zsl::zsl_hip`].
+pub use zengpu_zsl::zsl_hip;
+
 /// A column-major 4×4 float matrix for use in `#[derive(ZslPushConst)]` structs.
 ///
 /// Wrap any `mat4` value (glam, nalgebra, hand-rolled) as `ZslMat4(m.to_cols_array())`

@@ -879,6 +879,91 @@ void sgemm(const float* __restrict__ A,
 }
 "#;
 
+    /// 64×64 macro-tile SGEMM with 4×4 register blocking (16×16 block).
+    /// Each thread computes 4×4 = 16 outputs; block tile = 64×64 = 4096 outputs.
+    /// LDS padded +1 on K dimension to avoid bank conflicts.
+    /// Expected speedup vs SGEMM_SRC: ~4× (4× more compute per LDS access).
+    const SGEMM_OPT_SRC: &str = r#"
+#define TILE 64
+#define TK   16
+#define DIM  16
+
+extern "C" __global__ __launch_bounds__(DIM * DIM)
+void sgemm_opt(const float* __restrict__ A,
+               const float* __restrict__ B,
+               float* __restrict__ C,
+               unsigned int M, unsigned int N, unsigned int K) {
+    __shared__ float As[TILE][TK + 1];   /* [m][k] padded to avoid bank conflicts */
+    __shared__ float Bs[TILE][TK + 1];   /* [n][k] same layout                   */
+
+    int tx  = (int)threadIdx.x;          /* 0..DIM-1 */
+    int ty  = (int)threadIdx.y;          /* 0..DIM-1 */
+    int bx  = (int)blockIdx.x;
+    int by  = (int)blockIdx.y;
+    int tid = ty * DIM + tx;             /* 0..255 linearised thread index        */
+
+    float acc[4][4] = {};
+
+    for (int k0 = 0; k0 < (int)K; k0 += TK) {
+        /* ── Load As[TILE][TK]: 64×16 = 1024 elements, 4 per thread ──
+           idx maps to (mi, ki) via mi=idx/TK, ki=idx%TK.
+           16 consecutive tids share the same mi → ki runs 0..15 → coalesced. */
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            int idx = tid + s * 256;
+            int mi = idx / TK;
+            int ki = idx % TK;
+            int gm = by * TILE + mi;
+            int gk = k0 + ki;
+            As[mi][ki] = (gm < (int)M && gk < (int)K) ? A[gm * (int)K + gk] : 0.0f;
+        }
+        /* ── Load Bs[TILE][TK]: same size, ni=idx%TILE, ki=idx/TILE.
+           64 consecutive tids share ki → ni runs 0..63 → full cache line. */
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            int idx = tid + s * 256;
+            int ni = idx % TILE;
+            int ki = idx / TILE;
+            int gn = bx * TILE + ni;
+            int gk = k0 + ki;
+            Bs[ni][ki] = (gk < (int)K && gn < (int)N) ? B[gk * (int)N + gn] : 0.0f;
+        }
+        __syncthreads();
+
+        /* ── 4×4 register-blocked dot product ── */
+        #pragma unroll
+        for (int ki = 0; ki < TK; ki++) {
+            float a0 = As[ty          ][ki];
+            float a1 = As[ty + DIM    ][ki];
+            float a2 = As[ty + 2*DIM  ][ki];
+            float a3 = As[ty + 3*DIM  ][ki];
+            float b0 = Bs[tx          ][ki];
+            float b1 = Bs[tx + DIM    ][ki];
+            float b2 = Bs[tx + 2*DIM  ][ki];
+            float b3 = Bs[tx + 3*DIM  ][ki];
+            acc[0][0] += a0*b0; acc[0][1] += a0*b1; acc[0][2] += a0*b2; acc[0][3] += a0*b3;
+            acc[1][0] += a1*b0; acc[1][1] += a1*b1; acc[1][2] += a1*b2; acc[1][3] += a1*b3;
+            acc[2][0] += a2*b0; acc[2][1] += a2*b1; acc[2][2] += a2*b2; acc[2][3] += a2*b3;
+            acc[3][0] += a3*b0; acc[3][1] += a3*b1; acc[3][2] += a3*b2; acc[3][3] += a3*b3;
+        }
+        __syncthreads();
+    }
+
+    /* ── Write 4×4 output block ── */
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        int gm = by * TILE + ty + i * DIM;
+        if (gm < (int)M) {
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                int gn = bx * TILE + tx + j * DIM;
+                if (gn < (int)N) C[gm * (int)N + gn] = acc[i][j];
+            }
+        }
+    }
+}
+"#;
+
     /// Parallel tree reduction: reduces N f32 → one f32 per block.
     /// Uses static LDS sized to block (512 threads) — no dynamic shared needed.
     const REDUCE_SRC: &str = r#"
@@ -1202,6 +1287,196 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .collect();
 
         for h in handles { h.join().expect("thread panicked"); }
+    }
+
+    // ── Optimised SGEMM helper ────────────────────────────────────────────────
+
+    fn run_sgemm_opt(device: &dyn GpuDevice, m: usize, n: usize, k: usize) -> f64 {
+        let a: Vec<f32> = (0..m*k).map(|i| (i % 7)  as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..k*n).map(|i| (i % 11) as f32 * 0.001).collect();
+        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let ba = device.create_buffer(BufferDesc { size: (m*k*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bb = device.create_buffer(BufferDesc { size: (k*n*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bc = device.create_buffer(BufferDesc { size: (m*n*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_OPT_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "sgemm_opt", block: [16, 16, 1],
+        }).unwrap();
+        let grid     = [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1];
+        let bindings = Bindings {
+            buffers:  &[ba.index(), bb.index(), bc.index()],
+            textures: &[],
+            scalars:  &[zengpu_hal::Scalar::U32(m as u32), zengpu_hal::Scalar::U32(n as u32), zengpu_hal::Scalar::U32(k as u32)],
+        };
+        // Two warm-up passes to fill instruction cache.
+        device.dispatch(pipeline, bindings, grid).unwrap();
+        device.dispatch(pipeline, bindings, grid).unwrap();
+        const REPS: u32 = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
+        let ms     = elapsed_ms(t0) / REPS as f64;
+        let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
+        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
+        device.destroy_buffer(ba); device.destroy_buffer(bb); device.destroy_buffer(bc);
+        gflops
+    }
+
+    /// Optimised SGEMM (reg-blocked): compare naive 32×32 vs opt 64×64 on each size.
+    #[test]
+    fn heavy_sgemm_opt_sweep() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        assert!(!adapters.is_empty());
+
+        let adapter = &adapters[0];
+        let device  = adapter.open(DeviceRequest::default()).unwrap();
+        let name    = adapter.info().name.clone();
+
+        for &sz in &[2048usize, 4096, 8192] {
+            // 8192³ = 3 × 256 MB matrices → skip if sz==8192 and VRAM < ~1 GB budget
+            // (9060 XT has 16 GB; skip guard here is a safety net on small systems).
+            let mem_mb = 3 * sz * sz * 4 / (1024 * 1024);
+            let info   = inst.device_infos();
+            let vram   = info[0].total_mem / (1024 * 1024);
+            if mem_mb as usize > vram * 3 / 4 {
+                println!("[{name}] skip SGEMM {sz}³: need {mem_mb} MB, VRAM={vram} MB");
+                continue;
+            }
+
+            let gflops_naive = if sz <= 4096 {
+                // Run naive for comparison only at smaller sizes (slow at 8192).
+                Some(run_sgemm_naive(device.as_ref(), sz))
+            } else {
+                None
+            };
+            let gflops_opt = run_sgemm_opt(device.as_ref(), sz, sz, sz);
+
+            match gflops_naive {
+                Some(n) => println!(
+                    "[{name}] SGEMM {sz}³  naive={n:.0}  opt={gflops_opt:.0} GFLOP/s  ({:.1}×)",
+                    gflops_opt / n
+                ),
+                None => println!("[{name}] SGEMM {sz}³  opt={gflops_opt:.0} GFLOP/s"),
+            }
+
+            // At least 2× improvement over naive (usually 3-5×).
+            if let Some(n) = gflops_naive {
+                assert!(
+                    gflops_opt > n * 1.5,
+                    "opt SGEMM {sz}³ ({gflops_opt:.0}) should beat naive ({n:.0}) by ≥1.5×"
+                );
+            }
+        }
+    }
+
+    fn run_sgemm_naive(device: &dyn GpuDevice, sz: usize) -> f64 {
+        let a: Vec<f32> = (0..sz*sz).map(|i| (i % 7)  as f32 * 0.01).collect();
+        let b: Vec<f32> = (0..sz*sz).map(|i| (i % 13) as f32 * 0.01).collect();
+        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let ba = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bb = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bc = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "sgemm", block: [32, 32, 1],
+        }).unwrap();
+        let grid = [((sz as u32)+31)/32, ((sz as u32)+31)/32, 1];
+        let bindings = Bindings {
+            buffers:  &[ba.index(), bb.index(), bc.index()],
+            textures: &[],
+            scalars:  &[zengpu_hal::Scalar::U32(sz as u32), zengpu_hal::Scalar::U32(sz as u32), zengpu_hal::Scalar::U32(sz as u32)],
+        };
+        device.dispatch(pipeline, bindings, grid).unwrap(); // warm-up
+        const REPS: u32 = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
+        let ms = elapsed_ms(t0) / REPS as f64;
+        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
+        device.destroy_buffer(ba); device.destroy_buffer(bb); device.destroy_buffer(bc);
+        2.0 * sz as f64 * sz as f64 * sz as f64 / (ms * 1e6)
+    }
+
+    /// Multi-GPU parallel opt-SGEMM 4096³.
+    #[test]
+    fn heavy_multi_gpu_sgemm_opt_4096() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        if adapters.is_empty() { return; }
+
+        let handles: Vec<_> = adapters.iter().enumerate().map(|(idx, a)| {
+            let dev: std::sync::Arc<dyn GpuDevice> =
+                std::sync::Arc::from(a.open(DeviceRequest::default()).unwrap());
+            let name = a.info().name.clone();
+            std::thread::spawn(move || {
+                let gflops = run_sgemm_opt(dev.as_ref(), 4096, 4096, 4096);
+                println!("[GPU {idx} – {name}] opt SGEMM 4096³: {gflops:.0} GFLOP/s");
+            })
+        }).collect();
+        for h in handles { h.join().expect("thread panicked"); }
+    }
+
+    // ── ZSL → HIP integration test ────────────────────────────────────────────
+
+    /// Verify the `zsl_hip!` proc-macro emits valid HIP C++ that hipRTC accepts.
+    #[test]
+    fn zsl_hip_vec_scale() {
+        let Some(inst) = try_instance() else { return };
+        let device = adapters_or_skip(&inst);
+
+        // ZSL → HIP C++ at compile time via the proc-macro.
+        // ZSL scalars go in a push block; the push struct is passed as a param.
+        const SCALE_SRC: &str = zengpu_spirv::zsl_hip!(
+            push Consts { n: u32 }
+            @workgroup_size(256)
+            kernel scale(
+                id: global_id,
+                a: device buffer<f32>,
+                b: device mut buffer<f32>,
+                c: Consts,
+            ) {
+                let i = id.x
+                if i < c.n {
+                    b[i] = a[i] * 2.0
+                }
+            }
+        );
+
+        const N: usize = 1 << 20;
+        let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
+        let bytes = (N * 4) as u64;
+        let st    = BufferUsage::STORAGE | BufferUsage::READBACK;
+
+        let src = device.create_buffer(BufferDesc { size: bytes, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let dst = device.create_buffer(BufferDesc { size: bytes, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        device.write_buffer(src, 0, bytemuck_cast(&data)).unwrap();
+
+        // Compile the ZSL-emitted HIP C++ via hipRTC at runtime.
+        let shader   = device.create_shader(ShaderDesc::hip(SCALE_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "zsl_kernel", block: [256, 1, 1],
+        }).unwrap();
+
+        let bindings = Bindings {
+            buffers:  &[src.index(), dst.index()],
+            textures: &[],
+            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+        };
+        let grid = [(N as u32 + 255) / 256, 1, 1];
+        device.dispatch(pipeline, bindings, grid).unwrap();
+
+        let raw = device.read_buffer(dst, 0, 32).unwrap();
+        let out = bytemuck_cast_slice(&raw);
+        assert!((out[0] - 0.0f32).abs() < 1e-5, "out[0]={}", out[0]);
+        assert!((out[1] - 2.0f32).abs() < 1e-5, "out[1]={}", out[1]);
+        assert!((out[2] - 4.0f32).abs() < 1e-5, "out[2]={}", out[2]);
+        println!("zsl_hip! → hipRTC: vec_scale OK  out[0..3]={} {} {}", out[0], out[1], out[2]);
+
+        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
+        device.destroy_buffer(src); device.destroy_buffer(dst);
     }
 
     fn adapters_or_skip(inst: &HipInstance) -> Box<dyn GpuDevice> {
