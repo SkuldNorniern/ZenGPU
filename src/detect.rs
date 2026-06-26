@@ -63,8 +63,9 @@ fn probe_all(out: &mut Vec<BackendAvailability>) {
 
     #[cfg(feature = "hip")]
     {
-        let inst = zengpu_hip::HipInstance::new();
-        push_if_nonempty(out, "hip", &inst);
+        if let Ok(inst) = zengpu_hip::HipInstance::new() {
+            push_if_nonempty(out, "hip", &inst);
+        }
     }
 
     #[cfg(feature = "dx12")]

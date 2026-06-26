@@ -1907,6 +1907,7 @@ version = "0.0.1"
 dependencies = [
  "log",
  "zengpu-hal",
+ "zengpu-spirv",
 ]
 
 [[package]]

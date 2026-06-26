@@ -172,6 +172,23 @@ fn compile_native_zsl_msl(src: &str) -> Result<String, String> {
     }
 }
 
+#[proc_macro]
+pub fn zsl_hip(input: TokenStream) -> TokenStream {
+    let src = input.to_string();
+    match compile_native_zsl_hip(&src) {
+        Ok(hip) => format!("{hip:?}").parse().expect("string literal must parse"),
+        Err(msg) => compile_error_tokens(&msg),
+    }
+}
+
+fn compile_native_zsl_hip(src: &str) -> Result<String, String> {
+    use frontend::parser::Shader;
+    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
+        Shader::Compute(m) => Ok(backend::hip::lower_compute(&m).source),
+        Shader::Graphics(_) => Err("zsl_hip!: graphics shaders not supported (compute only)".into()),
+    }
+}
+
 /// Build the `&[u32]` literal token stream without `quote`.
 fn words_to_slice_tokens(words: &[u32]) -> TokenStream {
     let mut s = String::with_capacity(words.len() * 12 + 4);
