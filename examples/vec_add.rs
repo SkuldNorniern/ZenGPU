@@ -10,19 +10,12 @@
 
 use zengpu::{
     AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
-    GpuInstance, MemoryUsage, Scalar, ShaderDesc, VulkanInstance, zsl,
+    GpuInstance, MemoryUsage, Scalar, VulkanInstance, ZslShader, zsl,
 };
 
 // ── Shader ────────────────────────────────────────────────────────────────────
 
-/// vec_add: out[i] = a[i] + b[i] for i in 0..len.
-///
-/// Push constant layout (matches Bindings packing in `dispatch`):
-///   offset 0: uint a_idx   = bindings.buffers[0]
-///   offset 4: uint b_idx   = bindings.buffers[1]
-///   offset 8: uint out_idx = bindings.buffers[2]
-///   offset 12: uint len    = bindings.scalars[0]
-const SHADER_SPV: &[u32] = zsl!(
+const SHADER: ZslShader = zsl!(
     push P { len: u32 }
     @workgroup_size(256)
     kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -75,10 +68,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     device.write_buffer(hb, 0, as_bytes(&b_data))?;
 
     // ── Create compute pipeline ─────────────────────────────────────────────
-    let spv_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(SHADER_SPV.as_ptr() as *const u8, SHADER_SPV.len() * 4)
-    };
-    let shader = device.create_shader(ShaderDesc::spirv(spv_bytes))?;
+    let shader = device.create_shader(SHADER.spirv_desc())?;
     let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,
         entry: "main",
