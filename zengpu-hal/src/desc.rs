@@ -69,6 +69,8 @@ pub enum ShaderSource<'a> {
     Msl(&'a [u8]),
     /// HIP C++ kernel source as UTF-8 bytes, compiled at runtime via hipRTC.
     Hip(&'a [u8]),
+    /// CUDA C++ kernel source as UTF-8 bytes, compiled at runtime via NVRTC.
+    CudaSrc(&'a [u8]),
 }
 
 /// Describes a shader module to create.
@@ -91,6 +93,10 @@ impl<'a> ShaderDesc<'a> {
     /// HIP C++ kernel source (compiled via hipRTC on the AMD ROCm backend).
     pub fn hip(source: &'a str) -> Self {
         Self { source: ShaderSource::Hip(source.as_bytes()) }
+    }
+    /// CUDA C++ kernel source (compiled via NVRTC on the NVIDIA CUDA backend).
+    pub fn cuda_src(source: &'a str) -> Self {
+        Self { source: ShaderSource::CudaSrc(source.as_bytes()) }
     }
 }
 
