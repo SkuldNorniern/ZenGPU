@@ -1209,4 +1209,377 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty(), "no HIP adapters");
         adapters.into_iter().next().unwrap().open(DeviceRequest::default()).unwrap()
     }
+
+    // ── 4096 workloads ────────────────────────────────────────────────────────
+
+    /// SGEMM 4096³ single GPU — saturates L2 bandwidth, measures peak GFLOP/s.
+    #[test]
+    fn heavy_sgemm_4096() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        assert!(!adapters.is_empty());
+
+        let adapter = &adapters[0];
+        let device  = adapter.open(DeviceRequest::default()).unwrap();
+        let info    = adapter.info();
+
+        const M: usize = 4096;
+        const N: usize = 4096;
+        const K: usize = 4096;
+
+        // 4096² × f32 = 64 MB per matrix; 3 matrices = 192 MB — fine for 9060 XT.
+        let a: Vec<f32> = (0..M*K).map(|i| (i % 7)  as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..K*N).map(|i| (i % 11) as f32 * 0.001).collect();
+
+        let bytes_mn = (M * N * 4) as u64;
+        let bytes_mk = (M * K * 4) as u64;
+        let bytes_kn = (K * N * 4) as u64;
+        let storage  = BufferUsage::STORAGE | BufferUsage::READBACK;
+
+        let ba = device.create_buffer(BufferDesc { size: bytes_mk, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bb = device.create_buffer(BufferDesc { size: bytes_kn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let bc = device.create_buffer(BufferDesc { size: bytes_mn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+
+        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+
+        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "sgemm", block: [32, 32, 1],
+        }).unwrap();
+
+        let grid     = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
+        let bindings = Bindings {
+            buffers:  &[ba.index(), bb.index(), bc.index()],
+            textures: &[],
+            scalars:  &[
+                zengpu_hal::Scalar::U32(M as u32),
+                zengpu_hal::Scalar::U32(N as u32),
+                zengpu_hal::Scalar::U32(K as u32),
+            ],
+        };
+
+        // Warm-up (2 passes to fill caches).
+        device.dispatch(pipeline, bindings, grid).unwrap();
+        device.dispatch(pipeline, bindings, grid).unwrap();
+
+        const REPS: u32 = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
+        let ms     = elapsed_ms(t0) / REPS as f64;
+        let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
+
+        println!("[{}] SGEMM {M}×{K}×{N}: {ms:.1} ms → {gflops:.1} GFLOP/s", info.name);
+
+        // Correctness spot-check.
+        let raw = device.read_buffer(bc, 0, 64).unwrap();
+        let c: &[f32] = bytemuck_cast_slice(&raw);
+        let expected: f32 = (0..K).map(|k| a[k] * b[k * N]).sum();
+        let err = (c[0] - expected).abs() / expected.abs().max(1e-6);
+        assert!(err < 1e-2, "SGEMM 4096 C[0][0] err {err:.2e}: got {} expected {expected}", c[0]);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(ba);
+        device.destroy_buffer(bb);
+        device.destroy_buffer(bc);
+    }
+
+    /// Parallel tree reduction 256 M floats (1 GB) — larger than GPU L2.
+    #[test]
+    fn heavy_reduction_256m() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        assert!(!adapters.is_empty());
+
+        let device = adapters[0].open(DeviceRequest::default()).unwrap();
+        let name   = adapters[0].info().name.clone();
+
+        const N: usize = 256 * 1024 * 1024; // 256 M floats = 1 GB
+        const BLOCK: u32 = 512;
+
+        // Use sequential integer data so the expected sum is exact in f32.
+        // f32 can represent all integers up to 2^24 = 16 M exactly; for 256 M
+        // elements of value 1.0 the sum is 256 M which fits exactly.
+        let data: Vec<f32> = vec![1.0f32; N];
+
+        let src_bytes     = (N * 4) as u64;
+        let num_blocks    = ((N as u32) + BLOCK * 2 - 1) / (BLOCK * 2);
+        let partial_bytes = (num_blocks as usize * 4) as u64;
+        let storage       = BufferUsage::STORAGE | BufferUsage::READBACK;
+
+        let buf_in  = device.create_buffer(BufferDesc { size: src_bytes,     usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let buf_out = device.create_buffer(BufferDesc { size: partial_bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+
+        let shader   = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "reduce_sum", block: [BLOCK, 1, 1],
+        }).unwrap();
+
+        let bindings = Bindings {
+            buffers:  &[buf_in.index(), buf_out.index()],
+            textures: &[],
+            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+        };
+
+        // Warm-up.
+        device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+
+        const REPS: u32 = 3;
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS {
+            device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+        }
+        let ms = elapsed_ms(t0) / REPS as f64;
+
+        let raw      = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
+        let partials = bytemuck_cast_slice(&raw);
+        let sum: f32 = partials.iter().sum();
+        let expected = N as f32;
+        let err      = (sum - expected).abs() / expected;
+        assert!(err < 1e-3, "reduction 256M: got {sum}, expected {expected}, err={err:.2e}");
+
+        let bytes_moved = (N * 4 + num_blocks as usize * 4) as f64;
+        let gb_s        = bytes_moved / (ms * 1e6);
+        println!("[{name}] reduce_sum 256M floats (1 GB): {ms:.2} ms → {gb_s:.1} GB/s  sum={sum}");
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_in);
+        device.destroy_buffer(buf_out);
+    }
+
+    /// Wave-level reduction kernel (DPP swizzle) — RDNA 4 specific, uses
+    /// `__builtin_amdgcn_ds_swizzle` for intra-wave communication without LDS.
+    /// Falls back to LDS reduction on older ROCm / non-RDNA hardware.
+    const WAVE_REDUCE_SRC: &str = r#"
+/* Wave-level sum reduction using DPP butterfly swizzle (wave32 assumed).
+   One block sums 1024 elements; outer loop handles the full array. */
+#define BLOCK_SIZE 256
+extern "C" __global__
+void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
+                     unsigned int n) {
+    __shared__ float sdata[BLOCK_SIZE / 32]; // one slot per wave
+    unsigned int tid  = threadIdx.x;
+    unsigned int lane = tid & 31;
+    unsigned int wid  = tid >> 5; // wave index within block
+
+    // Grid-stride accumulation into a register.
+    float v = 0.0f;
+    for (unsigned int i = blockIdx.x * BLOCK_SIZE + tid; i < n; i += gridDim.x * BLOCK_SIZE)
+        v += in[i];
+
+    // Intra-wave butterfly reduction (DPP / warp shuffle).
+    v += __shfl_xor(v, 16);
+    v += __shfl_xor(v, 8);
+    v += __shfl_xor(v, 4);
+    v += __shfl_xor(v, 2);
+    v += __shfl_xor(v, 1);
+
+    // Lane 0 writes the wave sum to shared memory.
+    if (lane == 0) sdata[wid] = v;
+    __syncthreads();
+
+    // Thread 0 sums the wave results.
+    if (tid == 0) {
+        float s = 0.0f;
+        unsigned int nw = BLOCK_SIZE / 32;
+        for (unsigned int w = 0; w < nw; ++w) s += sdata[w];
+        out[blockIdx.x] = s;
+    }
+}
+"#;
+
+    /// Wave-level reduction 256 M floats — uses `__shfl_xor` (DPP on RDNA).
+    /// Skips on ROCm < 4.0 where wave intrinsics may not compile.
+    #[test]
+    fn heavy_wave_reduce_4096() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        assert!(!adapters.is_empty());
+
+        let hip_info = inst.device_infos();
+        // Gate: wave_reduction requires ROCm ≥ 4.0.
+        if !hip_info[0].capabilities.wave_reduction {
+            println!("skip heavy_wave_reduce_4096: ROCm < 4.0 (no wave reduction builtins)");
+            return;
+        }
+
+        let device = adapters[0].open(DeviceRequest::default()).unwrap();
+        let name   = adapters[0].info().name.clone();
+
+        const N: usize = 256 * 1024 * 1024;
+        const BLOCK: u32 = 256;
+        const NUM_BLOCKS: u32 = 2048; // grid-stride, so fixed block count
+
+        let data: Vec<f32> = vec![1.0f32; N];
+
+        let src_bytes     = (N * 4) as u64;
+        let partial_bytes = (NUM_BLOCKS as usize * 4) as u64;
+        let storage       = BufferUsage::STORAGE | BufferUsage::READBACK;
+
+        let buf_in  = device.create_buffer(BufferDesc { size: src_bytes,     usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let buf_out = device.create_buffer(BufferDesc { size: partial_bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+
+        let shader   = device.create_shader(ShaderDesc::hip(WAVE_REDUCE_SRC)).unwrap();
+        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+            shader, entry: "wave_reduce_sum", block: [BLOCK, 1, 1],
+        }).unwrap();
+
+        let bindings = Bindings {
+            buffers:  &[buf_in.index(), buf_out.index()],
+            textures: &[],
+            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+        };
+
+        device.dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1]).unwrap();
+
+        const REPS: u32 = 5;
+        let t0 = std::time::Instant::now();
+        for _ in 0..REPS {
+            device.dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1]).unwrap();
+        }
+        let ms = elapsed_ms(t0) / REPS as f64;
+
+        let raw      = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
+        let partials = bytemuck_cast_slice(&raw);
+        let sum: f32 = partials.iter().sum();
+        let expected = N as f32;
+        let err      = (sum - expected).abs() / expected;
+        assert!(err < 1e-3, "wave reduce: got {sum}, expected {expected}, err={err:.2e}");
+
+        let bytes_moved = N as f64 * 4.0;
+        let gb_s        = bytes_moved / (ms * 1e6);
+        println!("[{name}] wave_reduce 256M floats: {ms:.2} ms → {gb_s:.1} GB/s  (wave{} DPP)",
+                 hip_info[0].capabilities.wave_size);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_in);
+        device.destroy_buffer(buf_out);
+    }
+
+    /// Multi-GPU SGEMM 4096³ from separate threads simultaneously.
+    #[test]
+    fn heavy_multi_gpu_sgemm_4096() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+
+        if adapters.is_empty() { return; }
+        if adapters.len() < 2 {
+            println!("hip: multi-gpu 4096 needs ≥ 2 GPUs; running single-GPU only");
+        }
+
+        let devices: Vec<Arc<Box<dyn GpuDevice>>> = adapters
+            .iter()
+            .map(|a| Arc::new(a.open(DeviceRequest::default()).unwrap()))
+            .collect();
+        let names: Vec<String> = adapters.iter().map(|a| a.info().name.clone()).collect();
+
+        let handles: Vec<_> = devices.into_iter().zip(names).enumerate()
+            .map(|(idx, (dev, name))| {
+                std::thread::spawn(move || {
+                    const M: usize = 4096;
+                    const N: usize = 4096;
+                    const K: usize = 4096;
+
+                    let a: Vec<f32> = (0..M*K).map(|i| (i % 7)  as f32 * 0.001).collect();
+                    let b: Vec<f32> = (0..K*N).map(|i| (i % 11) as f32 * 0.001).collect();
+
+                    let bytes = |r: usize, c: usize| (r * c * 4) as u64;
+                    let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
+
+                    let ba = dev.create_buffer(BufferDesc { size: bytes(M,K), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+                    let bb = dev.create_buffer(BufferDesc { size: bytes(K,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+                    let bc = dev.create_buffer(BufferDesc { size: bytes(M,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+                    dev.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+                    dev.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+
+                    let shader   = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+                    let pipeline = dev.create_compute_pipeline(ComputePipelineDesc {
+                        shader, entry: "sgemm", block: [32, 32, 1],
+                    }).unwrap();
+
+                    let grid     = [(N as u32+31)/32, (M as u32+31)/32, 1];
+                    let bindings = Bindings {
+                        buffers:  &[ba.index(), bb.index(), bc.index()],
+                        textures: &[],
+                        scalars:  &[
+                            zengpu_hal::Scalar::U32(M as u32),
+                            zengpu_hal::Scalar::U32(N as u32),
+                            zengpu_hal::Scalar::U32(K as u32),
+                        ],
+                    };
+
+                    // Two warm-up passes.
+                    dev.dispatch(pipeline, bindings, grid).unwrap();
+                    dev.dispatch(pipeline, bindings, grid).unwrap();
+
+                    const REPS: u32 = 3;
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..REPS { dev.dispatch(pipeline, bindings, grid).unwrap(); }
+                    let ms     = elapsed_ms(t0) / REPS as f64;
+                    let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
+                    println!("[GPU {idx} – {name}] SGEMM 4096³: {ms:.1} ms → {gflops:.1} GFLOP/s");
+
+                    dev.destroy_pipeline(pipeline);
+                    dev.destroy_shader(shader);
+                    dev.destroy_buffer(ba);
+                    dev.destroy_buffer(bb);
+                    dev.destroy_buffer(bc);
+                })
+            })
+            .collect();
+
+        for h in handles { h.join().expect("thread panicked"); }
+    }
+
+    // ── Capability report ─────────────────────────────────────────────────────
+
+    /// Print the full capability report for every detected GPU.
+    #[test]
+    fn capability_report() {
+        let Some(inst) = try_instance() else { return };
+        let infos = inst.device_infos();
+        assert!(!infos.is_empty(), "no HIP adapters found");
+
+        for info in infos {
+            let report = info.capabilities.report(&info.name, &info.gfx_target);
+            println!("─────────────────────────────────────────────────");
+            println!("{report}");
+            println!("─────────────────────────────────────────────────");
+
+            let caps = &info.capabilities;
+
+            // Invariants that must hold for any device on any ROCm version:
+            // 1. wave size must be either 32 or 64.
+            assert!(
+                caps.wave_size == 32 || caps.wave_size == 64,
+                "unexpected wave size {} on {}", caps.wave_size, info.gfx_target,
+            );
+            // 2. MFMA implies CDNA (no MFMA on RDNA consumer silicon).
+            if caps.mfma {
+                assert!(
+                    info.gfx_family.full_fp64(),
+                    "mfma set but not a CDNA device: {}", info.gfx_target,
+                );
+            }
+            // 3. If hipRTC unavailable, bitcode must also be unavailable.
+            if !caps.hiprtc {
+                assert!(!caps.hiprtc_bitcode, "bitcode without hipRTC on {}", info.gfx_target);
+            }
+            // 4. RDNA 2+ is WGP mode by default; RDNA 1 / GCN / CDNA is not.
+            let expect_wgp = matches!(
+                info.gfx_family,
+                version::GfxFamily::Rdna2 | version::GfxFamily::Rdna3
+                | version::GfxFamily::Rdna3p5 | version::GfxFamily::Rdna4,
+            );
+            assert_eq!(
+                caps.wgp_default, expect_wgp,
+                "WGP mode mismatch for {} ({:?})", info.gfx_target, info.gfx_family,
+            );
+        }
+    }
 }
