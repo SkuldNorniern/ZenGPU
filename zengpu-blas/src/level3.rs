@@ -93,7 +93,6 @@ fn spv_bytes(words: &[u32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words)) }
 }
 
-/// Try SPIR-V first (Vulkan); fall back to PTX for CUDA/HIP backends.
 fn create_gemm_shader(device: &dyn GpuDevice) -> Result<ShaderHandle> {
     device
         .create_shader(ShaderDesc::spirv(spv_bytes(GEMM_SPV)))
