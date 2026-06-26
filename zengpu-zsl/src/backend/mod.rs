@@ -6,3 +6,6 @@ pub mod spirv;
 
 #[allow(dead_code, unused_imports)]
 pub mod hip;
+
+#[allow(dead_code, unused_imports)]
+pub mod cuda;
