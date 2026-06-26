@@ -106,9 +106,6 @@ required-features = ["vulkan", "blas"]
 name = "cube"
 required-features = ["vulkan"]
 
-[[example]]
-name = "hip_compute"
-required-features = ["hip"]
 
 [package.metadata.docs.rs]
 all-features = true
