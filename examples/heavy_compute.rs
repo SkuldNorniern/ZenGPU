@@ -133,10 +133,11 @@ fn run_hip(dim: u32, reps: u32) -> Result<(), Box<dyn std::error::Error>> {
 
     let start = Instant::now();
     for rep in 0..reps {
+        let t = Instant::now();
         device.dispatch(pipeline, bindings, grid)?;
-        if rep == 0 || (rep + 1) % 4 == 0 || rep + 1 == reps {
-            eprintln!("completed SGEMM pass {}/{}", rep + 1, reps);
-        }
+        let rep_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let rep_gflops = 2.0 * m as f64 * n as f64 * k as f64 / (rep_ms * 1e6);
+        eprintln!("pass {:>3}/{reps}  {rep_ms:6.1} ms  {rep_gflops:6.0} GFLOP/s", rep + 1);
     }
     let elapsed = start.elapsed();
 
@@ -235,7 +236,7 @@ fn run_blas(dim: u32, reps: u32) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dim  = env_u32("ZENGPU_HEAVY_DIM", 4096);
+    let dim  = env_u32("ZENGPU_HEAVY_DIM", 8192);
     let reps = env_u32("ZENGPU_HEAVY_REPS", 64);
     let backend = std::env::var("ZENGPU_BACKEND").unwrap_or_default();
 
