@@ -153,12 +153,30 @@ impl InstanceBuilder {
 
     // ── HIP ───────────────────────────────────────────────────────────────────
 
-    /// Add the AMD ROCm/HIP compute backend. Never fails at construction —
-    /// returns no adapters until HIP runtime bindings are added.
+    /// Add the AMD ROCm/HIP compute backend.
+    /// Returns `Err` if the HIP runtime is absent or fails to initialise.
     #[cfg(feature = "hip")]
-    pub fn hip(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_hip::HipInstance::new()));
-        self
+    pub fn hip(mut self) -> zengpu_hal::Result<Self> {
+        let inst = zengpu_hip::HipInstance::new()?;
+        self.backends.push(Box::new(inst));
+        Ok(self)
+    }
+
+    /// Try to add the ROCm/HIP backend; silently returns `self` unchanged if
+    /// HIP is unavailable. Useful when ROCm is an optional acceleration path.
+    #[cfg(feature = "hip")]
+    pub fn try_hip(self) -> Result<Self, Self> {
+        match zengpu_hip::HipInstance::new() {
+            Ok(inst) => {
+                let mut s = self;
+                s.backends.push(Box::new(inst));
+                Ok(s)
+            }
+            Err(e) => {
+                log::debug!("zengpu: HIP unavailable: {e}");
+                Err(self)
+            }
+        }
     }
 
     // ── DX12 ──────────────────────────────────────────────────────────────────
