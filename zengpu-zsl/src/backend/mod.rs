@@ -10,3 +10,7 @@ pub mod spirv;
 // HIP C++ backend: consumed by zengpu-hip's hipRTC path via the `zsl_hip!` macro.
 #[allow(dead_code, unused_imports)]
 pub mod hip;
+
+// CUDA C++ backend: consumed by zengpu-cuda's NVRTC path via the `zsl_cuda!` macro.
+#[allow(dead_code, unused_imports)]
+pub mod cuda;
