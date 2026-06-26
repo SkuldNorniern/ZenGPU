@@ -156,14 +156,16 @@ fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
 
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
-const VERT_SPV: &[u32] = zsl!(
+use zengpu::ZslShader;
+
+const VERT_ZSL: ZslShader = zsl!(
     push P { mvp: mat4x4<f32> }
     vertex vs(@location(0) in_pos: f32x3, @location(1) in_color: f32x3, p: P) -> (f32x4, f32x3) {
         (p.mvp * in_pos.extend(1.0), in_color)
     }
 );
 
-const FRAG_SPV: &[u32] = zsl!(
+const FRAG_ZSL: ZslShader = zsl!(
     fragment fs(@location(0) v_color: f32x3) -> f32x4 {
         v_color.extend(1.0)
     }
@@ -617,8 +619,8 @@ fn create_pipeline(
     layout: vk::PipelineLayout,
 ) -> Result<vk::Pipeline> {
     let dev = ctx.device();
-    let vert = create_shader_module(dev, VERT_SPV)?;
-    let frag = create_shader_module(dev, FRAG_SPV)?;
+    let vert = create_shader_module(dev, VERT_ZSL.spv)?;
+    let frag = create_shader_module(dev, FRAG_ZSL.spv)?;
     let entry = c"main";
     let stages = [
         vk::PipelineShaderStageCreateInfo {
