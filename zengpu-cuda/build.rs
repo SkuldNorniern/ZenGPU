@@ -12,4 +12,6 @@ fn main() {
             println!("cargo:rustc-link-search=native={lib_dir}");
         }
     }
+    // NVRTC for runtime compilation of CUDA C++ sources.
+    println!("cargo:rustc-link-lib=nvrtc");
 }

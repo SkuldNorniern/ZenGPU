@@ -24,6 +24,76 @@ use zengpu_hal::{
 
 use error::{cu, from_cuda};
 
+// ── NVRTC bindings ────────────────────────────────────────────────────────────
+
+type NvrtcProgram = *mut std::ffi::c_void;
+
+#[link(name = "nvrtc")]
+unsafe extern "C" {
+    fn nvrtcCreateProgram(
+        prog: *mut NvrtcProgram,
+        src: *const std::ffi::c_char,
+        name: *const std::ffi::c_char,
+        num_headers: i32,
+        headers: *const *const std::ffi::c_char,
+        include_names: *const *const std::ffi::c_char,
+    ) -> i32;
+    fn nvrtcCompileProgram(prog: NvrtcProgram, num_opts: i32, opts: *const *const std::ffi::c_char) -> i32;
+    fn nvrtcGetPTXSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
+    fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut std::ffi::c_char) -> i32;
+    fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
+    fn nvrtcGetProgramLogSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
+    fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut std::ffi::c_char) -> i32;
+}
+
+const NVRTC_SUCCESS: i32 = 0;
+
+fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
+    let src_cstr = std::ffi::CString::new(src)
+        .map_err(|_| GpuError::Backend("nvrtc: CUDA C++ source contains NUL byte".into()))?;
+    let name_cstr = std::ffi::CString::new("zsl_kernel.cu").unwrap();
+
+    let mut prog: NvrtcProgram = std::ptr::null_mut();
+    let r = unsafe {
+        nvrtcCreateProgram(
+            &mut prog,
+            src_cstr.as_ptr(),
+            name_cstr.as_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if r != NVRTC_SUCCESS {
+        return Err(GpuError::Backend(format!("nvrtcCreateProgram failed: {r}")));
+    }
+
+    let r = unsafe { nvrtcCompileProgram(prog, 0, std::ptr::null()) };
+    if r != NVRTC_SUCCESS {
+        let log = unsafe {
+            let mut log_size = 0usize;
+            nvrtcGetProgramLogSize(prog, &mut log_size);
+            let mut buf = vec![0i8; log_size];
+            nvrtcGetProgramLog(prog, buf.as_mut_ptr());
+            nvrtcDestroyProgram(&mut prog);
+            String::from_utf8_lossy(
+                &buf.iter().map(|&b| b as u8).collect::<Vec<_>>()
+            ).into_owned()
+        };
+        return Err(GpuError::Backend(format!("nvrtc compilation failed:\n{log}")));
+    }
+
+    let ptx = unsafe {
+        let mut ptx_size = 0usize;
+        nvrtcGetPTXSize(prog, &mut ptx_size);
+        let mut buf = vec![0i8; ptx_size];
+        nvrtcGetPTX(prog, buf.as_mut_ptr());
+        nvrtcDestroyProgram(&mut prog);
+        buf.iter().map(|&b| b as u8).collect::<Vec<_>>()
+    };
+    Ok(ptx)
+}
+
 // ── CudaInstance ──────────────────────────────────────────────────────────────
 
 /// Entry-point for the CUDA backend. Calls `cuInit` at construction; if CUDA
@@ -338,13 +408,16 @@ impl GpuDevice for CudaDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        let ShaderSource::Ptx(ptx) = desc.source else {
-            return Err(GpuError::Backend(
-                "cuda: only PTX shaders are supported".into(),
-            ));
+        let mut ptx_vec: Vec<u8> = match desc.source {
+            ShaderSource::Ptx(ptx) => ptx.to_vec(),
+            ShaderSource::CudaSrc(src) => nvrtc_compile_to_ptx(src)?,
+            _ => {
+                return Err(GpuError::Backend(
+                    "cuda: only PTX or CUDA C++ (CudaSrc) shaders are supported".into(),
+                ));
+            }
         };
         // cuModuleLoadData requires a null-terminated PTX string.
-        let mut ptx_vec: Vec<u8> = ptx.to_vec();
         if ptx_vec.last() != Some(&0) {
             ptx_vec.push(0);
         }
