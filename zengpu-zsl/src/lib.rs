@@ -102,11 +102,14 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
         .map_err(|_| "ZslPushConst: generated code failed to parse".to_string())
 }
 
-/// Native ZSL to a SPIR-V word slice (`&[u32]`). Unlike [`zsl_spirv`] (Rust-shaped syntax), this
-/// uses ZenGPU's own front end without `syn` or `quote`. Compute kernels only:
+/// Compiles native ZSL source to a [`ZslShader`] holding every backend's compiled form.
+///
+/// Carries SPIR-V (Vulkan), HIP C++ (ROCm), MSL (Metal) and CUDA C++ (NVIDIA), all from the same
+/// ZSL source. At runtime pick one with
+/// [`ZslShader::for_backend`](::zengpu_spirv::ZslShader::for_backend).
 ///
 /// ```ignore
-/// const SPV: &[u32] = zengpu_spirv::zsl!(
+/// const SHADER: ZslShader = zengpu_spirv::zsl!(
 ///     push Push { n: u32, scale: f32 }
 ///     @workgroup_size(64)
 ///     kernel scale(p: Push, src: device buffer<f32>, dst: device mut buffer<f32>, id: global_id) {
@@ -118,70 +121,72 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
 #[proc_macro]
 pub fn zsl(input: TokenStream) -> TokenStream {
     let src = input.to_string();
-    match compile_native_zsl(&src) {
-        Ok(words) => words_to_slice_tokens(&words),
+    match compile_zsl_all(&src) {
+        Ok(ts) => ts,
         Err(msg) => compile_error_tokens(&msg),
     }
 }
 
-fn compile_native_zsl(src: &str) -> Result<Vec<u32>, String> {
-    use frontend::parser::Shader;
-    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
-        Shader::Compute(m) => backend::spirv::lower_compute(&m),
-        Shader::Graphics(m) => backend::spirv::lower_graphics(&m),
-    }
+fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
+    use frontend::parser::{Shader, parse_zsl};
+    let shader = parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))?;
+
+    let spv_words = match &shader {
+        Shader::Compute(m) => backend::spirv::lower_compute(m)?,
+        Shader::Graphics(m) => backend::spirv::lower_graphics(m)?,
+    };
+    let hip_src = match &shader {
+        Shader::Compute(m) => backend::hip::lower_compute(m).source,
+        Shader::Graphics(_) => String::new(),
+    };
+    let msl_src = match &shader {
+        Shader::Compute(m) => backend::msl::lower_compute(m).source,
+        Shader::Graphics(m) => backend::msl::lower_graphics(m).source,
+    };
+    let cuda_src = match &shader {
+        Shader::Compute(m) => backend::cuda::lower_compute(m).source,
+        Shader::Graphics(_) => String::new(),
+    };
+
+    let mut s = String::new();
+    s.push_str("::zengpu_spirv::ZslShader { spv: ");
+    s.push_str(&words_to_slice_str(&spv_words));
+    s.push_str(", hip: ");
+    push_str_lit(&mut s, &hip_src);
+    s.push_str(", msl: ");
+    push_str_lit(&mut s, &msl_src);
+    s.push_str(", cuda: ");
+    push_str_lit(&mut s, &cuda_src);
+    s.push_str(" }");
+
+    s.parse().map_err(|_| "ZSL: generated ZslShader literal failed to parse".to_string())
 }
 
-/// Native ZSL to MSL source (`&str`), with the same syntax as [`zsl`]. Compute kernels only.
-///
-/// The kernel is named `zsl_main`. Buffers bind at `[[buffer(0..n)]]`, push scalars at
-/// `[[buffer(n)]]`, and the thread id at `[[thread_position_in_grid]]`.
-#[proc_macro]
-pub fn zsl_msl(input: TokenStream) -> TokenStream {
-    let src = input.to_string();
-    match compile_native_zsl_msl(&src) {
-        Ok(msl) => format!("{msl:?}").parse().expect("string literal must parse"),
-        Err(msg) => compile_error_tokens(&msg),
-    }
-}
-
-fn compile_native_zsl_msl(src: &str) -> Result<String, String> {
-    use frontend::parser::Shader;
-    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
-        Shader::Compute(m) => Ok(backend::msl::lower_compute(&m).source),
-        Shader::Graphics(m) => Ok(backend::msl::lower_graphics(&m).source),
-    }
-}
-
-#[proc_macro]
-pub fn zsl_hip(input: TokenStream) -> TokenStream {
-    let src = input.to_string();
-    match compile_native_zsl_hip(&src) {
-        Ok(hip) => format!("{hip:?}").parse().expect("string literal must parse"),
-        Err(msg) => compile_error_tokens(&msg),
-    }
-}
-
-fn compile_native_zsl_hip(src: &str) -> Result<String, String> {
-    use frontend::parser::Shader;
-    match frontend::parser::parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))? {
-        Shader::Compute(m) => Ok(backend::hip::lower_compute(&m).source),
-        Shader::Graphics(_) => Err("zsl_hip!: graphics shaders not supported (compute only)".into()),
-    }
-}
-
-fn words_to_slice_tokens(words: &[u32]) -> TokenStream {
+fn words_to_slice_str(words: &[u32]) -> String {
     let mut s = String::with_capacity(words.len() * 12 + 4);
     s.push_str("&[");
     for (i, w) in words.iter().enumerate() {
-        if i > 0 {
-            s.push(',');
-        }
+        if i > 0 { s.push(','); }
         s.push_str(&w.to_string());
         s.push_str("u32");
     }
     s.push(']');
-    s.parse().expect("generated &[u32] literal must parse")
+    s
+}
+
+fn push_str_lit(s: &mut String, v: &str) {
+    s.push('"');
+    for c in v.chars() {
+        match c {
+            '"'  => s.push_str("\\\""),
+            '\\' => s.push_str("\\\\"),
+            '\n' => s.push_str("\\n"),
+            '\r' => s.push_str("\\r"),
+            '\t' => s.push_str("\\t"),
+            c    => s.push(c),
+        }
+    }
+    s.push('"');
 }
 
 fn compile_error_tokens(msg: &str) -> TokenStream {

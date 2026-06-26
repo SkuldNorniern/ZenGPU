@@ -58,6 +58,8 @@ pub enum ShaderSource<'a> {
     Msl(&'a [u8]),
     /// HIP C++ kernel source as UTF-8 bytes, compiled at runtime via hipRTC.
     Hip(&'a [u8]),
+    /// CUDA C++ kernel source as UTF-8 bytes, compiled at runtime via NVRTC.
+    CudaSrc(&'a [u8]),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -77,6 +79,9 @@ impl<'a> ShaderDesc<'a> {
     }
     pub fn hip(source: &'a str) -> Self {
         Self { source: ShaderSource::Hip(source.as_bytes()) }
+    }
+    pub fn cuda_src(source: &'a str) -> Self {
+        Self { source: ShaderSource::CudaSrc(source.as_bytes()) }
     }
 }
 
