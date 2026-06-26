@@ -298,7 +298,7 @@ impl GpuDevice for MetalDevice {
         {
             let ShaderSource::Msl(bytes) = desc.source else {
                 return Err(GpuError::Backend(
-                    "metal: only ShaderSource::Msl is supported (use zsl_msl!)".into(),
+                    "metal: only ShaderSource::Msl is supported (use zsl!().msl)".into(),
                 ));
             };
             let source = std::str::from_utf8(bytes)
@@ -516,9 +516,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn metal_saxpy() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::zsl_msl;
+        use zengpu_spirv::{ZslShader, zsl};
 
-        const MSL: &str = zsl_msl!(
+        const SAXPY: ZslShader = zsl!(
             push P { n: u32, alpha: f32 }
             @workgroup_size(64)
             kernel saxpy(x: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
@@ -532,7 +532,7 @@ mod tests {
         let y: Vec<f32> = (0..n).map(|i| (i * 10) as f32).collect();
         let bx = make_f32(&*dev, &x, false);
         let by = make_f32(&*dev, &y, true);
-        let sh = dev.create_shader(ShaderDesc::msl(MSL)).unwrap();
+        let sh = dev.create_shader(ShaderDesc::msl(SAXPY.msl)).unwrap();
         let p = dev
             .create_compute_pipeline(ComputePipelineDesc { shader: sh, entry: "zsl_main", block: [64, 1, 1] })
             .unwrap();
@@ -558,9 +558,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn metal_vec_add_multi_threadgroup() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::zsl_msl;
+        use zengpu_spirv::{ZslShader, zsl};
 
-        const MSL: &str = zsl_msl!(
+        const ADD: ZslShader = zsl!(
             push P { n: u32 }
             @workgroup_size(256)
             kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -575,7 +575,7 @@ mod tests {
         let ba = make_f32(&*dev, &a, false);
         let bb = make_f32(&*dev, &b, false);
         let bout = make_f32(&*dev, &vec![-1.0f32; n], true);
-        let sh = dev.create_shader(ShaderDesc::msl(MSL)).unwrap();
+        let sh = dev.create_shader(ShaderDesc::msl(ADD.msl)).unwrap();
         let p = dev
             .create_compute_pipeline(ComputePipelineDesc { shader: sh, entry: "zsl_main", block: [256, 1, 1] })
             .unwrap();
@@ -647,9 +647,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn vec_add_compute_on_metal() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
-        use zengpu_spirv::zsl_msl;
+        use zengpu_spirv::{ZslShader, zsl};
 
-        const MSL: &str = zsl_msl!(
+        const ADD: ZslShader = zsl!(
             push P { n: u32 }
             @workgroup_size(256)
             kernel add(
@@ -688,7 +688,7 @@ mod tests {
         device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
 
-        let shader = device.create_shader(ShaderDesc::msl(MSL)).expect("shader");
+        let shader = device.create_shader(ShaderDesc::msl(ADD.msl)).expect("shader");
         let pipeline = device
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -721,14 +721,16 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn offscreen_triangle_render_on_metal() {
-        use zengpu_spirv::zsl_msl;
+        use zengpu_spirv::{ZslShader, zsl};
 
-        const VS: &str = zsl_msl!(
+        const VS_SHADER: ZslShader = zsl!(
             vertex vs(@location(0) pos: f32x4) -> f32x4 { pos }
         );
-        const FS: &str = zsl_msl!(
+        const FS_SHADER: ZslShader = zsl!(
             fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
         );
+        let vs = VS_SHADER.msl;
+        let fs = FS_SHADER.msl;
 
         let Some(device) = metal::Device::system_default() else { return };
         let queue = device.new_command_queue();
@@ -747,12 +749,12 @@ mod tests {
 
         let opts = metal::CompileOptions::new();
         let vs_fn = device
-            .new_library_with_source(VS, &opts)
+            .new_library_with_source(vs, &opts)
             .unwrap()
             .get_function("zsl_main", None)
             .unwrap();
         let fs_fn = device
-            .new_library_with_source(FS, &opts)
+            .new_library_with_source(fs, &opts)
             .unwrap()
             .get_function("zsl_main", None)
             .unwrap();
