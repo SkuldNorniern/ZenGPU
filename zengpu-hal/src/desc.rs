@@ -67,6 +67,8 @@ pub enum ShaderSource<'a> {
     Ptx(&'a [u8]),
     /// Metal Shading Language source as UTF-8 bytes.
     Msl(&'a [u8]),
+    /// HIP C++ kernel source as UTF-8 bytes, compiled at runtime via hipRTC.
+    Hip(&'a [u8]),
 }
 
 /// Describes a shader module to create.
@@ -85,6 +87,10 @@ impl<'a> ShaderDesc<'a> {
     /// Metal Shading Language source.
     pub fn msl(source: &'a str) -> Self {
         Self { source: ShaderSource::Msl(source.as_bytes()) }
+    }
+    /// HIP C++ kernel source (compiled via hipRTC on the AMD ROCm backend).
+    pub fn hip(source: &'a str) -> Self {
+        Self { source: ShaderSource::Hip(source.as_bytes()) }
     }
 }
 
