@@ -2543,9 +2543,9 @@ mod tests {
 
     #[test]
     fn dispatch_batch_chains_ops_with_visible_writes() {
-        use zengpu_spirv::zsl;
+        use zengpu_spirv::{ZslShader, zsl};
 
-        const ADD_SPV: &[u32] = zsl!(
+        const ADD_ZSL: ZslShader = zsl!(
             push P { len: u32 }
             @workgroup_size(64)
             kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -2553,7 +2553,7 @@ mod tests {
                 if i < p.len { out[i] = a[i] + b[i] }
             }
         );
-        const RELU_SPV: &[u32] = zsl!(
+        const RELU_ZSL: ZslShader = zsl!(
             push P { len: u32 }
             @workgroup_size(64)
             kernel relu(inp: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -2564,12 +2564,7 @@ mod tests {
 
         let Some(dev) = try_device() else { return };
 
-        let to_bytes = |w: &[u32]| -> &[u8] {
-            unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, std::mem::size_of_val(w)) }
-        };
-        let add_shader = dev
-            .create_shader(ShaderDesc::spirv(to_bytes(ADD_SPV)))
-            .unwrap();
+        let add_shader = dev.create_shader(ADD_ZSL.spirv_desc()).unwrap();
         let add_pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: add_shader,
@@ -2577,9 +2572,7 @@ mod tests {
                 block: [64, 1, 1],
             })
             .unwrap();
-        let relu_shader = dev
-            .create_shader(ShaderDesc::spirv(to_bytes(RELU_SPV)))
-            .unwrap();
+        let relu_shader = dev.create_shader(RELU_ZSL.spirv_desc()).unwrap();
         let relu_pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: relu_shader,

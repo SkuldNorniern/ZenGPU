@@ -58,12 +58,15 @@ pub use instance::Instance;
 /// Backend-independent HAL types and traits.
 pub use zengpu_hal as hal;
 
-/// Compile ZSL to SPIR-V at build time.
+/// ZSL shader macros and the [`ZslShader`] type.
 pub use zengpu_spirv as spirv;
 
-/// Compile native ZSL source to SPIR-V at build time (compute + vertex/fragment).
+/// Compile native ZSL source to all GPU backends at build time.
 /// See [`zengpu_spirv::zsl`] for the syntax.
 pub use zengpu_spirv::zsl;
+
+/// All-backend compiled form of a ZSL shader — produced by [`zsl!`].
+pub use zengpu_spirv::ZslShader;
 
 // Flat re-exports of the shared vocabulary so callers write `zengpu::BufferHandle`
 // rather than `zengpu::hal::BufferHandle`.
