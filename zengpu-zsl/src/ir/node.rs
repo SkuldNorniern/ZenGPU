@@ -60,6 +60,8 @@ pub enum IrStmt {
 pub enum BuiltinFn {
     Abs,
     Sign,
+    Exp,
+    Log,
     Sqrt,
     Floor,
     Ceil,
@@ -78,6 +80,8 @@ impl BuiltinFn {
         match self {
             BuiltinFn::Abs => "abs",
             BuiltinFn::Sign => "sign",
+            BuiltinFn::Exp => "exp",
+            BuiltinFn::Log => "log",
             BuiltinFn::Sqrt => "sqrt",
             BuiltinFn::Floor => "floor",
             BuiltinFn::Ceil => "ceil",
