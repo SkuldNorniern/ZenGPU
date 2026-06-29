@@ -15,6 +15,8 @@ mod glsl_op {
     pub const CEIL: u32 = 9;
     pub const FRACT: u32 = 10;
     pub const POW: u32 = 26;
+    pub const EXP: u32 = 27;
+    pub const LOG: u32 = 28;
     pub const SQRT: u32 = 31;
     pub const F_MIN: u32 = 37;
     pub const F_MAX: u32 = 40;
@@ -600,6 +602,8 @@ fn lower_builtin(
         // Unary GLSL builtins: f32 → f32
         BuiltinFn::Abs
         | BuiltinFn::Sign
+        | BuiltinFn::Exp
+        | BuiltinFn::Log
         | BuiltinFn::Sqrt
         | BuiltinFn::Floor
         | BuiltinFn::Ceil
@@ -614,6 +618,8 @@ fn lower_builtin(
             let opcode = match func {
                 BuiltinFn::Abs => glsl_op::F_ABS,
                 BuiltinFn::Sign => glsl_op::F_SIGN,
+                BuiltinFn::Exp => glsl_op::EXP,
+                BuiltinFn::Log => glsl_op::LOG,
                 BuiltinFn::Sqrt => glsl_op::SQRT,
                 BuiltinFn::Floor => glsl_op::FLOOR,
                 BuiltinFn::Ceil => glsl_op::CEIL,

@@ -179,6 +179,8 @@ fn emit_expr(e: &IrExpr) -> String {
             match func {
                 BuiltinFn::Abs       => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign      => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
+                BuiltinFn::Exp       => format!("expf({})", args_s[0]),
+                BuiltinFn::Log       => format!("logf({})", args_s[0]),
                 BuiltinFn::Sqrt      => format!("sqrtf({})", args_s[0]),
                 BuiltinFn::Floor     => format!("floorf({})", args_s[0]),
                 BuiltinFn::Ceil      => format!("ceilf({})", args_s[0]),

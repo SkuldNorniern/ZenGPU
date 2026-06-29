@@ -1142,6 +1142,8 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
+        "exp" => BuiltinFn::Exp,
+        "log" => BuiltinFn::Log,
         "sqrt" => BuiltinFn::Sqrt,
         "floor" => BuiltinFn::Floor,
         "ceil" => BuiltinFn::Ceil,
@@ -1189,6 +1191,8 @@ fn gfx_builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
+        "exp" => BuiltinFn::Exp,
+        "log" => BuiltinFn::Log,
         "sqrt" => BuiltinFn::Sqrt,
         "floor" => BuiltinFn::Floor,
         "ceil" => BuiltinFn::Ceil,
