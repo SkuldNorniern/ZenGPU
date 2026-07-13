@@ -225,6 +225,7 @@ fn emit_expr(e: &IrExpr) -> String {
         IrExpr::Builtin { func, args } => {
             let args_s: Vec<String> = args.iter().map(emit_expr).collect();
             match func {
+                BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
                 BuiltinFn::Exp => format!("expf({})", args_s[0]),

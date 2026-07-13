@@ -76,6 +76,7 @@ pub enum IrStmt {
 /// Maps to GLSL.std.450 and the Metal stdlib.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
+    U32,
     Abs,
     Sign,
     Exp,
@@ -97,6 +98,7 @@ pub enum BuiltinFn {
 impl BuiltinFn {
     pub fn name(self) -> &'static str {
         match self {
+            BuiltinFn::U32 => "u32",
             BuiltinFn::Abs => "abs",
             BuiltinFn::Sign => "sign",
             BuiltinFn::Exp => "exp",
