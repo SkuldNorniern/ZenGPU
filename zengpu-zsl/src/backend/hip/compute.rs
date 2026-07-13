@@ -131,6 +131,16 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             indent(s, depth);
             let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
         }
+        IrStmt::AtomicAdd { buf, index, value } => {
+            indent(s, depth);
+            let _ = writeln!(
+                s,
+                "atomicAdd(&{}[(unsigned int)({})], {});",
+                buf,
+                emit_expr(index),
+                emit_expr(value)
+            );
+        }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
             let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index), emit_expr(value));

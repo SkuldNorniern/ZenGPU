@@ -7,7 +7,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ash::{Device, khr, vk};
+use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
     CompareFn, ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, FilterMode, Format,
@@ -390,6 +390,10 @@ impl VulkanDevice {
             ));
         }
         extensions.push(khr::dynamic_rendering::NAME.as_ptr());
+        let shader_atomic_float = supports_extension(ext::shader_atomic_float::NAME);
+        if shader_atomic_float {
+            extensions.push(ext::shader_atomic_float::NAME.as_ptr());
+        }
 
         let queue_family =
             queue_family(&shared.instance, physical, needs_graphics).ok_or_else(|| {
@@ -435,6 +439,13 @@ impl VulkanDevice {
             dynamic_rendering: vk::TRUE,
             ..Default::default()
         };
+        let mut atomic_float_feat = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT {
+            shader_buffer_float32_atomic_add: vk::TRUE,
+            ..Default::default()
+        };
+        if shader_atomic_float {
+            dynamic_rendering_feat.p_next = &mut atomic_float_feat as *mut _ as *mut c_void;
+        }
         desc_idx.p_next = &mut dynamic_rendering_feat as *mut _ as *mut c_void;
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {

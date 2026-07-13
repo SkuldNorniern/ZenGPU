@@ -180,6 +180,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
         IrStmt::AssignShared { .. } | IrStmt::Barrier => {
             panic!("workgroup operations are unavailable in graphics shaders")
         }
+        IrStmt::AtomicAdd { .. } => {
+            panic!("atomic_add is unavailable in graphics shaders")
+        }
         IrStmt::Eval(expr) => {
             indent(s, depth);
             let _ = writeln!(s, "{};", emit_expr(expr));

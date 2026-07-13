@@ -1,6 +1,6 @@
 //! IR → MSL lowering for compute kernels.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
@@ -32,6 +32,8 @@ pub fn lower_compute(module: &Module) -> MslShader {
 
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    let mut atomic_buffers = HashSet::new();
+    collect_atomic_buffers(&e.body, &mut atomic_buffers);
 
     let has_push = !scalars.is_empty();
     if has_push {
@@ -45,7 +47,8 @@ pub fn lower_compute(module: &Module) -> MslShader {
     let _ = writeln!(s, "kernel void {ENTRY}(");
     let mut slot = 0u32;
     for b in &buffers {
-        let _ = writeln!(s, "    device float* {b} [[buffer({slot})]],");
+        let elem = if atomic_buffers.contains(b) { "atomic_float" } else { "float" };
+        let _ = writeln!(s, "    device {elem}* {b} [[buffer({slot})]],");
         slot += 1;
     }
     if has_push {
@@ -78,6 +81,24 @@ struct Ctx<'a> {
     locals: HashMap<&'a str, ScalarTy>,
 }
 
+fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
+    for stmt in stmts {
+        match stmt {
+            IrStmt::AtomicAdd { buf, .. } => {
+                buffers.insert(buf);
+            }
+            IrStmt::If { then, else_, .. } => {
+                collect_atomic_buffers(then, buffers);
+                if let Some(else_) = else_ {
+                    collect_atomic_buffers(else_, buffers);
+                }
+            }
+            IrStmt::For { body, .. } => collect_atomic_buffers(body, buffers),
+            _ => {}
+        }
+    }
+}
+
 fn indent(s: &mut String, depth: usize) {
     for _ in 0..depth {
         s.push_str("    ");
@@ -102,6 +123,16 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
             let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
+        }
+        IrStmt::AtomicAdd { buf, index, value } => {
+            indent(s, depth);
+            let _ = writeln!(
+                s,
+                "atomic_fetch_add_explicit(&{}[uint({})], {}, memory_order_relaxed);",
+                buf,
+                emit_expr(index),
+                emit_expr(value)
+            );
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);

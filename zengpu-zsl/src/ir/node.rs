@@ -64,6 +64,12 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
+    /// `atomic_add(buf, index, value)` on a mutable device buffer.
+    AtomicAdd {
+        buf: String,
+        index: IrExpr,
+        value: IrExpr,
+    },
     /// `name[index] = value;` for workgroup-shared memory.
     AssignShared {
         name: String,

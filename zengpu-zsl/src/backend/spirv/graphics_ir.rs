@@ -473,6 +473,9 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
         IrStmt::AssignShared { .. } | IrStmt::Barrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }
+        IrStmt::AtomicAdd { .. } => {
+            Err("atomic_add is only available in compute shaders".into())
+        }
     }
 }
 
