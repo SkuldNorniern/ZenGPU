@@ -13,6 +13,7 @@ pub enum GpuError {
     DeviceLost,
     OutOfMemory(MemoryUsage),
     UnsupportedFeatures(Features),
+    Unsupported(String),
     /// Used without the creation usage it needs (see `UsageError`). The validation layer
     /// raises this.
     InvalidUsage(UsageError),
@@ -58,6 +59,7 @@ impl Display for GpuError {
             GpuError::UnsupportedFeatures(features) => {
                 write!(f, "unsupported features: {features:?}")
             }
+            GpuError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             GpuError::InvalidUsage(e) => write!(f, "invalid usage: {e}"),
             GpuError::ShaderCompile(msg) => write!(f, "shader compile error: {msg}"),
             GpuError::PipelineCreation(msg) => write!(f, "pipeline creation error: {msg}"),
