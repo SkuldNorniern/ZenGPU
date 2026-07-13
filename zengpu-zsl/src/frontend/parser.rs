@@ -1,11 +1,11 @@
-//! Native ZSL parser for compute kernels: tokens to [`crate::ir::Module`]. Hand-written recursive descent
-//! over [`lex`] tokens, with no `syn` or `quote`.
+//! Native ZSL parser (compute): tokens to [`crate::ir::Module`].
 //!
-//! Statements have no terminators. The expression parser is greedy, so a statement ends where the
-//! next token cannot extend it. Newlines are not used, since the proc-macro shell loses them.
+//! Dependency-free (no `syn` or `quote`). Recursive descent over the [`lex`] token stream.
+//! Statements need no terminators. The expression parser is greedy, so a statement ends where the
+//! next token cannot extend it (maximal munch). This matches `zen.md`'s terminator-free syntax
+//! without relying on newlines, which the proc-macro shell loses when it stringifies its input.
 //!
 //! Grammar (compute slice):
-//!
 //! ```text
 //! module    := ("module" dotted)? push* attr* "kernel" Ident "(" params ")" block
 //! push      := "push" Ident "{" (Ident ":" scalar)* "}"
@@ -15,6 +15,8 @@
 //! stmt      := "let" Ident (":" scalar)? "=" expr
 //!            | "if" expr block ("else" block)?
 //!            | "for" Ident "in" expr ".." expr block
+//!            | "barrier" "(" ")"
+//!            | "atomic_add" "(" Ident "," expr "," expr ")"
 //!            | expr ("=" expr)?
 //! ```
 
@@ -451,6 +453,27 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::LParen, "`(` after barrier")?;
             self.expect(&Tok::RParen, "`)` after barrier(")?;
             return Ok(IrStmt::Barrier);
+        }
+        if self.eat_kw("atomic_add") {
+            self.expect(&Tok::LParen, "`(` after atomic_add")?;
+            let buf = self.ident()?;
+            self.expect(&Tok::Comma, "`,` after atomic_add buffer")?;
+            let index = self.parse_expr(ctx)?;
+            self.expect(&Tok::Comma, "`,` after atomic_add index")?;
+            let value = self.parse_expr(ctx)?;
+            self.expect(&Tok::RParen, "`)` after atomic_add arguments")?;
+            if !*ctx.buffers.get(&buf).unwrap_or(&false) {
+                return self.err(format!(
+                    "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
+                ));
+            }
+            if infer_ty(&index, ctx) != ScalarTy::F32 {
+                return self.err("atomic_add index must be an f32-typed expression");
+            }
+            if infer_ty(&value, ctx) != ScalarTy::F32 {
+                return self.err("atomic_add value must be an f32-typed expression");
+            }
+            return Ok(IrStmt::AtomicAdd { buf, index, value });
         }
         let lhs = self.parse_expr(ctx)?;
         if self.eat(&Tok::Eq) {
@@ -1436,6 +1459,36 @@ mod tests {
         "#;
         let e = parse_compute(src).unwrap_err();
         assert!(e.msg.contains("read-only"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn atomic_add_requires_mutable_buffer_and_f32_operands() {
+        let read_only = r#"
+            @workgroup_size(1)
+            kernel k(x: device buffer<f32>) {
+                atomic_add(x, 0.0, 1.0)
+            }
+        "#;
+        let e = parse_compute(read_only).unwrap_err();
+        assert!(e.msg.contains("mutable device buffer"), "got: {}", e.msg);
+
+        let bad_index = r#"
+            @workgroup_size(1)
+            kernel k(x: device mut buffer<f32>, id: global_id) {
+                atomic_add(x, id.x, 1.0)
+            }
+        "#;
+        let e = parse_compute(bad_index).unwrap_err();
+        assert!(e.msg.contains("index must be an f32"), "got: {}", e.msg);
+
+        let bad_value = r#"
+            @workgroup_size(1)
+            kernel k(idx: device buffer<f32>, x: device mut buffer<f32>, id: global_id) {
+                atomic_add(x, idx[id.x], id.x)
+            }
+        "#;
+        let e = parse_compute(bad_value).unwrap_err();
+        assert!(e.msg.contains("value must be an f32"), "got: {}", e.msg);
     }
 
     #[test]

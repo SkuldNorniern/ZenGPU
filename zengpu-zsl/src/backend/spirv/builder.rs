@@ -8,6 +8,7 @@ pub struct Id(pub u32);
 
 #[allow(dead_code)]
 mod op {
+    pub const EXTENSION: u32 = 10;
     pub const CAPABILITY: u32 = 17;
     pub const EXT_INST_IMPORT: u32 = 11;
     pub const MEMORY_MODEL: u32 = 14;
@@ -40,6 +41,7 @@ mod op {
     pub const LOOP_MERGE: u32 = 246;
     pub const RETURN: u32 = 253;
     pub const CONTROL_BARRIER: u32 = 224;
+    pub const ATOMIC_FADD_EXT: u32 = 6035;
     pub const IADD: u32 = 128;
     pub const FADD: u32 = 129;
     pub const ISUB: u32 = 130;
@@ -108,6 +110,7 @@ pub mod sc {
 mod cap {
     pub const SHADER: u32 = 1;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 4437;
+    pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
 
 mod exec_model {
@@ -127,6 +130,7 @@ pub mod builtin {
 pub struct SpvBuilder {
     next_id: u32,
     capabilities: Vec<u32>,
+    extensions: Vec<u32>,
     imports: Vec<u32>,
     memory_model: Vec<u32>,
     entry_points: Vec<u32>,
@@ -144,6 +148,7 @@ impl SpvBuilder {
         Self {
             next_id: 1,
             capabilities: Vec::new(),
+            extensions: Vec::new(),
             imports: Vec::new(),
             memory_model: Vec::new(),
             entry_points: Vec::new(),
@@ -172,6 +177,16 @@ impl SpvBuilder {
             op::CAPABILITY,
             &[cap::RUNTIME_DESCRIPTOR_ARRAY],
         );
+    }
+
+    pub fn enable_atomic_float32_add_ext(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::ATOMIC_FLOAT32_ADD_EXT],
+        );
+        let name = encode_string("SPV_EXT_shader_atomic_float");
+        emit_raw(&mut self.extensions, op::EXTENSION, &name);
     }
 
     pub fn ext_inst_import_glsl(&mut self) -> Id {
@@ -412,6 +427,23 @@ impl SpvBuilder {
             op::CONTROL_BARRIER,
             &[execution_scope.0, memory_scope.0, semantics.0],
         );
+    }
+
+    pub fn op_atomic_fadd_ext(
+        &mut self,
+        ty: Id,
+        ptr: Id,
+        scope: Id,
+        semantics: Id,
+        value: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::ATOMIC_FADD_EXT,
+            &[ty.0, id.0, ptr.0, scope.0, semantics.0, value.0],
+        );
+        id
     }
 
     pub fn op_branch(&mut self, target: Id) {
@@ -765,6 +797,7 @@ impl SpvBuilder {
             bound, 0,
         ];
         out.extend_from_slice(&self.capabilities);
+        out.extend_from_slice(&self.extensions);
         out.extend_from_slice(&self.imports);
         out.extend_from_slice(&self.memory_model);
         out.extend_from_slice(&self.entry_points);

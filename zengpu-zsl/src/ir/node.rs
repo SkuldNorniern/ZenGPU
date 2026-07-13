@@ -46,6 +46,12 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
+    /// Mutable device buffers only.
+    AtomicAdd {
+        buf: String,
+        index: IrExpr,
+        value: IrExpr,
+    },
     AssignShared {
         name: String,
         index: IrExpr,
