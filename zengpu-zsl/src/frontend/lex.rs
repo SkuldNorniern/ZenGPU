@@ -146,6 +146,26 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     i += 1;
                 }
             }
+            // Scientific exponent (`1e-12`, `3.4E+38`). The exponent belongs
+            // to the numeric token, unlike a type suffix.
+            if i < n && (bytes[i] == b'e' || bytes[i] == b'E') {
+                let exponent_start = i;
+                i += 1;
+                if i < n && (bytes[i] == b'+' || bytes[i] == b'-') {
+                    i += 1;
+                }
+                let digits_start = i;
+                while i < n && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == digits_start {
+                    return Err(LexError {
+                        msg: "float exponent requires digits".into(),
+                        at: exponent_start,
+                    });
+                }
+                is_float = true;
+            }
             let num_end = i;
             // Optional type suffix (u32/i32/f32/…) — consumed and ignored.
             if i < n && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
@@ -251,6 +271,8 @@ mod tests {
         assert_eq!(kinds("256"), vec![Tok::Int(256)]);
         assert_eq!(kinds("1.0"), vec![Tok::Float(1.0)]);
         assert_eq!(kinds("0.5"), vec![Tok::Float(0.5)]);
+        assert_eq!(kinds("1e-12"), vec![Tok::Float(1e-12)]);
+        assert_eq!(kinds("3.4E+38"), vec![Tok::Float(3.4e38)]);
     }
 
     #[test]

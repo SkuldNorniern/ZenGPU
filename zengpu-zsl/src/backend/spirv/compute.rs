@@ -714,6 +714,17 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
 fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Result<Val, String> {
     let name = func.name();
     match func {
+        BuiltinFn::U32 => {
+            if args.len() != 1 {
+                return Err("ZSL: u32() takes 1 arg".into());
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let id = coerce(ctx, v, ScalarTy::U32);
+            Ok(Val {
+                id,
+                ty: ScalarTy::U32,
+            })
+        }
         // Unary GLSL builtins: f32 → f32
         BuiltinFn::Abs
         | BuiltinFn::Sign

@@ -757,6 +757,9 @@ impl<'a> Parser<'a> {
             msg: format!("unknown function `{name}`"),
             at: self.span(),
         })?;
+        if func == BuiltinFn::U32 && args.len() != 1 {
+            return self.err("u32() takes 1 arg");
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 
@@ -1280,6 +1283,7 @@ fn bin(op: IrBinOp, lhs: IrExpr, rhs: IrExpr) -> IrExpr {
 
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
+        "u32" => BuiltinFn::U32,
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
         "exp" => BuiltinFn::Exp,
@@ -1310,7 +1314,10 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => ScalarTy::U32,
         IrExpr::BufferLoad { .. } => ScalarTy::F32,
         IrExpr::SharedLoad { .. } => ScalarTy::F32,
-        IrExpr::Builtin { .. } => ScalarTy::F32,
+        IrExpr::Builtin { func, .. } => match func {
+            BuiltinFn::U32 => ScalarTy::U32,
+            _ => ScalarTy::F32,
+        },
         IrExpr::Neg(e) => infer_ty(e, ctx),
         IrExpr::Binary { op, lhs, rhs } => match op {
             IrBinOp::Lt
@@ -1386,6 +1393,7 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
         IrExpr::SharedLoad { .. } => GfxTy::F32,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => GfxTy::U32,
         IrExpr::Builtin { func, args } => match func {
+            BuiltinFn::U32 => GfxTy::U32,
             BuiltinFn::Length => GfxTy::F32,
             _ => args
                 .first()

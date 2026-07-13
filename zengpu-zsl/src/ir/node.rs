@@ -98,6 +98,7 @@ pub enum IrStmt {
 /// Built-in math functions (map to GLSL.std.450 / Metal stdlib).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
+    U32,
     Abs,
     Sign,
     Exp,
@@ -120,6 +121,7 @@ impl BuiltinFn {
     /// The ZSL source spelling, used in diagnostics.
     pub fn name(self) -> &'static str {
         match self {
+            BuiltinFn::U32 => "u32",
             BuiltinFn::Abs => "abs",
             BuiltinFn::Sign => "sign",
             BuiltinFn::Exp => "exp",
