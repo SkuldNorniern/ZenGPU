@@ -92,7 +92,10 @@ impl AppKitWindowHandle {
 
 impl Win32WindowHandle {
     pub fn new(hwnd: NonZeroIsize) -> Self {
-        Self { hwnd, hinstance: None }
+        Self {
+            hwnd,
+            hinstance: None,
+        }
     }
 }
 

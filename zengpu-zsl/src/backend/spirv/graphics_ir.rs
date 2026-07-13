@@ -4,6 +4,8 @@
 //! (no `syn`/`quote`/`proc-macro2`): errors are plain `String`s. Mirrors the
 //! emission of the (legacy, syn-based) `graphics` backend, driven by IR nodes.
 
+use crate::ir::GfxInput;
+
 /// GLSL.std.450 extended instruction opcodes.
 mod glsl_op {
     pub const F_ABS: u32 = 4;
@@ -123,7 +125,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> R<Vec<u32>> {
     let t_ptr_in_vec4 = spv.type_pointer(sc::INPUT, t_vec4);
 
     // Input variables, in location order.
-    let mut sorted_inputs: Vec<&crate::ir::GfxInput> = e.inputs.iter().collect();
+    let mut sorted_inputs: Vec<&GfxInput> = e.inputs.iter().collect();
     sorted_inputs.sort_by_key(|i| i.location);
     let mut input_vars: HashMap<String, InputVar> = HashMap::new();
     let mut interface: Vec<Id> = Vec::new();
@@ -140,7 +142,11 @@ pub fn lower_graphics(module: &GraphicsModule) -> R<Vec<u32>> {
         interface.push(var);
         input_vars.insert(
             input.name.clone(),
-            InputVar { var, ty: input.ty, elem_ty },
+            InputVar {
+                var,
+                ty: input.ty,
+                elem_ty,
+            },
         );
     }
 
@@ -249,7 +255,14 @@ pub fn lower_graphics(module: &GraphicsModule) -> R<Vec<u32>> {
                 GfxTy::Mat4 => (t_mat4, GfxTy::Mat4),
                 _ => (t_f32, GfxTy::F32),
             };
-            (s.name.clone(), ScalarInfo { pc_index: n_buf_params + i as u32, ty, gty })
+            (
+                s.name.clone(),
+                ScalarInfo {
+                    pc_index: n_buf_params + i as u32,
+                    ty,
+                    gty,
+                },
+            )
         })
         .collect();
 
@@ -308,7 +321,14 @@ pub fn lower_graphics(module: &GraphicsModule) -> R<Vec<u32>> {
             *slot = spv.type_pointer(sc::FUNCTION, elem_ty);
         }
         let ptr = spv.op_variable(*slot, sc::FUNCTION);
-        locals.insert(name.clone(), LocalVar { ptr, ty: *gty, elem_ty });
+        locals.insert(
+            name.clone(),
+            LocalVar {
+                ptr,
+                ty: *gty,
+                elem_ty,
+            },
+        );
     }
 
     let mut ctx = Ctx {
@@ -398,12 +418,16 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             let g_bufs = ctx.g_bufs_var.ok_or("internal: no g_bufs")?;
             let pc_var = ctx.pc_var.ok_or("internal: no push-constant block")?;
             let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
-            let pc_chain = ctx.spv.op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
+            let pc_chain = ctx
+                .spv
+                .op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx = lower_expr(ctx, index)?;
             let idx_id = scalar_to_u32(ctx, idx);
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+            let ptr_elem =
+                ctx.spv
+                    .op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = scalar_to_f32(ctx, rhs);
             ctx.spv.op_store(ptr_elem, rhs_id);
@@ -416,7 +440,8 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             if let Some(else_block) = else_ {
                 let else_label = ctx.spv.fresh_id();
                 ctx.spv.op_selection_merge(merge_label);
-                ctx.spv.op_branch_conditional(cond_id, then_label, else_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, then_label, else_label);
                 ctx.spv.label_with_id(then_label);
                 for s in then {
                     lower_stmt(ctx, s)?;
@@ -429,7 +454,8 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
                 ctx.spv.op_branch(merge_label);
             } else {
                 ctx.spv.op_selection_merge(merge_label);
-                ctx.spv.op_branch_conditional(cond_id, then_label, merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond_id, then_label, merge_label);
                 ctx.spv.label_with_id(then_label);
                 for s in then {
                     lower_stmt(ctx, s)?;
@@ -500,13 +526,19 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             Ok(GVal { id, ty: GfxTy::F32 })
         }
         IrExpr::Local(name) => {
-            let l = ctx.locals.get(name).ok_or_else(|| format!("unknown local `{name}`"))?;
+            let l = ctx
+                .locals
+                .get(name)
+                .ok_or_else(|| format!("unknown local `{name}`"))?;
             let (ty, ptr, elem_ty) = (l.ty, l.ptr, l.elem_ty);
             let id = ctx.spv.op_load(elem_ty, ptr);
             Ok(GVal { id, ty })
         }
         IrExpr::Input(name) => {
-            let v = ctx.inputs.get(name).ok_or_else(|| format!("unknown input `{name}`"))?;
+            let v = ctx
+                .inputs
+                .get(name)
+                .ok_or_else(|| format!("unknown input `{name}`"))?;
             let (ty, var, elem_ty) = (v.ty, v.var, v.elem_ty);
             let id = ctx.spv.op_load(elem_ty, var);
             Ok(GVal { id, ty })
@@ -536,19 +568,25 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             let g_bufs = ctx.g_bufs_var.ok_or("internal: no g_bufs")?;
             let pc_var = ctx.pc_var.ok_or("internal: no push-constant block")?;
             let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
-            let pc_chain = ctx.spv.op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
+            let pc_chain = ctx
+                .spv
+                .op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx = lower_expr(ctx, index)?;
             let idx_id = scalar_to_u32(ctx, idx);
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+            let ptr_elem =
+                ctx.spv
+                    .op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let id = ctx.spv.op_load(ctx.t_f32, ptr_elem);
             Ok(GVal { id, ty: GfxTy::F32 })
         }
         IrExpr::FieldAccess { base, component } => {
             let composite = lower_expr(ctx, base)?;
             let t_f32 = ctx.t_f32;
-            let id = ctx.spv.op_composite_extract(t_f32, composite.id, &[*component]);
+            let id = ctx
+                .spv
+                .op_composite_extract(t_f32, composite.id, &[*component]);
             Ok(GVal { id, ty: GfxTy::F32 })
         }
         IrExpr::VecConstruct { dim, args } => {
@@ -581,7 +619,10 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             let z = ctx.spv.op_composite_extract(t_f32, b.id, &[2]);
             let t_vec4 = ctx.t_vec4;
             let id = ctx.spv.op_composite_construct(t_vec4, &[x, y, z, ext_id]);
-            Ok(GVal { id, ty: GfxTy::Vec4 })
+            Ok(GVal {
+                id,
+                ty: GfxTy::Vec4,
+            })
         }
         IrExpr::Dot { a, b } => {
             let a = lower_expr(ctx, a)?;
@@ -700,7 +741,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let ty = ctx.spv_elem_ty(x.ty);
             let glsl = ctx.glsl_ext;
-            let id = ctx.spv.op_ext_inst(ty, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
+            let id = ctx
+                .spv
+                .op_ext_inst(ty, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
             Ok(GVal { id, ty: x.ty })
         }
         BuiltinFn::Mix => {
@@ -715,7 +758,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let ty = ctx.spv_elem_ty(a.ty);
             let glsl = ctx.glsl_ext;
-            let id = ctx.spv.op_ext_inst(ty, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
+            let id = ctx
+                .spv
+                .op_ext_inst(ty, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
             Ok(GVal { id, ty: a.ty })
         }
     }
@@ -732,12 +777,18 @@ fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> 
         }
         let t_vec4 = ctx.t_vec4;
         let id = ctx.spv.op_matrix_times_vector(t_vec4, lhs.id, rhs.id);
-        return Ok(GVal { id, ty: GfxTy::Vec4 });
+        return Ok(GVal {
+            id,
+            ty: GfxTy::Vec4,
+        });
     }
     // Vector op vector (component-wise).
     if is_vec(lhs.ty) && is_vec(rhs.ty) {
         if lhs.ty != rhs.ty {
-            return Err(format!("vec op requires matching types; got {:?} and {:?}", lhs.ty, rhs.ty));
+            return Err(format!(
+                "vec op requires matching types; got {:?} and {:?}",
+                lhs.ty, rhs.ty
+            ));
         }
         let ty = ctx.spv_elem_ty(lhs.ty);
         let id = match op {
@@ -828,5 +879,14 @@ fn unify_scalars(ctx: &mut Ctx<'_>, lhs: GVal, rhs: GVal) -> (GVal, GVal) {
     }
     let l = scalar_to_f32(ctx, lhs);
     let r = scalar_to_f32(ctx, rhs);
-    (GVal { id: l, ty: GfxTy::F32 }, GVal { id: r, ty: GfxTy::F32 })
+    (
+        GVal {
+            id: l,
+            ty: GfxTy::F32,
+        },
+        GVal {
+            id: r,
+            ty: GfxTy::F32,
+        },
+    )
 }

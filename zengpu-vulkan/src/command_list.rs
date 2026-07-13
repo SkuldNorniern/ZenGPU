@@ -4,7 +4,12 @@
 //! owned, pooled `vk::CommandBuffer` that records straight to `ash` — no
 //! intermediate command list, no per-frame allocation after warmup.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    mem,
+    ops::Range,
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 use ash::vk;
 use zengpu_hal::{
@@ -408,9 +413,7 @@ impl RenderCommands for VulkanCommandList {
             layer_count: 1,
             color_attachment_count: count as u32,
             p_color_attachments: color_attachments.as_ptr(),
-            p_depth_attachment: depth_info
-                .as_ref()
-                .map_or(std::ptr::null(), |(info, _)| info),
+            p_depth_attachment: depth_info.as_ref().map_or(ptr::null(), |(info, _)| info),
             ..Default::default()
         };
         unsafe {
@@ -577,7 +580,7 @@ impl RenderCommands for VulkanCommandList {
         self.current_index_buffer = Some(buffer);
     }
 
-    fn draw(&mut self, vertices: core::ops::Range<u32>, instances: core::ops::Range<u32>) {
+    fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
         unsafe {
             self.inner.device.cmd_draw(
                 self.cmd,
@@ -589,7 +592,7 @@ impl RenderCommands for VulkanCommandList {
         }
     }
 
-    fn draw_indexed(&mut self, indices: core::ops::Range<u32>, instances: core::ops::Range<u32>) {
+    fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>) {
         unsafe {
             self.inner.device.cmd_draw_indexed(
                 self.cmd,
@@ -606,8 +609,7 @@ impl RenderCommands for VulkanCommandList {
         unsafe {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
         }
-        let pending =
-            std::mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
+        let pending = mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
         let mut targets = self.render_targets.lock().unwrap();
         for target in pending.into_iter().flatten() {
             if let Some(rt) = targets.get_mut(target) {

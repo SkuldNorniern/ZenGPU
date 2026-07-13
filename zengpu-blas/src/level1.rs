@@ -49,9 +49,9 @@ fn check_f32_shape(a: &DeviceArray, b: &DeviceArray, op: &str) -> Result<u32> {
 
 /// Compiled pipelines for BLAS Level-1 operations. Create once per device.
 pub struct Level1Kernels {
-    axpy_shader:       ShaderHandle,
+    axpy_shader: ShaderHandle,
     pub axpy_pipeline: PipelineHandle,
-    scal_shader:       ShaderHandle,
+    scal_shader: ShaderHandle,
     pub scal_pipeline: PipelineHandle,
 }
 
@@ -61,14 +61,14 @@ impl Level1Kernels {
         let axpy_shader = device.create_shader(AXPY_ZSL.spirv_desc())?;
         let axpy_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: axpy_shader,
-            entry:  "main",
-            block:  [256, 1, 1],
+            entry: "main",
+            block: [256, 1, 1],
         })?;
         let scal_shader = device.create_shader(SCAL_ZSL.spirv_desc())?;
         let scal_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: scal_shader,
-            entry:  "main",
-            block:  [256, 1, 1],
+            entry: "main",
+            block: [256, 1, 1],
         })?;
         Ok(Self {
             axpy_shader,
@@ -102,8 +102,8 @@ impl Level1Kernels {
         device.dispatch(
             self.axpy_pipeline,
             Bindings {
-                buffers:  &[x.buffer.index(), y.buffer.index()],
-                scalars:  &[Scalar::U32(n), Scalar::F32(alpha)],
+                buffers: &[x.buffer.index(), y.buffer.index()],
+                scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],
@@ -130,8 +130,8 @@ impl Level1Kernels {
         device.dispatch(
             self.scal_pipeline,
             Bindings {
-                buffers:  &[x.buffer.index()],
-                scalars:  &[Scalar::U32(n), Scalar::F32(alpha)],
+                buffers: &[x.buffer.index()],
+                scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],

@@ -51,7 +51,7 @@ fn env_u32(name: &str, default: u32) -> u32 {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let dim  = env_u32("ZENGPU_HEAVY_DIM", 1024);
+    let dim = env_u32("ZENGPU_HEAVY_DIM", 1024);
     let reps = env_u32("ZENGPU_HEAVY_REPS", 4);
 
     // Build an instance with all compiled-in backends.
@@ -71,10 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_str()
     {
         "vulkan" => BackendPreference::Vulkan,
-        "cuda"   => BackendPreference::Cuda,
-        "hip"    => BackendPreference::Hip,
-        "metal"  => BackendPreference::Metal,
-        _        => BackendPreference::Auto,
+        "cuda" => BackendPreference::Cuda,
+        "hip" => BackendPreference::Hip,
+        "metal" => BackendPreference::Metal,
+        _ => BackendPreference::Auto,
     };
 
     let adapter = inst
@@ -95,19 +95,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let gflops_total = 2.0 * m as f64 * n as f64 * k as f64 * reps as f64 / 1e9;
     eprintln!("SGEMM {m}×{k} @ {k}×{n}, {reps} rep(s)  ~{gflops_total:.1} GFLOP");
 
-    let a_data: Vec<f32> = (0..m * k).map(|i| ((i * 17 + 3) % 31) as f32 * 0.125 - 2.0).collect();
-    let b_data: Vec<f32> = (0..k * n).map(|i| ((i * 13 + 7) % 29) as f32 * 0.1 - 1.4).collect();
+    let a_data: Vec<f32> = (0..m * k)
+        .map(|i| ((i * 17 + 3) % 31) as f32 * 0.125 - 2.0)
+        .collect();
+    let b_data: Vec<f32> = (0..k * n)
+        .map(|i| ((i * 13 + 7) % 29) as f32 * 0.1 - 1.4)
+        .collect();
 
     let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-    let ba = device.create_buffer(BufferDesc { size: (m * k * 4) as u64, usage: st, memory: MemoryUsage::GpuOnly })?;
-    let bb = device.create_buffer(BufferDesc { size: (k * n * 4) as u64, usage: st, memory: MemoryUsage::GpuOnly })?;
-    let bc = device.create_buffer(BufferDesc { size: (m * n * 4) as u64, usage: st, memory: MemoryUsage::GpuOnly })?;
+    let ba = device.create_buffer(BufferDesc {
+        size: (m * k * 4) as u64,
+        usage: st,
+        memory: MemoryUsage::GpuOnly,
+    })?;
+    let bb = device.create_buffer(BufferDesc {
+        size: (k * n * 4) as u64,
+        usage: st,
+        memory: MemoryUsage::GpuOnly,
+    })?;
+    let bc = device.create_buffer(BufferDesc {
+        size: (m * n * 4) as u64,
+        usage: st,
+        memory: MemoryUsage::GpuOnly,
+    })?;
     device.write_buffer(ba, 0, as_bytes_f32(&a_data))?;
     device.write_buffer(bb, 0, as_bytes_f32(&b_data))?;
 
     // Select the right compiled form for the active backend, then create pipeline.
     let (shader_desc, entry) = SGEMM.for_backend(info.backend);
-    let shader   = device.create_shader(shader_desc)?;
+    let shader = device.create_shader(shader_desc)?;
     let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,
         entry,
@@ -116,9 +132,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let grid = [(n as u32).div_ceil(16), (m as u32).div_ceil(16), 1];
     let bindings = Bindings {
-        buffers:  &[ba.index(), bb.index(), bc.index()],
+        buffers: &[ba.index(), bb.index(), bc.index()],
         textures: &[],
-        scalars:  &[Scalar::U32(m as u32), Scalar::U32(n as u32), Scalar::U32(k as u32)],
+        scalars: &[
+            Scalar::U32(m as u32),
+            Scalar::U32(n as u32),
+            Scalar::U32(k as u32),
+        ],
     };
 
     // Warmup.
@@ -130,7 +150,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device.dispatch(pipeline, bindings, grid)?;
         let ms = t.elapsed().as_secs_f64() * 1000.0;
         let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
-        eprintln!("pass {:>3}/{reps}  {ms:7.1} ms  {gflops:8.1} GFLOP/s", rep + 1);
+        eprintln!(
+            "pass {:>3}/{reps}  {ms:7.1} ms  {gflops:8.1} GFLOP/s",
+            rep + 1
+        );
     }
     let elapsed = start.elapsed();
 
@@ -138,15 +161,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let samples = [(0, 0), (m / 3, n / 3), (m / 2, n / 2), (m - 1, n - 1)];
     for (row, col) in samples {
-        let expected: f32 = (0..k).map(|i| a_data[row * k + i] * b_data[i * n + col]).sum();
+        let expected: f32 = (0..k)
+            .map(|i| a_data[row * k + i] * b_data[i * n + col])
+            .sum();
         let got = out[row * n + col];
         if (got - expected).abs() / expected.abs().max(1.0) > 0.01 {
-            return Err(format!("SGEMM mismatch [{row},{col}]: got {got}, expected {expected}").into());
+            return Err(
+                format!("SGEMM mismatch [{row},{col}]: got {got}, expected {expected}").into(),
+            );
         }
     }
 
     let total_gflops = gflops_total / elapsed.as_secs_f64();
-    eprintln!("SGEMM OK  {reps}×({m}×{k} @ {k}×{n}) in {elapsed:?}  ({total_gflops:.1} GFLOP/s avg)");
+    eprintln!(
+        "SGEMM OK  {reps}×({m}×{k} @ {k}×{n}) in {elapsed:?}  ({total_gflops:.1} GFLOP/s avg)"
+    );
 
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);

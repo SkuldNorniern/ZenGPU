@@ -1,8 +1,13 @@
 //! Vulkan entry point and instance.
 
-use std::sync::Arc;
+use std::{
+    cmp::Reverse,
+    ffi::{CStr, c_void},
+    ptr,
+    sync::Arc,
+};
 
-use ash::{Entry, Instance, ext, vk};
+use ash::{Entry, Instance, ext, khr, vk};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuError, GpuInstance,
     PowerPreference,
@@ -14,9 +19,9 @@ unsafe extern "system" fn vulkan_debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _ty: vk::DebugUtilsMessageTypeFlagsEXT,
     data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _user: *mut std::ffi::c_void,
+    _user: *mut c_void,
 ) -> vk::Bool32 {
-    let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) }.to_string_lossy();
+    let msg = unsafe { CStr::from_ptr((*data).p_message) }.to_string_lossy();
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         log::error!("[Vulkan] {msg}");
     } else {
@@ -67,14 +72,14 @@ impl VulkanInstance {
         let available_layers =
             unsafe { entry.enumerate_instance_layer_properties() }.unwrap_or_default();
 
-        let has_ext = |name: &std::ffi::CStr| {
+        let has_ext = |name: &CStr| {
             available_exts
                 .iter()
-                .any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name })
+                .any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) == name })
         };
         let has_layer = |name: &[u8]| {
             available_layers.iter().any(|l| {
-                let s = unsafe { std::ffi::CStr::from_ptr(l.layer_name.as_ptr()) };
+                let s = unsafe { CStr::from_ptr(l.layer_name.as_ptr()) };
                 s.to_bytes() == name
             })
         };
@@ -97,7 +102,7 @@ impl VulkanInstance {
         }
 
         if surface_extensions {
-            let require = |name: &'static std::ffi::CStr| -> zengpu_hal::Result<*const i8> {
+            let require = |name: &'static CStr| -> zengpu_hal::Result<*const i8> {
                 if !has_ext(name) {
                     return Err(GpuError::Backend(format!(
                         "required Vulkan instance extension is unavailable: {}",
@@ -107,20 +112,18 @@ impl VulkanInstance {
                 Ok(name.as_ptr())
             };
 
-            ext_names.push(require(ash::khr::surface::NAME)?);
+            ext_names.push(require(khr::surface::NAME)?);
             #[cfg(target_os = "windows")]
-            ext_names.push(require(ash::khr::win32_surface::NAME)?);
+            ext_names.push(require(khr::win32_surface::NAME)?);
             #[cfg(target_os = "linux")]
             {
-                if has_ext(ash::khr::xcb_surface::NAME) {
-                    ext_names.push(ash::khr::xcb_surface::NAME.as_ptr());
+                if has_ext(khr::xcb_surface::NAME) {
+                    ext_names.push(khr::xcb_surface::NAME.as_ptr());
                 }
-                if has_ext(ash::khr::wayland_surface::NAME) {
-                    ext_names.push(ash::khr::wayland_surface::NAME.as_ptr());
+                if has_ext(khr::wayland_surface::NAME) {
+                    ext_names.push(khr::wayland_surface::NAME.as_ptr());
                 }
-                if !has_ext(ash::khr::xcb_surface::NAME)
-                    && !has_ext(ash::khr::wayland_surface::NAME)
-                {
+                if !has_ext(khr::xcb_surface::NAME) && !has_ext(khr::wayland_surface::NAME) {
                     return Err(GpuError::Backend(
                         "Vulkan loader supports neither XCB nor Wayland surfaces".to_string(),
                     ));
@@ -129,8 +132,8 @@ impl VulkanInstance {
             #[cfg(target_os = "macos")]
             {
                 ext_names.push(require(ash::mvk::macos_surface::NAME)?);
-                if has_ext(ash::khr::portability_enumeration::NAME) {
-                    ext_names.push(ash::khr::portability_enumeration::NAME.as_ptr());
+                if has_ext(khr::portability_enumeration::NAME) {
+                    ext_names.push(khr::portability_enumeration::NAME.as_ptr());
                     flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
                 }
             }
@@ -141,13 +144,13 @@ impl VulkanInstance {
             p_application_info: &app_info,
             enabled_extension_count: ext_names.len() as u32,
             pp_enabled_extension_names: if ext_names.is_empty() {
-                std::ptr::null()
+                ptr::null()
             } else {
                 ext_names.as_ptr()
             },
             enabled_layer_count: layer_names.len() as u32,
             pp_enabled_layer_names: if layer_names.is_empty() {
-                std::ptr::null()
+                ptr::null()
             } else {
                 layer_names.as_ptr()
             },
@@ -242,7 +245,7 @@ impl VulkanInstance {
                 let dt = vk_device_type(props.device_type);
                 let score = type_score(dt, pref);
                 let name = unsafe {
-                    std::ffi::CStr::from_ptr(props.device_name.as_ptr())
+                    CStr::from_ptr(props.device_name.as_ptr())
                         .to_string_lossy()
                         .into_owned()
                 };
@@ -299,7 +302,7 @@ impl GpuInstance for VulkanInstance {
             .map(|phys| {
                 let props = unsafe { self.shared.instance.get_physical_device_properties(phys) };
                 let name = unsafe {
-                    std::ffi::CStr::from_ptr(props.device_name.as_ptr())
+                    CStr::from_ptr(props.device_name.as_ptr())
                         .to_string_lossy()
                         .into_owned()
                 };
@@ -318,7 +321,7 @@ impl GpuInstance for VulkanInstance {
 
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
         let mut adapters = self.enumerate_adapters();
-        adapters.sort_by_key(|a| std::cmp::Reverse(type_score(a.info().device_type, req.power)));
+        adapters.sort_by_key(|a| Reverse(type_score(a.info().device_type, req.power)));
         adapters.into_iter().next()
     }
 }

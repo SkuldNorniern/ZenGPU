@@ -43,7 +43,9 @@ where
     let display = match win.display_handle().expect("display handle").as_raw() {
         D::AppKit(_) => z::DisplayHandle::AppKit,
         D::Windows(_) => z::DisplayHandle::Windows,
-        D::Xcb(h) => z::DisplayHandle::Xcb(z::XcbDisplayHandle { connection: h.connection }),
+        D::Xcb(h) => z::DisplayHandle::Xcb(z::XcbDisplayHandle {
+            connection: h.connection,
+        }),
         D::Wayland(h) => z::DisplayHandle::Wayland(z::WaylandDisplayHandle { display: h.display }),
         other => panic!("unsupported display handle: {other:?}"),
     };

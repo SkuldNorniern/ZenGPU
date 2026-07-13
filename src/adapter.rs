@@ -1,3 +1,5 @@
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+
 use zengpu_hal::{AdapterInfo, DeviceRequest, GpuAdapter, HalCapabilities, Result};
 
 use crate::device::Device;
@@ -35,8 +37,8 @@ impl Adapter {
     }
 }
 
-impl std::fmt::Debug for Adapter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Adapter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let info = self.inner.info();
         f.debug_struct("Adapter")
             .field("name", &info.name)

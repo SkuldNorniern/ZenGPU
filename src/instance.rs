@@ -137,7 +137,8 @@ impl InstanceBuilder {
     /// [`Instance::enumerate_adapters`].
     #[cfg(feature = "cuda")]
     pub fn cuda(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_cuda::CudaInstance::new()));
+        self.backends
+            .push(Box::new(zengpu_cuda::CudaInstance::new()));
         self
     }
 
@@ -147,7 +148,8 @@ impl InstanceBuilder {
     /// adapters on non-Apple platforms until device enumeration is implemented.
     #[cfg(feature = "metal")]
     pub fn metal(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_metal::MetalInstance::new()));
+        self.backends
+            .push(Box::new(zengpu_metal::MetalInstance::new()));
         self
     }
 
@@ -185,7 +187,8 @@ impl InstanceBuilder {
     /// adapters on non-Windows platforms or until DXGI enumeration is added.
     #[cfg(feature = "dx12")]
     pub fn dx12(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_dx12::Dx12Instance::new()));
+        self.backends
+            .push(Box::new(zengpu_dx12::Dx12Instance::new()));
         self
     }
 

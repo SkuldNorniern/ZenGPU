@@ -5,6 +5,8 @@
 //! Object-safe, so a backend can be held as `Box<dyn GpuDevice>` / `Arc<dyn
 //! GpuDevice>` and selected at runtime.
 
+use core::any::Any;
+
 use crate::command::{Bindings, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
@@ -17,7 +19,7 @@ use crate::types::Features;
 pub trait GpuDevice: Send + Sync {
     /// Downcast to the concrete backend type. Required for backend-specific
     /// operations (e.g. creating a Vulkan swapchain from a VulkanDevice).
-    fn as_any(&self) -> &dyn core::any::Any;
+    fn as_any(&self) -> &dyn Any;
 
     /// Which HAL capabilities this backend implements.
     fn capabilities(&self) -> HalCapabilities;

@@ -1,11 +1,14 @@
+use core::any::Any;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, GpuDevice, HalCapabilities,
     PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc,
     TextureHandle,
 };
 
-impl std::fmt::Debug for Device {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Device {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Device")
             .field("capabilities", &self.inner.capabilities())
             .finish_non_exhaustive()
@@ -147,7 +150,7 @@ impl Device {
 /// calls; this impl only activates when the trait is in scope and a trait
 /// object / bound is required.
 impl GpuDevice for Device {
-    fn as_any(&self) -> &dyn core::any::Any {
+    fn as_any(&self) -> &dyn Any {
         // Delegate into the concrete backend so `downcast_ref::<VulkanDevice>()` works.
         self.inner.as_any()
     }
@@ -208,8 +211,12 @@ impl GpuDevice for Device {
         self.inner.destroy_pipeline(pipeline)
     }
 
-    fn dispatch(&self, pipeline: PipelineHandle, bindings: Bindings<'_>, grid: [u32; 3]) -> Result<()> {
+    fn dispatch(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
         self.inner.dispatch(pipeline, bindings, grid)
     }
 }
-

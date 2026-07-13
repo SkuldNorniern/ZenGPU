@@ -11,6 +11,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 zengpu-hal.workspace = true
 cuda-oxide = "0.4.0"

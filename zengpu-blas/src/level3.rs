@@ -156,8 +156,8 @@ impl GemmKernel {
         device.dispatch(
             self.pipeline,
             Bindings {
-                buffers:  &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
-                scalars:  &[
+                buffers: &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
+                scalars: &[
                     Scalar::U32(m),
                     Scalar::U32(n),
                     Scalar::U32(k),

@@ -9,8 +9,7 @@ pub fn lower_compute(module: &Module) -> HipShader {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
-    let locals: HashMap<&str, ScalarTy> =
-        e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    let locals: HashMap<&str, ScalarTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
 
     let buffers: Vec<(&str, Mutability)> = e
         .params
@@ -37,10 +36,18 @@ pub fn lower_compute(module: &Module) -> HipShader {
     let _ = writeln!(s, "void {ENTRY}(");
 
     for (i, (name, mutability)) in buffers.iter().enumerate() {
-        let comma = if i + 1 < buffers.len() + scalars.len() { "," } else { "" };
+        let comma = if i + 1 < buffers.len() + scalars.len() {
+            ","
+        } else {
+            ""
+        };
         match mutability {
-            Mutability::Read      => { let _ = writeln!(s, "    const float* __restrict__ {name}{comma}"); }
-            Mutability::ReadWrite => { let _ = writeln!(s, "    float* __restrict__ {name}{comma}"); }
+            Mutability::Read => {
+                let _ = writeln!(s, "    const float* __restrict__ {name}{comma}");
+            }
+            Mutability::ReadWrite => {
+                let _ = writeln!(s, "    float* __restrict__ {name}{comma}");
+            }
         }
     }
 
@@ -52,10 +59,19 @@ pub fn lower_compute(module: &Module) -> HipShader {
 
     s.push_str(") {\n");
 
-    let _ = writeln!(s, "    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;");
+    let _ = writeln!(
+        s,
+        "    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;"
+    );
     if local_size[1] > 1 || local_size[2] > 1 {
-        let _ = writeln!(s, "    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;");
-        let _ = writeln!(s, "    unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;");
+        let _ = writeln!(
+            s,
+            "    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"
+        );
+        let _ = writeln!(
+            s,
+            "    unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"
+        );
     }
 
     let ctx = Ctx { locals };
@@ -86,8 +102,8 @@ fn indent(s: &mut String, depth: usize) {
 
 fn hip_scalar(ty: ScalarTy) -> &'static str {
     match ty {
-        ScalarTy::U32  => "unsigned int",
-        ScalarTy::F32  => "float",
+        ScalarTy::U32 => "unsigned int",
+        ScalarTy::F32 => "float",
         ScalarTy::Bool => "bool",
     }
 }
@@ -95,7 +111,11 @@ fn hip_scalar(ty: ScalarTy) -> &'static str {
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
     match stmt {
         IrStmt::Let { name, init } => {
-            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or(ScalarTy::U32);
+            let ty = ctx
+                .locals
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(ScalarTy::U32);
             indent(s, depth);
             let _ = writeln!(s, "{} {} = {};", hip_scalar(ty), name, emit_expr(init));
         }
@@ -154,16 +174,19 @@ fn emit_expr(e: &IrExpr) -> String {
                 format!("{v}f")
             }
         }
-        IrExpr::Local(n)       => n.clone(),
+        IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => n.clone(),
         IrExpr::BufferLoad { buf, index } => format!("{}[{}]", buf, emit_expr(index)),
         IrExpr::GlobalId(0) => "gx".into(),
         IrExpr::GlobalId(1) => "gy".into(),
         IrExpr::GlobalId(2) => "gz".into(),
         IrExpr::GlobalId(n) => format!("/* bad GlobalId({n}) */ 0u"),
-        IrExpr::Input(n)    => n.clone(),
+        IrExpr::Input(n) => n.clone(),
         IrExpr::FieldAccess { base, component } => {
-            let field = ["x", "y", "z", "w"].get(*component as usize).copied().unwrap_or("x");
+            let field = ["x", "y", "z", "w"]
+                .get(*component as usize)
+                .copied()
+                .unwrap_or("x");
             format!("{}.{}", emit_expr(base), field)
         }
         IrExpr::VecConstruct { dim, args } => {
@@ -177,21 +200,26 @@ fn emit_expr(e: &IrExpr) -> String {
         IrExpr::Builtin { func, args } => {
             let args_s: Vec<String> = args.iter().map(emit_expr).collect();
             match func {
-                BuiltinFn::Abs       => format!("fabsf({})", args_s[0]),
-                BuiltinFn::Sign      => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
-                BuiltinFn::Exp       => format!("expf({})", args_s[0]),
-                BuiltinFn::Log       => format!("logf({})", args_s[0]),
-                BuiltinFn::Sqrt      => format!("sqrtf({})", args_s[0]),
-                BuiltinFn::Floor     => format!("floorf({})", args_s[0]),
-                BuiltinFn::Ceil      => format!("ceilf({})", args_s[0]),
-                BuiltinFn::Fract     => format!("({0} - floorf({0}))", args_s[0]),
-                BuiltinFn::Pow       => format!("powf({}, {})", args_s[0], args_s[1]),
-                BuiltinFn::Min       => format!("fminf({}, {})", args_s[0], args_s[1]),
-                BuiltinFn::Max       => format!("fmaxf({}, {})", args_s[0], args_s[1]),
-                BuiltinFn::Clamp     => format!("fminf(fmaxf({}, {}), {})", args_s[0], args_s[1], args_s[2]),
-                BuiltinFn::Mix       => format!("({0} + ({2}) * ({1} - {0}))", args_s[0], args_s[1], args_s[2]),
+                BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
+                BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
+                BuiltinFn::Exp => format!("expf({})", args_s[0]),
+                BuiltinFn::Log => format!("logf({})", args_s[0]),
+                BuiltinFn::Sqrt => format!("sqrtf({})", args_s[0]),
+                BuiltinFn::Floor => format!("floorf({})", args_s[0]),
+                BuiltinFn::Ceil => format!("ceilf({})", args_s[0]),
+                BuiltinFn::Fract => format!("({0} - floorf({0}))", args_s[0]),
+                BuiltinFn::Pow => format!("powf({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::Min => format!("fminf({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::Max => format!("fmaxf({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::Clamp => {
+                    format!("fminf(fmaxf({}, {}), {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Mix => format!(
+                    "({0} + ({2}) * ({1} - {0}))",
+                    args_s[0], args_s[1], args_s[2]
+                ),
                 BuiltinFn::Normalize => format!("__hip_normalize_stub({})", args_s[0]),
-                BuiltinFn::Length    => format!("sqrtf(dot({0}, {0}))", args_s[0]),
+                BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
             }
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(inner)),
@@ -201,14 +229,14 @@ fn emit_expr(e: &IrExpr) -> String {
                 IrBinOp::Sub => "-",
                 IrBinOp::Mul => "*",
                 IrBinOp::Div => "/",
-                IrBinOp::Lt  => "<",
-                IrBinOp::Le  => "<=",
-                IrBinOp::Gt  => ">",
-                IrBinOp::Ge  => ">=",
-                IrBinOp::Eq  => "==",
-                IrBinOp::Ne  => "!=",
+                IrBinOp::Lt => "<",
+                IrBinOp::Le => "<=",
+                IrBinOp::Gt => ">",
+                IrBinOp::Ge => ">=",
+                IrBinOp::Eq => "==",
+                IrBinOp::Ne => "!=",
                 IrBinOp::And => "&&",
-                IrBinOp::Or  => "||",
+                IrBinOp::Or => "||",
             };
             format!("({} {} {})", emit_expr(lhs), op_s, emit_expr(rhs))
         }

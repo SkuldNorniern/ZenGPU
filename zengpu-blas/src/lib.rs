@@ -50,7 +50,7 @@ use zengpu_hal::{GpuDevice, Result};
 /// separately.
 pub struct Blas {
     pub level1: Level1Kernels,
-    pub gemm:   GemmKernel,
+    pub gemm: GemmKernel,
 }
 
 impl Blas {
@@ -58,7 +58,7 @@ impl Blas {
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         Ok(Self {
             level1: Level1Kernels::new(device)?,
-            gemm:   GemmKernel::new(device)?,
+            gemm: GemmKernel::new(device)?,
         })
     }
 

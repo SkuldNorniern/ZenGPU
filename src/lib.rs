@@ -49,7 +49,7 @@ pub mod instance;
 pub mod log;
 
 pub use adapter::Adapter;
-pub use detect::{detect_backends, BackendAvailability};
+pub use detect::{BackendAvailability, detect_backends};
 pub use device::Device;
 pub use instance::Instance;
 
@@ -98,9 +98,7 @@ pub use zengpu_blas::GemmKernel;
 /// Flat re-export: concrete Vulkan types required by windowed / backend-aware
 /// code. For most use cases the [`Instance`] builder is sufficient.
 #[cfg(feature = "vulkan")]
-pub use zengpu_vulkan::{
-    BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance,
-};
+pub use zengpu_vulkan::{BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance};
 
 // ── Backend sub-crates (power-user access) ───────────────────────────────────
 
