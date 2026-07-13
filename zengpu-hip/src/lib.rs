@@ -587,7 +587,6 @@ impl GpuDevice for HipDevice {
                 ),
                 "hipModuleLaunchKernel",
             )?;
-            check(hipStreamSynchronize(std::ptr::null_mut()), "hipStreamSynchronize")?;
         }
         Ok(())
     }
