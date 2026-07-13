@@ -279,6 +279,22 @@ mod phase_z_tests {
     "#;
 
     #[test]
+    fn u32_cast_lowers_on_all_compute_backends() {
+        let source = r#"
+            @workgroup_size(1)
+            kernel cast_index(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+                let index = u32(src[id.x])
+                out[id.x] = src[index]
+            }
+        "#;
+        let module = parse_compute(source).expect("parse u32 cast");
+        assert!(hip::lower_compute(&module).source.contains("(unsigned int)"));
+        assert!(cuda::lower_compute(&module).source.contains("(unsigned int)"));
+        assert!(msl::lower_compute(&module).source.contains("uint("));
+        spirv::lower_compute(&module).expect("lower u32 cast to SPIR-V");
+    }
+
+    #[test]
     fn scatter_add_lowers_on_all_backends_and_has_spirv_atomic_extension() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
         let hip_source = hip::lower_compute(&module).source;

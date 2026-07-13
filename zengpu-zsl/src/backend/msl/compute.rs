@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
-use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
 
 /// Lower a compute [`Module`] to MSL.
@@ -194,7 +194,10 @@ fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::GroupId(c) => format!("group.{}", component(*c)),
         IrExpr::Builtin { func, args } => {
             let a: Vec<String> = args.iter().map(emit_expr).collect();
-            format!("{}({})", func.name(), a.join(", "))
+            match func {
+                BuiltinFn::U32 => format!("uint({})", a[0]),
+                _ => format!("{}({})", func.name(), a.join(", ")),
+            }
         }
         IrExpr::Neg(e) => format!("(-{})", emit_expr(e)),
         IrExpr::Binary { op, lhs, rhs } => {
