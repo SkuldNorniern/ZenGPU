@@ -13,6 +13,7 @@ mod glsl_op {
     pub const FLOOR: u32 = 8;
     pub const CEIL: u32 = 9;
     pub const FRACT: u32 = 10;
+    pub const TANH: u32 = 21;
     pub const POW: u32 = 26;
     pub const EXP: u32 = 27;
     pub const LOG: u32 = 28;
@@ -669,6 +670,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         BuiltinFn::Abs
         | BuiltinFn::Sign
         | BuiltinFn::Exp
+        | BuiltinFn::Tanh
         | BuiltinFn::Log
         | BuiltinFn::Sqrt
         | BuiltinFn::Floor
@@ -691,6 +693,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
                 BuiltinFn::Abs => glsl_op::F_ABS,
                 BuiltinFn::Sign => glsl_op::F_SIGN,
                 BuiltinFn::Exp => glsl_op::EXP,
+                BuiltinFn::Tanh => glsl_op::TANH,
                 BuiltinFn::Log => glsl_op::LOG,
                 BuiltinFn::Sqrt => glsl_op::SQRT,
                 BuiltinFn::Floor => glsl_op::FLOOR,
