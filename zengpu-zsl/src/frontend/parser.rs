@@ -490,8 +490,9 @@ impl<'a> Parser<'a> {
                     "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
                 ));
             }
-            if infer_ty(&index, ctx) != ScalarTy::F32 {
-                return self.err("atomic_add index must be an f32-typed expression");
+            let index_ty = infer_ty(&index, ctx);
+            if index_ty != ScalarTy::U32 && index_ty != ScalarTy::F32 {
+                return self.err("atomic_add index must be a u32- or f32-typed expression");
             }
             if infer_ty(&value, ctx) != ScalarTy::F32 {
                 return self.err("atomic_add value must be an f32-typed expression");
@@ -1282,6 +1283,7 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
         "exp" => BuiltinFn::Exp,
+        "tanh" => BuiltinFn::Tanh,
         "log" => BuiltinFn::Log,
         "sqrt" => BuiltinFn::Sqrt,
         "floor" => BuiltinFn::Floor,
@@ -1519,14 +1521,13 @@ mod tests {
         let e = parse_compute(read_only).unwrap_err();
         assert!(e.msg.contains("mutable device buffer"), "got: {}", e.msg);
 
-        let bad_index = r#"
+        let u32_index = r#"
             @workgroup_size(1)
             kernel k(x: device mut buffer<f32>, id: global_id) {
                 atomic_add(x, id.x, 1.0)
             }
         "#;
-        let e = parse_compute(bad_index).unwrap_err();
-        assert!(e.msg.contains("index must be an f32"), "got: {}", e.msg);
+        parse_compute(u32_index).expect("u32 indices are natural buffer indices");
 
         let bad_value = r#"
             @workgroup_size(1)
