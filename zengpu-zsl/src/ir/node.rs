@@ -10,8 +10,11 @@ pub enum IrExpr {
     Local(String),
     ScalarParam(String),
     BufferLoad { buf: String, index: Box<IrExpr> },
+    SharedLoad { name: String, index: Box<IrExpr> },
     /// Component 0, 1 or 2. Compute only.
     GlobalId(u32),
+    LocalId(u32),
+    GroupId(u32),
     Input(String),
     FieldAccess { base: Box<IrExpr>, component: u32 },
     /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
@@ -43,6 +46,12 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
+    AssignShared {
+        name: String,
+        index: IrExpr,
+        value: IrExpr,
+    },
+    Barrier,
     If {
         cond: IrExpr,
         then: Vec<IrStmt>,

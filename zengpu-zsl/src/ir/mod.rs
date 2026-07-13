@@ -66,9 +66,17 @@ pub enum EntryKind {
 pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
+    pub shared: Vec<SharedDecl>,
     /// Local variables in declaration order. The SPIR-V backend hoists them to the entry block.
     pub locals: Vec<(String, ScalarTy)>,
     pub body: Vec<IrStmt>,
+}
+
+#[derive(Debug)]
+pub struct SharedDecl {
+    pub name: String,
+    pub elem: ScalarTy,
+    pub len: u32,
 }
 
 #[derive(Debug)]
