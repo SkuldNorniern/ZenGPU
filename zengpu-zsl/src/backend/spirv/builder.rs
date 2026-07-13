@@ -25,6 +25,7 @@ mod op {
     pub const TYPE_FLOAT: u32 = 22;
     pub const TYPE_VECTOR: u32 = 23;
     pub const TYPE_RUNTIME_ARRAY: u32 = 29;
+    pub const TYPE_ARRAY: u32 = 28;
     pub const TYPE_STRUCT: u32 = 30;
     pub const TYPE_POINTER: u32 = 32;
     pub const TYPE_FUNCTION: u32 = 33;
@@ -42,6 +43,7 @@ mod op {
     pub const SELECTION_MERGE: u32 = 247;
     pub const LOOP_MERGE: u32 = 246;
     pub const RETURN: u32 = 253;
+    pub const CONTROL_BARRIER: u32 = 224;
     pub const IADD: u32 = 128;
     pub const FADD: u32 = 129;
     pub const ISUB: u32 = 130;
@@ -108,6 +110,7 @@ pub mod sc {
     pub const STORAGE_BUFFER: u32 = 12;
     pub const PUSH_CONSTANT: u32 = 9;
     pub const FUNCTION: u32 = 7;
+    pub const WORKGROUP: u32 = 4;
 }
 
 /// SPIR-V capability constants.
@@ -128,6 +131,8 @@ mod exec_model {
 pub mod builtin {
     pub const POSITION: u32 = 0;
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
+    pub const LOCAL_INVOCATION_ID: u32 = 27;
+    pub const WORKGROUP_ID: u32 = 26;
 }
 
 /// Accumulates SPIR-V instructions, serializing to a word stream.
@@ -306,6 +311,24 @@ impl SpvBuilder {
         id
     }
 
+    pub fn type_array(&mut self, elem: Id, len: Id) -> Id {
+        let id = self.fresh_id();
+        // The length constant must precede OpTypeArray, so fixed arrays live in
+        // the combined types/constants/globals section after that constant.
+        emit(&mut self.constants_globals, op::TYPE_ARRAY, &[id.0, elem.0, len.0]);
+        id
+    }
+
+    pub fn type_pointer_global(&mut self, storage_class: u32, pointee: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.constants_globals,
+            op::TYPE_POINTER,
+            &[id.0, storage_class, pointee.0],
+        );
+        id
+    }
+
     pub fn type_struct(&mut self, members: &[Id]) -> Id {
         let id = self.fresh_id();
         let mut words = vec![id.0];
@@ -417,6 +440,14 @@ impl SpvBuilder {
 
     pub fn op_return(&mut self) {
         emit(&mut self.functions, op::RETURN, &[]);
+    }
+
+    pub fn op_control_barrier(&mut self, execution_scope: Id, memory_scope: Id, semantics: Id) {
+        emit(
+            &mut self.functions,
+            op::CONTROL_BARRIER,
+            &[execution_scope.0, memory_scope.0, semantics.0],
+        );
     }
 
     pub fn op_branch(&mut self, target: Id) {

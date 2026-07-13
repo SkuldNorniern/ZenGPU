@@ -76,9 +76,19 @@ pub enum EntryKind {
 pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
+    /// Workgroup-shared arrays declared in the kernel body.
+    pub shared: Vec<SharedDecl>,
     /// Locals in declaration order (the SPIR-V backend hoists these).
     pub locals: Vec<(String, ScalarTy)>,
     pub body: Vec<IrStmt>,
+}
+
+/// A fixed-size workgroup-shared array.
+#[derive(Debug)]
+pub struct SharedDecl {
+    pub name: String,
+    pub elem: ScalarTy,
+    pub len: u32,
 }
 
 /// A ZSL module — one entry point for now.

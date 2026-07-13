@@ -111,11 +111,26 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let t_ptr_in_uvec3 = spv.type_pointer(sc::INPUT, t_uvec3);
     let gid_var = spv.global_variable(t_ptr_in_uvec3, sc::INPUT);
     spv.decorate(gid_var, deco::BUILT_IN, &[builtin::GLOBAL_INVOCATION_ID]);
+    let lid_var = spv.global_variable(t_ptr_in_uvec3, sc::INPUT);
+    spv.decorate(lid_var, deco::BUILT_IN, &[builtin::LOCAL_INVOCATION_ID]);
+    let group_var = spv.global_variable(t_ptr_in_uvec3, sc::INPUT);
+    spv.decorate(group_var, deco::BUILT_IN, &[builtin::WORKGROUP_ID]);
+
+    // ── Workgroup-shared arrays ─────────────────────────────────────────────
+    let t_ptr_wg_f32 = spv.type_pointer(sc::WORKGROUP, t_f32);
+    let mut shared = HashMap::new();
+    for decl in &entry.shared {
+        let len = spv.constant_u32(t_u32, decl.len);
+        let array_ty = spv.type_array(t_f32, len);
+        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+        let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
+        shared.insert(decl.name.clone(), var);
+    }
 
     // ── Function + entry-point declaration ───────────────────────────────────
     let t_fn = spv.type_function(t_void, &[]);
     let fn_id = spv.fresh_id();
-    spv.entry_point_glcompute(fn_id, "main", &[gid_var]);
+    spv.entry_point_glcompute(fn_id, "main", &[gid_var, lid_var, group_var]);
     spv.execution_mode_local_size(fn_id, local_size[0], local_size[1], local_size[2]);
 
     // ── Constants ────────────────────────────────────────────────────────────
@@ -207,6 +222,10 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
         scalar_params: scalar_param_map,
         pc_var,
         gid_var,
+        lid_var,
+        group_var,
+        shared,
+        t_ptr_wg_f32,
         const_0_u32,
         locals,
         t_ptr_pc_u32,
@@ -262,6 +281,10 @@ struct LowerCtx<'a> {
     n_buf_params: u32,
     pc_var: Option<Id>,
     gid_var: Id,
+    lid_var: Id,
+    group_var: Id,
+    shared: HashMap<String, Id>,
+    t_ptr_wg_f32: Id,
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
     t_ptr_pc_u32: Id,
@@ -338,6 +361,26 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
             ctx.spv.op_store(ptr_elem, rhs_id);
+            Ok(())
+        }
+
+        IrStmt::AssignShared { name, index, value } => {
+            let var = *ctx.shared.get(name)
+                .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
+            let idx = lower_expr(ctx, index)?;
+            let idx = coerce(ctx, idx, ScalarTy::U32);
+            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
+            let rhs = lower_expr(ctx, value)?;
+            let rhs = coerce(ctx, rhs, ScalarTy::F32);
+            ctx.spv.op_store(ptr, rhs);
+            Ok(())
+        }
+
+        IrStmt::Barrier => {
+            // ScopeWorkgroup = 2; AcquireRelease|WorkgroupMemory = 0x108.
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 2);
+            let semantics = ctx.spv.constant_u32(ctx.t_u32, 0x108);
+            ctx.spv.op_control_barrier(scope, scope, semantics);
             Ok(())
         }
 
@@ -516,6 +559,16 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             })
         }
 
+        IrExpr::SharedLoad { name, index } => {
+            let var = *ctx.shared.get(name)
+                .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
+            let idx = lower_expr(ctx, index)?;
+            let idx = coerce(ctx, idx, ScalarTy::U32);
+            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
+            let id = ctx.spv.op_load(ctx.t_f32, ptr);
+            Ok(Val { id, ty: ScalarTy::F32 })
+        }
+
         IrExpr::GlobalId(component) => {
             let gid_var = ctx.gid_var;
             let t_uvec3 = ctx.t_uvec3;
@@ -526,6 +579,14 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 id: val,
                 ty: ScalarTy::U32,
             })
+        }
+
+
+        IrExpr::LocalId(component) | IrExpr::GroupId(component) => {
+            let var = if matches!(expr, IrExpr::LocalId(_)) { ctx.lid_var } else { ctx.group_var };
+            let id3 = ctx.spv.op_load(ctx.t_uvec3, var);
+            let id = ctx.spv.op_composite_extract(ctx.t_u32, id3, &[*component]);
+            Ok(Val { id, ty: ScalarTy::U32 })
         }
 
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
