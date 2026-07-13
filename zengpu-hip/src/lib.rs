@@ -645,7 +645,8 @@ impl GpuDevice for HipDevice {
                 ),
                 "hipModuleLaunchKernel",
             )?;
-            check(hipStreamSynchronize(std::ptr::null_mut()), "hipStreamSynchronize")?;
+            // No per-dispatch sync: launches queue on the null stream (ordered execution).
+            // The host blocks only at readback (`read_buffer` synchronizes after its D→H copy).
         }
         Ok(())
     }
