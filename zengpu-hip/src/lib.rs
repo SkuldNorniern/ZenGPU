@@ -302,7 +302,7 @@ impl HipInstance {
             .collect();
 
         for d in &devices {
-            log::info!(
+            log::debug!(
                 "hip: [{ordinal}] {name} ({gfx}/{family}) — {mem} MiB, {cu} CUs @ {clk} MHz, ROCm {rocm}",
                 ordinal = d.ordinal,
                 name    = d.name,
