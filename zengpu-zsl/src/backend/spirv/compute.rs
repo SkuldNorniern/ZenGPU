@@ -41,6 +41,9 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
 
     spv.capability_shader();
     spv.capability_runtime_descriptor_array();
+    if has_atomic_add(&entry.body) {
+        spv.enable_atomic_float32_add_ext();
+    }
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
@@ -310,6 +313,17 @@ fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), String> {
     Ok(())
 }
 
+fn has_atomic_add(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        IrStmt::AtomicAdd { .. } => true,
+        IrStmt::If { then, else_, .. } => {
+            has_atomic_add(then) || else_.as_deref().is_some_and(has_atomic_add)
+        }
+        IrStmt::For { body, .. } => has_atomic_add(body),
+        _ => false,
+    })
+}
+
 fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     match stmt {
         IrStmt::Let { name, init } => {
@@ -361,6 +375,34 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
             ctx.spv.op_store(ptr_elem, rhs_id);
+            Ok(())
+        }
+
+        IrStmt::AtomicAdd { buf, index, value } => {
+            let buf_pc_index = ctx
+                .buf_params
+                .get(buf)
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
+                .pc_index;
+            let pc_var = ctx
+                .pc_var
+                .ok_or_else(|| "ZSL: no push constant block".to_string())?;
+            let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
+            let pc_chain = ctx.spv.op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
+            let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
+            let idx_val = lower_expr(ctx, index)?;
+            let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
+            let ptr_elem = ctx.spv.op_access_chain(
+                ctx.t_ptr_ssbo_f32,
+                ctx.g_bufs_var,
+                &[buf_idx, ctx.const_0_u32, idx_id],
+            );
+            let rhs = lower_expr(ctx, value)?;
+            let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
+            // ScopeDevice = 1; MemorySemanticsRelaxed = 0.
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
+            let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
+            ctx.spv.op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
             Ok(())
         }
 

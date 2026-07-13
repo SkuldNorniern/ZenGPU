@@ -267,6 +267,125 @@ mod phase_z_tests {
         }
     "#;
 
+    const SCATTER_ADD: &str = r#"
+        push Scatter { n: u32 }
+        @workgroup_size(256)
+        kernel scatter_add(idx: device buffer<f32>, val: device buffer<f32>, out: device mut buffer<f32>, p: Scatter, id: global_id) {
+            let i = id.x
+            if i < p.n {
+                atomic_add(out, idx[i], val[i])
+            }
+        }
+    "#;
+
+    #[test]
+    fn scatter_add_lowers_on_all_backends_and_has_spirv_atomic_extension() {
+        let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
+        let hip_source = hip::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).source;
+        assert!(hip_source.contains("atomicAdd(&out["));
+        assert!(cuda_source.contains("atomicAdd(&out["));
+        assert!(msl_source.contains("device atomic_float* out"));
+        assert!(msl_source.contains("atomic_fetch_add_explicit(&out["));
+        assert!(msl_source.contains("memory_order_relaxed"));
+
+        let words = spirv::lower_compute(&module).expect("lower scatter_add to SPIR-V");
+        let mut at = 5usize;
+        let mut atomic_fadds = 0;
+        let mut atomic_float_caps = 0;
+        let mut atomic_extension = false;
+        while at < words.len() {
+            let wc = (words[at] >> 16) as usize;
+            let opcode = words[at] & 0xffff;
+            assert!(wc > 0 && at + wc <= words.len(), "malformed SPIR-V instruction at word {at}");
+            if opcode == 6035 {
+                assert_eq!(wc, 7, "malformed OpAtomicFAddEXT");
+                atomic_fadds += 1;
+            }
+            if opcode == 17 && wc == 2 && words[at + 1] == 6033 {
+                atomic_float_caps += 1;
+            }
+            if opcode == 10 {
+                let bytes: Vec<u8> = words[at + 1..at + wc]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .collect();
+                atomic_extension |= bytes == b"SPV_EXT_shader_atomic_float";
+            }
+            at += wc;
+        }
+        assert_eq!(atomic_fadds, 1, "missing OpAtomicFAddEXT");
+        assert_eq!(atomic_float_caps, 1, "missing AtomicFloat32AddEXT capability");
+        assert!(atomic_extension, "missing SPV_EXT_shader_atomic_float extension");
+    }
+
+    #[test]
+    fn scatter_add_hip_exact_match_when_gpu_present() {
+        let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
+        let shader = hip::lower_compute(&module);
+        assert!(shader.source.contains("atomicAdd(&out["));
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP scatter proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_scatter_add_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_scatter_add_{}_{}", std::process::id(), tag));
+        let harness = format!(r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned N = 65536, BINS = 37;
+    std::vector<float> idx(N), val(N), out(BINS, 0.0f), ref(BINS, 0.0f);
+    for (unsigned i = 0; i < N; ++i) {{
+        unsigned bin = (i * 17 + i / 11) % BINS;
+        idx[i] = float(bin);
+        val[i] = float((i % 4) + 1);
+        ref[bin] += val[i];
+    }}
+    float *didx = nullptr, *dval = nullptr, *dout = nullptr;
+    if (hipMalloc(&didx, idx.size()*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dval, val.size()*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dout, out.size()*sizeof(float)) != hipSuccess) return 2;
+    hipMemcpy(didx, idx.data(), idx.size()*sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(dval, val.data(), val.size()*sizeof(float), hipMemcpyHostToDevice);
+    hipMemset(dout, 0, out.size()*sizeof(float));
+    zsl_kernel<<<dim3((N+255)/256), dim3(256)>>>(didx, dval, dout, N);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(out.data(), dout, out.size()*sizeof(float), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < BINS; ++i) mismatches += out[i] != ref[i];
+    std::printf("SCATTER_EXACT mismatches=%u\n", mismatches);
+    hipFree(didx); hipFree(dval); hipFree(dout);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#, shader.source);
+        std::fs::write(&src_path, harness).expect("write HIP scatter proof source");
+        let compile = Command::new(&hipcc).arg("-O2").arg(&src_path).arg("-o").arg(&exe_path)
+            .output().expect("run hipcc");
+        if !compile.status.success() {
+            panic!("HIP scatter compilation failed:\n{}", String::from_utf8_lossy(&compile.stderr));
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP scatter_add");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(run.status.success(), "HIP scatter_add failed: {stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+        eprintln!("HIP scatter_add: {}", stdout.trim());
+    }
+
     #[test]
     fn tiled_gemm_spirv_has_workgroup_memory_and_barrier() {
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
