@@ -34,6 +34,28 @@ pub trait GpuDevice: Send + Sync {
     /// have been created with [`crate::BufferUsage::READBACK`].
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Backend device ordinal, or `-1` when the backend does not expose one.
+    fn device_ordinal(&self) -> i32 {
+        -1
+    }
+
+    /// Whether direct device-to-device copies from `peer_ordinal` are usable.
+    fn can_peer(&self, _peer_ordinal: i32) -> bool {
+        false
+    }
+
+    /// Copy `bytes` from a buffer owned by `src_device` into `dst`.
+    /// Backends without multi-device copy support return an error by default.
+    fn copy_from_peer(
+        &self,
+        _dst: BufferHandle,
+        _src_device: &dyn GpuDevice,
+        _src: BufferHandle,
+        _bytes: u64,
+    ) -> Result<()> {
+        Err(GpuError::Unsupported("peer device copy".into()))
+    }
+
     /// Destroy `buffer`, invalidating its handle. A stale handle is a no-op.
     fn destroy_buffer(&self, buffer: BufferHandle);
 

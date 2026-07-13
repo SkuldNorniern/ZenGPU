@@ -4,6 +4,7 @@
 //! gfx11xx (RDNA 3), gfx12xx (RDNA 4). Multi-GPU: open one `HipDevice`
 //! per adapter; they are `Send + Sync` and can be driven from separate threads.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +30,7 @@ use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 type HipError = i32;
 const HIP_SUCCESS: HipError = 0;
+const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipError = 704;
 
 const HIP_MEMCPY_H2D: i32 = 1;
 const HIP_MEMCPY_D2H: i32 = 2;
@@ -46,9 +48,18 @@ unsafe extern "C" {
     fn hipDeviceTotalMem(bytes: *mut usize, device: i32) -> HipError;
     fn hipGetDeviceProperties(props: *mut u8, device: i32) -> HipError;
     fn hipSetDevice(device: i32) -> HipError;
+    fn hipDeviceCanAccessPeer(canAccess: *mut i32, device: i32, peerDevice: i32) -> HipError;
+    fn hipDeviceEnablePeerAccess(peerDevice: i32, flags: u32) -> HipError;
     fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> HipError;
     fn hipFree(ptr: *mut c_void) -> HipError;
     fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> HipError;
+    fn hipMemcpyPeer(
+        dst: *mut c_void,
+        dstDevice: i32,
+        src: *const c_void,
+        srcDevice: i32,
+        bytes: usize,
+    ) -> HipError;
     fn hipModuleLoadData(module: *mut HipModule, image: *const c_void) -> HipError;
     fn hipModuleGetFunction(func: *mut HipFunction, module: HipModule, name: *const i8)
     -> HipError;
@@ -418,6 +429,7 @@ impl GpuAdapter for HipAdapter {
         Ok(Box::new(HipDevice {
             dev_info: Arc::new(self.dev_info.clone()),
             inner: Mutex::new(HipDeviceInner::new(self.dev_info.ordinal)),
+            peer_access: Mutex::new(HashMap::new()),
         }))
     }
 }
@@ -427,6 +439,7 @@ impl GpuAdapter for HipAdapter {
 pub struct HipDevice {
     dev_info: Arc<HipDeviceInfo>,
     inner: Mutex<HipDeviceInner>,
+    peer_access: Mutex<HashMap<i32, bool>>,
 }
 
 impl HipDevice {
@@ -589,6 +602,109 @@ impl GpuDevice for HipDevice {
             )?;
         }
         Ok(out)
+    }
+
+    fn device_ordinal(&self) -> i32 {
+        self.dev_info.ordinal
+    }
+
+    fn can_peer(&self, peer_ordinal: i32) -> bool {
+        let mut cache = self.peer_access.lock().unwrap();
+        if let Some(&can_access) = cache.get(&peer_ordinal) {
+            return can_access;
+        }
+
+        let mut can_access = 0;
+        let usable = unsafe {
+            hipDeviceCanAccessPeer(&mut can_access, self.dev_info.ordinal, peer_ordinal)
+                == HIP_SUCCESS
+                && can_access != 0
+                && hipSetDevice(self.dev_info.ordinal) == HIP_SUCCESS
+                && matches!(
+                    hipDeviceEnablePeerAccess(peer_ordinal, 0),
+                    HIP_SUCCESS | HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED
+                )
+        };
+        cache.insert(peer_ordinal, usable);
+        usable
+    }
+
+    fn copy_from_peer(
+        &self,
+        dst: BufferHandle,
+        src_device: &dyn GpuDevice,
+        src: BufferHandle,
+        bytes: u64,
+    ) -> Result<()> {
+        let src_device = src_device
+            .as_any()
+            .downcast_ref::<HipDevice>()
+            .ok_or_else(|| GpuError::Unsupported("hip: peer source is not a HIP device".into()))?;
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| GpuError::Backend("hip: peer copy size exceeds usize".into()))?;
+
+        let (dst_ptr, dst_size) = {
+            let inner = self.inner.lock().unwrap();
+            let buffer = inner.buffers.get(dst).ok_or_else(|| Self::stale(dst))?;
+            (buffer.ptr, buffer.size)
+        };
+        let (src_ptr, src_size) = {
+            let inner = src_device.inner.lock().unwrap();
+            let buffer = inner.buffers.get(src).ok_or_else(|| Self::stale(src))?;
+            (buffer.ptr, buffer.size)
+        };
+        if bytes > dst_size || bytes > src_size {
+            return Err(GpuError::Backend(format!(
+                "hip: peer copy of {bytes} bytes exceeds source ({src_size}) or destination ({dst_size}) buffer"
+            )));
+        }
+
+        let dst_ordinal = self.dev_info.ordinal;
+        let src_ordinal = src_device.dev_info.ordinal;
+        unsafe {
+            if self.can_peer(src_ordinal) {
+                check(
+                    hipMemcpyPeer(dst_ptr, dst_ordinal, src_ptr, src_ordinal, bytes),
+                    "hipMemcpyPeer",
+                )?;
+                check(hipSetDevice(dst_ordinal), "hipSetDevice destination")?;
+                check(
+                    hipStreamSynchronize(std::ptr::null_mut()),
+                    "hipStreamSynchronize peer copy",
+                )?;
+            } else {
+                let mut staging = vec![0u8; bytes];
+                check(hipSetDevice(src_ordinal), "hipSetDevice peer source")?;
+                check(
+                    hipMemcpy(
+                        staging.as_mut_ptr() as *mut c_void,
+                        src_ptr,
+                        bytes,
+                        HIP_MEMCPY_D2H,
+                    ),
+                    "hipMemcpy peer fallback D→H",
+                )?;
+                check(
+                    hipStreamSynchronize(std::ptr::null_mut()),
+                    "hipStreamSynchronize peer fallback D→H",
+                )?;
+                check(hipSetDevice(dst_ordinal), "hipSetDevice peer destination")?;
+                check(
+                    hipMemcpy(
+                        dst_ptr,
+                        staging.as_ptr() as *const c_void,
+                        bytes,
+                        HIP_MEMCPY_H2D,
+                    ),
+                    "hipMemcpy peer fallback H→D",
+                )?;
+                check(
+                    hipStreamSynchronize(std::ptr::null_mut()),
+                    "hipStreamSynchronize peer fallback H→D",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
@@ -849,6 +965,49 @@ void vec_add(const float* __restrict__ a,
         let back = device.read_buffer(buf, 0, data.len() as u64).unwrap();
         assert_eq!(data, back, "buffer roundtrip mismatch");
         device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn peer_buffer_copy() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        if adapters.len() < 2 {
+            println!(
+                "hip: peer copy test needs ≥ 2 GPUs; found {}",
+                adapters.len()
+            );
+            return;
+        }
+
+        let dev0 = adapters[0].open(DeviceRequest::default()).unwrap();
+        let dev1 = adapters[1].open(DeviceRequest::default()).unwrap();
+        let values = [1.25f32, -2.5, 3.75, 1024.5, -0.125, 42.0];
+        let data: Vec<u8> = values.iter().flat_map(|value| value.to_ne_bytes()).collect();
+        let desc = BufferDesc {
+            size: data.len() as u64,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::GpuOnly,
+        };
+        let dst = dev0.create_buffer(desc).unwrap();
+        let src = dev1.create_buffer(desc).unwrap();
+        dev1.write_buffer(src, 0, &data).unwrap();
+
+        let direct = dev0.can_peer(dev1.device_ordinal());
+        println!(
+            "hip: GPU {} ← GPU {} peer copy: {}",
+            dev0.device_ordinal(),
+            dev1.device_ordinal(),
+            if direct { "P2P fast path" } else { "host-staging fallback" }
+        );
+        dev0
+            .copy_from_peer(dst, dev1.as_ref(), src, data.len() as u64)
+            .unwrap();
+        let copied = dev0.read_buffer(dst, 0, data.len() as u64).unwrap();
+        assert_eq!(copied, data, "peer buffer copy mismatch");
+        println!("hip: peer copy correctness: OK");
+
+        dev0.destroy_buffer(dst);
+        dev1.destroy_buffer(src);
     }
 
     /// Compile and run vec_add on GPU 0, verify results on CPU.
