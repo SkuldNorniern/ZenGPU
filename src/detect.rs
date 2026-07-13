@@ -34,8 +34,16 @@ pub fn detect_backends() -> Vec<BackendAvailability> {
     out
 }
 
-fn push_if_nonempty(out: &mut Vec<BackendAvailability>, name: &'static str, inst: &dyn GpuInstance) {
-    let adapters: Vec<AdapterInfo> = inst.enumerate_adapters().into_iter().map(|a| a.info().clone()).collect();
+fn push_if_nonempty(
+    out: &mut Vec<BackendAvailability>,
+    name: &'static str,
+    inst: &dyn GpuInstance,
+) {
+    let adapters: Vec<AdapterInfo> = inst
+        .enumerate_adapters()
+        .into_iter()
+        .map(|a| a.info().clone())
+        .collect();
     if !adapters.is_empty() {
         out.push(BackendAvailability { name, adapters });
     }

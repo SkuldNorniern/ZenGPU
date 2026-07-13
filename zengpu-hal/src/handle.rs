@@ -5,6 +5,8 @@
 //! one whose generation no longer matches its slot — is rejected, which is what
 //! gives the validation layer use-after-free detection without UB.
 
+use core::fmt::{Debug, Formatter, Result as FmtResult};
+use core::hash::{Hash, Hasher};
 use core::marker::PhantomData;
 
 /// A generational key into a [`SlotMap`]. `Copy`, backend-free, and carries a
@@ -30,14 +32,14 @@ impl<K> PartialEq for Handle<K> {
     }
 }
 impl<K> Eq for Handle<K> {}
-impl<K> core::hash::Hash for Handle<K> {
-    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+impl<K> Hash for Handle<K> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
         self.idx.hash(state);
         self.generation.hash(state);
     }
 }
-impl<K> core::fmt::Debug for Handle<K> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl<K> Debug for Handle<K> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "Handle({}, gen {})", self.idx, self.generation)
     }
 }

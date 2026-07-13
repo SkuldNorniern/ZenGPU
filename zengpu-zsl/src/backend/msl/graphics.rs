@@ -39,7 +39,11 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
 
     // Stage-in inputs. Vertex inputs are vertex-buffer attributes; fragment
     // inputs are interpolated varyings.
-    let in_qualifier = if e.is_fragment { "user(locn" } else { "attribute(" };
+    let in_qualifier = if e.is_fragment {
+        "user(locn"
+    } else {
+        "attribute("
+    };
     if !e.inputs.is_empty() {
         s.push_str("struct StageIn {\n");
         for inp in &e.inputs {
@@ -291,30 +295,37 @@ mod tests {
 
     #[test]
     fn vertex_mvp_with_varying() {
-        let m = graphics(r#"
+        let m = graphics(
+            r#"
             push P { mvp: mat4x4<f32> }
             vertex vs(@location(0) pos: f32x3, @location(1) col: f32x3, p: P) -> (f32x4, f32x3) {
                 (p.mvp * pos.extend(1.0), col)
             }
-        "#);
+        "#,
+        );
         assert!(m.source.contains("struct Push {"));
         assert!(m.source.contains("float4x4 mvp;"));
         assert!(m.source.contains("float3 pos [[attribute(0)]]"));
         assert!(m.source.contains("float4 position [[position]]"));
         assert!(m.source.contains("float3 vary0 [[user(locn0)]]"));
         assert!(m.source.contains("vertex VsOut zsl_main"));
-        assert!(m.source.contains("out.position = (pc.mvp * float4(in.pos, 1.0));"));
+        assert!(
+            m.source
+                .contains("out.position = (pc.mvp * float4(in.pos, 1.0));")
+        );
         assert!(m.source.contains("out.vary0 = in.col;"));
         let _ = metal_compiles(&m.source);
     }
 
     #[test]
     fn fragment_color() {
-        let m = graphics(r#"
+        let m = graphics(
+            r#"
             fragment fs(@location(0) v_color: f32x3) -> f32x4 {
                 v_color.extend(1.0)
             }
-        "#);
+        "#,
+        );
         assert!(m.source.contains("float3 v_color [[user(locn0)]]"));
         assert!(m.source.contains("fragment float4 zsl_main"));
         assert!(m.source.contains("return float4(in.v_color, 1.0);"));

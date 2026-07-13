@@ -18,7 +18,7 @@ use cuda_oxide::{
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance,
-    HalCapabilities, PipelineHandle, Result, Scalar, SamplerDesc, SamplerHandle, ShaderDesc,
+    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
     ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, marker,
 };
 
@@ -38,7 +38,11 @@ unsafe extern "C" {
         headers: *const *const std::ffi::c_char,
         include_names: *const *const std::ffi::c_char,
     ) -> i32;
-    fn nvrtcCompileProgram(prog: NvrtcProgram, num_opts: i32, opts: *const *const std::ffi::c_char) -> i32;
+    fn nvrtcCompileProgram(
+        prog: NvrtcProgram,
+        num_opts: i32,
+        opts: *const *const std::ffi::c_char,
+    ) -> i32;
     fn nvrtcGetPTXSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
     fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut std::ffi::c_char) -> i32;
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
@@ -76,11 +80,11 @@ fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
             let mut buf = vec![0i8; log_size];
             nvrtcGetProgramLog(prog, buf.as_mut_ptr());
             nvrtcDestroyProgram(&mut prog);
-            String::from_utf8_lossy(
-                &buf.iter().map(|&b| b as u8).collect::<Vec<_>>()
-            ).into_owned()
+            String::from_utf8_lossy(&buf.iter().map(|&b| b as u8).collect::<Vec<_>>()).into_owned()
         };
-        return Err(GpuError::Backend(format!("nvrtc compilation failed:\n{log}")));
+        return Err(GpuError::Backend(format!(
+            "nvrtc compilation failed:\n{log}"
+        )));
     }
 
     let ptx = unsafe {
@@ -130,9 +134,7 @@ impl GpuInstance for CudaInstance {
             Ok(devices) => devices
                 .into_iter()
                 .map(|dev| {
-                    let name = dev
-                        .name()
-                        .unwrap_or_else(|_| "Unknown CUDA Device".into());
+                    let name = dev.name().unwrap_or_else(|_| "Unknown CUDA Device".into());
                     let info = AdapterInfo {
                         name,
                         vendor: 0x10de, // NVIDIA PCI vendor ID
@@ -194,8 +196,8 @@ impl GpuAdapter for CudaAdapter {
             ctx: UnsafeCell::new(ctx),
             ctx_lock: Mutex::new(()),
             stream,
-            buffers:   Mutex::new(SlotMap::new()),
-            shaders:   Mutex::new(SlotMap::new()),
+            buffers: Mutex::new(SlotMap::new()),
+            shaders: Mutex::new(SlotMap::new()),
             pipelines: Mutex::new(SlotMap::new()),
         }))
     }
@@ -225,7 +227,7 @@ unsafe impl Sync for CudaShader {}
 
 #[derive(Clone, Copy)]
 struct CudaPipeline {
-    func:  cuda_oxide::sys::CUfunction,
+    func: cuda_oxide::sys::CUfunction,
     block: [u32; 3],
 }
 
@@ -246,13 +248,13 @@ unsafe impl Sync for CudaPipeline {}
 /// `Rc<Handle>` is always created and destroyed within the same locked
 /// method call — it never crosses a thread boundary.
 pub struct CudaDevice {
-    ctx:       UnsafeCell<Context>,
-    ctx_lock:  Mutex<()>,
+    ctx: UnsafeCell<Context>,
+    ctx_lock: Mutex<()>,
     /// Persistent compute stream — created once in `open()`, reused across all
     /// dispatches to eliminate per-kernel create/destroy overhead.
-    stream:    cuda_oxide::sys::CUstream,
-    buffers:   Mutex<SlotMap<marker::Buffer,   CudaBuffer>>,
-    shaders:   Mutex<SlotMap<marker::Shader,   CudaShader>>,
+    stream: cuda_oxide::sys::CUstream,
+    buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
+    shaders: Mutex<SlotMap<marker::Shader, CudaShader>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
 }
 
@@ -277,8 +279,8 @@ impl CudaDevice {
 impl Drop for CudaDevice {
     fn drop(&mut self) {
         // `&mut self` provides exclusive access — ctx_lock not needed.
-        let buffers:   Vec<CudaBuffer>   = self.buffers.get_mut().unwrap().drain().collect();
-        let shaders:   Vec<CudaShader>   = self.shaders.get_mut().unwrap().drain().collect();
+        let buffers: Vec<CudaBuffer> = self.buffers.get_mut().unwrap().drain().collect();
+        let shaders: Vec<CudaShader> = self.shaders.get_mut().unwrap().drain().collect();
         let pipelines: Vec<CudaPipeline> = self.pipelines.get_mut().unwrap().drain().collect();
 
         // UnsafeCell::get_mut is safe here because of the exclusive &mut self.
@@ -435,7 +437,10 @@ impl GpuDevice for CudaDevice {
             .shaders
             .lock()
             .map_err(|_| GpuError::DeviceLost)?
-            .insert(CudaShader { module, _ptx: ptx_vec });
+            .insert(CudaShader {
+                module,
+                _ptx: ptx_vec,
+            });
         Ok(handle)
     }
 
@@ -445,9 +450,8 @@ impl GpuDevice for CudaDevice {
             Err(_) => return,
         };
         if let Some(cs) = cs {
-            let _ = self.with_context(|_handle| {
-                cu(unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) })
-            });
+            let _ = self
+                .with_context(|_handle| cu(unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) }));
         }
     }
 
@@ -465,13 +469,15 @@ impl GpuDevice for CudaDevice {
 
         let func = self.with_context(|_handle| {
             let mut f: cuda_oxide::sys::CUfunction = std::ptr::null_mut();
-            cu(unsafe {
-                cuda_oxide::sys::cuModuleGetFunction(&mut f, module, entry.as_ptr())
-            })?;
+            cu(unsafe { cuda_oxide::sys::cuModuleGetFunction(&mut f, module, entry.as_ptr()) })?;
             Ok(f)
         })?;
 
-        let block = if desc.block == [0, 0, 0] { [256, 1, 1] } else { desc.block };
+        let block = if desc.block == [0, 0, 0] {
+            [256, 1, 1]
+        } else {
+            desc.block
+        };
         let handle = self
             .pipelines
             .lock()
@@ -568,8 +574,12 @@ impl GpuDevice for CudaDevice {
                 cu(unsafe {
                     cuda_oxide::sys::cuLaunchKernel(
                         cp.func,
-                        op.grid[0], op.grid[1], op.grid[2],
-                        cp.block[0], cp.block[1], cp.block[2],
+                        op.grid[0],
+                        op.grid[1],
+                        op.grid[2],
+                        cp.block[0],
+                        cp.block[1],
+                        cp.block[2],
                         0,
                         stream,
                         kernel_params.as_mut_ptr(),
@@ -678,9 +688,10 @@ mod tests {
             return;
         }
         for (i, dev) in devices.iter().enumerate() {
-            let name    = dev.name().unwrap_or_else(|_| "?".into());
+            let name = dev.name().unwrap_or_else(|_| "?".into());
             let vram_mb = dev.memory_size().unwrap_or(0) / (1024 * 1024);
-            let cc      = dev.compute_capability()
+            let cc = dev
+                .compute_capability()
                 .map(|v| format!("sm_{}{}", v.major, v.minor))
                 .unwrap_or_else(|_| "?".into());
             println!("CUDA device {i}: {name}  |  {vram_mb} MiB  |  {cc}");
@@ -718,7 +729,9 @@ mod tests {
         let first: Vec<u8> = (0u8..128).collect();
         let second: Vec<u8> = (128u8..=255).collect();
         device.write_buffer(buf, 0, &first).expect("write first");
-        device.write_buffer(buf, 128, &second).expect("write second");
+        device
+            .write_buffer(buf, 128, &second)
+            .expect("write second");
         // Read back first half and second half separately.
         let rb_first = device.read_buffer(buf, 0, 128).expect("read first");
         let rb_second = device.read_buffer(buf, 128, 128).expect("read second");
@@ -784,36 +797,64 @@ mod tests {
         let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
 
         let size = (N * std::mem::size_of::<f32>()) as u64;
-        let buf_a   = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
-        let buf_b   = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
-        let buf_out = device.create_buffer(BufferDesc { size, usage: zengpu_hal::BufferUsage::STORAGE, memory: zengpu_hal::MemoryUsage::GpuOnly }).unwrap();
+        let buf_a = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_b = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_out = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
 
         let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
         let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
         device.write_buffer(buf_a, 0, &a_bytes).unwrap();
         device.write_buffer(buf_b, 0, &b_bytes).unwrap();
 
-        let shader = device.create_shader(ShaderDesc::ptx(VEC_ADD_PTX)).expect("load PTX");
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "vec_add_f32",
-            block: [256, 1, 1],
-        }).expect("create pipeline");
+        let shader = device
+            .create_shader(ShaderDesc::ptx(VEC_ADD_PTX))
+            .expect("load PTX");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .expect("create pipeline");
 
-        device.dispatch(
-            pipeline,
-            Bindings {
-                buffers:  &[buf_a.index(), buf_b.index(), buf_out.index()],
-                scalars:  &[Scalar::U32(N as u32)],
-                textures: &[],
-            },
-            [(N as u32).div_ceil(256), 1, 1],
-        ).expect("dispatch");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), buf_out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                [(N as u32).div_ceil(256), 1, 1],
+            )
+            .expect("dispatch");
 
         let raw = device.read_buffer(buf_out, 0, size).unwrap();
         for i in 0..N {
-            let got = f32::from_le_bytes(raw[i*4..i*4+4].try_into().unwrap());
-            assert!((got - expected[i]).abs() < 1e-4, "out[{i}] = {got}, expected {}", expected[i]);
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            assert!(
+                (got - expected[i]).abs() < 1e-4,
+                "out[{i}] = {got}, expected {}",
+                expected[i]
+            );
         }
 
         device.destroy_pipeline(pipeline);
@@ -848,39 +889,49 @@ mod tests {
         device.write_buffer(buf_a, 0, &a_bytes).unwrap();
         device.write_buffer(buf_b, 0, &b_bytes).unwrap();
 
-        let shader = device.create_shader(ShaderDesc::ptx(VEC_ADD_PTX)).expect("load PTX");
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "vec_add_f32",
-            block: [256, 1, 1],
-        }).expect("create pipeline");
+        let shader = device
+            .create_shader(ShaderDesc::ptx(VEC_ADD_PTX))
+            .expect("load PTX");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .expect("create pipeline");
 
         let grid = [(N as u32).div_ceil(256), 1, 1];
-        device.dispatch_batch(&[
-            zengpu_hal::DispatchOp {
-                pipeline,
-                bindings: Bindings {
-                    buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
-                    scalars: &[Scalar::U32(N as u32)],
-                    textures: &[],
+        device
+            .dispatch_batch(&[
+                zengpu_hal::DispatchOp {
+                    pipeline,
+                    bindings: Bindings {
+                        buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
+                        scalars: &[Scalar::U32(N as u32)],
+                        textures: &[],
+                    },
+                    grid,
                 },
-                grid,
-            },
-            zengpu_hal::DispatchOp {
-                pipeline,
-                bindings: Bindings {
-                    buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
-                    scalars: &[Scalar::U32(N as u32)],
-                    textures: &[],
+                zengpu_hal::DispatchOp {
+                    pipeline,
+                    bindings: Bindings {
+                        buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
+                        scalars: &[Scalar::U32(N as u32)],
+                        textures: &[],
+                    },
+                    grid,
                 },
-                grid,
-            },
-        ]).expect("dispatch_batch");
+            ])
+            .expect("dispatch_batch");
 
         let raw = device.read_buffer(buf_out, 0, size).unwrap();
         for i in 0..N {
-            let got = f32::from_le_bytes(raw[i*4..i*4+4].try_into().unwrap());
-            assert!((got - expected[i]).abs() < 1e-3, "out[{i}] = {got}, expected {}", expected[i]);
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            assert!(
+                (got - expected[i]).abs() < 1e-3,
+                "out[{i}] = {got}, expected {}",
+                expected[i]
+            );
         }
 
         device.destroy_pipeline(pipeline);

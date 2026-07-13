@@ -11,6 +11,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 zengpu-zsl = { path = "../zengpu-zsl", version = "0.0.1" }
 zengpu-hal.workspace = true

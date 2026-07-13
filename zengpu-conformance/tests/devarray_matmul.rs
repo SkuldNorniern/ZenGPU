@@ -24,9 +24,12 @@ fn register_cpu_gemm_kernel(cpu: &CpuDevice, pipeline: zengpu_hal::PipelineHandl
         pipeline,
         Box::new(|ctx: &mut CpuKernelCtx| {
             let (m, n, k, alpha) = match ctx.scalars[..] {
-                [Scalar::U32(m), Scalar::U32(n), Scalar::U32(k), Scalar::F32(alpha)] => {
-                    (m as usize, n as usize, k as usize, alpha)
-                }
+                [
+                    Scalar::U32(m),
+                    Scalar::U32(n),
+                    Scalar::U32(k),
+                    Scalar::F32(alpha),
+                ] => (m as usize, n as usize, k as usize, alpha),
                 _ => return,
             };
             let read = |buf: &[u8], i: usize| {

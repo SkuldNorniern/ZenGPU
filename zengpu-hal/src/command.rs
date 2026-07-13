@@ -1,6 +1,8 @@
 //! Command-recording value types — bindless bindings and inline scalars
 //! Backends consume these when recording a dispatch or draw.
 
+use crate::handle::PipelineHandle;
+
 /// An inline scalar argument passed to a pipeline (push-constant-sized).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
@@ -27,7 +29,7 @@ pub struct Bindings<'a> {
 /// One dispatch within a [`crate::GpuDevice::dispatch_batch`] call.
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchOp<'a> {
-    pub pipeline: crate::handle::PipelineHandle,
+    pub pipeline: PipelineHandle,
     pub bindings: Bindings<'a>,
     pub grid: [u32; 3],
 }

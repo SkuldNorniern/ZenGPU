@@ -10,4 +10,7 @@ authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 keywords = ["window", "handle", "gpu", "ffi"]
 categories = ["os", "rendering"]
 
+[lints]
+workspace = true
+
 [dependencies]

@@ -18,6 +18,8 @@
 //! );
 //! ```
 
+use std::slice;
+
 use zengpu_hal::{BackendPreference, ShaderDesc};
 
 /// All-backend compiled form of a ZSL shader.
@@ -51,9 +53,8 @@ impl ZslShader {
 
     /// Convenience: SPIR-V [`ShaderDesc`] for Vulkan-only callers.
     pub fn spirv_desc(&self) -> ShaderDesc<'_> {
-        let bytes = unsafe {
-            std::slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4)
-        };
+        let bytes =
+            unsafe { slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4) };
         ShaderDesc::spirv(bytes)
     }
 }

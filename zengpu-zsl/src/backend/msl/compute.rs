@@ -12,8 +12,7 @@ pub fn lower_compute(module: &Module) -> MslShader {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
-    let locals: HashMap<&str, ScalarTy> =
-        e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    let locals: HashMap<&str, ScalarTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
     let buffers: Vec<&str> = e
         .params
         .iter()
@@ -82,7 +81,11 @@ fn indent(s: &mut String, depth: usize) {
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
     match stmt {
         IrStmt::Let { name, init } => {
-            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or(ScalarTy::U32);
+            let ty = ctx
+                .locals
+                .get(name.as_str())
+                .copied()
+                .unwrap_or(ScalarTy::U32);
             indent(s, depth);
             let _ = writeln!(s, "{} {} = {};", msl_scalar(ty), name, emit_expr(init));
         }
@@ -231,7 +234,10 @@ mod tests {
             Ok(o) => Some(if o.status.success() {
                 true
             } else {
-                panic!("MSL failed to compile:\n{}", String::from_utf8_lossy(&o.stderr))
+                panic!(
+                    "MSL failed to compile:\n{}",
+                    String::from_utf8_lossy(&o.stderr)
+                )
             }),
             Err(_) => None, // xcrun not available
         }

@@ -8,8 +8,12 @@
 //! definitions, ids past the declared bound, and a missing entry point.
 
 use std::collections::HashMap;
+use std::{
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+};
 
-use crate::decode::{self, DecodeError, Module};
+use crate::decode::{self, DecodeError, Instruction, Module};
 
 /// A single structural problem.
 #[derive(Clone, Debug)]
@@ -20,8 +24,8 @@ pub struct Issue {
     pub message: String,
 }
 
-impl std::fmt::Display for Issue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Issue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(
             f,
             "word {}: {} (op {}): {}",
@@ -37,8 +41,8 @@ pub enum ValidateError {
     Structural(Vec<Issue>),
 }
 
-impl std::fmt::Display for ValidateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ValidateError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::Decode(e) => write!(f, "decode: {e}"),
             Self::Structural(issues) => {
@@ -52,7 +56,7 @@ impl std::fmt::Display for ValidateError {
     }
 }
 
-impl std::error::Error for ValidateError {}
+impl Error for ValidateError {}
 
 /// Validate a SPIR-V word stream structurally. `Ok(())` means no structural
 /// defects were found (the module may still be semantically invalid).
@@ -131,7 +135,7 @@ pub fn validate_module(module: &Module) -> Vec<Issue> {
 
 fn check_ref(
     issues: &mut Vec<Issue>,
-    inst: &crate::decode::Instruction,
+    inst: &Instruction,
     defs: &HashMap<u32, usize>,
     id: u32,
     role: &str,
@@ -143,7 +147,7 @@ fn check_ref(
     }
 }
 
-fn issue(inst: &crate::decode::Instruction, message: String) -> Issue {
+fn issue(inst: &Instruction, message: String) -> Issue {
     Issue {
         word_offset: inst.word_offset,
         opcode: inst.opcode,

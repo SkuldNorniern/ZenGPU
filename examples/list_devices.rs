@@ -12,11 +12,11 @@ fn main() {
         println!("[{}]  {} device(s)", b.name, b.adapters.len());
         for (i, a) in b.adapters.iter().enumerate() {
             let kind = match a.device_type {
-                DeviceType::Discrete   => "discrete",
+                DeviceType::Discrete => "discrete",
                 DeviceType::Integrated => "integrated",
-                DeviceType::Virtual    => "virtual",
-                DeviceType::Cpu        => "cpu",
-                DeviceType::Unknown    => "unknown",
+                DeviceType::Virtual => "virtual",
+                DeviceType::Cpu => "cpu",
+                DeviceType::Unknown => "unknown",
             };
             println!(
                 "  [{}] {}  ({})  vendor={:#06x}  device={:#06x}",

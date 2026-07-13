@@ -8,8 +8,8 @@
 #[allow(unused_imports)]
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
-    DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result,
-    SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
+    DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, Result, SamplerDesc,
+    SamplerHandle, TextureDesc, TextureHandle,
 };
 
 // ── Dx12Instance ──────────────────────────────────────────────────────────────

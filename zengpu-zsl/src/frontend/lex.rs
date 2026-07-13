@@ -219,7 +219,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         };
         out.push(Token {
             tok,
-            span: Span { start: i, end: i + len },
+            span: Span {
+                start: i,
+                end: i + len,
+            },
         });
         i += len;
     }
@@ -278,8 +281,17 @@ mod tests {
         assert_eq!(
             kinds("<= >= == != && || -> .. < > ="),
             vec![
-                Tok::Le, Tok::Ge, Tok::EqEq, Tok::Ne, Tok::AndAnd, Tok::OrOr, Tok::Arrow,
-                Tok::DotDot, Tok::Lt, Tok::Gt, Tok::Eq,
+                Tok::Le,
+                Tok::Ge,
+                Tok::EqEq,
+                Tok::Ne,
+                Tok::AndAnd,
+                Tok::OrOr,
+                Tok::Arrow,
+                Tok::DotDot,
+                Tok::Lt,
+                Tok::Gt,
+                Tok::Eq,
             ]
         );
     }
@@ -289,8 +301,16 @@ mod tests {
         assert_eq!(
             kinds("(){}[],:;@"),
             vec![
-                Tok::LParen, Tok::RParen, Tok::LBrace, Tok::RBrace, Tok::LBracket, Tok::RBracket,
-                Tok::Comma, Tok::Colon, Tok::Semi, Tok::At,
+                Tok::LParen,
+                Tok::RParen,
+                Tok::LBrace,
+                Tok::RBrace,
+                Tok::LBracket,
+                Tok::RBracket,
+                Tok::Comma,
+                Tok::Colon,
+                Tok::Semi,
+                Tok::At,
             ]
         );
     }
@@ -299,7 +319,11 @@ mod tests {
     fn comments_skipped() {
         assert_eq!(
             kinds("a // line\n b /* block */ c"),
-            vec![Tok::Ident("a".into()), Tok::Ident("b".into()), Tok::Ident("c".into())]
+            vec![
+                Tok::Ident("a".into()),
+                Tok::Ident("b".into()),
+                Tok::Ident("c".into())
+            ]
         );
     }
 

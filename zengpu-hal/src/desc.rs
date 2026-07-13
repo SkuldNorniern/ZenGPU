@@ -81,22 +81,32 @@ pub struct ShaderDesc<'a> {
 
 impl<'a> ShaderDesc<'a> {
     pub fn spirv(bytes: &'a [u8]) -> Self {
-        Self { source: ShaderSource::Spirv(bytes) }
+        Self {
+            source: ShaderSource::Spirv(bytes),
+        }
     }
     pub fn ptx(bytes: &'a [u8]) -> Self {
-        Self { source: ShaderSource::Ptx(bytes) }
+        Self {
+            source: ShaderSource::Ptx(bytes),
+        }
     }
     /// Metal Shading Language source.
     pub fn msl(source: &'a str) -> Self {
-        Self { source: ShaderSource::Msl(source.as_bytes()) }
+        Self {
+            source: ShaderSource::Msl(source.as_bytes()),
+        }
     }
     /// HIP C++ kernel source (compiled via hipRTC on the AMD ROCm backend).
     pub fn hip(source: &'a str) -> Self {
-        Self { source: ShaderSource::Hip(source.as_bytes()) }
+        Self {
+            source: ShaderSource::Hip(source.as_bytes()),
+        }
     }
     /// CUDA C++ kernel source (compiled via NVRTC on the NVIDIA CUDA backend).
     pub fn cuda_src(source: &'a str) -> Self {
-        Self { source: ShaderSource::CudaSrc(source.as_bytes()) }
+        Self {
+            source: ShaderSource::CudaSrc(source.as_bytes()),
+        }
     }
 }
 
@@ -306,8 +316,7 @@ pub struct RasterState {
 ///
 /// Selects which fragments pass the depth test. Defaults to [`CompareFn::Less`].
 /// Use [`CompareFn::Greater`] with a `1.0` depth clear for reverse-Z.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompareFn {
     Never,
     #[default]
@@ -319,7 +328,6 @@ pub enum CompareFn {
     NotEqual,
     Always,
 }
-
 
 /// Depth test/write configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

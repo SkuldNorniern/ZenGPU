@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, DispatchOp, GpuAdapter,
-    GpuDevice, GpuError, GpuInstance, HalCapabilities, PipelineHandle, Result,
-    SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc,
-    TextureHandle, UsageError, marker,
+    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, DispatchOp, GpuAdapter, GpuDevice,
+    GpuError, GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, UsageError,
+    marker,
 };
 
 // ── Generated layout constants (produced by build.rs) ─────────────────────────
@@ -33,10 +33,10 @@ const HIP_SUCCESS: HipError = 0;
 const HIP_MEMCPY_H2D: i32 = 1;
 const HIP_MEMCPY_D2H: i32 = 2;
 
-type HipModule   = *mut c_void;
+type HipModule = *mut c_void;
 type HipFunction = *mut c_void;
-type HipStream   = *mut c_void; // null = default stream
-type HiprtcProg  = *mut c_void;
+type HipStream = *mut c_void; // null = default stream
+type HiprtcProg = *mut c_void;
 
 #[link(name = "amdhip64")]
 unsafe extern "C" {
@@ -50,12 +50,17 @@ unsafe extern "C" {
     fn hipFree(ptr: *mut c_void) -> HipError;
     fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> HipError;
     fn hipModuleLoadData(module: *mut HipModule, image: *const c_void) -> HipError;
-    fn hipModuleGetFunction(func: *mut HipFunction, module: HipModule, name: *const i8) -> HipError;
+    fn hipModuleGetFunction(func: *mut HipFunction, module: HipModule, name: *const i8)
+    -> HipError;
     fn hipModuleUnload(module: HipModule) -> HipError;
     fn hipModuleLaunchKernel(
         f: HipFunction,
-        gx: u32, gy: u32, gz: u32,
-        bx: u32, by: u32, bz: u32,
+        gx: u32,
+        gy: u32,
+        gz: u32,
+        bx: u32,
+        by: u32,
+        bz: u32,
         shared_bytes: u32,
         stream: HipStream,
         kernel_params: *mut *mut c_void,
@@ -97,13 +102,16 @@ fn check(code: HipError, ctx: &str) -> Result<()> {
 /// Falls back to "" on layout mismatch (older ROCm with smaller struct).
 fn gcn_arch_from_prop(blob: &[u8]) -> String {
     let start = HIP_PROP_GCN_ARCH_OFF;
-    let end   = start + HIP_PROP_GCN_ARCH_LEN;
+    let end = start + HIP_PROP_GCN_ARCH_LEN;
     if blob.len() < end {
         return String::new();
     }
     let slice = &blob[start..end];
     // Find the null terminator.
-    let len = slice.iter().position(|&b| b == 0).unwrap_or(HIP_PROP_GCN_ARCH_LEN);
+    let len = slice
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(HIP_PROP_GCN_ARCH_LEN);
     String::from_utf8_lossy(&slice[..len]).into_owned()
 }
 
@@ -132,14 +140,14 @@ fn clock_mhz_from_prop(blob: &[u8]) -> u32 {
 
 #[derive(Debug, Clone)]
 pub struct HipDeviceInfo {
-    pub ordinal:      i32,
-    pub name:         String,
+    pub ordinal: i32,
+    pub name: String,
     /// Bare gfx target, e.g. "gfx1200". Empty if undetectable.
-    pub gfx_target:   String,
-    pub gfx_family:   GfxFamily,
-    pub total_mem:    usize,
-    pub cu_count:     u32,
-    pub clock_mhz:    u32,
+    pub gfx_target: String,
+    pub gfx_family: GfxFamily,
+    pub total_mem: usize,
+    pub cu_count: u32,
+    pub clock_mhz: u32,
     /// ROCm feature capabilities for this device.
     pub capabilities: HipCapabilities,
 }
@@ -157,7 +165,9 @@ impl HipDeviceInfo {
             .into_owned();
 
         let mut total_mem: usize = 0;
-        unsafe { hipDeviceTotalMem(&mut total_mem, ordinal); }
+        unsafe {
+            hipDeviceTotalMem(&mut total_mem, ordinal);
+        }
 
         // Query hipDeviceProp_t into an opaque blob.
         let mut blob = vec![0u8; HIP_PROP_SIZE];
@@ -185,41 +195,77 @@ impl HipDeviceInfo {
                 .unwrap_or(gfx_target)
         };
 
-        let rocm    = RocmVersion::COMPILE_TIME;
-        let caps    = HipCapabilities::from_device(rocm, &gfx_target);
-        let family  = GfxFamily::from_gfx(&gfx_target);
+        let rocm = RocmVersion::COMPILE_TIME;
+        let caps = HipCapabilities::from_device(rocm, &gfx_target);
+        let family = GfxFamily::from_gfx(&gfx_target);
 
-        Some(Self { ordinal, name, gfx_target, gfx_family: family, total_mem, cu_count, clock_mhz, capabilities: caps })
+        Some(Self {
+            ordinal,
+            name,
+            gfx_target,
+            gfx_family: family,
+            total_mem,
+            cu_count,
+            clock_mhz,
+            capabilities: caps,
+        })
     }
-
 }
 
 /// Name-based gfx heuristic — last-resort fallback for old ROCm (< 5.x) or
 /// cross-compilation where `hipGetDeviceProperties` is unavailable.
 fn gfx_from_name_heuristic(name: &str) -> String {
     // RDNA 4
-    if name.contains("9070") { return "gfx1201".into(); }
-    if name.contains("9060") { return "gfx1200".into(); }
+    if name.contains("9070") {
+        return "gfx1201".into();
+    }
+    if name.contains("9060") {
+        return "gfx1200".into();
+    }
     // RDNA 3.5 (Strix)
-    if name.contains("890M") || name.contains("880M") { return "gfx1150".into(); }
+    if name.contains("890M") || name.contains("880M") {
+        return "gfx1150".into();
+    }
     // RDNA 3
-    if name.contains("7900") || name.contains("7800") || name.contains("7700") { return "gfx1100".into(); }
-    if name.contains("7600") { return "gfx1102".into(); }
+    if name.contains("7900") || name.contains("7800") || name.contains("7700") {
+        return "gfx1100".into();
+    }
+    if name.contains("7600") {
+        return "gfx1102".into();
+    }
     // RDNA 2
-    if name.contains("6950") || name.contains("6900") || name.contains("6800") { return "gfx1030".into(); }
-    if name.contains("6700") { return "gfx1031".into(); }
-    if name.contains("6600") { return "gfx1032".into(); }
+    if name.contains("6950") || name.contains("6900") || name.contains("6800") {
+        return "gfx1030".into();
+    }
+    if name.contains("6700") {
+        return "gfx1031".into();
+    }
+    if name.contains("6600") {
+        return "gfx1032".into();
+    }
     // RDNA 1
-    if name.contains("5700") { return "gfx1010".into(); }
+    if name.contains("5700") {
+        return "gfx1010".into();
+    }
     // CDNA 3
-    if name.contains("MI300") { return "gfx942".into(); }
+    if name.contains("MI300") {
+        return "gfx942".into();
+    }
     // CDNA 2
-    if name.contains("MI250") || name.contains("MI210") { return "gfx90a".into(); }
+    if name.contains("MI250") || name.contains("MI210") {
+        return "gfx90a".into();
+    }
     // CDNA 1
-    if name.contains("MI100") { return "gfx908".into(); }
+    if name.contains("MI100") {
+        return "gfx908".into();
+    }
     // Vega / GCN 5
-    if name.contains("Vega20") || name.contains("MI50") || name.contains("MI60") { return "gfx906".into(); }
-    if name.contains("Vega10") || name.contains("Vega 64") || name.contains("Vega 56") { return "gfx900".into(); }
+    if name.contains("Vega20") || name.contains("MI50") || name.contains("MI60") {
+        return "gfx906".into();
+    }
+    if name.contains("Vega10") || name.contains("Vega 64") || name.contains("Vega 56") {
+        return "gfx900".into();
+    }
     // Unknown — let hipRTC auto-detect
     String::new()
 }
@@ -228,8 +274,8 @@ fn gfx_from_name_heuristic(name: &str) -> String {
 
 #[allow(dead_code)]
 struct HipBuffer {
-    ptr:   *mut c_void,
-    size:  usize,
+    ptr: *mut c_void,
+    size: usize,
     usage: BufferUsage,
 }
 unsafe impl Send for HipBuffer {}
@@ -243,7 +289,7 @@ unsafe impl Sync for HipShader {}
 
 struct HipPipeline {
     function: HipFunction,
-    block:    [u32; 3],
+    block: [u32; 3],
 }
 unsafe impl Send for HipPipeline {}
 unsafe impl Sync for HipPipeline {}
@@ -251,9 +297,9 @@ unsafe impl Sync for HipPipeline {}
 // ── Device inner (one per ordinal) ───────────────────────────────────────────
 
 struct HipDeviceInner {
-    ordinal:   i32,
-    buffers:   SlotMap<marker::Buffer,   HipBuffer>,
-    shaders:   SlotMap<marker::Shader,   HipShader>,
+    ordinal: i32,
+    buffers: SlotMap<marker::Buffer, HipBuffer>,
+    shaders: SlotMap<marker::Shader, HipShader>,
     pipelines: SlotMap<marker::Pipeline, HipPipeline>,
 }
 
@@ -261,8 +307,8 @@ impl HipDeviceInner {
     fn new(ordinal: i32) -> Self {
         Self {
             ordinal,
-            buffers:   SlotMap::new(),
-            shaders:   SlotMap::new(),
+            buffers: SlotMap::new(),
+            shaders: SlotMap::new(),
             pipelines: SlotMap::new(),
         }
     }
@@ -297,21 +343,24 @@ impl HipInstance {
         let mut count: i32 = 0;
         unsafe { hipGetDeviceCount(&mut count) };
 
-        let devices: Vec<HipDeviceInfo> = (0..count)
-            .filter_map(|i| HipDeviceInfo::query(i))
-            .collect();
+        let devices: Vec<HipDeviceInfo> =
+            (0..count).filter_map(|i| HipDeviceInfo::query(i)).collect();
 
         for d in &devices {
             log::debug!(
                 "hip: [{ordinal}] {name} ({gfx}/{family}) — {mem} MiB, {cu} CUs @ {clk} MHz, ROCm {rocm}",
                 ordinal = d.ordinal,
-                name    = d.name,
-                gfx     = if d.gfx_target.is_empty() { "unknown" } else { &d.gfx_target },
-                family  = d.gfx_family.name(),
-                mem     = d.total_mem / (1024 * 1024),
-                cu      = d.cu_count,
-                clk     = d.clock_mhz,
-                rocm    = d.capabilities.rocm,
+                name = d.name,
+                gfx = if d.gfx_target.is_empty() {
+                    "unknown"
+                } else {
+                    &d.gfx_target
+                },
+                family = d.gfx_family.name(),
+                mem = d.total_mem / (1024 * 1024),
+                cu = d.cu_count,
+                clk = d.clock_mhz,
+                rocm = d.capabilities.rocm,
             );
         }
 
@@ -331,11 +380,11 @@ impl GpuInstance for HipInstance {
             .map(|d| {
                 Box::new(HipAdapter {
                     info: AdapterInfo {
-                        name:        d.name.clone(),
-                        vendor:      0x1002, // AMD PCI vendor
-                        device:      0,
+                        name: d.name.clone(),
+                        vendor: 0x1002, // AMD PCI vendor
+                        device: 0,
                         device_type: DeviceType::Discrete,
-                        backend:     BackendPreference::Hip,
+                        backend: BackendPreference::Hip,
                     },
                     dev_info: d.clone(),
                 }) as Box<dyn GpuAdapter>
@@ -352,19 +401,23 @@ impl GpuInstance for HipInstance {
 // ── HipAdapter ────────────────────────────────────────────────────────────────
 
 pub struct HipAdapter {
-    info:     AdapterInfo,
+    info: AdapterInfo,
     dev_info: HipDeviceInfo,
 }
 
 impl GpuAdapter for HipAdapter {
-    fn info(&self) -> &AdapterInfo { &self.info }
+    fn info(&self) -> &AdapterInfo {
+        &self.info
+    }
 
-    fn capabilities(&self) -> HalCapabilities { HalCapabilities::compute_only() }
+    fn capabilities(&self) -> HalCapabilities {
+        HalCapabilities::compute_only()
+    }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
         Ok(Box::new(HipDevice {
             dev_info: Arc::new(self.dev_info.clone()),
-            inner:    Mutex::new(HipDeviceInner::new(self.dev_info.ordinal)),
+            inner: Mutex::new(HipDeviceInner::new(self.dev_info.ordinal)),
         }))
     }
 }
@@ -373,12 +426,14 @@ impl GpuAdapter for HipAdapter {
 
 pub struct HipDevice {
     dev_info: Arc<HipDeviceInfo>,
-    inner:    Mutex<HipDeviceInner>,
+    inner: Mutex<HipDeviceInner>,
 }
 
 impl HipDevice {
     /// Access device properties outside of the locked inner.
-    pub fn device_info(&self) -> &HipDeviceInfo { &self.dev_info }
+    pub fn device_info(&self) -> &HipDeviceInfo {
+        &self.dev_info
+    }
 
     // ── hipRTC compilation ────────────────────────────────────────────────────
 
@@ -389,7 +444,7 @@ impl HipDevice {
 
         // Build compile options via capability-aware helper.
         // Older ROCm versions may not accept all flags (-O3 gated to ≥ 5.0).
-        let caps  = &self.dev_info.capabilities;
+        let caps = &self.dev_info.capabilities;
         let flags = caps.rtc_options(&self.dev_info.gfx_target);
         let opts_owned: Vec<CString> = flags
             .iter()
@@ -407,10 +462,14 @@ impl HipDevice {
                 &mut prog,
                 src_c.as_ptr(),
                 name_c.as_ptr(),
-                0, std::ptr::null(), std::ptr::null(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
             );
             if rc != 0 {
-                return Err(GpuError::ShaderCompile(format!("hiprtcCreateProgram: {rc}")));
+                return Err(GpuError::ShaderCompile(format!(
+                    "hiprtcCreateProgram: {rc}"
+                )));
             }
 
             let rc = hiprtcCompileProgram(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr());
@@ -436,9 +495,9 @@ impl HipDevice {
 
     fn stale<K>(handle: zengpu_hal::Handle<K>) -> GpuError {
         GpuError::InvalidUsage(UsageError::StaleHandle {
-            index:        handle.index(),
+            index: handle.index(),
             expected_gen: handle.generation(),
-            actual_gen:   0,
+            actual_gen: 0,
         })
     }
 }
@@ -451,14 +510,21 @@ unsafe fn fetch_rtc_log(prog: HiprtcProg) -> String {
     }
     let mut buf = vec![0i8; sz];
     unsafe { hiprtcGetProgramLog(prog, buf.as_mut_ptr()) };
-    let bytes: Vec<u8> = buf[..sz.saturating_sub(1)].iter().map(|&b| b as u8).collect();
+    let bytes: Vec<u8> = buf[..sz.saturating_sub(1)]
+        .iter()
+        .map(|&b| b as u8)
+        .collect();
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
 impl GpuDevice for HipDevice {
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 
-    fn capabilities(&self) -> HalCapabilities { HalCapabilities::compute_only() }
+    fn capabilities(&self) -> HalCapabilities {
+        HalCapabilities::compute_only()
+    }
 
     // ── Buffer ────────────────────────────────────────────────────────────────
 
@@ -470,17 +536,29 @@ impl GpuDevice for HipDevice {
         let mut ptr: *mut c_void = std::ptr::null_mut();
         unsafe { check(hipMalloc(&mut ptr, size), "hipMalloc")? };
 
-        Ok(inner.buffers.insert(HipBuffer { ptr, size, usage: desc.usage }))
+        Ok(inner.buffers.insert(HipBuffer {
+            ptr,
+            size,
+            usage: desc.usage,
+        }))
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let inner = self.inner.lock().unwrap();
         inner.activate()?;
-        let buf = inner.buffers.get(buffer).ok_or_else(|| Self::stale(buffer))?;
+        let buf = inner
+            .buffers
+            .get(buffer)
+            .ok_or_else(|| Self::stale(buffer))?;
         let dst = unsafe { (buf.ptr as *mut u8).add(offset as usize) as *mut c_void };
         unsafe {
             check(
-                hipMemcpy(dst, data.as_ptr() as *const c_void, data.len(), HIP_MEMCPY_H2D),
+                hipMemcpy(
+                    dst,
+                    data.as_ptr() as *const c_void,
+                    data.len(),
+                    HIP_MEMCPY_H2D,
+                ),
                 "hipMemcpy H→D",
             )
         }
@@ -489,15 +567,26 @@ impl GpuDevice for HipDevice {
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         let inner = self.inner.lock().unwrap();
         inner.activate()?;
-        let buf = inner.buffers.get(buffer).ok_or_else(|| Self::stale(buffer))?;
+        let buf = inner
+            .buffers
+            .get(buffer)
+            .ok_or_else(|| Self::stale(buffer))?;
         let src = unsafe { (buf.ptr as *const u8).add(offset as usize) as *const c_void };
         let mut out = vec![0u8; len as usize];
         unsafe {
             check(
-                hipMemcpy(out.as_mut_ptr() as *mut c_void, src, len as usize, HIP_MEMCPY_D2H),
+                hipMemcpy(
+                    out.as_mut_ptr() as *mut c_void,
+                    src,
+                    len as usize,
+                    HIP_MEMCPY_D2H,
+                ),
                 "hipMemcpy D→H",
             )?;
-            check(hipStreamSynchronize(std::ptr::null_mut()), "hipStreamSynchronize")?;
+            check(
+                hipStreamSynchronize(std::ptr::null_mut()),
+                "hipStreamSynchronize",
+            )?;
         }
         Ok(out)
     }
@@ -575,11 +664,21 @@ impl GpuDevice for HipDevice {
 
         let mut func: HipFunction = std::ptr::null_mut();
         unsafe {
-            check(hipModuleGetFunction(&mut func, module, entry.as_ptr()), "hipModuleGetFunction")?
+            check(
+                hipModuleGetFunction(&mut func, module, entry.as_ptr()),
+                "hipModuleGetFunction",
+            )?
         };
 
-        let block = if desc.block == [0, 0, 0] { [256, 1, 1] } else { desc.block };
-        Ok(inner.pipelines.insert(HipPipeline { function: func, block }))
+        let block = if desc.block == [0, 0, 0] {
+            [256, 1, 1]
+        } else {
+            desc.block
+        };
+        Ok(inner.pipelines.insert(HipPipeline {
+            function: func,
+            block,
+        }))
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
@@ -636,8 +735,12 @@ impl GpuDevice for HipDevice {
             check(
                 hipModuleLaunchKernel(
                     pipe.function,
-                    grid[0], grid[1], grid[2],
-                    pipe.block[0], pipe.block[1], pipe.block[2],
+                    grid[0],
+                    grid[1],
+                    grid[2],
+                    pipe.block[0],
+                    pipe.block[1],
+                    pipe.block[2],
                     0,
                     std::ptr::null_mut(),
                     params.as_mut_ptr(),
@@ -680,7 +783,10 @@ void vec_add(const float* __restrict__ a,
     fn try_instance() -> Option<HipInstance> {
         match HipInstance::new() {
             Ok(inst) => Some(inst),
-            Err(e)   => { println!("hip: skipped — {e}"); None }
+            Err(e) => {
+                println!("hip: skipped — {e}");
+                None
+            }
         }
     }
 
@@ -694,18 +800,28 @@ void vec_add(const float* __restrict__ a,
             println!("  [{}] {}", i.device, i.name);
         }
         // Require at least one GPU if ROCm initialised successfully.
-        assert!(!adapters.is_empty(), "ROCm initialised but found no adapters");
+        assert!(
+            !adapters.is_empty(),
+            "ROCm initialised but found no adapters"
+        );
     }
 
     #[test]
     fn device_info_gcn_target() {
         let Some(inst) = try_instance() else { return };
         for info in inst.device_infos() {
-            println!("  [{ordinal}] {name} → gfx target: {gfx:?}",
-                ordinal = info.ordinal, name = info.name, gfx = info.gfx_target);
+            println!(
+                "  [{ordinal}] {name} → gfx target: {gfx:?}",
+                ordinal = info.ordinal,
+                name = info.name,
+                gfx = info.gfx_target
+            );
             // gfx_target must be non-empty for any ROCm-supported GPU.
-            assert!(!info.gfx_target.is_empty(),
-                "no gfx target derived for {}", info.name);
+            assert!(
+                !info.gfx_target.is_empty(),
+                "no gfx target derived for {}",
+                info.name
+            );
         }
     }
 
@@ -714,16 +830,21 @@ void vec_add(const float* __restrict__ a,
         let Some(inst) = try_instance() else { return };
         let adapter = match inst.request_adapter(AdapterRequest::default()) {
             Some(a) => a,
-            None    => { println!("hip: no adapter"); return }
+            None => {
+                println!("hip: no adapter");
+                return;
+            }
         };
         let device = adapter.open(DeviceRequest::default()).unwrap();
 
         let data: Vec<u8> = (0u8..128).collect();
-        let buf = device.create_buffer(BufferDesc {
-            size:   data.len() as u64,
-            usage:  BufferUsage::STORAGE | BufferUsage::READBACK,
-            memory: MemoryUsage::GpuOnly,
-        }).unwrap();
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: data.len() as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
         device.write_buffer(buf, 0, &data).unwrap();
         let back = device.read_buffer(buf, 0, data.len() as u64).unwrap();
         assert_eq!(data, back, "buffer roundtrip mismatch");
@@ -737,7 +858,10 @@ void vec_add(const float* __restrict__ a,
         let adapters = inst.enumerate_adapters();
         assert!(!adapters.is_empty());
 
-        run_vec_add(adapters[0].open(DeviceRequest::default()).unwrap().as_ref(), "GPU 0");
+        run_vec_add(
+            adapters[0].open(DeviceRequest::default()).unwrap().as_ref(),
+            "GPU 0",
+        );
     }
 
     /// Run vec_add on ALL available GPUs sequentially.
@@ -757,7 +881,10 @@ void vec_add(const float* __restrict__ a,
         let Some(inst) = try_instance() else { return };
         let adapters = inst.enumerate_adapters();
         if adapters.len() < 2 {
-            println!("hip: multi-gpu test needs ≥ 2 GPUs; found {}", adapters.len());
+            println!(
+                "hip: multi-gpu test needs ≥ 2 GPUs; found {}",
+                adapters.len()
+            );
             return;
         }
 
@@ -790,38 +917,62 @@ void vec_add(const float* __restrict__ a,
         let b: Vec<f32> = (0..N).map(|i| (N - i) as f32).collect();
 
         let byte_len = (N * 4) as u64;
-        let storage  = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let buf_a = device.create_buffer(BufferDesc { size: byte_len, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let buf_b = device.create_buffer(BufferDesc { size: byte_len, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let buf_c = device.create_buffer(BufferDesc { size: byte_len, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let buf_a = device
+            .create_buffer(BufferDesc {
+                size: byte_len,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_b = device
+            .create_buffer(BufferDesc {
+                size: byte_len,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_c = device
+            .create_buffer(BufferDesc {
+                size: byte_len,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
 
         device.write_buffer(buf_a, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(buf_b, 0, bytemuck_cast(&b)).unwrap();
 
         let shader = device.create_shader(ShaderDesc::hip(VEC_ADD_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "vec_add",
-            block: [256, 1, 1],
-        }).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add",
+                block: [256, 1, 1],
+            })
+            .unwrap();
 
         let blocks = ((N as u32) + 255) / 256;
-        device.dispatch(
-            pipeline,
-            Bindings {
-                buffers:  &[buf_a.index(), buf_b.index(), buf_c.index()],
-                textures: &[],
-                scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
-            },
-            [blocks, 1, 1],
-        ).unwrap();
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), buf_c.index()],
+                    textures: &[],
+                    scalars: &[zengpu_hal::Scalar::U32(N as u32)],
+                },
+                [blocks, 1, 1],
+            )
+            .unwrap();
 
         let raw = device.read_buffer(buf_c, 0, byte_len).unwrap();
         let c: &[f32] = bytemuck_cast_slice(&raw);
 
         let expected = N as f32;
-        let mismatches: Vec<_> = c.iter().enumerate()
+        let mismatches: Vec<_> = c
+            .iter()
+            .enumerate()
             .filter(|&(_, &v)| (v - expected).abs() > 1e-3)
             .take(5)
             .collect();
@@ -830,7 +981,11 @@ void vec_add(const float* __restrict__ a,
             "{label}: vec_add result mismatch at indices {:?} (expected {expected})",
             mismatches.iter().map(|(i, _)| i).collect::<Vec<_>>()
         );
-        println!("{label}: vec_add {N} elements OK (c[0]={}, c[N-1]={})", c[0], c[N - 1]);
+        println!(
+            "{label}: vec_add {N} elements OK (c[0]={}, c[N-1]={})",
+            c[0],
+            c[N - 1]
+        );
 
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
@@ -1014,40 +1169,60 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty());
 
         let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let info   = adapters[0].info();
+        let info = adapters[0].info();
 
         const M: usize = 2048;
         const N: usize = 2048;
         const K: usize = 2048;
 
-        let a: Vec<f32> = (0..M*K).map(|i| (i % 17) as f32 * 0.01).collect();
-        let b: Vec<f32> = (0..K*N).map(|i| (i % 13) as f32 * 0.01).collect();
+        let a: Vec<f32> = (0..M * K).map(|i| (i % 17) as f32 * 0.01).collect();
+        let b: Vec<f32> = (0..K * N).map(|i| (i % 13) as f32 * 0.01).collect();
 
         let bytes_mn = (M * N * 4) as u64;
         let bytes_mk = (M * K * 4) as u64;
         let bytes_kn = (K * N * 4) as u64;
-        let storage  = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let ba = device.create_buffer(BufferDesc { size: bytes_mk, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bb = device.create_buffer(BufferDesc { size: bytes_kn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bc = device.create_buffer(BufferDesc { size: bytes_mn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let ba = device
+            .create_buffer(BufferDesc {
+                size: bytes_mk,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bb = device
+            .create_buffer(BufferDesc {
+                size: bytes_kn,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bc = device
+            .create_buffer(BufferDesc {
+                size: bytes_mn,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
 
         device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
 
-        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "sgemm",
-            block: [32, 32, 1],
-        }).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm",
+                block: [32, 32, 1],
+            })
+            .unwrap();
 
         // Warm-up.
         let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
         let bindings = Bindings {
-            buffers:  &[ba.index(), bb.index(), bc.index()],
+            buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
-            scalars:  &[
+            scalars: &[
                 zengpu_hal::Scalar::U32(M as u32),
                 zengpu_hal::Scalar::U32(N as u32),
                 zengpu_hal::Scalar::U32(K as u32),
@@ -1063,17 +1238,24 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         }
         let ms = elapsed_ms(t0) / REPS as f64;
 
-        let flop  = 2.0 * M as f64 * N as f64 * K as f64;
+        let flop = 2.0 * M as f64 * N as f64 * K as f64;
         let gflops = flop / (ms * 1e6);
 
-        println!("[{}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s", info.name);
+        println!(
+            "[{}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s",
+            info.name
+        );
 
         // Correctness spot-check: C[0][0] = sum_k A[0][k]*B[k][0].
         let raw = device.read_buffer(bc, 0, bytes_mn).unwrap();
         let c: &[f32] = bytemuck_cast_slice(&raw);
         let expected_c00: f32 = (0..K).map(|k| a[k] * b[k * N]).sum();
         let err = (c[0] - expected_c00).abs() / expected_c00.abs().max(1e-6);
-        assert!(err < 1e-3, "SGEMM C[0][0] error {err:.2e}: got {}, expected {expected_c00}", c[0]);
+        assert!(
+            err < 1e-3,
+            "SGEMM C[0][0] error {err:.2e}: got {}, expected {expected_c00}",
+            c[0]
+        );
 
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
@@ -1099,17 +1281,33 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let partial_bytes = (num_blocks as usize * 4) as u64;
         let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let buf_in  = device.create_buffer(BufferDesc { size: src_bytes,     usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let buf_out = device.create_buffer(BufferDesc { size: partial_bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let buf_in = device
+            .create_buffer(BufferDesc {
+                size: src_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_out = device
+            .create_buffer(BufferDesc {
+                size: partial_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
 
-        device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+        device
+            .write_buffer(buf_in, 0, bytemuck_cast(&data))
+            .unwrap();
 
-        let shader   = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader,
-            entry: "reduce_sum",
-            block: [BLOCK, 1, 1],
-        }).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "reduce_sum",
+                block: [BLOCK, 1, 1],
+            })
+            .unwrap();
 
         // hipModuleLaunchKernel needs shared_bytes > 0 for `extern __shared__`.
         // Our Bindings API doesn't carry shared_bytes yet — work around by
@@ -1125,18 +1323,22 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         // Simpler: rewrite to use static shared memory size.
 
         let bindings = Bindings {
-            buffers:  &[buf_in.index(), buf_out.index()],
+            buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
         // Warm-up.
-        device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+        device
+            .dispatch(pipeline, bindings, [num_blocks, 1, 1])
+            .unwrap();
 
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+            device
+                .dispatch(pipeline, bindings, [num_blocks, 1, 1])
+                .unwrap();
         }
         let ms = elapsed_ms(t0) / REPS as f64;
 
@@ -1146,7 +1348,10 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let sum: f32 = partials.iter().sum();
         let expected = N as f32;
         let err = (sum - expected).abs() / expected;
-        assert!(err < 1e-3, "reduction sum wrong: got {sum}, expected {expected}, err={err:.2e}");
+        assert!(
+            err < 1e-3,
+            "reduction sum wrong: got {sum}, expected {expected}, err={err:.2e}"
+        );
 
         // Bytes read + written: N*4 read + num_blocks*4 written.
         let bytes_moved = (N * 4 + num_blocks as usize * 4) as f64;
@@ -1169,7 +1374,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         // Test on every GPU.
         for adapter in &adapters {
             let device = adapter.open(DeviceRequest::default()).unwrap();
-            let name   = adapter.info().name.clone();
+            let name = adapter.info().name.clone();
 
             const N: usize = 256 * 1024 * 1024; // 256 M floats = 1 GB
             const BLOCK: u32 = 256;
@@ -1178,20 +1383,41 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             let bytes = (N * 4) as u64;
             let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-            let buf_in  = device.create_buffer(BufferDesc { size: bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-            let buf_out = device.create_buffer(BufferDesc { size: bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-            device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+            let buf_in = device
+                .create_buffer(BufferDesc {
+                    size: bytes,
+                    usage: storage,
+                    memory: MemoryUsage::GpuOnly,
+                })
+                .unwrap();
+            let buf_out = device
+                .create_buffer(BufferDesc {
+                    size: bytes,
+                    usage: storage,
+                    memory: MemoryUsage::GpuOnly,
+                })
+                .unwrap();
+            device
+                .write_buffer(buf_in, 0, bytemuck_cast(&data))
+                .unwrap();
 
-            let shader   = device.create_shader(ShaderDesc::hip(SCALE_SRC)).unwrap();
-            let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-                shader, entry: "mem_scale", block: [BLOCK, 1, 1],
-            }).unwrap();
+            let shader = device.create_shader(ShaderDesc::hip(SCALE_SRC)).unwrap();
+            let pipeline = device
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry: "mem_scale",
+                    block: [BLOCK, 1, 1],
+                })
+                .unwrap();
 
-            let grid     = [(N as u32 + BLOCK - 1) / BLOCK, 1, 1];
+            let grid = [(N as u32 + BLOCK - 1) / BLOCK, 1, 1];
             let bindings = Bindings {
-                buffers:  &[buf_in.index(), buf_out.index()],
+                buffers: &[buf_in.index(), buf_out.index()],
                 textures: &[],
-                scalars:  &[zengpu_hal::Scalar::F32(2.0f32), zengpu_hal::Scalar::U32(N as u32)],
+                scalars: &[
+                    zengpu_hal::Scalar::F32(2.0f32),
+                    zengpu_hal::Scalar::U32(N as u32),
+                ],
             };
 
             // Warm-up.
@@ -1227,7 +1453,10 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let Some(inst) = try_instance() else { return };
         let adapters = inst.enumerate_adapters();
         if adapters.len() < 2 {
-            println!("hip: multi-gpu SGEMM needs ≥ 2 GPUs; found {}", adapters.len());
+            println!(
+                "hip: multi-gpu SGEMM needs ≥ 2 GPUs; found {}",
+                adapters.len()
+            );
             // Still run on GPU 0 so CI doesn't skip.
         }
 
@@ -1246,24 +1475,46 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                     const M: usize = 2048;
                     const N: usize = 2048;
                     const K: usize = 2048;
-                    let a: Vec<f32> = (0..M*K).map(|i| (i % 7) as f32 * 0.1).collect();
-                    let b: Vec<f32> = (0..K*N).map(|i| (i % 5) as f32 * 0.1).collect();
+                    let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.1).collect();
+                    let b: Vec<f32> = (0..K * N).map(|i| (i % 5) as f32 * 0.1).collect();
                     let bytes = |r: usize, c: usize| (r * c * 4) as u64;
                     let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-                    let ba = dev.create_buffer(BufferDesc { size: bytes(M,K), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-                    let bb = dev.create_buffer(BufferDesc { size: bytes(K,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-                    let bc = dev.create_buffer(BufferDesc { size: bytes(M,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+                    let ba = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(M, K),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
+                    let bb = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(K, N),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
+                    let bc = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(M, N),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
                     dev.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
                     dev.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-                    let shader   = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-                    let pipeline = dev.create_compute_pipeline(ComputePipelineDesc {
-                        shader, entry: "sgemm", block: [32, 32, 1],
-                    }).unwrap();
-                    let grid = [(N as u32+31)/32, (M as u32+31)/32, 1];
+                    let shader = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+                    let pipeline = dev
+                        .create_compute_pipeline(ComputePipelineDesc {
+                            shader,
+                            entry: "sgemm",
+                            block: [32, 32, 1],
+                        })
+                        .unwrap();
+                    let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
                     let bindings = Bindings {
-                        buffers:  &[ba.index(), bb.index(), bc.index()],
+                        buffers: &[ba.index(), bb.index(), bc.index()],
                         textures: &[],
-                        scalars:  &[
+                        scalars: &[
                             zengpu_hal::Scalar::U32(M as u32),
                             zengpu_hal::Scalar::U32(N as u32),
                             zengpu_hal::Scalar::U32(K as u32),
@@ -1274,10 +1525,14 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                     // Timed.
                     const REPS: u32 = 5;
                     let t0 = std::time::Instant::now();
-                    for _ in 0..REPS { dev.dispatch(pipeline, bindings, grid).unwrap(); }
+                    for _ in 0..REPS {
+                        dev.dispatch(pipeline, bindings, grid).unwrap();
+                    }
                     let ms = elapsed_ms(t0) / REPS as f64;
                     let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
-                    println!("[GPU {idx} – {name}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s");
+                    println!(
+                        "[GPU {idx} – {name}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s"
+                    );
                     dev.destroy_pipeline(pipeline);
                     dev.destroy_shader(shader);
                     dev.destroy_buffer(ba);
@@ -1287,40 +1542,75 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             })
             .collect();
 
-        for h in handles { h.join().expect("thread panicked"); }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
     }
 
     // ── Optimised SGEMM helper ────────────────────────────────────────────────
 
     fn run_sgemm_opt(device: &dyn GpuDevice, m: usize, n: usize, k: usize) -> f64 {
-        let a: Vec<f32> = (0..m*k).map(|i| (i % 7)  as f32 * 0.001).collect();
-        let b: Vec<f32> = (0..k*n).map(|i| (i % 11) as f32 * 0.001).collect();
+        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 * 0.001).collect();
         let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-        let ba = device.create_buffer(BufferDesc { size: (m*k*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bb = device.create_buffer(BufferDesc { size: (k*n*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bc = device.create_buffer(BufferDesc { size: (m*n*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let ba = device
+            .create_buffer(BufferDesc {
+                size: (m * k * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bb = device
+            .create_buffer(BufferDesc {
+                size: (k * n * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bc = device
+            .create_buffer(BufferDesc {
+                size: (m * n * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
         device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_OPT_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "sgemm_opt", block: [16, 16, 1],
-        }).unwrap();
-        let grid     = [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1];
+        let shader = device
+            .create_shader(ShaderDesc::hip(SGEMM_OPT_SRC))
+            .unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm_opt",
+                block: [16, 16, 1],
+            })
+            .unwrap();
+        let grid = [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1];
         let bindings = Bindings {
-            buffers:  &[ba.index(), bb.index(), bc.index()],
+            buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(m as u32), zengpu_hal::Scalar::U32(n as u32), zengpu_hal::Scalar::U32(k as u32)],
+            scalars: &[
+                zengpu_hal::Scalar::U32(m as u32),
+                zengpu_hal::Scalar::U32(n as u32),
+                zengpu_hal::Scalar::U32(k as u32),
+            ],
         };
         // Two warm-up passes to fill instruction cache.
         device.dispatch(pipeline, bindings, grid).unwrap();
         device.dispatch(pipeline, bindings, grid).unwrap();
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
-        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
-        let ms     = elapsed_ms(t0) / REPS as f64;
+        for _ in 0..REPS {
+            device.dispatch(pipeline, bindings, grid).unwrap();
+        }
+        let ms = elapsed_ms(t0) / REPS as f64;
         let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
-        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
-        device.destroy_buffer(ba); device.destroy_buffer(bb); device.destroy_buffer(bc);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(ba);
+        device.destroy_buffer(bb);
+        device.destroy_buffer(bc);
         gflops
     }
 
@@ -1332,15 +1622,15 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty());
 
         let adapter = &adapters[0];
-        let device  = adapter.open(DeviceRequest::default()).unwrap();
-        let name    = adapter.info().name.clone();
+        let device = adapter.open(DeviceRequest::default()).unwrap();
+        let name = adapter.info().name.clone();
 
         for &sz in &[2048usize, 4096, 8192] {
             // 8192³ = 3 × 256 MB matrices → skip if sz==8192 and VRAM < ~1 GB budget
             // (9060 XT has 16 GB; skip guard here is a safety net on small systems).
             let mem_mb = 3 * sz * sz * 4 / (1024 * 1024);
-            let info   = inst.device_infos();
-            let vram   = info[0].total_mem / (1024 * 1024);
+            let info = inst.device_infos();
+            let vram = info[0].total_mem / (1024 * 1024);
             if mem_mb as usize > vram * 3 / 4 {
                 println!("[{name}] skip SGEMM {sz}³: need {mem_mb} MB, VRAM={vram} MB");
                 continue;
@@ -1373,31 +1663,62 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
     }
 
     fn run_sgemm_naive(device: &dyn GpuDevice, sz: usize) -> f64 {
-        let a: Vec<f32> = (0..sz*sz).map(|i| (i % 7)  as f32 * 0.01).collect();
-        let b: Vec<f32> = (0..sz*sz).map(|i| (i % 13) as f32 * 0.01).collect();
+        let a: Vec<f32> = (0..sz * sz).map(|i| (i % 7) as f32 * 0.01).collect();
+        let b: Vec<f32> = (0..sz * sz).map(|i| (i % 13) as f32 * 0.01).collect();
         let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-        let ba = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bb = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bc = device.create_buffer(BufferDesc { size: (sz*sz*4) as u64, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let ba = device
+            .create_buffer(BufferDesc {
+                size: (sz * sz * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bb = device
+            .create_buffer(BufferDesc {
+                size: (sz * sz * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bc = device
+            .create_buffer(BufferDesc {
+                size: (sz * sz * 4) as u64,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
         device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "sgemm", block: [32, 32, 1],
-        }).unwrap();
-        let grid = [((sz as u32)+31)/32, ((sz as u32)+31)/32, 1];
+        let shader = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm",
+                block: [32, 32, 1],
+            })
+            .unwrap();
+        let grid = [((sz as u32) + 31) / 32, ((sz as u32) + 31) / 32, 1];
         let bindings = Bindings {
-            buffers:  &[ba.index(), bb.index(), bc.index()],
+            buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(sz as u32), zengpu_hal::Scalar::U32(sz as u32), zengpu_hal::Scalar::U32(sz as u32)],
+            scalars: &[
+                zengpu_hal::Scalar::U32(sz as u32),
+                zengpu_hal::Scalar::U32(sz as u32),
+                zengpu_hal::Scalar::U32(sz as u32),
+            ],
         };
         device.dispatch(pipeline, bindings, grid).unwrap(); // warm-up
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
-        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
+        for _ in 0..REPS {
+            device.dispatch(pipeline, bindings, grid).unwrap();
+        }
         let ms = elapsed_ms(t0) / REPS as f64;
-        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
-        device.destroy_buffer(ba); device.destroy_buffer(bb); device.destroy_buffer(bc);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(ba);
+        device.destroy_buffer(bb);
+        device.destroy_buffer(bc);
         2.0 * sz as f64 * sz as f64 * sz as f64 / (ms * 1e6)
     }
 
@@ -1406,18 +1727,26 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
     fn heavy_multi_gpu_sgemm_opt_4096() {
         let Some(inst) = try_instance() else { return };
         let adapters = inst.enumerate_adapters();
-        if adapters.is_empty() { return; }
+        if adapters.is_empty() {
+            return;
+        }
 
-        let handles: Vec<_> = adapters.iter().enumerate().map(|(idx, a)| {
-            let dev: std::sync::Arc<dyn GpuDevice> =
-                std::sync::Arc::from(a.open(DeviceRequest::default()).unwrap());
-            let name = a.info().name.clone();
-            std::thread::spawn(move || {
-                let gflops = run_sgemm_opt(dev.as_ref(), 4096, 4096, 4096);
-                println!("[GPU {idx} – {name}] opt SGEMM 4096³: {gflops:.0} GFLOP/s");
+        let handles: Vec<_> = adapters
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| {
+                let dev: std::sync::Arc<dyn GpuDevice> =
+                    std::sync::Arc::from(a.open(DeviceRequest::default()).unwrap());
+                let name = a.info().name.clone();
+                std::thread::spawn(move || {
+                    let gflops = run_sgemm_opt(dev.as_ref(), 4096, 4096, 4096);
+                    println!("[GPU {idx} – {name}] opt SGEMM 4096³: {gflops:.0} GFLOP/s");
+                })
             })
-        }).collect();
-        for h in handles { h.join().expect("thread panicked"); }
+            .collect();
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
     }
 
     // ── ZSL → HIP integration test ────────────────────────────────────────────
@@ -1449,22 +1778,38 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         const N: usize = 1 << 20;
         let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
         let bytes = (N * 4) as u64;
-        let st    = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let src = device.create_buffer(BufferDesc { size: bytes, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
-        let dst = device.create_buffer(BufferDesc { size: bytes, usage: st, memory: MemoryUsage::GpuOnly }).unwrap();
+        let src = device
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let dst = device
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: st,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
         device.write_buffer(src, 0, bytemuck_cast(&data)).unwrap();
 
         // Compile ZSL's HIP C++ form via hipRTC at runtime.
-        let shader   = device.create_shader(ShaderDesc::hip(scale_src)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "zsl_kernel", block: [256, 1, 1],
-        }).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(scale_src)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_kernel",
+                block: [256, 1, 1],
+            })
+            .unwrap();
 
         let bindings = Bindings {
-            buffers:  &[src.index(), dst.index()],
+            buffers: &[src.index(), dst.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
         let grid = [(N as u32 + 255) / 256, 1, 1];
         device.dispatch(pipeline, bindings, grid).unwrap();
@@ -1474,16 +1819,26 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!((out[0] - 0.0f32).abs() < 1e-5, "out[0]={}", out[0]);
         assert!((out[1] - 2.0f32).abs() < 1e-5, "out[1]={}", out[1]);
         assert!((out[2] - 4.0f32).abs() < 1e-5, "out[2]={}", out[2]);
-        println!("zsl! → hipRTC: vec_scale OK  out[0..3]={} {} {}", out[0], out[1], out[2]);
+        println!(
+            "zsl! → hipRTC: vec_scale OK  out[0..3]={} {} {}",
+            out[0], out[1], out[2]
+        );
 
-        device.destroy_pipeline(pipeline); device.destroy_shader(shader);
-        device.destroy_buffer(src); device.destroy_buffer(dst);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(src);
+        device.destroy_buffer(dst);
     }
 
     fn adapters_or_skip(inst: &HipInstance) -> Box<dyn GpuDevice> {
         let adapters = inst.enumerate_adapters();
         assert!(!adapters.is_empty(), "no HIP adapters");
-        adapters.into_iter().next().unwrap().open(DeviceRequest::default()).unwrap()
+        adapters
+            .into_iter()
+            .next()
+            .unwrap()
+            .open(DeviceRequest::default())
+            .unwrap()
     }
 
     // ── 4096 workloads ────────────────────────────────────────────────────────
@@ -1496,39 +1851,61 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty());
 
         let adapter = &adapters[0];
-        let device  = adapter.open(DeviceRequest::default()).unwrap();
-        let info    = adapter.info();
+        let device = adapter.open(DeviceRequest::default()).unwrap();
+        let info = adapter.info();
 
         const M: usize = 4096;
         const N: usize = 4096;
         const K: usize = 4096;
 
         // 4096² × f32 = 64 MB per matrix; 3 matrices = 192 MB — fine for 9060 XT.
-        let a: Vec<f32> = (0..M*K).map(|i| (i % 7)  as f32 * 0.001).collect();
-        let b: Vec<f32> = (0..K*N).map(|i| (i % 11) as f32 * 0.001).collect();
+        let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.001).collect();
+        let b: Vec<f32> = (0..K * N).map(|i| (i % 11) as f32 * 0.001).collect();
 
         let bytes_mn = (M * N * 4) as u64;
         let bytes_mk = (M * K * 4) as u64;
         let bytes_kn = (K * N * 4) as u64;
-        let storage  = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let ba = device.create_buffer(BufferDesc { size: bytes_mk, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bb = device.create_buffer(BufferDesc { size: bytes_kn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let bc = device.create_buffer(BufferDesc { size: bytes_mn, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+        let ba = device
+            .create_buffer(BufferDesc {
+                size: bytes_mk,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bb = device
+            .create_buffer(BufferDesc {
+                size: bytes_kn,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bc = device
+            .create_buffer(BufferDesc {
+                size: bytes_mn,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
 
         device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
 
-        let shader   = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "sgemm", block: [32, 32, 1],
-        }).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm",
+                block: [32, 32, 1],
+            })
+            .unwrap();
 
-        let grid     = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
+        let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
         let bindings = Bindings {
-            buffers:  &[ba.index(), bb.index(), bc.index()],
+            buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
-            scalars:  &[
+            scalars: &[
                 zengpu_hal::Scalar::U32(M as u32),
                 zengpu_hal::Scalar::U32(N as u32),
                 zengpu_hal::Scalar::U32(K as u32),
@@ -1541,18 +1918,27 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
 
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
-        for _ in 0..REPS { device.dispatch(pipeline, bindings, grid).unwrap(); }
-        let ms     = elapsed_ms(t0) / REPS as f64;
+        for _ in 0..REPS {
+            device.dispatch(pipeline, bindings, grid).unwrap();
+        }
+        let ms = elapsed_ms(t0) / REPS as f64;
         let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
 
-        println!("[{}] SGEMM {M}×{K}×{N}: {ms:.1} ms → {gflops:.1} GFLOP/s", info.name);
+        println!(
+            "[{}] SGEMM {M}×{K}×{N}: {ms:.1} ms → {gflops:.1} GFLOP/s",
+            info.name
+        );
 
         // Correctness spot-check.
         let raw = device.read_buffer(bc, 0, 64).unwrap();
         let c: &[f32] = bytemuck_cast_slice(&raw);
         let expected: f32 = (0..K).map(|k| a[k] * b[k * N]).sum();
         let err = (c[0] - expected).abs() / expected.abs().max(1e-6);
-        assert!(err < 1e-2, "SGEMM 4096 C[0][0] err {err:.2e}: got {} expected {expected}", c[0]);
+        assert!(
+            err < 1e-2,
+            "SGEMM 4096 C[0][0] err {err:.2e}: got {} expected {expected}",
+            c[0]
+        );
 
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
@@ -1569,7 +1955,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty());
 
         let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let name   = adapters[0].info().name.clone();
+        let name = adapters[0].info().name.clone();
 
         const N: usize = 256 * 1024 * 1024; // 256 M floats = 1 GB
         const BLOCK: u32 = 512;
@@ -1579,45 +1965,70 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         // elements of value 1.0 the sum is 256 M which fits exactly.
         let data: Vec<f32> = vec![1.0f32; N];
 
-        let src_bytes     = (N * 4) as u64;
-        let num_blocks    = ((N as u32) + BLOCK * 2 - 1) / (BLOCK * 2);
+        let src_bytes = (N * 4) as u64;
+        let num_blocks = ((N as u32) + BLOCK * 2 - 1) / (BLOCK * 2);
         let partial_bytes = (num_blocks as usize * 4) as u64;
-        let storage       = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let buf_in  = device.create_buffer(BufferDesc { size: src_bytes,     usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let buf_out = device.create_buffer(BufferDesc { size: partial_bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+        let buf_in = device
+            .create_buffer(BufferDesc {
+                size: src_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_out = device
+            .create_buffer(BufferDesc {
+                size: partial_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        device
+            .write_buffer(buf_in, 0, bytemuck_cast(&data))
+            .unwrap();
 
-        let shader   = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "reduce_sum", block: [BLOCK, 1, 1],
-        }).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "reduce_sum",
+                block: [BLOCK, 1, 1],
+            })
+            .unwrap();
 
         let bindings = Bindings {
-            buffers:  &[buf_in.index(), buf_out.index()],
+            buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
         // Warm-up.
-        device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+        device
+            .dispatch(pipeline, bindings, [num_blocks, 1, 1])
+            .unwrap();
 
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, [num_blocks, 1, 1]).unwrap();
+            device
+                .dispatch(pipeline, bindings, [num_blocks, 1, 1])
+                .unwrap();
         }
         let ms = elapsed_ms(t0) / REPS as f64;
 
-        let raw      = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
+        let raw = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
         let partials = bytemuck_cast_slice(&raw);
         let sum: f32 = partials.iter().sum();
         let expected = N as f32;
-        let err      = (sum - expected).abs() / expected;
-        assert!(err < 1e-3, "reduction 256M: got {sum}, expected {expected}, err={err:.2e}");
+        let err = (sum - expected).abs() / expected;
+        assert!(
+            err < 1e-3,
+            "reduction 256M: got {sum}, expected {expected}, err={err:.2e}"
+        );
 
         let bytes_moved = (N * 4 + num_blocks as usize * 4) as f64;
-        let gb_s        = bytes_moved / (ms * 1e6);
+        let gb_s = bytes_moved / (ms * 1e6);
         println!("[{name}] reduce_sum 256M floats (1 GB): {ms:.2} ms → {gb_s:.1} GB/s  sum={sum}");
 
         device.destroy_pipeline(pipeline);
@@ -1683,7 +2094,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
         }
 
         let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let name   = adapters[0].info().name.clone();
+        let name = adapters[0].info().name.clone();
 
         const N: usize = 256 * 1024 * 1024;
         const BLOCK: u32 = 256;
@@ -1691,45 +2102,74 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
 
         let data: Vec<f32> = vec![1.0f32; N];
 
-        let src_bytes     = (N * 4) as u64;
+        let src_bytes = (N * 4) as u64;
         let partial_bytes = (NUM_BLOCKS as usize * 4) as u64;
-        let storage       = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-        let buf_in  = device.create_buffer(BufferDesc { size: src_bytes,     usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        let buf_out = device.create_buffer(BufferDesc { size: partial_bytes, usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-        device.write_buffer(buf_in, 0, bytemuck_cast(&data)).unwrap();
+        let buf_in = device
+            .create_buffer(BufferDesc {
+                size: src_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let buf_out = device
+            .create_buffer(BufferDesc {
+                size: partial_bytes,
+                usage: storage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        device
+            .write_buffer(buf_in, 0, bytemuck_cast(&data))
+            .unwrap();
 
-        let shader   = device.create_shader(ShaderDesc::hip(WAVE_REDUCE_SRC)).unwrap();
-        let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-            shader, entry: "wave_reduce_sum", block: [BLOCK, 1, 1],
-        }).unwrap();
+        let shader = device
+            .create_shader(ShaderDesc::hip(WAVE_REDUCE_SRC))
+            .unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "wave_reduce_sum",
+                block: [BLOCK, 1, 1],
+            })
+            .unwrap();
 
         let bindings = Bindings {
-            buffers:  &[buf_in.index(), buf_out.index()],
+            buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
-            scalars:  &[zengpu_hal::Scalar::U32(N as u32)],
+            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
-        device.dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1]).unwrap();
+        device
+            .dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1])
+            .unwrap();
 
         const REPS: u32 = 5;
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1]).unwrap();
+            device
+                .dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1])
+                .unwrap();
         }
         let ms = elapsed_ms(t0) / REPS as f64;
 
-        let raw      = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
+        let raw = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
         let partials = bytemuck_cast_slice(&raw);
         let sum: f32 = partials.iter().sum();
         let expected = N as f32;
-        let err      = (sum - expected).abs() / expected;
-        assert!(err < 1e-3, "wave reduce: got {sum}, expected {expected}, err={err:.2e}");
+        let err = (sum - expected).abs() / expected;
+        assert!(
+            err < 1e-3,
+            "wave reduce: got {sum}, expected {expected}, err={err:.2e}"
+        );
 
         let bytes_moved = N as f64 * 4.0;
-        let gb_s        = bytes_moved / (ms * 1e6);
-        println!("[{name}] wave_reduce 256M floats: {ms:.2} ms → {gb_s:.1} GB/s  (wave{} DPP)",
-                 hip_info[0].capabilities.wave_size);
+        let gb_s = bytes_moved / (ms * 1e6);
+        println!(
+            "[{name}] wave_reduce 256M floats: {ms:.2} ms → {gb_s:.1} GB/s  (wave{} DPP)",
+            hip_info[0].capabilities.wave_size
+        );
 
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
@@ -1743,7 +2183,9 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
         let Some(inst) = try_instance() else { return };
         let adapters = inst.enumerate_adapters();
 
-        if adapters.is_empty() { return; }
+        if adapters.is_empty() {
+            return;
+        }
         if adapters.len() < 2 {
             println!("hip: multi-gpu 4096 needs ≥ 2 GPUs; running single-GPU only");
         }
@@ -1754,35 +2196,60 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             .collect();
         let names: Vec<String> = adapters.iter().map(|a| a.info().name.clone()).collect();
 
-        let handles: Vec<_> = devices.into_iter().zip(names).enumerate()
+        let handles: Vec<_> = devices
+            .into_iter()
+            .zip(names)
+            .enumerate()
             .map(|(idx, (dev, name))| {
                 std::thread::spawn(move || {
                     const M: usize = 4096;
                     const N: usize = 4096;
                     const K: usize = 4096;
 
-                    let a: Vec<f32> = (0..M*K).map(|i| (i % 7)  as f32 * 0.001).collect();
-                    let b: Vec<f32> = (0..K*N).map(|i| (i % 11) as f32 * 0.001).collect();
+                    let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.001).collect();
+                    let b: Vec<f32> = (0..K * N).map(|i| (i % 11) as f32 * 0.001).collect();
 
                     let bytes = |r: usize, c: usize| (r * c * 4) as u64;
                     let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
 
-                    let ba = dev.create_buffer(BufferDesc { size: bytes(M,K), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-                    let bb = dev.create_buffer(BufferDesc { size: bytes(K,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
-                    let bc = dev.create_buffer(BufferDesc { size: bytes(M,N), usage: storage, memory: MemoryUsage::GpuOnly }).unwrap();
+                    let ba = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(M, K),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
+                    let bb = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(K, N),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
+                    let bc = dev
+                        .create_buffer(BufferDesc {
+                            size: bytes(M, N),
+                            usage: storage,
+                            memory: MemoryUsage::GpuOnly,
+                        })
+                        .unwrap();
                     dev.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
                     dev.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
 
-                    let shader   = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-                    let pipeline = dev.create_compute_pipeline(ComputePipelineDesc {
-                        shader, entry: "sgemm", block: [32, 32, 1],
-                    }).unwrap();
+                    let shader = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
+                    let pipeline = dev
+                        .create_compute_pipeline(ComputePipelineDesc {
+                            shader,
+                            entry: "sgemm",
+                            block: [32, 32, 1],
+                        })
+                        .unwrap();
 
-                    let grid     = [(N as u32+31)/32, (M as u32+31)/32, 1];
+                    let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
                     let bindings = Bindings {
-                        buffers:  &[ba.index(), bb.index(), bc.index()],
+                        buffers: &[ba.index(), bb.index(), bc.index()],
                         textures: &[],
-                        scalars:  &[
+                        scalars: &[
                             zengpu_hal::Scalar::U32(M as u32),
                             zengpu_hal::Scalar::U32(N as u32),
                             zengpu_hal::Scalar::U32(K as u32),
@@ -1795,8 +2262,10 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
 
                     const REPS: u32 = 3;
                     let t0 = std::time::Instant::now();
-                    for _ in 0..REPS { dev.dispatch(pipeline, bindings, grid).unwrap(); }
-                    let ms     = elapsed_ms(t0) / REPS as f64;
+                    for _ in 0..REPS {
+                        dev.dispatch(pipeline, bindings, grid).unwrap();
+                    }
+                    let ms = elapsed_ms(t0) / REPS as f64;
                     let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
                     println!("[GPU {idx} – {name}] SGEMM 4096³: {ms:.1} ms → {gflops:.1} GFLOP/s");
 
@@ -1809,7 +2278,9 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             })
             .collect();
 
-        for h in handles { h.join().expect("thread panicked"); }
+        for h in handles {
+            h.join().expect("thread panicked");
+        }
     }
 
     // ── Capability report ─────────────────────────────────────────────────────
@@ -1833,28 +2304,38 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             // 1. wave size must be either 32 or 64.
             assert!(
                 caps.wave_size == 32 || caps.wave_size == 64,
-                "unexpected wave size {} on {}", caps.wave_size, info.gfx_target,
+                "unexpected wave size {} on {}",
+                caps.wave_size,
+                info.gfx_target,
             );
             // 2. MFMA implies CDNA (no MFMA on RDNA consumer silicon).
             if caps.mfma {
                 assert!(
                     info.gfx_family.full_fp64(),
-                    "mfma set but not a CDNA device: {}", info.gfx_target,
+                    "mfma set but not a CDNA device: {}",
+                    info.gfx_target,
                 );
             }
             // 3. If hipRTC unavailable, bitcode must also be unavailable.
             if !caps.hiprtc {
-                assert!(!caps.hiprtc_bitcode, "bitcode without hipRTC on {}", info.gfx_target);
+                assert!(
+                    !caps.hiprtc_bitcode,
+                    "bitcode without hipRTC on {}",
+                    info.gfx_target
+                );
             }
             // 4. RDNA 2+ is WGP mode by default; RDNA 1 / GCN / CDNA is not.
             let expect_wgp = matches!(
                 info.gfx_family,
-                version::GfxFamily::Rdna2 | version::GfxFamily::Rdna3
-                | version::GfxFamily::Rdna3p5 | version::GfxFamily::Rdna4,
+                version::GfxFamily::Rdna2
+                    | version::GfxFamily::Rdna3
+                    | version::GfxFamily::Rdna3p5
+                    | version::GfxFamily::Rdna4,
             );
             assert_eq!(
                 caps.wgp_default, expect_wgp,
-                "WGP mode mismatch for {} ({:?})", info.gfx_target, info.gfx_family,
+                "WGP mode mismatch for {} ({:?})",
+                info.gfx_target, info.gfx_family,
             );
         }
     }
