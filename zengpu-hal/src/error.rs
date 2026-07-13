@@ -19,6 +19,8 @@ pub enum GpuError {
     OutOfMemory(MemoryUsage),
     /// One or more required features are unavailable on this adapter.
     UnsupportedFeatures(Features),
+    /// An operation is not supported by this backend or device pairing.
+    Unsupported(String),
     /// A resource was used in a way its creation did not permit (see
     /// [`UsageError`]). This is the class the validation layer raises.
     InvalidUsage(UsageError),
@@ -74,6 +76,7 @@ impl Display for GpuError {
             GpuError::UnsupportedFeatures(features) => {
                 write!(f, "unsupported features: {features:?}")
             }
+            GpuError::Unsupported(msg) => write!(f, "unsupported: {msg}"),
             GpuError::InvalidUsage(e) => write!(f, "invalid usage: {e}"),
             GpuError::ShaderCompile(msg) => write!(f, "shader compile error: {msg}"),
             GpuError::PipelineCreation(msg) => write!(f, "pipeline creation error: {msg}"),
