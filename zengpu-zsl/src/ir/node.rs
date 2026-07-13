@@ -18,8 +18,14 @@ pub enum IrExpr {
     ScalarParam(String),
     /// `buf[index]` — a bindless storage-buffer element load.
     BufferLoad { buf: String, index: Box<IrExpr> },
+    /// `name[index]` — an element load from workgroup-shared memory.
+    SharedLoad { name: String, index: Box<IrExpr> },
     /// `global_id().{x|y|z}` → component `0`/`1`/`2` (compute only).
     GlobalId(u32),
+    /// `local_id().{x|y|z}` (compute only).
+    LocalId(u32),
+    /// `group_id().{x|y|z}` (compute only).
+    GroupId(u32),
     /// A graphics `@location` vertex/fragment input.
     Input(String),
     /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
@@ -58,6 +64,14 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
+    /// `name[index] = value;` for workgroup-shared memory.
+    AssignShared {
+        name: String,
+        index: IrExpr,
+        value: IrExpr,
+    },
+    /// A workgroup execution and memory barrier.
+    Barrier,
     /// `if cond { then } [else { else_ }]`
     If {
         cond: IrExpr,

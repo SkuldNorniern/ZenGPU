@@ -26,7 +26,7 @@ use crate::ir::BufElem;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{
     Entry, EntryKind, GfxInput, GfxScalar, GfxTy, GraphicsEntry, GraphicsModule, Module,
-    Mutability, Param, ParamKind, ScalarTy,
+    Mutability, Param, ParamKind, ScalarTy, SharedDecl,
 };
 
 /// A parse error: a message and the byte offset where it occurred (if known).
@@ -82,6 +82,8 @@ struct Ctx {
     id_param: Option<String>,           // the `id: global_id` param name
     locals: HashMap<String, ScalarTy>,  // name → type (accumulated)
     locals_order: Vec<(String, ScalarTy)>,
+    shared: HashMap<String, SharedDecl>,
+    shared_order: Vec<String>,
 }
 
 /// Resolved symbol tables for a graphics (vertex/fragment) body.
@@ -216,9 +218,17 @@ impl<'a> Parser<'a> {
             id_param: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
+            shared: HashMap::new(),
+            shared_order: Vec::new(),
         };
         let params = self.parse_params(&mut ctx)?;
         let body = self.parse_block(&mut ctx)?;
+
+        let shared = ctx.shared_order.iter().map(|name| SharedDecl {
+            name: name.clone(),
+            elem: ctx.shared[name].elem,
+            len: ctx.shared[name].len,
+        }).collect();
 
         if self.pos != self.toks.len() {
             return self.err("unexpected trailing tokens after kernel");
@@ -228,6 +238,7 @@ impl<'a> Parser<'a> {
             entry: Entry {
                 kind: EntryKind::Compute { local_size },
                 params,
+                shared,
                 locals: ctx.locals_order,
                 body,
             },
@@ -409,9 +420,44 @@ impl<'a> Parser<'a> {
             if self.peek().is_none() {
                 return self.err("unterminated block");
             }
-            stmts.push(self.parse_stmt(ctx)?);
+            if self.eat_kw("shared") {
+                self.parse_shared(ctx)?;
+            } else {
+                stmts.push(self.parse_stmt(ctx)?);
+            }
         }
         Ok(stmts)
+    }
+
+    fn parse_shared(&mut self, ctx: &mut Ctx) -> Result<(), ParseError> {
+        let name = self.ident()?;
+        self.expect(&Tok::Colon, "`:` after shared name")?;
+        if !self.eat_kw("array") {
+            return self.err("shared declarations require `array<f32, N>`");
+        }
+        self.expect(&Tok::Lt, "`<` in array<f32, N>")?;
+        let elem = self.parse_scalar_type()?;
+        if elem != ScalarTy::F32 {
+            return self.err("only shared array<f32, N> is supported");
+        }
+        self.expect(&Tok::Comma, "`,` in array<f32, N>")?;
+        let len = match self.peek() {
+            Some(Tok::Int(v)) if *v > 0 && *v <= u32::MAX as u64 => {
+                let len = *v as u32;
+                self.pos += 1;
+                len
+            }
+            _ => return self.err("shared array length must be a positive u32 literal"),
+        };
+        self.expect(&Tok::Gt, "`>` in array<f32, N>")?;
+        if ctx.shared.contains_key(&name) || ctx.buffers.contains_key(&name)
+            || ctx.locals.contains_key(&name)
+        {
+            return self.err(format!("duplicate symbol `{name}`"));
+        }
+        ctx.shared_order.push(name.clone());
+        ctx.shared.insert(name.clone(), SharedDecl { name, elem, len });
+        Ok(())
     }
 
     fn parse_stmt(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
@@ -423,6 +469,11 @@ impl<'a> Parser<'a> {
         }
         if self.eat_kw("for") {
             return self.parse_for(ctx);
+        }
+        if self.eat_kw("barrier") {
+            self.expect(&Tok::LParen, "`(` after barrier")?;
+            self.expect(&Tok::RParen, "`)` after barrier(")?;
+            return Ok(IrStmt::Barrier);
         }
         // Expression statement or assignment.
         let lhs = self.parse_expr(ctx)?;
@@ -443,7 +494,13 @@ impl<'a> Parser<'a> {
                         value: rhs,
                     })
                 }
-                _ => self.err("invalid assignment target; use a local or buf[i]"),
+                IrExpr::SharedLoad { name, index } => {
+                    if !ctx.shared.contains_key(&name) {
+                        return self.err(format!("`{name}` is not a declared shared array"));
+                    }
+                    Ok(IrStmt::AssignShared { name, index: *index, value: rhs })
+                }
+                _ => self.err("invalid assignment target; use a local, buffer[i], or shared[i]"),
             }
         } else {
             Ok(IrStmt::Eval(lhs))
@@ -452,6 +509,9 @@ impl<'a> Parser<'a> {
 
     fn parse_let(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
         let name = self.ident()?;
+        if ctx.shared.contains_key(&name) {
+            return self.err(format!("`{name}` is already a shared array"));
+        }
         let annot = if self.eat(&Tok::Colon) {
             Some(self.parse_scalar_type()?)
         } else {
@@ -478,6 +538,9 @@ impl<'a> Parser<'a> {
 
     fn parse_for(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
         let var = self.ident()?;
+        if ctx.shared.contains_key(&var) {
+            return self.err(format!("`{var}` is already a shared array"));
+        }
         if !self.eat_kw("in") {
             return self.err("expected `in` in for-loop");
         }
@@ -591,6 +654,19 @@ impl<'a> Parser<'a> {
                 let name = self.ident()?;
                 // Call?
                 if self.peek() == Some(&Tok::LParen) {
+                    if name == "local_id" || name == "group_id" {
+                        self.expect(&Tok::LParen, "`(`")?;
+                        self.expect(&Tok::RParen, "`)`")?;
+                        self.expect(&Tok::Dot, "`.x`, `.y`, or `.z` after index builtin")?;
+                        let field = self.ident()?;
+                        let comp = match field.as_str() {
+                            "x" => 0,
+                            "y" => 1,
+                            "z" => 2,
+                            other => return self.err(format!("index builtin has no field `.{other}`; use .x/.y/.z")),
+                        };
+                        return Ok(if name == "local_id" { IrExpr::LocalId(comp) } else { IrExpr::GroupId(comp) });
+                    }
                     return self.parse_call(ctx, &name);
                 }
                 // Field access: push.field / id.x
@@ -619,15 +695,18 @@ impl<'a> Parser<'a> {
                 }
                 // Buffer index: buf[i]
                 if self.eat(&Tok::LBracket) {
-                    if !ctx.buffers.contains_key(&name) {
-                        return self.err(format!("`{name}` is not a buffer; cannot index"));
-                    }
                     let index = self.parse_expr(ctx)?;
                     self.expect(&Tok::RBracket, "`]`")?;
-                    return Ok(IrExpr::BufferLoad {
-                        buf: name,
-                        index: Box::new(index),
-                    });
+                    if ctx.buffers.contains_key(&name) {
+                        return Ok(IrExpr::BufferLoad { buf: name, index: Box::new(index) });
+                    }
+                    if ctx.shared.contains_key(&name) {
+                        if infer_ty(&index, ctx) != ScalarTy::U32 {
+                            return self.err("shared array index must be u32");
+                        }
+                        return Ok(IrExpr::SharedLoad { name, index: Box::new(index) });
+                    }
+                    return self.err(format!("`{name}` is not a buffer or shared array; cannot index"));
                 }
                 // Bare name → a local.
                 if ctx.locals.contains_key(&name) {
@@ -1203,7 +1282,9 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
         IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(ScalarTy::U32),
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(ScalarTy::F32),
         IrExpr::GlobalId(_) => ScalarTy::U32,
+        IrExpr::LocalId(_) | IrExpr::GroupId(_) => ScalarTy::U32,
         IrExpr::BufferLoad { .. } => ScalarTy::F32,
+        IrExpr::SharedLoad { .. } => ScalarTy::F32,
         IrExpr::Builtin { .. } => ScalarTy::F32,
         IrExpr::Neg(e) => infer_ty(e, ctx),
         IrExpr::Binary { op, lhs, rhs } => match op {
@@ -1277,6 +1358,8 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
         IrExpr::Dot { .. } => GfxTy::F32,
         IrExpr::BufferLoad { .. } => GfxTy::F32,
         IrExpr::GlobalId(_) => GfxTy::U32,
+        IrExpr::SharedLoad { .. } => GfxTy::F32,
+        IrExpr::LocalId(_) | IrExpr::GroupId(_) => GfxTy::U32,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::Length => GfxTy::F32,
             _ => args

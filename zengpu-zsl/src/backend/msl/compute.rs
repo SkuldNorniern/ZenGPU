@@ -51,7 +51,13 @@ pub fn lower_compute(module: &Module) -> MslShader {
     if has_push {
         let _ = writeln!(s, "    constant Push& pc [[buffer({slot})]],");
     }
-    s.push_str("    uint3 gid [[thread_position_in_grid]]\n) {\n");
+    s.push_str("    uint3 gid [[thread_position_in_grid]],\n");
+    s.push_str("    uint3 lid [[thread_position_in_threadgroup]],\n");
+    s.push_str("    uint3 group [[threadgroup_position_in_grid]]\n) {\n");
+
+    for shared in &e.shared {
+        let _ = writeln!(s, "    threadgroup float {}[{}];", shared.name, shared.len);
+    }
 
     let ctx = Ctx { locals };
     for st in &e.body {
@@ -96,6 +102,14 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
             let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
+        }
+        IrStmt::AssignShared { name, index, value } => {
+            indent(s, depth);
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index), emit_expr(value));
+        }
+        IrStmt::Barrier => {
+            indent(s, depth);
+            s.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);\n");
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
@@ -143,7 +157,10 @@ fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
         IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)),
+        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(index)),
         IrExpr::GlobalId(c) => format!("gid.{}", component(*c)),
+        IrExpr::LocalId(c) => format!("lid.{}", component(*c)),
+        IrExpr::GroupId(c) => format!("group.{}", component(*c)),
         IrExpr::Builtin { func, args } => {
             let a: Vec<String> = args.iter().map(emit_expr).collect();
             format!("{}({})", func.name(), a.join(", "))

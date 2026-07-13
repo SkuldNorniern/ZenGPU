@@ -59,6 +59,10 @@ pub fn lower_compute(module: &Module) -> HipShader {
 
     s.push_str(") {\n");
 
+    for shared in &e.shared {
+        let _ = writeln!(s, "    __shared__ float {}[{}];", shared.name, shared.len);
+    }
+
     let _ = writeln!(
         s,
         "    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;"
@@ -127,6 +131,14 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             indent(s, depth);
             let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
         }
+        IrStmt::AssignShared { name, index, value } => {
+            indent(s, depth);
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index), emit_expr(value));
+        }
+        IrStmt::Barrier => {
+            indent(s, depth);
+            s.push_str("__syncthreads();\n");
+        }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
             let _ = writeln!(s, "if ({}) {{", emit_expr(cond));
@@ -177,10 +189,13 @@ fn emit_expr(e: &IrExpr) -> String {
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => n.clone(),
         IrExpr::BufferLoad { buf, index } => format!("{}[{}]", buf, emit_expr(index)),
+        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(index)),
         IrExpr::GlobalId(0) => "gx".into(),
         IrExpr::GlobalId(1) => "gy".into(),
         IrExpr::GlobalId(2) => "gz".into(),
         IrExpr::GlobalId(n) => format!("/* bad GlobalId({n}) */ 0u"),
+        IrExpr::LocalId(c) => format!("threadIdx.{}", ["x", "y", "z"][*c as usize]),
+        IrExpr::GroupId(c) => format!("blockIdx.{}", ["x", "y", "z"][*c as usize]),
         IrExpr::Input(n) => n.clone(),
         IrExpr::FieldAccess { base, component } => {
             let field = ["x", "y", "z", "w"]

@@ -177,6 +177,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             indent(s, depth);
             s.push_str("}\n");
         }
+        IrStmt::AssignShared { .. } | IrStmt::Barrier => {
+            panic!("workgroup operations are unavailable in graphics shaders")
+        }
         IrStmt::Eval(expr) => {
             indent(s, depth);
             let _ = writeln!(s, "{};", emit_expr(expr));
@@ -211,7 +214,8 @@ fn emit_expr(expr: &IrExpr) -> String {
         IrExpr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", emit_expr(lhs), binop(*op), emit_expr(rhs))
         }
-        IrExpr::GlobalId(_) => "/* global_id unavailable in graphics */".to_string(),
+        IrExpr::GlobalId(_) | IrExpr::LocalId(_) | IrExpr::GroupId(_)
+        | IrExpr::SharedLoad { .. } => "/* compute expression unavailable in graphics */".to_string(),
     }
 }
 
