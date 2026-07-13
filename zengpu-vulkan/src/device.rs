@@ -1,5 +1,10 @@
 
-use std::sync::{Arc, Mutex};
+use std::{
+    any::Any,
+    ffi::{CStr, CString, c_void},
+    ptr::{copy_nonoverlapping, null, null_mut},
+    sync::{Arc, Mutex},
+};
 
 use ash::{Device, khr, vk};
 use zengpu_hal::{
@@ -12,10 +17,12 @@ use zengpu_hal::{
     VertexFormat, WindowHandles, marker,
 };
 
-use crate::command_list::{CmdListPool, VulkanCommandList};
+use crate::command_list::{COLOR_SUBRESOURCE, CmdListPool, VulkanCommandList};
+use crate::depth_target::{DEPTH_FORMAT, DepthTarget};
 use crate::instance::VulkanShared;
+use crate::offscreen::OffscreenTarget;
 use crate::surface::VulkanSurface;
-use crate::swapchain::map_vk_err;
+use crate::swapchain::{DeviceContext, map_vk_err};
 
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
@@ -102,11 +109,9 @@ impl VulkanPipeline {
     }
 }
 
-/// Render target for a [`RenderPassDesc`](zengpu_hal::RenderPassDesc) attachment: a swapchain image
-/// or an offscreen texture.
-///
-/// `layout` tracks the current `vk::ImageLayout` for barriers, because there is no render pass
-/// object to emit them.
+/// Render target for a `RenderPassDesc` attachment: swapchain image or offscreen texture.
+/// `layout` tracks the current `vk::ImageLayout` for barriers: dynamic rendering has no
+/// render pass to do it.
 pub(crate) struct VulkanRenderTarget {
     pub image: vk::Image,
     pub view: vk::ImageView,
@@ -178,8 +183,7 @@ pub struct VulkanDevice {
     samplers: Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
     shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
-    /// Render targets that commands can attach to. Shared with
-    /// [`VulkanCommandList`](crate::command_list::VulkanCommandList).
+    /// Render targets (swapchain images, offscreen textures) that commands attach to.
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     bindless: BindlessState,
     pipeline_cache: vk::PipelineCache,
@@ -191,8 +195,8 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
-    pub fn context(&self) -> crate::swapchain::DeviceContext {
-        crate::swapchain::DeviceContext::from_inner(Arc::clone(&self.inner))
+    pub fn context(&self) -> DeviceContext {
+        DeviceContext::from_inner(Arc::clone(&self.inner))
     }
 
     pub fn wait_idle(&self) -> Result<()> {
@@ -205,7 +209,7 @@ impl VulkanDevice {
     }
 
     /// Blocks until the GPU finishes it.
-    pub fn submit_and_wait(&self, list: crate::command_list::VulkanCommandList) -> Result<()> {
+    pub fn submit_and_wait(&self, list: VulkanCommandList) -> Result<()> {
         let cmd = list.cmd;
         let pool = Arc::clone(&list.pool);
         unsafe {
@@ -251,7 +255,7 @@ impl VulkanDevice {
     /// image must be in `COLOR_ATTACHMENT_OPTIMAL`, and is returned there after the copy.
     pub fn copy_offscreen_to_buffer(
         &self,
-        offscreen: &crate::offscreen::OffscreenTarget,
+        offscreen: &OffscreenTarget,
         buffer: BufferHandle,
     ) -> Result<()> {
         let image = offscreen.image();
@@ -269,7 +273,7 @@ impl VulkanDevice {
                 src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 dst_access_mask: vk::AccessFlags::TRANSFER_READ,
                 image,
-                subresource_range: crate::command_list::COLOR_SUBRESOURCE,
+                subresource_range: COLOR_SUBRESOURCE,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 ..Default::default()
@@ -314,7 +318,7 @@ impl VulkanDevice {
                 src_access_mask: vk::AccessFlags::TRANSFER_READ,
                 dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 image,
-                subresource_range: crate::command_list::COLOR_SUBRESOURCE,
+                subresource_range: COLOR_SUBRESOURCE,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 ..Default::default()
@@ -348,13 +352,13 @@ impl VulkanDevice {
                 .enumerate_device_extension_properties(physical)
         }
         .map_err(|e| GpuError::Backend(format!("enumerate device extensions: {e}")))?;
-        let supports_extension = |name: &std::ffi::CStr| {
+        let supports_extension = |name: &CStr| {
             available_extensions.iter().any(|extension| unsafe {
-                std::ffi::CStr::from_ptr(extension.extension_name.as_ptr()) == name
+                CStr::from_ptr(extension.extension_name.as_ptr()) == name
             })
         };
-        if supports_extension(ash::khr::portability_subset::NAME) {
-            extensions.push(ash::khr::portability_subset::NAME.as_ptr());
+        if supports_extension(khr::portability_subset::NAME) {
+            extensions.push(khr::portability_subset::NAME.as_ptr());
         }
         if !supports_extension(khr::dynamic_rendering::NAME) {
             return Err(GpuError::Backend(
@@ -406,7 +410,7 @@ impl VulkanDevice {
             dynamic_rendering: vk::TRUE,
             ..Default::default()
         };
-        desc_idx.p_next = &mut dynamic_rendering_feat as *mut _ as *mut std::ffi::c_void;
+        desc_idx.p_next = &mut dynamic_rendering_feat as *mut _ as *mut c_void;
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
@@ -425,19 +429,19 @@ impl VulkanDevice {
             },
             ..Default::default()
         };
-        features2.p_next = &mut desc_idx as *mut _ as *mut std::ffi::c_void;
+        features2.p_next = &mut desc_idx as *mut _ as *mut c_void;
 
         let device_create_info = vk::DeviceCreateInfo {
-            p_next: &features2 as *const _ as *const std::ffi::c_void,
+            p_next: &features2 as *const _ as *const c_void,
             queue_create_info_count: 1,
             p_queue_create_infos: &queue_info,
             enabled_extension_count: extensions.len() as u32,
             pp_enabled_extension_names: if extensions.is_empty() {
-                std::ptr::null()
+                null()
             } else {
                 extensions.as_ptr()
             },
-            p_enabled_features: std::ptr::null(),
+            p_enabled_features: null(),
             ..Default::default()
         };
 
@@ -520,7 +524,7 @@ impl VulkanDevice {
             shared,
             physical,
             req,
-            &[ash::khr::swapchain::NAME.as_ptr()],
+            &[khr::swapchain::NAME.as_ptr()],
             true,
         )
     }
@@ -676,7 +680,7 @@ fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
                 flags: vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
                 binding_count: bindings.len() as u32,
                 p_bindings: bindings.as_ptr(),
-                p_next: &mut flags_info as *mut _ as *mut std::ffi::c_void,
+                p_next: &mut flags_info as *mut _ as *mut c_void,
                 ..Default::default()
             },
             None,
@@ -866,7 +870,7 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 }
 
 impl GpuDevice for VulkanDevice {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -951,7 +955,7 @@ impl GpuDevice for VulkanDevice {
                 }
             }
         } else {
-            std::ptr::null_mut()
+            null_mut()
         };
 
         let vk_buf = buffer;
@@ -990,7 +994,7 @@ impl GpuDevice for VulkanDevice {
             )));
         }
         unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.mapped.add(start), data.len());
+            copy_nonoverlapping(data.as_ptr(), buf.mapped.add(start), data.len());
         }
         Ok(())
     }
@@ -1024,7 +1028,7 @@ impl GpuDevice for VulkanDevice {
         }
         let mut out = vec![0u8; len as usize];
         unsafe {
-            std::ptr::copy_nonoverlapping(buf.mapped.add(start), out.as_mut_ptr(), len as usize);
+            copy_nonoverlapping(buf.mapped.add(start), out.as_mut_ptr(), len as usize);
         }
         Ok(out)
     }
@@ -1051,9 +1055,9 @@ impl GpuDevice for VulkanDevice {
             1
         };
         if desc.dimension == TexDim::Cube && array_layers != 6 {
-            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
-                "TexDim::Cube requires array_layers == 6, got {array_layers}"
-            ))));
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!("TexDim::Cube requires array_layers == 6, got {array_layers}"),
+            )));
         }
 
         let format = hal_format_to_vk(desc.format);
@@ -1255,7 +1259,11 @@ impl GpuDevice for VulkanDevice {
             address_mode_w: addr,
             min_lod: desc.lod_min,
             max_lod: desc.lod_max,
-            anisotropy_enable: if anisotropy_enable { vk::TRUE } else { vk::FALSE },
+            anisotropy_enable: if anisotropy_enable {
+                vk::TRUE
+            } else {
+                vk::FALSE
+            },
             max_anisotropy,
             compare_enable: if desc.compare.is_some() {
                 vk::TRUE
@@ -1376,7 +1384,7 @@ impl GpuDevice for VulkanDevice {
                 .map_err(|e| GpuError::PipelineCreation(format!("vkCreatePipelineLayout: {e}")))?
         };
 
-        let entry = std::ffi::CString::new(desc.entry)
+        let entry = CString::new(desc.entry)
             .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
         let stage = vk::PipelineShaderStageCreateInfo {
             stage: vk::ShaderStageFlags::COMPUTE,
@@ -1505,8 +1513,7 @@ impl GpuDevice for VulkanDevice {
                 ..Default::default()
             };
             unsafe {
-                for (i, (vk_pipeline, vk_layout, pc, pc_len, grid)) in resolved.iter().enumerate()
-                {
+                for (i, (vk_pipeline, vk_layout, pc, pc_len, grid)) in resolved.iter().enumerate() {
                     dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *vk_pipeline);
                     dev.cmd_bind_descriptor_sets(
                         cmd,
@@ -1670,7 +1677,13 @@ impl VulkanDevice {
             let tex = textures.get(texture).ok_or_else(|| {
                 GpuError::Backend("generate_mipmaps: stale texture handle".to_string())
             })?;
-            (tex.image, tex.extent, tex.depth, tex.mip_levels, tex.array_layers)
+            (
+                tex.image,
+                tex.extent,
+                tex.depth,
+                tex.mip_levels,
+                tex.array_layers,
+            )
         };
         if mip_levels < 2 {
             return Ok(());
@@ -1857,7 +1870,7 @@ impl VulkanDevice {
             (vert, frag)
         };
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: build stages");
-        let entry = std::ffi::CString::new("main").unwrap();
+        let entry = CString::new("main").unwrap();
         let stages = [
             vk::PipelineShaderStageCreateInfo {
                 stage: vk::ShaderStageFlags::VERTEX,
@@ -1991,7 +2004,7 @@ impl VulkanDevice {
         };
 
         let create_info = vk::GraphicsPipelineCreateInfo {
-            p_next: &rendering_info as *const _ as *const std::ffi::c_void,
+            p_next: &rendering_info as *const _ as *const c_void,
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
             p_vertex_input_state: &vertex_input,
@@ -2049,7 +2062,7 @@ impl VulkanDevice {
 
     /// Register `depth` as a render target. After a resize, register the recreated target and
     /// `unregister_render_target` the stale handle.
-    pub fn register_depth_target(&self, depth: &crate::depth_target::DepthTarget) -> TargetHandle {
+    pub fn register_depth_target(&self, depth: &DepthTarget) -> TargetHandle {
         let (width, height) = depth.extent();
         self.render_targets
             .lock()
@@ -2057,7 +2070,7 @@ impl VulkanDevice {
             .insert(VulkanRenderTarget {
                 image: depth.image(),
                 view: depth.view(),
-                format: crate::depth_target::DEPTH_FORMAT,
+                format: DEPTH_FORMAT,
                 extent: vk::Extent2D { width, height },
                 layout: vk::ImageLayout::UNDEFINED,
             })
@@ -2438,7 +2451,8 @@ mod tests {
                 ..tex_desc(zengpu_hal::TexDim::D2)
             })
             .unwrap();
-        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4]).unwrap();
+        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4])
+            .unwrap();
         dev.upload_texture_data_region(tex, 1, 0, &[0x80u8; 4 * 4 * 4])
             .unwrap();
         dev.destroy_texture(tex);
@@ -2477,7 +2491,8 @@ mod tests {
                 ..tex_desc(zengpu_hal::TexDim::D2)
             })
             .unwrap();
-        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4]).unwrap();
+        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4])
+            .unwrap();
         dev.generate_mipmaps(tex).unwrap();
         dev.destroy_texture(tex);
     }
@@ -2535,13 +2550,21 @@ mod tests {
 
         let a_vals: Vec<f32> = (0..n).map(|i| i as f32 - 4.0).collect();
         let b_vals: Vec<f32> = (0..n).map(|_| -10.0).collect();
-        dev.write_buffer(a, 0, to_bytes(unsafe {
-            std::slice::from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len())
-        }))
+        dev.write_buffer(
+            a,
+            0,
+            to_bytes(unsafe {
+                std::slice::from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len())
+            }),
+        )
         .unwrap();
-        dev.write_buffer(b, 0, to_bytes(unsafe {
-            std::slice::from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len())
-        }))
+        dev.write_buffer(
+            b,
+            0,
+            to_bytes(unsafe {
+                std::slice::from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len())
+            }),
+        )
         .unwrap();
 
         dev.dispatch_batch(&[
@@ -2567,9 +2590,8 @@ mod tests {
         .unwrap();
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
-        let result: &[f32] = unsafe {
-            std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n as usize)
-        };
+        let result: &[f32] =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };
         assert_eq!(result, &[0.0; 8]);
 
         dev.destroy_pipeline(add_pipeline);

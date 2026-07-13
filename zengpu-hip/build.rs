@@ -6,13 +6,11 @@
 /// 4. Compiles a C probe for `hipDeviceProp_t` field offsets, which shift between major ROCm
 ///    releases. Without an AMD compiler (or when cross-compiling) it falls back to ROCm 6/7 x86-64
 ///    offsets.
-
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let rocm_path = std::env::var("ROCM_PATH")
-        .unwrap_or_else(|_| find_rocm());
+    let rocm_path = std::env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
 
     println!("cargo:rustc-link-search=native={rocm_path}/lib");
     println!("cargo:rustc-link-lib=amdhip64");
@@ -86,14 +84,14 @@ fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
     let result = probe_layout(rocm_path);
 
     let defaults = match rocm_major {
-        ..=4   => (1184, 944,  288, 388, 348),
-        5      => (1344, 1096, 288, 388, 348),
-        _      => (1472, 1160, 288, 388, 348),
+        ..=4 => (1184, 944, 288, 388, 348),
+        5 => (1344, 1096, 288, 388, 348),
+        _ => (1472, 1160, 288, 388, 348),
     };
 
     let (prop_size, gcn_off, mem_off, cu_off, clk_off) = match result {
         Ok(layout) => layout,
-        Err(e)     => {
+        Err(e) => {
             println!(
                 "cargo:warning=zengpu-hip: layout probe failed ({e}); \
                  using ROCm {rocm_major}.{rocm_minor} defaults"
@@ -122,7 +120,9 @@ fn probe_layout(rocm_path: &str) -> Result<(usize, usize, usize, usize, usize), 
     let src = out_dir.join("hip_probe.cpp");
     let bin = out_dir.join("hip_probe");
 
-    std::fs::write(&src, r#"
+    std::fs::write(
+        &src,
+        r#"
 #define __HIP_PLATFORM_AMD__
 #include <hip/hip_runtime_api.h>
 #include <stdio.h>
@@ -136,7 +136,9 @@ int main(void) {
         offsetof(hipDeviceProp_t, clockRate));
     return 0;
 }
-"#).map_err(|e| e.to_string())?;
+"#,
+    )
+    .map_err(|e| e.to_string())?;
 
     let compilers = [
         format!("{rocm_path}/bin/hipcc"),
@@ -146,24 +148,22 @@ int main(void) {
     ];
 
     for compiler in &compilers {
-        if !PathBuf::from(compiler).exists()
-            && compiler != "clang++"
-            && compiler != "g++"
-        {
+        if !PathBuf::from(compiler).exists() && compiler != "clang++" && compiler != "g++" {
             continue;
         }
         let mut cmd = Command::new(compiler);
         cmd.arg(&src).arg("-o").arg(&bin);
         if compiler.contains("clang++") && !compiler.contains("hipcc") {
             cmd.arg(format!("-I{rocm_path}/include"))
-               .arg("-D__HIP_PLATFORM_AMD__");
+                .arg("-D__HIP_PLATFORM_AMD__");
         }
         if let Ok(o) = cmd.output() {
             if o.status.success() {
                 if let Ok(run) = Command::new(&bin).output() {
                     if run.status.success() {
                         let s = String::from_utf8_lossy(&run.stdout);
-                        let n: Vec<usize> = s.split_whitespace()
+                        let n: Vec<usize> = s
+                            .split_whitespace()
                             .filter_map(|t| t.parse().ok())
                             .collect();
                         if n.len() == 5 {

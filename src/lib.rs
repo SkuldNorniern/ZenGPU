@@ -48,7 +48,7 @@ pub mod instance;
 pub mod log;
 
 pub use adapter::Adapter;
-pub use detect::{detect_backends, BackendAvailability};
+pub use detect::{BackendAvailability, detect_backends};
 pub use device::Device;
 pub use instance::Instance;
 
@@ -82,9 +82,7 @@ pub use zengpu_blas::GemmKernel;
 
 /// Concrete Vulkan types for windowed, backend-aware code. Most code needs only [`Instance`].
 #[cfg(feature = "vulkan")]
-pub use zengpu_vulkan::{
-    BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance,
-};
+pub use zengpu_vulkan::{BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance};
 
 /// Vulkan backend (1.2+, graphics + compute). Most code: use [`Device::as_vulkan`].
 #[cfg(feature = "vulkan")]

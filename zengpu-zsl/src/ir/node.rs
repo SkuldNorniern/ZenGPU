@@ -17,7 +17,10 @@ pub enum IrExpr {
     /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
     VecConstruct { dim: u8, args: Vec<IrExpr> },
     /// `vec3.extend(scalar)` returns an `f32x4`.
-    Extend { base: Box<IrExpr>, scalar: Box<IrExpr> },
+    Extend {
+        base: Box<IrExpr>,
+        scalar: Box<IrExpr>,
+    },
     /// `dot(a, b)` returns a scalar.
     Dot { a: Box<IrExpr>, b: Box<IrExpr> },
     /// A built-in math call, such as `abs`, `min` or `clamp`.

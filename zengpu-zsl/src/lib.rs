@@ -73,9 +73,15 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
             }
         }
         match type_name.as_str() {
-            "u32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::U32(self.{fname})")),
-            "i32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::I32(self.{fname})")),
-            "f32" => exprs.push(format!("::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname})")),
+            "u32" => exprs.push(format!(
+                "::zengpu_spirv::_zsl_priv::Scalar::U32(self.{fname})"
+            )),
+            "i32" => exprs.push(format!(
+                "::zengpu_spirv::_zsl_priv::Scalar::I32(self.{fname})"
+            )),
+            "f32" => exprs.push(format!(
+                "::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname})"
+            )),
             "ZslMat4" => {
                 for i in 0..16 {
                     exprs.push(format!(
@@ -159,14 +165,17 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     push_str_lit(&mut s, &cuda_src);
     s.push_str(" }");
 
-    s.parse().map_err(|_| "ZSL: generated ZslShader literal failed to parse".to_string())
+    s.parse()
+        .map_err(|_| "ZSL: generated ZslShader literal failed to parse".to_string())
 }
 
 fn words_to_slice_str(words: &[u32]) -> String {
     let mut s = String::with_capacity(words.len() * 12 + 4);
     s.push_str("&[");
     for (i, w) in words.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         s.push_str(&w.to_string());
         s.push_str("u32");
     }
@@ -178,12 +187,12 @@ fn push_str_lit(s: &mut String, v: &str) {
     s.push('"');
     for c in v.chars() {
         match c {
-            '"'  => s.push_str("\\\""),
+            '"' => s.push_str("\\\""),
             '\\' => s.push_str("\\\\"),
             '\n' => s.push_str("\\n"),
             '\r' => s.push_str("\\r"),
             '\t' => s.push_str("\\t"),
-            c    => s.push(c),
+            c => s.push(c),
         }
     }
     s.push('"');

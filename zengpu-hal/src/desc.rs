@@ -69,19 +69,29 @@ pub struct ShaderDesc<'a> {
 
 impl<'a> ShaderDesc<'a> {
     pub fn spirv(bytes: &'a [u8]) -> Self {
-        Self { source: ShaderSource::Spirv(bytes) }
+        Self {
+            source: ShaderSource::Spirv(bytes),
+        }
     }
     pub fn ptx(bytes: &'a [u8]) -> Self {
-        Self { source: ShaderSource::Ptx(bytes) }
+        Self {
+            source: ShaderSource::Ptx(bytes),
+        }
     }
     pub fn msl(source: &'a str) -> Self {
-        Self { source: ShaderSource::Msl(source.as_bytes()) }
+        Self {
+            source: ShaderSource::Msl(source.as_bytes()),
+        }
     }
     pub fn hip(source: &'a str) -> Self {
-        Self { source: ShaderSource::Hip(source.as_bytes()) }
+        Self {
+            source: ShaderSource::Hip(source.as_bytes()),
+        }
     }
     pub fn cuda_src(source: &'a str) -> Self {
-        Self { source: ShaderSource::CudaSrc(source.as_bytes()) }
+        Self {
+            source: ShaderSource::CudaSrc(source.as_bytes()),
+        }
     }
 }
 
@@ -249,8 +259,7 @@ pub struct RasterState {
 }
 
 /// The default is `Less`. For reverse-Z, use `Greater` with a `1.0` depth clear.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompareFn {
     Never,
     #[default]

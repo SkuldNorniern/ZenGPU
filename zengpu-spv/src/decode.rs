@@ -1,4 +1,9 @@
 
+use std::{
+    error::Error,
+    fmt::{Display, Formatter, Result as FmtResult},
+};
+
 use crate::opcodes::{self, OpInfo};
 
 /// SPIR-V magic number (`0x07230203`).
@@ -59,8 +64,8 @@ pub enum DecodeError {
     },
 }
 
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for DecodeError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Self::TooShort => write!(f, "SPIR-V stream shorter than 5-word header"),
             Self::BadMagic(m) => {
@@ -79,7 +84,7 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl Error for DecodeError {}
 
 pub fn decode(words: &[u32]) -> Result<Module, DecodeError> {
     if words.len() < 5 {

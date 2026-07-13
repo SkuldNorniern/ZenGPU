@@ -130,14 +130,16 @@ impl InstanceBuilder {
     /// Add CUDA. Never fails here. Without CUDA at runtime it yields no adapters.
     #[cfg(feature = "cuda")]
     pub fn cuda(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_cuda::CudaInstance::new()));
+        self.backends
+            .push(Box::new(zengpu_cuda::CudaInstance::new()));
         self
     }
 
     /// Add Metal. Never fails here. Yields no adapters off Apple platforms.
     #[cfg(feature = "metal")]
     pub fn metal(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_metal::MetalInstance::new()));
+        self.backends
+            .push(Box::new(zengpu_metal::MetalInstance::new()));
         self
     }
 
@@ -173,7 +175,8 @@ impl InstanceBuilder {
     /// yet implemented.
     #[cfg(feature = "dx12")]
     pub fn dx12(mut self) -> Self {
-        self.backends.push(Box::new(zengpu_dx12::Dx12Instance::new()));
+        self.backends
+            .push(Box::new(zengpu_dx12::Dx12Instance::new()));
         self
     }
 

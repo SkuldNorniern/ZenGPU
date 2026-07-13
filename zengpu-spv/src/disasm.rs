@@ -1,12 +1,12 @@
 //! Render a decoded module as SPIRV-Tools-style assembly text.
 
-use crate::decode::{Instruction, Module};
+use crate::decode::{Instruction, Module, decode};
 use crate::opcodes::{self, Trailing};
 
 /// Text disassembly. A decode failure comes back as one comment line, so callers can
 /// log it unconditionally.
 pub fn disassemble(words: &[u32]) -> String {
-    match crate::decode::decode(words) {
+    match decode(words) {
         Ok(module) => disassemble_module(&module),
         Err(e) => format!("; <decode error: {e}>\n"),
     }

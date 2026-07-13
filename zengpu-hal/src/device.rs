@@ -1,6 +1,8 @@
 //! Backend-independent device trait. Object-safe: `Box<dyn GpuDevice>` or `Arc<dyn GpuDevice>`
 //! select at runtime.
 
+use core::any::Any;
+
 use crate::command::{Bindings, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
@@ -12,7 +14,7 @@ use crate::types::Features;
 pub trait GpuDevice: Send + Sync {
     /// Returns the backend device for backend-specific calls, e.g. a Vulkan swapchain
     /// from a `VulkanDevice`.
-    fn as_any(&self) -> &dyn core::any::Any;
+    fn as_any(&self) -> &dyn Any;
 
     fn capabilities(&self) -> HalCapabilities;
 

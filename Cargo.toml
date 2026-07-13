@@ -15,6 +15,9 @@ homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [workspace]
 resolver = "2"
 members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
@@ -29,6 +32,15 @@ homepage = "https://github.com/SkuldNorniern/ZenGPU"
 authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
 keywords = ["gpu", "vulkan", "compute", "graphics", "rendering"]
 categories = ["graphics", "rendering", "hardware-support", "science"]
+
+[workspace.lints.clippy]
+absolute_paths = "deny"
+result_large_err = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "warn"
+expect_used = "warn"
 
 [workspace.dependencies]
 zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }

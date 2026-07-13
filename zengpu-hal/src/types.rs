@@ -1,5 +1,7 @@
 //! Core value types shared across ZenGPU. No backend or consumer types.
 
+use core::ops::{BitOr, BitOrAssign};
+
 /// `Auto` picks the best native backend. WebGPU is not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum BackendPreference {
@@ -74,13 +76,13 @@ impl BufferUsage {
     }
 }
 
-impl core::ops::BitOr for BufferUsage {
+impl BitOr for BufferUsage {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
 }
-impl core::ops::BitOrAssign for BufferUsage {
+impl BitOrAssign for BufferUsage {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
@@ -118,13 +120,13 @@ impl Features {
     }
 }
 
-impl core::ops::BitOr for Features {
+impl BitOr for Features {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
 }
-impl core::ops::BitOrAssign for Features {
+impl BitOrAssign for Features {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }
@@ -156,13 +158,13 @@ impl TextureUsage {
     }
 }
 
-impl core::ops::BitOr for TextureUsage {
+impl BitOr for TextureUsage {
     type Output = Self;
     fn bitor(self, rhs: Self) -> Self {
         Self(self.0 | rhs.0)
     }
 }
-impl core::ops::BitOrAssign for TextureUsage {
+impl BitOrAssign for TextureUsage {
     fn bitor_assign(&mut self, rhs: Self) {
         self.0 |= rhs.0;
     }

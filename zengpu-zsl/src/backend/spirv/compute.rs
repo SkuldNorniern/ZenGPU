@@ -305,7 +305,9 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
             let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+            let ptr_elem = ctx
+                .spv
+                .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
             ctx.spv.op_store(ptr_elem, rhs_id);
@@ -351,11 +353,10 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let hi_val = lower_expr(ctx, hi)?;
             let hi_id = coerce(ctx, hi_val, ScalarTy::U32);
 
-            let loop_ptr = ctx
-                .locals
-                .get(var)
-                .map(|l| l.ptr)
-                .ok_or_else(|| format!("ZSL: for-loop variable `{var}` not declared as a local"))?;
+            let loop_ptr =
+                ctx.locals.get(var).map(|l| l.ptr).ok_or_else(|| {
+                    format!("ZSL: for-loop variable `{var}` not declared as a local")
+                })?;
 
             ctx.spv.op_store(loop_ptr, lo_id);
 
@@ -400,12 +401,18 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     match expr {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
-            Ok(Val { id, ty: ScalarTy::U32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::U32,
+            })
         }
 
         IrExpr::LitF32(v) => {
             let id = ctx.spv.constant_f32(ctx.t_f32, *v);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
 
         IrExpr::Local(name) => {
@@ -462,10 +469,15 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
             let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx.spv.op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+            let ptr_elem = ctx
+                .spv
+                .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let t_f32 = ctx.t_f32;
             let id = ctx.spv.op_load(t_f32, ptr_elem);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
 
         IrExpr::GlobalId(component) => {
@@ -474,7 +486,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let gid = ctx.spv.op_load(t_uvec3, gid_var);
             let t_u32 = ctx.t_u32;
             let val = ctx.spv.op_composite_extract(t_u32, gid, &[*component]);
-            Ok(Val { id: val, ty: ScalarTy::U32 })
+            Ok(Val {
+                id: val,
+                ty: ScalarTy::U32,
+            })
         }
 
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
@@ -506,12 +521,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     }
 }
 
-fn lower_binary(
-    ctx: &mut LowerCtx<'_>,
-    op: IrBinOp,
-    lhs: Val,
-    rhs: Val,
-) -> Result<Val, String> {
+fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Result<Val, String> {
     match op {
         IrBinOp::Add => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fadd, SpvBuilder::op_iadd),
         IrBinOp::Sub => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fsub, SpvBuilder::op_isub),
@@ -537,7 +547,10 @@ fn lower_binary(
                     return Err("ZSL: comparisons not supported on bool".into());
                 }
             };
-            Ok(Val { id, ty: ScalarTy::Bool })
+            Ok(Val {
+                id,
+                ty: ScalarTy::Bool,
+            })
         }
         IrBinOp::And | IrBinOp::Or => {
             if lhs.ty != ScalarTy::Bool || rhs.ty != ScalarTy::Bool {
@@ -549,16 +562,15 @@ fn lower_binary(
                 IrBinOp::Or => ctx.spv.op_logical_or(bool_ty, lhs.id, rhs.id),
                 _ => unreachable!(),
             };
-            Ok(Val { id, ty: ScalarTy::Bool })
+            Ok(Val {
+                id,
+                ty: ScalarTy::Bool,
+            })
         }
     }
 }
 
-fn lower_builtin(
-    ctx: &mut LowerCtx<'_>,
-    func: BuiltinFn,
-    args: &[IrExpr],
-) -> Result<Val, String> {
+fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Result<Val, String> {
     let name = func.name();
     match func {
         BuiltinFn::Abs
@@ -590,7 +602,10 @@ fn lower_builtin(
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[v.id]);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
         BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
             if args.len() != 2 {
@@ -613,7 +628,10 @@ fn lower_builtin(
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[a.id, b.id]);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
         BuiltinFn::Clamp => {
             if args.len() != 3 {
@@ -630,7 +648,10 @@ fn lower_builtin(
             let id = ctx
                 .spv
                 .op_ext_inst(t_f32, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
         BuiltinFn::Mix => {
             if args.len() != 3 {
@@ -647,7 +668,10 @@ fn lower_builtin(
             let id = ctx
                 .spv
                 .op_ext_inst(t_f32, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
 
         BuiltinFn::Normalize | BuiltinFn::Length => {

@@ -1,11 +1,14 @@
+use core::any::Any;
+use std::fmt::{Debug, Formatter, Result as FmtResult};
+
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, GpuDevice, HalCapabilities,
     PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc,
     TextureHandle,
 };
 
-impl std::fmt::Debug for Device {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for Device {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         f.debug_struct("Device")
             .field("capabilities", &self.inner.capabilities())
             .finish_non_exhaustive()
@@ -128,7 +131,7 @@ impl Device {
 /// Inherent methods with the same name win for direct calls. The trait methods apply only when the
 /// trait is in scope.
 impl GpuDevice for Device {
-    fn as_any(&self) -> &dyn core::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
     }
 
@@ -188,8 +191,12 @@ impl GpuDevice for Device {
         self.inner.destroy_pipeline(pipeline)
     }
 
-    fn dispatch(&self, pipeline: PipelineHandle, bindings: Bindings<'_>, grid: [u32; 3]) -> Result<()> {
+    fn dispatch(
+        &self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<()> {
         self.inner.dispatch(pipeline, bindings, grid)
     }
 }
-

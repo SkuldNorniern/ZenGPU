@@ -21,10 +21,11 @@
 use std::collections::HashMap;
 
 use crate::frontend::lex::{Tok, Token, lex};
+use crate::ir::BufElem;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{
-    Entry, EntryKind, GfxInput, GfxScalar, GfxTy, GraphicsEntry, GraphicsModule, Module, Mutability,
-    Param, ParamKind, ScalarTy,
+    Entry, EntryKind, GfxInput, GfxScalar, GfxTy, GraphicsEntry, GraphicsModule, Module,
+    Mutability, Param, ParamKind, ScalarTy,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -98,9 +99,10 @@ impl<'a> Parser<'a> {
     }
 
     fn span(&self) -> Option<usize> {
-        self.toks.get(self.pos).map(|t| t.span.start).or_else(|| {
-            self.toks.last().map(|t| t.span.end)
-        })
+        self.toks
+            .get(self.pos)
+            .map(|t| t.span.start)
+            .or_else(|| self.toks.last().map(|t| t.span.end))
     }
 
     fn err<T>(&self, msg: impl Into<String>) -> Result<T, ParseError> {
@@ -167,7 +169,9 @@ impl<'a> Parser<'a> {
         while self.eat(&Tok::At) {
             let name = self.ident()?;
             if name != "workgroup_size" {
-                return self.err(format!("unknown attribute `@{name}`; expected @workgroup_size"));
+                return self.err(format!(
+                    "unknown attribute `@{name}`; expected @workgroup_size"
+                ));
             }
             self.expect(&Tok::LParen, "`(` after @workgroup_size")?;
             local_size = self.parse_workgroup_size()?;
@@ -260,7 +264,9 @@ impl<'a> Parser<'a> {
             "u32" => Ok(ScalarTy::U32),
             "f32" => Ok(ScalarTy::F32),
             "bool" => Ok(ScalarTy::Bool),
-            other => self.err(format!("unsupported scalar type `{other}`; use u32, f32, or bool")),
+            other => self.err(format!(
+                "unsupported scalar type `{other}`; use u32, f32, or bool"
+            )),
         }
     }
 
@@ -323,7 +329,7 @@ impl<'a> Parser<'a> {
             params.push(Param {
                 name: name.to_string(),
                 kind: ParamKind::Buffer {
-                    elem: crate::ir::BufElem::F32,
+                    elem: BufElem::F32,
                     mutability: if writable {
                         Mutability::ReadWrite
                     } else {
@@ -403,8 +409,9 @@ impl<'a> Parser<'a> {
                 IrExpr::BufferLoad { buf, index } => {
                     let writable = *ctx.buffers.get(&buf).unwrap_or(&false);
                     if !writable {
-                        return self
-                            .err(format!("`{buf}` is read-only; declare it `device mut buffer`"));
+                        return self.err(format!(
+                            "`{buf}` is read-only; declare it `device mut buffer`"
+                        ));
                     }
                     Ok(IrStmt::AssignBuffer {
                         buf,
@@ -572,8 +579,9 @@ impl<'a> Parser<'a> {
                             "y" => 1,
                             "z" => 2,
                             other => {
-                                return self
-                                    .err(format!("`global_id` has no field `.{other}`; use .x/.y/.z"));
+                                return self.err(format!(
+                                    "`global_id` has no field `.{other}`; use .x/.y/.z"
+                                ));
                             }
                         };
                         return Ok(IrExpr::GlobalId(comp));
@@ -611,8 +619,10 @@ impl<'a> Parser<'a> {
                 return self.err("unterminated call arguments");
             }
         }
-        let func = builtin_from_name(name)
-            .ok_or_else(|| ParseError { msg: format!("unknown function `{name}`"), at: self.span() })?;
+        let func = builtin_from_name(name).ok_or_else(|| ParseError {
+            msg: format!("unknown function `{name}`"),
+            at: self.span(),
+        })?;
         Ok(IrExpr::Builtin { func, args })
     }
 
@@ -691,7 +701,11 @@ impl<'a> Parser<'a> {
                     return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
                 }
                 ctx.inputs.insert(name.clone(), ty);
-                inputs.push(GfxInput { name, location: loc, ty });
+                inputs.push(GfxInput {
+                    name,
+                    location: loc,
+                    ty,
+                });
             } else if self.eat_kw("device") {
                 let writable = self.eat_kw("mut");
                 if !self.eat_kw("buffer") {
@@ -707,21 +721,29 @@ impl<'a> Parser<'a> {
                 buf_params.push(name);
             } else {
                 let struct_name = self.ident()?;
-                let fields = self.pushes.get(&struct_name).cloned().ok_or_else(|| ParseError {
-                    msg: format!("unknown type `{struct_name}` (no matching push block)"),
-                    at: self.span(),
-                })?;
+                let fields = self
+                    .pushes
+                    .get(&struct_name)
+                    .cloned()
+                    .ok_or_else(|| ParseError {
+                        msg: format!("unknown type `{struct_name}` (no matching push block)"),
+                        at: self.span(),
+                    })?;
                 if ctx.push_param.is_some() {
                     return self.err("only one push parameter is supported");
                 }
                 ctx.push_param = Some(name);
                 for (field, gty) in fields {
                     if !matches!(gty, GfxTy::F32 | GfxTy::U32 | GfxTy::Mat4) {
-                        return self
-                            .err(format!("graphics push field `{field}` must be f32/u32/mat4x4"));
+                        return self.err(format!(
+                            "graphics push field `{field}` must be f32/u32/mat4x4"
+                        ));
                     }
                     ctx.scalars.insert(field.clone(), gty);
-                    scalar_params.push(GfxScalar { name: field, ty: gty });
+                    scalar_params.push(GfxScalar {
+                        name: field,
+                        ty: gty,
+                    });
                 }
             }
             self.eat(&Tok::Comma);
@@ -888,9 +910,15 @@ impl<'a> Parser<'a> {
             IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
             IrExpr::BufferLoad { buf, index } => {
                 if !*ctx.buffers.get(&buf).unwrap_or(&false) {
-                    return self.err(format!("`{buf}` is read-only; declare it `device mut buffer`"));
+                    return self.err(format!(
+                        "`{buf}` is read-only; declare it `device mut buffer`"
+                    ));
                 }
-                Ok(IrStmt::AssignBuffer { buf, index: *index, value: rhs })
+                Ok(IrStmt::AssignBuffer {
+                    buf,
+                    index: *index,
+                    value: rhs,
+                })
             }
             _ => self.err("invalid assignment target; use a local or buf[i]"),
         }
@@ -1007,7 +1035,10 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::LBracket, "`[` to index a buffer")?;
                     let index = self.parse_g_expr(ctx)?;
                     self.expect(&Tok::RBracket, "`]`")?;
-                    return Ok(IrExpr::BufferLoad { buf: name, index: Box::new(index) });
+                    return Ok(IrExpr::BufferLoad {
+                        buf: name,
+                        index: Box::new(index),
+                    });
                 }
                 let base = if ctx.inputs.contains_key(&name) {
                     IrExpr::Input(name)
@@ -1032,7 +1063,10 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::LParen, "`(`")?;
                 let arg = self.parse_g_expr(ctx)?;
                 self.expect(&Tok::RParen, "`)`")?;
-                base = IrExpr::Extend { base: Box::new(base), scalar: Box::new(arg) };
+                base = IrExpr::Extend {
+                    base: Box::new(base),
+                    scalar: Box::new(arg),
+                };
             } else {
                 let component = match field.as_str() {
                     "x" => 0u32,
@@ -1041,7 +1075,10 @@ impl<'a> Parser<'a> {
                     "w" => 3,
                     other => return self.err(format!("unknown field `.{other}`; use .x/.y/.z/.w")),
                 };
-                base = IrExpr::FieldAccess { base: Box::new(base), component };
+                base = IrExpr::FieldAccess {
+                    base: Box::new(base),
+                    component,
+                };
             }
         }
         Ok(base)
@@ -1126,8 +1163,14 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
         IrExpr::Builtin { .. } => ScalarTy::F32,
         IrExpr::Neg(e) => infer_ty(e, ctx),
         IrExpr::Binary { op, lhs, rhs } => match op {
-            IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne
-            | IrBinOp::And | IrBinOp::Or => ScalarTy::Bool,
+            IrBinOp::Lt
+            | IrBinOp::Le
+            | IrBinOp::Gt
+            | IrBinOp::Ge
+            | IrBinOp::Eq
+            | IrBinOp::Ne
+            | IrBinOp::And
+            | IrBinOp::Or => ScalarTy::Bool,
             _ => {
                 let l = infer_ty(lhs, ctx);
                 let r = infer_ty(rhs, ctx);
@@ -1190,12 +1233,21 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
         IrExpr::GlobalId(_) => GfxTy::U32,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::Length => GfxTy::F32,
-            _ => args.first().map(|a| infer_gfx_ty(a, ctx)).unwrap_or(GfxTy::F32),
+            _ => args
+                .first()
+                .map(|a| infer_gfx_ty(a, ctx))
+                .unwrap_or(GfxTy::F32),
         },
         IrExpr::Neg(e) => infer_gfx_ty(e, ctx),
         IrExpr::Binary { op, lhs, rhs } => match op {
-            IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne
-            | IrBinOp::And | IrBinOp::Or => GfxTy::F32,
+            IrBinOp::Lt
+            | IrBinOp::Le
+            | IrBinOp::Gt
+            | IrBinOp::Ge
+            | IrBinOp::Eq
+            | IrBinOp::Ne
+            | IrBinOp::And
+            | IrBinOp::Or => GfxTy::F32,
             _ => {
                 let l = infer_gfx_ty(lhs, ctx);
                 let r = infer_gfx_ty(rhs, ctx);
@@ -1269,8 +1321,7 @@ mod tests {
             }
         "#;
         let m = parse_compute(src).expect("parse");
-        let types: std::collections::HashMap<_, _> =
-            m.entry.locals.iter().cloned().collect();
+        let types: std::collections::HashMap<_, _> = m.entry.locals.iter().cloned().collect();
         assert_eq!(types["i"], ScalarTy::U32);
         assert_eq!(types["v"], ScalarTy::F32);
     }

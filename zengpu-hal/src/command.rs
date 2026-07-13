@@ -1,5 +1,7 @@
 //! Command-recording value types, consumed by backends when recording a dispatch or draw.
 
+use crate::handle::PipelineHandle;
+
 /// Scalar arguments, kept push-constant sized.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Scalar {
@@ -20,7 +22,7 @@ pub struct Bindings<'a> {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchOp<'a> {
-    pub pipeline: crate::handle::PipelineHandle,
+    pub pipeline: PipelineHandle,
     pub bindings: Bindings<'a>,
     pub grid: [u32; 3],
 }

@@ -1,8 +1,12 @@
 //! Enum-based errors with no external crates. Raw backend types never leak into the public API.
 
+use core::fmt::{Display, Formatter, Result as FmtResult};
+use core::result::Result as CoreResult;
+use std::error::Error;
+
 use crate::types::{Features, MemoryUsage};
 
-pub type Result<T> = core::result::Result<T, GpuError>;
+pub type Result<T> = CoreResult<T, GpuError>;
 
 #[derive(Debug)]
 pub enum GpuError {
@@ -46,8 +50,8 @@ pub enum SurfaceError {
     OutOfMemory,
 }
 
-impl core::fmt::Display for GpuError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl Display for GpuError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             GpuError::DeviceLost => write!(f, "device lost"),
             GpuError::OutOfMemory(usage) => write!(f, "out of memory ({usage:?})"),
@@ -64,8 +68,8 @@ impl core::fmt::Display for GpuError {
     }
 }
 
-impl core::fmt::Display for UsageError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl Display for UsageError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             UsageError::StaleHandle {
                 index,
@@ -84,8 +88,8 @@ impl core::fmt::Display for UsageError {
     }
 }
 
-impl core::fmt::Display for SurfaceError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+impl Display for SurfaceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let s = match self {
             SurfaceError::Lost => "surface lost",
             SurfaceError::Outdated => "surface out of date",
@@ -96,7 +100,7 @@ impl core::fmt::Display for SurfaceError {
     }
 }
 
-impl std::error::Error for GpuError {}
+impl Error for GpuError {}
 
 impl From<SurfaceError> for GpuError {
     fn from(e: SurfaceError) -> Self {
