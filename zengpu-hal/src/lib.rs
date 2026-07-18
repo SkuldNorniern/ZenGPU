@@ -13,6 +13,7 @@ mod error;
 mod graphics;
 mod handle;
 mod request;
+mod submission;
 mod surface;
 mod types;
 
@@ -24,6 +25,7 @@ pub use graphics::{
     RenderPassDesc, Surface, ViewportScissor,
 };
 pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities};
+pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
 pub use surface::WindowHandles;
 
 pub use desc::{

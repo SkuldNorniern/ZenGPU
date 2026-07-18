@@ -4,17 +4,19 @@ use std::{
     ffi::{CStr, CString, c_void},
     ptr::{copy_nonoverlapping, null, null_mut},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
     CompareFn, ComputePipelineDesc, CullMode, DeviceLimits, DeviceRequest, DispatchOp, Features,
-    FilterMode, Format, FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
-    HalCapabilities, MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
-    SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
-    VertexFormat, WindowHandles, marker,
+    FilterMode, Format, FrontFace, GpuDevice, GpuError, GpuSubmission, GraphicsDevice,
+    GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle, PolygonMode,
+    PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
+    ShaderSource, SlotMap, StepMode, Submission, SubmissionStatus, SurfaceConfig, TargetHandle,
+    TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, VertexFormat, WindowHandles,
+    marker,
 };
 
 use crate::command_list::{COLOR_SUBRESOURCE, CmdListPool, VulkanCommandList};
@@ -48,6 +50,104 @@ unsafe impl Sync for BindlessState {}
 struct FencePool {
     inner: Arc<VulkanDeviceInner>,
     free: Mutex<Vec<vk::Fence>>,
+}
+
+struct VulkanSubmissionState {
+    fence: Option<vk::Fence>,
+    cmd: Option<vk::CommandBuffer>,
+}
+
+/// Fence-backed submission. Completion releases its fence and command buffer once. After a
+/// timed-out wait this handle still owns both, so a later poll or wait is safe.
+struct VulkanSubmission {
+    cycle_id: u64,
+    inner: Arc<VulkanDeviceInner>,
+    fence_pool: Arc<FencePool>,
+    cmd_pool: Arc<CmdListPool>,
+    state: Mutex<VulkanSubmissionState>,
+}
+
+impl VulkanSubmission {
+    fn complete_locked(&self, state: &mut VulkanSubmissionState) {
+        if let Some(fence) = state.fence.take() {
+            self.fence_pool.release(fence);
+        }
+        if let Some(cmd) = state.cmd.take() {
+            self.cmd_pool.release(cmd);
+        }
+    }
+
+    fn timeout_ns(timeout: Duration) -> u64 {
+        timeout.as_nanos().min(u128::from(u64::MAX)) as u64
+    }
+}
+
+impl GpuSubmission for VulkanSubmission {
+    fn cycle_id(&self) -> u64 {
+        self.cycle_id
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        let mut state = self.state.lock().unwrap();
+        let Some(fence) = state.fence else {
+            return Ok(SubmissionStatus::Complete);
+        };
+        let signaled = unsafe {
+            self.inner
+                .device
+                .get_fence_status(fence)
+                .map_err(|e| map_vk_err("vkGetFenceStatus", e))?
+        };
+        if signaled {
+            self.complete_locked(&mut state);
+            Ok(SubmissionStatus::Complete)
+        } else {
+            Ok(SubmissionStatus::Pending)
+        }
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let Some(fence) = state.fence else {
+            return Ok(());
+        };
+        let result = unsafe {
+            self.inner
+                .device
+                .wait_for_fences(&[fence], true, Self::timeout_ns(timeout))
+        };
+        match result {
+            Ok(()) => {
+                self.complete_locked(&mut state);
+                Ok(())
+            }
+            Err(vk::Result::TIMEOUT) => Err(GpuError::Timeout),
+            Err(e) => Err(map_vk_err("vkWaitForFences", e)),
+        }
+    }
+}
+
+impl Drop for VulkanSubmission {
+    fn drop(&mut self) {
+        let state = self.state.get_mut().unwrap();
+        let Some(fence) = state.fence else {
+            return;
+        };
+        let waited = unsafe { self.inner.device.wait_for_fences(&[fence], true, u64::MAX) };
+        if waited.is_ok() {
+            if let Some(fence) = state.fence.take() {
+                self.fence_pool.release(fence);
+            }
+            if let Some(cmd) = state.cmd.take() {
+                self.cmd_pool.release(cmd);
+            }
+        } else {
+            if let Some(fence) = state.fence.take() {
+                unsafe { self.inner.device.destroy_fence(fence, None) };
+            }
+            state.cmd.take();
+        }
+    }
 }
 
 impl FencePool {
@@ -200,7 +300,7 @@ pub struct VulkanDevice {
     bindless: BindlessState,
     pipeline_cache: vk::PipelineCache,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
-    fence_pool: FencePool,
+    fence_pool: Arc<FencePool>,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -569,7 +669,7 @@ impl VulkanDevice {
 
         let bindless = create_bindless(&inner.device, inner.limits)?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
-        let fence_pool = FencePool::new(Arc::clone(&inner));
+        let fence_pool = Arc::new(FencePool::new(Arc::clone(&inner)));
         let pipeline_cache = unsafe {
             inner
                 .device
@@ -689,6 +789,57 @@ impl VulkanDevice {
         }
 
         wait_result
+    }
+
+    /// The submission owns the fence and command buffer until it completes.
+    fn one_shot_submit_async<F>(&self, cycle_id: u64, record: F) -> Result<Submission>
+    where
+        F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
+    {
+        let cmd = self.cmd_list_pool.acquire()?;
+        let record_result = record(&self.inner.device, cmd);
+        let end_result = unsafe {
+            self.inner
+                .device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::Backend(format!("vkEndCommandBuffer: {e}")))
+        };
+        if let Err(e) = record_result.and(end_result) {
+            self.cmd_list_pool.release(cmd);
+            return Err(e);
+        }
+
+        let fence = self.fence_pool.acquire()?;
+        let submit_info = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        let submit_result = {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            unsafe {
+                self.inner
+                    .device
+                    .queue_submit(self.inner.queue, &[submit_info], fence)
+                    .map_err(|e| map_vk_err("vkQueueSubmit", e))
+            }
+        };
+        if let Err(e) = submit_result {
+            self.fence_pool.release(fence);
+            self.cmd_list_pool.release(cmd);
+            return Err(e);
+        }
+
+        Ok(Box::new(VulkanSubmission {
+            cycle_id,
+            inner: Arc::clone(&self.inner),
+            fence_pool: Arc::clone(&self.fence_pool),
+            cmd_pool: Arc::clone(&self.cmd_list_pool),
+            state: Mutex::new(VulkanSubmissionState {
+                fence: Some(fence),
+                cmd: Some(cmd),
+            }),
+        }))
     }
 
     /// Called by `create_buffer` for `STORAGE` buffers.
@@ -1880,9 +2031,176 @@ impl GpuDevice for VulkanDevice {
         drop(buffers);
         result
     }
+
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.submit_compute_batch_async(cycle_id, ops)
+    }
 }
 
 impl VulkanDevice {
+    fn submit_compute_batch_async(
+        &self,
+        cycle_id: u64,
+        ops: &[DispatchOp<'_>],
+    ) -> Result<Submission> {
+        if ops.is_empty() {
+            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
+        }
+
+        let buffers = self.buffers.lock().unwrap();
+        let textures = self.textures.lock().unwrap();
+        let bound_textures = self.bindless.bound_textures.lock().unwrap();
+        let pipelines = self.pipelines.lock().unwrap();
+
+        #[allow(clippy::type_complexity)]
+        let resolved: Vec<(
+            vk::Pipeline,
+            vk::PipelineLayout,
+            [u8; COMPUTE_PUSH_CONSTANT_BYTES],
+            usize,
+            [u32; 3],
+        )> = {
+            let mut out = Vec::with_capacity(ops.len());
+            for op in ops {
+                if op.grid.contains(&0) {
+                    return Err(GpuError::Dispatch(format!(
+                        "dispatch grid dimensions must be non-zero, got {:?}",
+                        op.grid
+                    )));
+                }
+                if op
+                    .grid
+                    .iter()
+                    .zip(self.inner.limits.max_dispatch_size)
+                    .any(|(requested, limit)| *requested > limit)
+                {
+                    return Err(GpuError::Dispatch(format!(
+                        "dispatch grid {:?} exceeds device limit {:?}",
+                        op.grid, self.inner.limits.max_dispatch_size
+                    )));
+                }
+                for &idx in op.bindings.buffers {
+                    if idx >= self.bindless.buffer_capacity {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!(
+                                "buffer binding index {idx} exceeds bindless capacity {}",
+                                self.bindless.buffer_capacity
+                            ),
+                        )));
+                    }
+                    let buffer = buffers.get_by_slot_index(idx).ok_or_else(|| {
+                        GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                            "buffer binding index {idx} is not live"
+                        )))
+                    })?;
+                    if !buffer.usage.contains(BufferUsage::STORAGE) {
+                        return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                            resource: "bound buffer",
+                            needed: "STORAGE",
+                        }));
+                    }
+                }
+                for &idx in op.bindings.textures {
+                    if idx >= self.bindless.texture_capacity {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!(
+                                "texture binding index {idx} exceeds bindless capacity {}",
+                                self.bindless.texture_capacity
+                            ),
+                        )));
+                    }
+                    if textures.get_by_slot_index(idx).is_none() || !bound_textures[idx as usize] {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!("texture binding index {idx} is not live and bound"),
+                        )));
+                    }
+                }
+                let p = pipelines
+                    .get(op.pipeline)
+                    .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
+                let (vk_pipeline, vk_layout) = match p {
+                    VulkanPipeline::Compute { layout, pipeline } => (*pipeline, *layout),
+                    VulkanPipeline::Graphics { .. } => {
+                        return Err(GpuError::Dispatch(
+                            "dispatch called with a graphics pipeline handle".to_string(),
+                        ));
+                    }
+                };
+
+                let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
+                let mut pc_len = 0usize;
+                let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
+                    if pc_len + 4 > pc.len() {
+                        return Err(GpuError::Dispatch(format!(
+                            "push constants exceed {} bytes",
+                            pc.len()
+                        )));
+                    }
+                    pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
+                    pc_len += 4;
+                    Ok(())
+                };
+                for &idx in op.bindings.buffers {
+                    push_pc(idx.to_ne_bytes())?;
+                }
+                for scalar in op.bindings.scalars {
+                    push_pc(match scalar {
+                        Scalar::U32(v) => v.to_ne_bytes(),
+                        Scalar::I32(v) => v.to_ne_bytes(),
+                        Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+                    })?;
+                }
+                out.push((vk_pipeline, vk_layout, pc, pc_len, op.grid));
+            }
+            out
+        };
+
+        let bindless_set = self.bindless.set;
+        let last = resolved.len() - 1;
+        self.one_shot_submit_async(cycle_id, move |dev, cmd| {
+            let barrier = vk::MemoryBarrier {
+                src_access_mask: vk::AccessFlags::SHADER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                ..Default::default()
+            };
+            unsafe {
+                for (i, (vk_pipeline, vk_layout, pc, pc_len, grid)) in resolved.iter().enumerate() {
+                    dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *vk_pipeline);
+                    dev.cmd_bind_descriptor_sets(
+                        cmd,
+                        vk::PipelineBindPoint::COMPUTE,
+                        *vk_layout,
+                        0,
+                        &[bindless_set],
+                        &[],
+                    );
+                    if *pc_len != 0 {
+                        dev.cmd_push_constants(
+                            cmd,
+                            *vk_layout,
+                            vk::ShaderStageFlags::COMPUTE,
+                            0,
+                            &pc[..*pc_len],
+                        );
+                    }
+                    dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
+                    if i != last {
+                        dev.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER,
+                            vk::DependencyFlags::empty(),
+                            &[barrier],
+                            &[],
+                            &[],
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Shared path for `upload_texture_data` (mip 0, layer 0) and `upload_texture_data_region`.
     fn upload_texture_data_impl(
         &self,
@@ -3148,27 +3466,36 @@ mod tests {
         )
         .unwrap();
 
-        dev.dispatch_batch(&[
-            DispatchOp {
-                pipeline: add_pipeline,
-                bindings: Bindings {
-                    buffers: &[a.index(), b.index(), sum.index()],
-                    textures: &[],
-                    scalars: &[Scalar::U32(n)],
-                },
-                grid: [n.div_ceil(64), 1, 1],
-            },
-            DispatchOp {
-                pipeline: relu_pipeline,
-                bindings: Bindings {
-                    buffers: &[sum.index(), out.index()],
-                    textures: &[],
-                    scalars: &[Scalar::U32(n)],
-                },
-                grid: [n.div_ceil(64), 1, 1],
-            },
-        ])
-        .unwrap();
+        let submission = dev
+            .submit_batch(
+                0x4d_50_50_49,
+                &[
+                    DispatchOp {
+                        pipeline: add_pipeline,
+                        bindings: Bindings {
+                            buffers: &[a.index(), b.index(), sum.index()],
+                            textures: &[],
+                            scalars: &[Scalar::U32(n)],
+                        },
+                        grid: [n.div_ceil(64), 1, 1],
+                    },
+                    DispatchOp {
+                        pipeline: relu_pipeline,
+                        bindings: Bindings {
+                            buffers: &[sum.index(), out.index()],
+                            textures: &[],
+                            scalars: &[Scalar::U32(n)],
+                        },
+                        grid: [n.div_ceil(64), 1, 1],
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(submission.cycle_id(), 0x4d_50_50_49);
+        let zero_wait = submission.wait(Duration::ZERO);
+        assert!(zero_wait.is_ok() || matches!(zero_wait, Err(GpuError::Timeout)));
+        submission.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
         let result: &[f32] =

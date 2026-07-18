@@ -11,6 +11,8 @@ pub type Result<T> = CoreResult<T, GpuError>;
 #[derive(Debug)]
 pub enum GpuError {
     DeviceLost,
+    /// A bounded wait expired. The work may still be running.
+    Timeout,
     OutOfMemory(MemoryUsage),
     UnsupportedFeatures(Features),
     Unsupported(String),
@@ -55,6 +57,7 @@ impl Display for GpuError {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             GpuError::DeviceLost => write!(f, "device lost"),
+            GpuError::Timeout => write!(f, "operation timed out"),
             GpuError::OutOfMemory(usage) => write!(f, "out of memory ({usage:?})"),
             GpuError::UnsupportedFeatures(features) => {
                 write!(f, "unsupported features: {features:?}")
@@ -135,5 +138,11 @@ mod tests {
     fn surface_error_converts() {
         let e: GpuError = SurfaceError::Outdated.into();
         assert!(matches!(e, GpuError::Surface(SurfaceError::Outdated)));
+    }
+
+    #[test]
+    fn submission_timeout_is_distinct_from_device_loss() {
+        assert_eq!(GpuError::Timeout.to_string(), "operation timed out");
+        assert!(!matches!(GpuError::Timeout, GpuError::DeviceLost));
     }
 }

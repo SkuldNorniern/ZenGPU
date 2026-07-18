@@ -8,6 +8,7 @@ use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, Text
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, HalCapabilities};
+use crate::submission::{CompletedSubmission, Submission};
 use crate::types::Features;
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
@@ -124,11 +125,12 @@ pub trait GpuDevice: Send + Sync {
 
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
 
-    /// Dispatches a kernel and blocks until the GPU is done.
+    /// Dispatches a compute kernel and blocks until the GPU work completes. `submit` is the
+    /// pollable, bounded version.
     ///
-    /// `bindings.buffers` are bindless SSBO slot indices, indexed with `nonuniformEXT`.
-    /// `bindings.scalars` become push constants, packed after the indices. `grid` is the workgroup
-    /// count per axis.
+    /// `bindings.buffers` are bindless SSBO slots, read with `nonuniformEXT`. `bindings.scalars`
+    /// become push constants, packed after the buffer indices. `grid` is the number of workgroups
+    /// per axis.
     fn dispatch(
         &self,
         _pipeline: PipelineHandle,
@@ -147,5 +149,35 @@ pub trait GpuDevice: Send + Sync {
             self.dispatch(op.pipeline, op.bindings, op.grid)?;
         }
         Ok(())
+    }
+
+    /// Starts a dispatch and returns its submission. `cycle_id` is opaque backend metadata, used to
+    /// reject late completions.
+    ///
+    /// The default dispatches synchronously and returns a completed handle.
+    fn submit(
+        &self,
+        cycle_id: u64,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<Submission> {
+        self.submit_batch(
+            cycle_id,
+            &[DispatchOp {
+                pipeline,
+                bindings,
+                grid,
+            }],
+        )
+    }
+
+    /// Waits for a submission, up to a timeout. A `wait` timeout does not cancel the work. Keep the
+    /// handle and all referenced resources until it completes.
+    ///
+    /// The default has no async submission and runs synchronously.
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.dispatch_batch(ops)?;
+        Ok(Box::new(CompletedSubmission::new(cycle_id)))
     }
 }
