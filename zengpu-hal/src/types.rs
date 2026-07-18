@@ -115,6 +115,9 @@ impl Features {
     pub const fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0
     }
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
     pub const fn is_empty(self) -> bool {
         self.0 == 0
     }
@@ -292,6 +295,10 @@ mod tests {
         assert!(!f.contains(Features::GRAPHICS));
         f |= Features::GRAPHICS;
         assert!(f.contains(Features::GRAPHICS));
+        assert_eq!(
+            f.difference(Features::COMPUTE),
+            Features::GRAPHICS | Features::DESCRIPTOR_INDEXING
+        );
     }
 
     #[test]
