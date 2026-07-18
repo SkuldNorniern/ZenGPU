@@ -139,25 +139,23 @@ impl Drop for OffscreenTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{VulkanDevice, VulkanInstance};
-    use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
+    use crate::VulkanInstance;
+    use zengpu_hal::DeviceRequest;
 
     #[test]
     fn offscreen_target_handles_are_valid() {
+        let _guard = crate::test_gpu_lock();
         let Ok(inst) = VulkanInstance::new() else {
             return;
         };
-        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+        let Some(adapter) = inst.request_vulkan_adapter() else {
             return;
         };
-        let Ok(dev) = adapter.open(DeviceRequest::default()) else {
-            return;
-        };
-        let Some(device) = dev.as_any().downcast_ref::<VulkanDevice>() else {
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
             return;
         };
 
-        let target = OffscreenTarget::new(device, Format::Rgba8Unorm, 64, 32).unwrap();
+        let target = OffscreenTarget::new(&device, Format::Rgba8Unorm, 64, 32).unwrap();
         assert_eq!(target.format(), Format::Rgba8Unorm);
         assert_eq!(target.extent(), (64, 32));
         let _ = target.texture_handle();
@@ -166,21 +164,19 @@ mod tests {
 
     #[test]
     fn offscreen_target_resize() {
+        let _guard = crate::test_gpu_lock();
         let Ok(inst) = VulkanInstance::new() else {
             return;
         };
-        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+        let Some(adapter) = inst.request_vulkan_adapter() else {
             return;
         };
-        let Ok(dev) = adapter.open(DeviceRequest::default()) else {
-            return;
-        };
-        let Some(device) = dev.as_any().downcast_ref::<VulkanDevice>() else {
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
             return;
         };
 
-        let mut target = OffscreenTarget::new(device, Format::Rgba8Unorm, 64, 32).unwrap();
-        target.resize(device, 128, 96).unwrap();
+        let mut target = OffscreenTarget::new(&device, Format::Rgba8Unorm, 64, 32).unwrap();
+        target.resize(&device, 128, 96).unwrap();
         assert_eq!(target.extent(), (128, 96));
         assert_eq!(target.format(), Format::Rgba8Unorm);
     }

@@ -2408,6 +2408,18 @@ fn sample_count_to_vk(samples: u32) -> vk::SampleCountFlags {
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        // Resources referenced by submitted work must not be destroyed until
+        // the device is idle. Synchronous HAL calls normally guarantee this,
+        // but graphics/raw-context users and error paths may still have work
+        // pending when the owning VulkanDevice is dropped.
+        let _queue = self
+            .inner
+            .queue_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        unsafe {
+            let _ = self.inner.device.device_wait_idle();
+        }
         let mut buffers = self.buffers.lock().unwrap();
         for buf in buffers.drain() {
             unsafe {
@@ -2461,14 +2473,42 @@ impl Drop for VulkanDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Deref;
+
     use super::*;
     use crate::instance::VulkanInstance;
     use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
 
-    fn try_device() -> Option<Box<dyn GpuDevice>> {
+    struct TestDevice {
+        dev: Box<dyn GpuDevice>,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Deref for TestDevice {
+        type Target = dyn GpuDevice;
+
+        fn deref(&self) -> &Self::Target {
+            self.dev.as_ref()
+        }
+    }
+
+    fn try_device() -> Option<TestDevice> {
+        let guard = crate::test_gpu_lock();
         let inst = VulkanInstance::new().ok()?;
         let adapter = inst.request_adapter(AdapterRequest::default())?;
-        adapter.open(DeviceRequest::default()).ok()
+        let dev = adapter.open(DeviceRequest::default()).ok()?;
+        Some(TestDevice { dev, _guard: guard })
+    }
+
+    fn try_graphics_device() -> Option<TestDevice> {
+        let guard = crate::test_gpu_lock();
+        let inst = VulkanInstance::new().ok()?;
+        let adapter = inst.request_vulkan_adapter()?;
+        let dev = adapter.open_headless(DeviceRequest::default()).ok()?;
+        Some(TestDevice {
+            dev: Box::new(dev),
+            _guard: guard,
+        })
     }
 
     fn rw_desc(size: u64) -> BufferDesc {
@@ -2488,6 +2528,43 @@ mod tests {
     #[test]
     fn compute_push_constant_abi_uses_vulkan_portable_minimum() {
         assert_eq!(COMPUTE_PUSH_CONSTANT_BYTES, 128);
+    }
+
+    #[test]
+    #[ignore = "explicit NVIDIA/Vulkan logical-device churn stress test"]
+    fn repeated_device_create_use_drop_stress() {
+        let _guard = crate::test_gpu_lock();
+        for cycle in 0..100u32 {
+            let inst = VulkanInstance::new().expect("create Vulkan instance");
+            let adapter = inst
+                .request_adapter(AdapterRequest::default())
+                .expect("find Vulkan adapter");
+            let dev = adapter
+                .open(DeviceRequest::default())
+                .expect("open Vulkan device");
+            let src = dev
+                .create_buffer(BufferDesc {
+                    size: 4096,
+                    usage: BufferUsage::TRANSFER_SRC,
+                    memory: MemoryUsage::Upload,
+                })
+                .expect("create upload buffer");
+            let dst = dev
+                .create_buffer(BufferDesc {
+                    size: 4096,
+                    usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                    memory: MemoryUsage::Readback,
+                })
+                .expect("create readback buffer");
+            let pattern = [cycle as u8; 4096];
+            dev.write_buffer(src, 0, &pattern).expect("write upload");
+            dev.copy_buffer(src, 0, dst, 0, 4096).expect("copy buffers");
+            assert_eq!(
+                dev.read_buffer(dst, 0, 4096).expect("read back"),
+                pattern,
+                "cycle {cycle}"
+            );
+        }
     }
 
     #[test]
@@ -2590,7 +2667,9 @@ mod tests {
 
     #[test]
     fn create_sampler_with_full_desc() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let sampler = dev
             .create_sampler(SamplerDesc {
                 min_filter: FilterMode::Linear,
@@ -2623,7 +2702,9 @@ mod tests {
 
     #[test]
     fn create_texture_2d_array() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let tex = dev
             .create_texture(TextureDesc {
                 array_layers: 4,
@@ -2635,7 +2716,9 @@ mod tests {
 
     #[test]
     fn create_texture_3d() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let tex = dev
             .create_texture(TextureDesc {
                 depth: 4,
@@ -2647,7 +2730,9 @@ mod tests {
 
     #[test]
     fn create_texture_cube_requires_six_layers() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let err = dev
             .create_texture(TextureDesc {
                 array_layers: 3,
@@ -2670,7 +2755,9 @@ mod tests {
 
     #[test]
     fn upload_texture_data_region_targets_specific_mip() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let tex = dev
             .create_texture(TextureDesc {
                 mip_levels: 2,
@@ -2687,7 +2774,9 @@ mod tests {
 
     #[test]
     fn generate_mipmaps_without_transfer_usage_fails() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let tex = dev
             .create_texture(TextureDesc {
                 mip_levels: 4,
@@ -2708,7 +2797,9 @@ mod tests {
 
     #[test]
     fn generate_mipmaps_builds_full_chain() {
-        let Some(dev) = try_device() else { return };
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
         let tex = dev
             .create_texture(TextureDesc {
                 mip_levels: 4,
@@ -2844,6 +2935,10 @@ mod tests {
         );
 
         let Some(dev) = try_device() else { return };
+        let TestDevice {
+            dev,
+            _guard: test_guard,
+        } = dev;
         let dev: Arc<dyn GpuDevice> = Arc::from(dev);
         let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
         let pipeline = dev
@@ -2902,6 +2997,8 @@ mod tests {
         }
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
+        drop(dev);
+        drop(test_guard);
     }
 
     #[test]

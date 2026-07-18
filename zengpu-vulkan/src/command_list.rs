@@ -35,57 +35,60 @@ const DEPTH_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     layer_count: 1,
 };
 
-/// Pool of reusable `vk::CommandBuffer`s for [`VulkanCommandList`]. Acquired
-/// buffers are reset (`RESET_COMMAND_BUFFER`) and reused — zero steady-state
-/// allocation once warmed up.
+/// Pool of reusable `vk::CommandBuffer`s for [`VulkanCommandList`]. Each
+/// command buffer has its own Vulkan command pool because recording operations
+/// are externally synchronized against that pool. Buffers are reset and
+/// reused with zero steady-state allocation once warmed up.
 pub(crate) struct CmdListPool {
     inner: Arc<VulkanDeviceInner>,
-    pool: vk::CommandPool,
     free: Mutex<Vec<vk::CommandBuffer>>,
+    pools: Mutex<Vec<vk::CommandPool>>,
 }
 
 impl CmdListPool {
     pub(crate) fn new(inner: Arc<VulkanDeviceInner>) -> Result<Self> {
-        let pool = unsafe {
-            inner.device.create_command_pool(
-                &vk::CommandPoolCreateInfo {
-                    flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                    queue_family_index: inner.queue_family,
-                    ..Default::default()
-                },
-                None,
-            )
-        }
-        .map_err(|e| GpuError::Backend(format!("create command list pool: {e}")))?;
         Ok(Self {
             inner,
-            pool,
             free: Mutex::new(Vec::new()),
+            pools: Mutex::new(Vec::new()),
         })
     }
 
     /// Acquire a command buffer — reused from the free list if one is
     /// available, otherwise freshly allocated — and begin recording.
     pub(crate) fn acquire(&self) -> Result<vk::CommandBuffer> {
-        // Allocation and command-buffer reset both externally synchronize on
-        // the VkCommandPool. Keep the pool mutex held for either operation;
-        // recording can proceed concurrently once each caller owns a distinct
-        // command buffer.
-        let mut free = self.free.lock().unwrap();
-        let (cmd, reused) = match free.pop() {
+        let (cmd, reused) = match self.free.lock().unwrap().pop() {
             Some(cmd) => (cmd, true),
             None => {
+                let pool = unsafe {
+                    self.inner.device.create_command_pool(
+                        &vk::CommandPoolCreateInfo {
+                            flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
+                            queue_family_index: self.inner.queue_family,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                }
+                .map_err(|e| GpuError::Backend(format!("create command list pool: {e}")))?;
                 let bufs = unsafe {
                     self.inner
                         .device
                         .allocate_command_buffers(&vk::CommandBufferAllocateInfo {
-                            command_pool: self.pool,
+                            command_pool: pool,
                             level: vk::CommandBufferLevel::PRIMARY,
                             command_buffer_count: 1,
                             ..Default::default()
                         })
-                }
-                .map_err(|e| GpuError::Backend(format!("allocate command buffer: {e}")))?;
+                };
+                let bufs = match bufs {
+                    Ok(bufs) => bufs,
+                    Err(e) => {
+                        unsafe { self.inner.device.destroy_command_pool(pool, None) };
+                        return Err(GpuError::Backend(format!("allocate command buffer: {e}")));
+                    }
+                };
+                self.pools.lock().unwrap().push(pool);
                 (bufs[0], false)
             }
         };
@@ -97,7 +100,6 @@ impl CmdListPool {
                     .map_err(|e| GpuError::Backend(format!("reset command buffer: {e}")))?;
             }
         }
-        drop(free);
         unsafe {
             self.inner.device.begin_command_buffer(
                 cmd,
@@ -121,7 +123,9 @@ impl CmdListPool {
 impl Drop for CmdListPool {
     fn drop(&mut self) {
         unsafe {
-            self.inner.device.destroy_command_pool(self.pool, None);
+            for pool in self.pools.get_mut().unwrap().drain(..) {
+                self.inner.device.destroy_command_pool(pool, None);
+            }
         }
     }
 }
