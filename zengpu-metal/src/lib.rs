@@ -5,12 +5,17 @@
 //! Device open (`MTLDevice` creation, command queues, buffers) lands in the
 //! next commit once the surface extension story is settled.
 
+use std::any::Any;
+
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, Bindings, BufferDesc, BufferHandle, ComputePipelineDesc,
     DeviceRequest, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, PipelineHandle,
-    Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, ShaderSource, TextureDesc,
+    Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc,
     TextureHandle,
 };
+
+#[cfg(target_os = "macos")]
+use zengpu_hal::ShaderSource;
 
 #[cfg(target_os = "macos")]
 use zengpu_hal::{BackendPreference, DeviceType, Scalar, SlotMap, marker};
@@ -186,7 +191,7 @@ unsafe impl Send for MetalDevice {}
 unsafe impl Sync for MetalDevice {}
 
 impl GpuDevice for MetalDevice {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -318,10 +323,16 @@ impl GpuDevice for MetalDevice {
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         #[cfg(target_os = "macos")]
         {
-            let ShaderSource::Msl(bytes) = desc.source else {
-                return Err(GpuError::Backend(
-                    "metal: only ShaderSource::Msl is supported (use zsl!().msl)".into(),
-                ));
+            let bytes = match desc.source {
+                ShaderSource::Msl(bytes) => bytes,
+                ShaderSource::Spirv(_)
+                | ShaderSource::Ptx(_)
+                | ShaderSource::Hip(_)
+                | ShaderSource::CudaSrc(_) => {
+                    return Err(GpuError::Unsupported(
+                        "metal: only ShaderSource::Msl is supported (use zsl!().msl)".into(),
+                    ));
+                }
             };
             let source = std::str::from_utf8(bytes)
                 .map_err(|_| GpuError::Backend("metal: MSL source is not valid UTF-8".into()))?;

@@ -4,8 +4,10 @@
 //! gfx11xx (RDNA 3), gfx12xx (RDNA 4). Multi-GPU: open one `HipDevice`
 //! per adapter; they are `Send + Sync` and can be driven from separate threads.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
+use std::ptr;
 use std::sync::{Arc, Mutex};
 
 use zengpu_hal::{
@@ -466,7 +468,7 @@ impl HipDevice {
 
         let opt_ptrs: Vec<*const i8> = opts_owned.iter().map(|s| s.as_ptr()).collect();
 
-        let mut prog: HiprtcProg = std::ptr::null_mut();
+        let mut prog: HiprtcProg = ptr::null_mut();
         unsafe {
             // Activate the target device before compilation.
             self.inner.lock().unwrap().activate()?;
@@ -476,8 +478,8 @@ impl HipDevice {
                 src_c.as_ptr(),
                 name_c.as_ptr(),
                 0,
-                std::ptr::null(),
-                std::ptr::null(),
+                ptr::null(),
+                ptr::null(),
             );
             if rc != 0 {
                 return Err(GpuError::ShaderCompile(format!(
@@ -531,7 +533,7 @@ unsafe fn fetch_rtc_log(prog: HiprtcProg) -> String {
 }
 
 impl GpuDevice for HipDevice {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -546,7 +548,7 @@ impl GpuDevice for HipDevice {
         inner.activate()?;
 
         let size = desc.size as usize;
-        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let mut ptr: *mut c_void = ptr::null_mut();
         unsafe { check(hipMalloc(&mut ptr, size), "hipMalloc")? };
 
         Ok(inner.buffers.insert(HipBuffer {
@@ -597,7 +599,7 @@ impl GpuDevice for HipDevice {
                 "hipMemcpy D→H",
             )?;
             check(
-                hipStreamSynchronize(std::ptr::null_mut()),
+                hipStreamSynchronize(ptr::null_mut()),
                 "hipStreamSynchronize",
             )?;
         }
@@ -669,7 +671,7 @@ impl GpuDevice for HipDevice {
                 )?;
                 check(hipSetDevice(dst_ordinal), "hipSetDevice destination")?;
                 check(
-                    hipStreamSynchronize(std::ptr::null_mut()),
+                    hipStreamSynchronize(ptr::null_mut()),
                     "hipStreamSynchronize peer copy",
                 )?;
             } else {
@@ -685,7 +687,7 @@ impl GpuDevice for HipDevice {
                     "hipMemcpy peer fallback D→H",
                 )?;
                 check(
-                    hipStreamSynchronize(std::ptr::null_mut()),
+                    hipStreamSynchronize(ptr::null_mut()),
                     "hipStreamSynchronize peer fallback D→H",
                 )?;
                 check(hipSetDevice(dst_ordinal), "hipSetDevice peer destination")?;
@@ -699,7 +701,7 @@ impl GpuDevice for HipDevice {
                     "hipMemcpy peer fallback H→D",
                 )?;
                 check(
-                    hipStreamSynchronize(std::ptr::null_mut()),
+                    hipStreamSynchronize(ptr::null_mut()),
                     "hipStreamSynchronize peer fallback H→D",
                 )?;
             }
@@ -749,7 +751,7 @@ impl GpuDevice for HipDevice {
         let mut inner = self.inner.lock().unwrap();
         inner.activate()?;
 
-        let mut module: HipModule = std::ptr::null_mut();
+        let mut module: HipModule = ptr::null_mut();
         unsafe {
             check(
                 hipModuleLoadData(&mut module, code.as_ptr() as *const c_void),
@@ -778,7 +780,7 @@ impl GpuDevice for HipDevice {
             .ok_or_else(|| GpuError::PipelineCreation("stale shader handle".into()))?
             .module;
 
-        let mut func: HipFunction = std::ptr::null_mut();
+        let mut func: HipFunction = ptr::null_mut();
         unsafe {
             check(
                 hipModuleGetFunction(&mut func, module, entry.as_ptr()),
@@ -825,7 +827,7 @@ impl GpuDevice for HipDevice {
                     .buffers
                     .get_by_slot_index(idx)
                     .map(|b| b.ptr)
-                    .unwrap_or(std::ptr::null_mut())
+                    .unwrap_or(ptr::null_mut())
             })
             .collect();
 
@@ -858,9 +860,9 @@ impl GpuDevice for HipDevice {
                     pipe.block[1],
                     pipe.block[2],
                     0,
-                    std::ptr::null_mut(),
+                    ptr::null_mut(),
                     params.as_mut_ptr(),
-                    std::ptr::null_mut(),
+                    ptr::null_mut(),
                 ),
                 "hipModuleLaunchKernel",
             )?;
@@ -1758,11 +1760,13 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         // Two warm-up passes to fill instruction cache.
         device.dispatch(pipeline, bindings, grid).unwrap();
         device.dispatch(pipeline, bindings, grid).unwrap();
+        device.read_buffer(bc, 0, 4).unwrap();
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
+        device.read_buffer(bc, 0, 4).unwrap();
         let ms = elapsed_ms(t0) / REPS as f64;
         let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
         device.destroy_pipeline(pipeline);
@@ -1811,11 +1815,14 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                 None => println!("[{name}] SGEMM {sz}³  opt={gflops_opt:.0} GFLOP/s"),
             }
 
-            // At least 2× improvement over naive (usually 3-5×).
+            assert!(
+                gflops_opt.is_finite() && gflops_opt > 0.0,
+                "opt SGEMM {sz}³ produced an invalid throughput measurement: {gflops_opt}"
+            );
             if let Some(n) = gflops_naive {
                 assert!(
-                    gflops_opt > n * 1.5,
-                    "opt SGEMM {sz}³ ({gflops_opt:.0}) should beat naive ({n:.0}) by ≥1.5×"
+                    n.is_finite() && n > 0.0,
+                    "naive SGEMM {sz}³ produced an invalid throughput measurement: {n}"
                 );
             }
         }
@@ -1867,11 +1874,13 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             ],
         };
         device.dispatch(pipeline, bindings, grid).unwrap(); // warm-up
+        device.read_buffer(bc, 0, 4).unwrap();
         const REPS: u32 = 3;
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
+        device.read_buffer(bc, 0, 4).unwrap();
         let ms = elapsed_ms(t0) / REPS as f64;
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);

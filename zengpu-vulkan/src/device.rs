@@ -2375,6 +2375,12 @@ mod tests {
         }
     }
 
+    fn u32s_to_bytes(words: &[u32]) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words))
+        }
+    }
+
     #[test]
     fn buffer_roundtrip() {
         let Some(dev) = try_device() else { return };
@@ -2626,7 +2632,7 @@ mod tests {
         dev.write_buffer(
             a,
             0,
-            to_bytes(unsafe {
+            u32s_to_bytes(unsafe {
                 std::slice::from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len())
             }),
         )
@@ -2634,7 +2640,7 @@ mod tests {
         dev.write_buffer(
             b,
             0,
-            to_bytes(unsafe {
+            u32s_to_bytes(unsafe {
                 std::slice::from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len())
             }),
         )
