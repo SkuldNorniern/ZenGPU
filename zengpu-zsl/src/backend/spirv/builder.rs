@@ -118,7 +118,7 @@ pub mod sc {
 #[allow(dead_code)]
 mod cap {
     pub const SHADER: u32 = 1;
-    pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 4437;
+    pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
 
@@ -186,6 +186,8 @@ impl SpvBuilder {
             op::CAPABILITY,
             &[cap::RUNTIME_DESCRIPTOR_ARRAY],
         );
+        let name = encode_string("SPV_EXT_descriptor_indexing");
+        emit_raw(&mut self.extensions, op::EXTENSION, &name);
     }
 
     pub fn enable_atomic_float32_add_ext(&mut self) {
