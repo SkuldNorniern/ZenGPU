@@ -22,6 +22,12 @@ pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 
 use ash::vk;
 
+#[cfg(test)]
+pub(crate) fn test_gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
     use zengpu_hal::Format;
     match f {
