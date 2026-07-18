@@ -108,6 +108,13 @@ impl<K, V> SlotMap<K, V> {
         }
     }
 
+    /// Slot index the next insertion will use. Useful when a backend has a
+    /// fixed-size bindless descriptor table and must reject an insertion
+    /// before publishing an out-of-range handle.
+    pub fn next_index(&self) -> u32 {
+        self.free.last().copied().unwrap_or(self.slots.len() as u32)
+    }
+
     /// Borrow the value for `handle`, or `None` if the handle is stale.
     pub fn get(&self, handle: Handle<K>) -> Option<&V> {
         self.slots
@@ -247,6 +254,16 @@ mod tests {
         assert_eq!(map.get(h), Some(&7));
         assert_eq!(map.remove(h), Some(7));
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn next_index_tracks_reused_slots() {
+        let mut map = Map::new();
+        assert_eq!(map.next_index(), 0);
+        let first = map.insert(10);
+        assert_eq!(map.next_index(), 1);
+        map.remove(first);
+        assert_eq!(map.next_index(), first.index());
     }
 
     #[test]
