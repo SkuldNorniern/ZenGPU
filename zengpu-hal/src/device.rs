@@ -25,6 +25,20 @@ pub trait GpuDevice: Send + Sync {
     /// Requires `BufferUsage::READBACK`.
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Copies a range from `src` to `dst`, synchronously. Bytes are visible to later ops on return.
+    /// `src` needs `TRANSFER_SRC` and `dst` needs `TRANSFER_DST`. Same-buffer copies are rejected.
+    /// A zero length is a no-op after validation.
+    fn copy_buffer(
+        &self,
+        _src: BufferHandle,
+        _src_offset: u64,
+        _dst: BufferHandle,
+        _dst_offset: u64,
+        _len: u64,
+    ) -> Result<()> {
+        Err(GpuError::Unsupported("buffer copy".into()))
+    }
+
     /// Backend device ordinal, or `-1` when the backend does not expose one.
     fn device_ordinal(&self) -> i32 {
         -1
