@@ -100,6 +100,12 @@ impl<K, V> SlotMap<K, V> {
         }
     }
 
+    /// Slot the next insert uses. Check it before publishing a handle to a fixed-size
+    /// descriptor table.
+    pub fn next_index(&self) -> u32 {
+        self.free.last().copied().unwrap_or(self.slots.len() as u32)
+    }
+
     pub fn get(&self, handle: Handle<K>) -> Option<&V> {
         self.slots
             .get(handle.idx as usize)
@@ -214,6 +220,16 @@ mod tests {
         assert_eq!(map.get(h), Some(&7));
         assert_eq!(map.remove(h), Some(7));
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn next_index_tracks_reused_slots() {
+        let mut map = Map::new();
+        assert_eq!(map.next_index(), 0);
+        let first = map.insert(10);
+        assert_eq!(map.next_index(), 1);
+        map.remove(first);
+        assert_eq!(map.next_index(), first.index());
     }
 
     #[test]
