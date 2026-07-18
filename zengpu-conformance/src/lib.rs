@@ -4,6 +4,9 @@
 //! `compare_*` runs the same op on two devices and requires byte-identical results. One of them is
 //! the CPU oracle.
 
+use std::mem;
+use std::slice;
+
 use zengpu_hal::{
     Bindings, BufferDesc, BufferUsage, GpuDevice, GpuError, MemoryUsage, PipelineHandle, Scalar,
     UsageError,
@@ -175,7 +178,7 @@ fn compute_desc(size: u64) -> BufferDesc {
 }
 
 pub fn as_bytes_f32(s: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+    unsafe { slice::from_raw_parts(s.as_ptr() as *const u8, mem::size_of_val(s)) }
 }
 
 pub fn from_bytes_f32(b: &[u8]) -> Vec<f32> {

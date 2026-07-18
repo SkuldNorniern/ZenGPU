@@ -6,11 +6,13 @@
 /// 4. Compiles a C probe for `hipDeviceProp_t` field offsets, which shift between major ROCm
 ///    releases. Without an AMD compiler (or when cross-compiling) it falls back to ROCm 6/7 x86-64
 ///    offsets.
+use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let rocm_path = std::env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
+    let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
 
     println!("cargo:rustc-link-search=native={rocm_path}/lib");
     println!("cargo:rustc-link-lib=amdhip64");
@@ -39,7 +41,7 @@ fn find_rocm() -> String {
 
 fn detect_rocm_version(rocm_path: &str) -> (u32, u32) {
     let version_h = format!("{rocm_path}/include/hip/hip_version.h");
-    if let Ok(text) = std::fs::read_to_string(&version_h) {
+    if let Ok(text) = fs::read_to_string(&version_h) {
         let major = parse_define(&text, "HIP_VERSION_MAJOR");
         let minor = parse_define(&text, "HIP_VERSION_MINOR");
         if let (Some(maj), Some(min)) = (major, minor) {
@@ -78,7 +80,7 @@ fn parse_define(text: &str, name: &str) -> Option<u32> {
 }
 
 fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let layout_rs = out_dir.join("hip_layout.rs");
 
     let result = probe_layout(rocm_path);
@@ -112,15 +114,15 @@ fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
          pub const HIP_PROP_CLOCK_OFF:      usize = {clk_off};\n\
          pub const HIP_PROP_GCN_ARCH_LEN:   usize = 256;\n",
     );
-    std::fs::write(&layout_rs, content).expect("write hip_layout.rs");
+    fs::write(&layout_rs, content).expect("write hip_layout.rs");
 }
 
 fn probe_layout(rocm_path: &str) -> Result<(usize, usize, usize, usize, usize), String> {
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src = out_dir.join("hip_probe.cpp");
     let bin = out_dir.join("hip_probe");
 
-    std::fs::write(
+    fs::write(
         &src,
         r#"
 #define __HIP_PLATFORM_AMD__
