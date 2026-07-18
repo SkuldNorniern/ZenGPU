@@ -364,6 +364,43 @@ mod phase_z_tests {
     }
 
     #[test]
+    fn spirv_bindless_descriptor_array_declares_extension() {
+        let module = parse_compute(TRIG).expect("parse bindless-buffer shader");
+        let words = spirv::lower_compute(&module).expect("lower bindless-buffer shader to SPIR-V");
+        let mut at = 5usize;
+        let mut runtime_descriptor_array = false;
+        let mut descriptor_indexing_extension = false;
+        while at < words.len() {
+            let wc = (words[at] >> 16) as usize;
+            let opcode = words[at] & 0xffff;
+            assert!(
+                wc > 0 && at + wc <= words.len(),
+                "malformed SPIR-V instruction at word {at}"
+            );
+            if opcode == 17 && wc == 2 && words[at + 1] == 5302 {
+                runtime_descriptor_array = true;
+            }
+            if opcode == 10 {
+                let bytes: Vec<u8> = words[at + 1..at + wc]
+                    .iter()
+                    .flat_map(|word| word.to_le_bytes())
+                    .take_while(|byte| *byte != 0)
+                    .collect();
+                descriptor_indexing_extension |= bytes == b"SPV_EXT_descriptor_indexing";
+            }
+            at += wc;
+        }
+        assert!(
+            runtime_descriptor_array,
+            "missing RuntimeDescriptorArray capability"
+        );
+        assert!(
+            descriptor_indexing_extension,
+            "missing SPV_EXT_descriptor_indexing extension"
+        );
+    }
+
+    #[test]
     fn u32_cast_lowers_on_all_compute_backends() {
         let source = r#"
             @workgroup_size(1)
