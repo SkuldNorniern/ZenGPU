@@ -278,6 +278,32 @@ mod phase_z_tests {
         }
     "#;
 
+    const TRIG: &str = r#"
+        @workgroup_size(64)
+        kernel trig(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+            let x = src[id.x]
+            out[id.x] = sin(x) + cos(x) + tan(x)
+        }
+    "#;
+
+    #[test]
+    fn trigonometry_lowers_on_all_compute_backends() {
+        let module = parse_compute(TRIG).expect("parse trigonometry");
+        let hip_source = hip::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).source;
+        assert!(hip_source.contains("sinf(x)"));
+        assert!(hip_source.contains("cosf(x)"));
+        assert!(hip_source.contains("tanf(x)"));
+        assert!(cuda_source.contains("sinf(x)"));
+        assert!(cuda_source.contains("cosf(x)"));
+        assert!(cuda_source.contains("tanf(x)"));
+        assert!(msl_source.contains("sin(x)"));
+        assert!(msl_source.contains("cos(x)"));
+        assert!(msl_source.contains("tan(x)"));
+        spirv::lower_compute(&module).expect("lower trigonometry to SPIR-V");
+    }
+
     #[test]
     fn u32_cast_lowers_on_all_compute_backends() {
         let source = r#"
