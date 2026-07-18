@@ -10,8 +10,7 @@ use std::any::Any;
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, Bindings, BufferDesc, BufferHandle, ComputePipelineDesc,
     DeviceRequest, GpuAdapter, GpuDevice, GpuError, GpuInstance, HalCapabilities, PipelineHandle,
-    Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc,
-    TextureHandle,
+    Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc, TextureHandle,
 };
 
 #[cfg(target_os = "macos")]

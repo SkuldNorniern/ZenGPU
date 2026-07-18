@@ -330,7 +330,11 @@ impl SpvBuilder {
         let id = self.fresh_id();
         // The length constant must precede OpTypeArray, so fixed arrays live in
         // the combined types/constants/globals section after that constant.
-        emit(&mut self.constants_globals, op::TYPE_ARRAY, &[id.0, elem.0, len.0]);
+        emit(
+            &mut self.constants_globals,
+            op::TYPE_ARRAY,
+            &[id.0, elem.0, len.0],
+        );
         id
     }
 

@@ -474,9 +474,7 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
         IrStmt::AssignShared { .. } | IrStmt::Barrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }
-        IrStmt::AtomicAdd { .. } => {
-            Err("atomic_add is only available in compute shaders".into())
-        }
+        IrStmt::AtomicAdd { .. } => Err("atomic_add is only available in compute shaders".into()),
     }
 }
 
@@ -659,8 +657,12 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             let r = lower_expr(ctx, rhs)?;
             lower_arith(ctx, *op, l, r)
         }
-        IrExpr::GlobalId(_) | IrExpr::LocalId(_) | IrExpr::GroupId(_)
-        | IrExpr::SharedLoad { .. } => Err("workgroup expressions are only available in compute shaders".into()),
+        IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::SharedLoad { .. } => {
+            Err("workgroup expressions are only available in compute shaders".into())
+        }
     }
 }
 

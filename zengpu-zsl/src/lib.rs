@@ -288,8 +288,16 @@ mod phase_z_tests {
             }
         "#;
         let module = parse_compute(source).expect("parse u32 cast");
-        assert!(hip::lower_compute(&module).source.contains("(unsigned int)"));
-        assert!(cuda::lower_compute(&module).source.contains("(unsigned int)"));
+        assert!(
+            hip::lower_compute(&module)
+                .source
+                .contains("(unsigned int)")
+        );
+        assert!(
+            cuda::lower_compute(&module)
+                .source
+                .contains("(unsigned int)")
+        );
         assert!(msl::lower_compute(&module).source.contains("uint("));
         spirv::lower_compute(&module).expect("lower u32 cast to SPIR-V");
     }
@@ -314,7 +322,10 @@ mod phase_z_tests {
         while at < words.len() {
             let wc = (words[at] >> 16) as usize;
             let opcode = words[at] & 0xffff;
-            assert!(wc > 0 && at + wc <= words.len(), "malformed SPIR-V instruction at word {at}");
+            assert!(
+                wc > 0 && at + wc <= words.len(),
+                "malformed SPIR-V instruction at word {at}"
+            );
             if opcode == 6035 {
                 assert_eq!(wc, 7, "malformed OpAtomicFAddEXT");
                 atomic_fadds += 1;
@@ -333,8 +344,14 @@ mod phase_z_tests {
             at += wc;
         }
         assert_eq!(atomic_fadds, 1, "missing OpAtomicFAddEXT");
-        assert_eq!(atomic_float_caps, 1, "missing AtomicFloat32AddEXT capability");
-        assert!(atomic_extension, "missing SPV_EXT_shader_atomic_float extension");
+        assert_eq!(
+            atomic_float_caps, 1,
+            "missing AtomicFloat32AddEXT capability"
+        );
+        assert!(
+            atomic_extension,
+            "missing SPV_EXT_shader_atomic_float extension"
+        );
     }
 
     #[test]
@@ -353,9 +370,14 @@ mod phase_z_tests {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_scatter_add_{}_{}.hip", std::process::id(), tag));
+        let src_path = dir.join(format!(
+            "zsl_scatter_add_{}_{}.hip",
+            std::process::id(),
+            tag
+        ));
         let exe_path = dir.join(format!("zsl_scatter_add_{}_{}", std::process::id(), tag));
-        let harness = format!(r#"
+        let harness = format!(
+            r#"
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <vector>
@@ -387,18 +409,34 @@ int main() {{
     hipFree(didx); hipFree(dval); hipFree(dout);
     return mismatches == 0 ? 0 : 4;
 }}
-"#, shader.source);
+"#,
+            shader.source
+        );
         std::fs::write(&src_path, harness).expect("write HIP scatter proof source");
-        let compile = Command::new(&hipcc).arg("-O2").arg(&src_path).arg("-o").arg(&exe_path)
-            .output().expect("run hipcc");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
         if !compile.status.success() {
-            panic!("HIP scatter compilation failed:\n{}", String::from_utf8_lossy(&compile.stderr));
+            panic!(
+                "HIP scatter compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
         }
-        let run = Command::new(&exe_path).output().expect("run HIP scatter_add");
+        let run = Command::new(&exe_path)
+            .output()
+            .expect("run HIP scatter_add");
         let _ = std::fs::remove_file(&src_path);
         let _ = std::fs::remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(run.status.success(), "HIP scatter_add failed: {stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+        assert!(
+            run.status.success(),
+            "HIP scatter_add failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         eprintln!("HIP scatter_add: {}", stdout.trim());
     }
 
@@ -424,7 +462,10 @@ int main() {{
         while at < words.len() {
             let wc = (words[at] >> 16) as usize;
             let opcode = words[at] & 0xffff;
-            assert!(wc > 0 && at + wc <= words.len(), "malformed SPIR-V instruction at word {at}");
+            assert!(
+                wc > 0 && at + wc <= words.len(),
+                "malformed SPIR-V instruction at word {at}"
+            );
             if opcode == 59 && wc >= 4 && words[at + 3] == 4 {
                 workgroup_vars += 1;
             }
@@ -434,7 +475,11 @@ int main() {{
             }
             at += wc;
         }
-        assert_eq!(at, words.len(), "SPIR-V instruction stream ended mid-instruction");
+        assert_eq!(
+            at,
+            words.len(),
+            "SPIR-V instruction stream ended mid-instruction"
+        );
         assert_eq!(workgroup_vars, 2, "missing Workgroup variables");
         assert_eq!(barriers, 2, "missing control barriers");
     }
@@ -449,7 +494,10 @@ int main() {{
         let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
         let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
-            eprintln!("skipping HIP compile/runtime proof: {} not found", hipcc.display());
+            eprintln!(
+                "skipping HIP compile/runtime proof: {} not found",
+                hipcc.display()
+            );
             return;
         }
 
@@ -458,7 +506,8 @@ int main() {{
         let dir = std::env::temp_dir();
         let src_path = dir.join(format!("zsl_tiled_gemm_{}_{}.hip", std::process::id(), tag));
         let exe_path = dir.join(format!("zsl_tiled_gemm_{}_{}", std::process::id(), tag));
-        let harness = format!(r#"
+        let harness = format!(
+            r#"
 #include <hip/hip_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -491,18 +540,34 @@ int main() {{
     hipFree(da); hipFree(db); hipFree(dc);
     return max_err < 1.0e-3f ? 0 : 4;
 }}
-"#, shader.source);
+"#,
+            shader.source
+        );
         std::fs::write(&src_path, harness).expect("write HIP proof source");
-        let compile = Command::new(&hipcc).arg("-O2").arg(&src_path).arg("-o").arg(&exe_path)
-            .output().expect("run hipcc");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
         if !compile.status.success() {
-            panic!("HIP compilation failed:\n{}", String::from_utf8_lossy(&compile.stderr));
+            panic!(
+                "HIP compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
         }
-        let run = Command::new(&exe_path).output().expect("run HIP tiled GEMM");
+        let run = Command::new(&exe_path)
+            .output()
+            .expect("run HIP tiled GEMM");
         let _ = std::fs::remove_file(&src_path);
         let _ = std::fs::remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(run.status.success(), "HIP tiled GEMM failed: {stdout}\n{}", String::from_utf8_lossy(&run.stderr));
+        assert!(
+            run.status.success(),
+            "HIP tiled GEMM failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
         eprintln!("HIP tiled GEMM: {}", stdout.trim());
         if !stdout.contains("SKIP_NO_HIP_GPU") {
             let max_err: f32 = stdout.split_whitespace().last().unwrap().parse().unwrap();

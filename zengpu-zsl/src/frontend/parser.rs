@@ -226,11 +226,15 @@ impl<'a> Parser<'a> {
         let params = self.parse_params(&mut ctx)?;
         let body = self.parse_block(&mut ctx)?;
 
-        let shared = ctx.shared_order.iter().map(|name| SharedDecl {
-            name: name.clone(),
-            elem: ctx.shared[name].elem,
-            len: ctx.shared[name].len,
-        }).collect();
+        let shared = ctx
+            .shared_order
+            .iter()
+            .map(|name| SharedDecl {
+                name: name.clone(),
+                elem: ctx.shared[name].elem,
+                len: ctx.shared[name].len,
+            })
+            .collect();
 
         if self.pos != self.toks.len() {
             return self.err("unexpected trailing tokens after kernel");
@@ -452,13 +456,15 @@ impl<'a> Parser<'a> {
             _ => return self.err("shared array length must be a positive u32 literal"),
         };
         self.expect(&Tok::Gt, "`>` in array<f32, N>")?;
-        if ctx.shared.contains_key(&name) || ctx.buffers.contains_key(&name)
+        if ctx.shared.contains_key(&name)
+            || ctx.buffers.contains_key(&name)
             || ctx.locals.contains_key(&name)
         {
             return self.err(format!("duplicate symbol `{name}`"));
         }
         ctx.shared_order.push(name.clone());
-        ctx.shared.insert(name.clone(), SharedDecl { name, elem, len });
+        ctx.shared
+            .insert(name.clone(), SharedDecl { name, elem, len });
         Ok(())
     }
 
@@ -522,7 +528,11 @@ impl<'a> Parser<'a> {
                     if !ctx.shared.contains_key(&name) {
                         return self.err(format!("`{name}` is not a declared shared array"));
                     }
-                    Ok(IrStmt::AssignShared { name, index: *index, value: rhs })
+                    Ok(IrStmt::AssignShared {
+                        name,
+                        index: *index,
+                        value: rhs,
+                    })
                 }
                 _ => self.err("invalid assignment target; use a local, buffer[i], or shared[i]"),
             }
@@ -687,9 +697,17 @@ impl<'a> Parser<'a> {
                             "x" => 0,
                             "y" => 1,
                             "z" => 2,
-                            other => return self.err(format!("index builtin has no field `.{other}`; use .x/.y/.z")),
+                            other => {
+                                return self.err(format!(
+                                    "index builtin has no field `.{other}`; use .x/.y/.z"
+                                ));
+                            }
                         };
-                        return Ok(if name == "local_id" { IrExpr::LocalId(comp) } else { IrExpr::GroupId(comp) });
+                        return Ok(if name == "local_id" {
+                            IrExpr::LocalId(comp)
+                        } else {
+                            IrExpr::GroupId(comp)
+                        });
                     }
                     return self.parse_call(ctx, &name);
                 }
@@ -722,15 +740,23 @@ impl<'a> Parser<'a> {
                     let index = self.parse_expr(ctx)?;
                     self.expect(&Tok::RBracket, "`]`")?;
                     if ctx.buffers.contains_key(&name) {
-                        return Ok(IrExpr::BufferLoad { buf: name, index: Box::new(index) });
+                        return Ok(IrExpr::BufferLoad {
+                            buf: name,
+                            index: Box::new(index),
+                        });
                     }
                     if ctx.shared.contains_key(&name) {
                         if infer_ty(&index, ctx) != ScalarTy::U32 {
                             return self.err("shared array index must be u32");
                         }
-                        return Ok(IrExpr::SharedLoad { name, index: Box::new(index) });
+                        return Ok(IrExpr::SharedLoad {
+                            name,
+                            index: Box::new(index),
+                        });
                     }
-                    return self.err(format!("`{name}` is not a buffer or shared array; cannot index"));
+                    return self.err(format!(
+                        "`{name}` is not a buffer or shared array; cannot index"
+                    ));
                 }
                 // Bare name → a local.
                 if ctx.locals.contains_key(&name) {

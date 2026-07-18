@@ -42,11 +42,7 @@ unsafe extern "C" {
         headers: *const *const c_char,
         include_names: *const *const c_char,
     ) -> i32;
-    fn nvrtcCompileProgram(
-        prog: NvrtcProgram,
-        num_opts: i32,
-        opts: *const *const c_char,
-    ) -> i32;
+    fn nvrtcCompileProgram(prog: NvrtcProgram, num_opts: i32, opts: *const *const c_char) -> i32;
     fn nvrtcGetPTXSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
     fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut c_char) -> i32;
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
@@ -189,10 +185,7 @@ impl GpuAdapter for CudaAdapter {
             let _handle = from_cuda(ctx.enter())?;
             let mut s: sys::CUstream = ptr::null_mut();
             cu(unsafe {
-                sys::cuStreamCreate(
-                    &mut s,
-                    sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
-                )
+                sys::cuStreamCreate(&mut s, sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING)
             })?;
             s
         };
@@ -429,12 +422,7 @@ impl GpuDevice for CudaDevice {
         }
         let module = self.with_context(|_handle| {
             let mut m: sys::CUmodule = ptr::null_mut();
-            cu(unsafe {
-                sys::cuModuleLoadData(
-                    &mut m,
-                    ptx_vec.as_ptr() as *const c_void,
-                )
-            })?;
+            cu(unsafe { sys::cuModuleLoadData(&mut m, ptx_vec.as_ptr() as *const c_void) })?;
             Ok(m)
         })?;
         let handle = self
@@ -454,8 +442,7 @@ impl GpuDevice for CudaDevice {
             Err(_) => return,
         };
         if let Some(cs) = cs {
-            let _ = self
-                .with_context(|_handle| cu(unsafe { sys::cuModuleUnload(cs.module) }));
+            let _ = self.with_context(|_handle| cu(unsafe { sys::cuModuleUnload(cs.module) }));
         }
     }
 
@@ -569,8 +556,7 @@ impl GpuDevice for CudaDevice {
                     n_params += 1;
                 }
 
-                let mut kernel_params: [*mut c_void; MAX_PARAMS] =
-                    [ptr::null_mut(); MAX_PARAMS];
+                let mut kernel_params: [*mut c_void; MAX_PARAMS] = [ptr::null_mut(); MAX_PARAMS];
                 for (i, slot) in storage.iter_mut().take(n_params).enumerate() {
                     kernel_params[i] = slot.as_mut_ptr() as *mut c_void;
                 }
@@ -649,6 +635,22 @@ const VEC_ADD_PTX: &[u8] = b"\
 done:\n\
     ret;\n\
 }\n\0";
+
+/// CUDA C++ equivalent of [`VEC_ADD_PTX`], compiled at runtime with NVRTC.
+#[cfg(test)]
+const VEC_ADD_CUDA: &str = r#"
+extern "C" __global__ void vec_add_f32(
+    const float* a,
+    const float* b,
+    float* c,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        c[i] = a[i] + b[i];
+    }
+}
+"#;
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -858,6 +860,67 @@ mod tests {
                 (got - expected[i]).abs() < 1e-4,
                 "out[{i}] = {got}, expected {}",
                 expected[i]
+            );
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_a);
+        device.destroy_buffer(buf_b);
+        device.destroy_buffer(buf_out);
+    }
+
+    /// End-to-end CUDA C++ path: NVRTC compilation, module load, launch, and readback.
+    #[test]
+    fn cuda_source_nvrtc_vec_add() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let a: Vec<f32> = (0..N).map(|i| i as f32 * 0.25).collect();
+        let b: Vec<f32> = (0..N).map(|i| 1000.0 - i as f32 * 0.5).collect();
+        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let buf_a = device.create_buffer(desc).expect("create a");
+        let buf_b = device.create_buffer(desc).expect("create b");
+        let buf_out = device.create_buffer(desc).expect("create output");
+
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        device.write_buffer(buf_a, 0, &a_bytes).expect("upload a");
+        device.write_buffer(buf_b, 0, &b_bytes).expect("upload b");
+
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(VEC_ADD_CUDA))
+            .expect("compile CUDA C++ with NVRTC");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .expect("create NVRTC pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), buf_out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                [(N as u32).div_ceil(256), 1, 1],
+            )
+            .expect("dispatch NVRTC kernel");
+
+        let raw = device.read_buffer(buf_out, 0, size).expect("read output");
+        for i in 0..N {
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            let expected = a[i] + b[i];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "out[{i}] = {got}, expected {expected}"
             );
         }
 
