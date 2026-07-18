@@ -657,6 +657,19 @@ extern "C" __global__ void vec_add_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zengpu_spirv::{ZslShader, zsl};
+
+    const TRIG_ZSL: ZslShader = zsl!(
+        push P { len: u32 }
+        @workgroup_size(64)
+        kernel trig(src: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.len {
+                let x = src[i]
+                out[i] = sin(x) + cos(x) + tan(x)
+            }
+        }
+    );
 
     #[test]
     fn instance_constructs_without_panic() {
@@ -929,6 +942,58 @@ mod tests {
         device.destroy_buffer(buf_a);
         device.destroy_buffer(buf_b);
         device.destroy_buffer(buf_out);
+    }
+
+    #[test]
+    fn zsl_trigonometry_runs_through_cuda() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 128;
+        let input: Vec<f32> = (0..N).map(|i| -0.5 + i as f32 / N as f32).collect();
+        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let src = device.create_buffer(desc).expect("create source");
+        let out = device.create_buffer(desc).expect("create output");
+        let input_bytes: Vec<u8> = input.iter().flat_map(|value| value.to_le_bytes()).collect();
+        device
+            .write_buffer(src, 0, &input_bytes)
+            .expect("upload source");
+
+        let (shader_desc, entry) = TRIG_ZSL.for_backend(BackendPreference::Cuda);
+        let shader = device.create_shader(shader_desc).expect("compile ZSL CUDA");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .expect("create ZSL CUDA pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[src.index(), out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                [(N as u32).div_ceil(64), 1, 1],
+            )
+            .expect("dispatch ZSL CUDA trigonometry");
+
+        let raw = device.read_buffer(out, 0, size).expect("read output");
+        for (i, value) in input.iter().copied().enumerate() {
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            let expected = value.sin() + value.cos() + value.tan();
+            assert!((got - expected).abs() < 2e-5, "out[{i}] mismatch");
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(src);
+        device.destroy_buffer(out);
     }
 
     #[test]
