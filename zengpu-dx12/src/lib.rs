@@ -5,6 +5,8 @@
 //! `d3d12` bindings land. All device operations return
 //! `GpuError::Backend("not yet implemented")`.
 
+use std::any::Any;
+
 #[allow(unused_imports)]
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, BufferDesc, BufferHandle, DeviceRequest,
@@ -73,7 +75,7 @@ impl GpuAdapter for Dx12Adapter {
 pub struct Dx12Device;
 
 impl GpuDevice for Dx12Device {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 

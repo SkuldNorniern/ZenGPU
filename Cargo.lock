@@ -1881,6 +1881,7 @@ dependencies = [
 name = "zengpu-cuda"
 version = "0.0.1"
 dependencies = [
+ "cc",
  "cuda-oxide",
  "log",
  "zengpu-hal",

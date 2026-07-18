@@ -20,6 +20,8 @@
 //! | gfx1200 (RDNA 4) targets            | 7.0      |
 //! | WMMAv2 matrix instructions (RDNA 3) | 5.4      |
 
+use std::fmt;
+
 use crate::hip_layout::{ROCM_VERSION_MAJOR, ROCM_VERSION_MINOR};
 
 pub use crate::hip_layout::{
@@ -68,8 +70,8 @@ impl RocmVersion {
     }
 }
 
-impl std::fmt::Display for RocmVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for RocmVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.major, self.minor)
     }
 }

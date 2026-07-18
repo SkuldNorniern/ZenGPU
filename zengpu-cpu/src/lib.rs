@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -117,7 +118,7 @@ fn out_of_bounds(start: usize, end: usize, len: usize) -> GpuError {
 // ── GpuDevice ─────────────────────────────────────────────────────────────────
 
 impl GpuDevice for CpuDevice {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -200,6 +201,11 @@ impl GpuDevice for CpuDevice {
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         let bytes = match desc.source {
             ShaderSource::Spirv(b) | ShaderSource::Ptx(b) | ShaderSource::Msl(b) => b,
+            ShaderSource::Hip(_) | ShaderSource::CudaSrc(_) => {
+                return Err(GpuError::Unsupported(
+                    "CPU backend does not support HIP or CUDA source shaders".to_string(),
+                ));
+            }
         };
         Ok(self.shaders.lock().unwrap().insert(bytes.to_vec()))
     }

@@ -12,10 +12,10 @@ use zengpu_hal::{
     BlendMode, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc,
     PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat, VertexLayout,
 };
-use zengpu_spirv::zsl;
+use zengpu_spirv::{ZslShader, zsl};
 use zengpu_vulkan::{DepthTarget, OffscreenTarget, VulkanInstance};
 
-const VS: &[u32] = zsl!(
+const VS: ZslShader = zsl!(
     push P { model: mat4x4<f32>, view_proj: mat4x4<f32> }
     vertex vs(
         @location(0) pos: f32x3,
@@ -27,7 +27,7 @@ const VS: &[u32] = zsl!(
     }
 );
 
-const FS: &[u32] = zsl!(
+const FS: ZslShader = zsl!(
     fragment fs(@location(0) v_col: f32x3) -> f32x4 {
         v_col.extend(1.0)
     }
@@ -71,10 +71,10 @@ fn main() {
 
     eprintln!("repro: create shaders (glslang SPIR-V)");
     let vs = device
-        .create_shader(ShaderDesc::spirv(bytemuck_cast(VS)))
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(VS.spv)))
         .expect("vs");
     let fs = device
-        .create_shader(ShaderDesc::spirv(bytemuck_cast(FS)))
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(FS.spv)))
         .expect("fs");
 
     eprintln!("repro: create_graphics_pipeline");
@@ -102,11 +102,11 @@ fn main() {
 
     eprintln!(
         "\n=== glslang VERTEX disassembly ===\n{}",
-        zengpu_spv::disassemble(VS)
+        zengpu_spv::disassemble(VS.spv)
     );
     eprintln!(
         "\n=== glslang FRAGMENT disassembly ===\n{}",
-        zengpu_spv::disassemble(FS)
+        zengpu_spv::disassemble(FS.spv)
     );
 }
 

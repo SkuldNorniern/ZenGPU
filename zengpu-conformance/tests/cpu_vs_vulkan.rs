@@ -7,11 +7,11 @@ use zengpu_cpu::CpuDevice;
 use zengpu_hal::{
     AdapterRequest, ComputePipelineDesc, DeviceRequest, GpuDevice, GpuInstance, ShaderDesc,
 };
-use zengpu_spirv::zsl;
+use zengpu_spirv::{ZslShader, zsl};
 use zengpu_vulkan::VulkanInstance;
 
 /// vec_add: out[i] = a[i] + b[i] for i in 0..len (matches `ZenGPU/examples/vec_add.rs`).
-const VEC_ADD_SPV: &[u32] = zsl!(
+const VEC_ADD_SHADER: ZslShader = zsl!(
     push P { len: u32 }
     @workgroup_size(256)
     kernel add(a: device buffer<f32>, b: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -23,7 +23,12 @@ const VEC_ADD_SPV: &[u32] = zsl!(
 );
 
 fn vec_add_spv_bytes() -> &'static [u8] {
-    unsafe { std::slice::from_raw_parts(VEC_ADD_SPV.as_ptr() as *const u8, VEC_ADD_SPV.len() * 4) }
+    unsafe {
+        std::slice::from_raw_parts(
+            VEC_ADD_SHADER.spv.as_ptr() as *const u8,
+            std::mem::size_of_val(VEC_ADD_SHADER.spv),
+        )
+    }
 }
 
 fn register_vec_add_kernel(dev: &CpuDevice, pipeline: zengpu_hal::PipelineHandle) {
