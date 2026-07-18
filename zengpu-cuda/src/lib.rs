@@ -189,9 +189,10 @@ impl GpuAdapter for CudaAdapter {
                 ctx_lock: Mutex::new(()),
                 stream,
             }),
-            buffers: Mutex::new(SlotMap::new()),
-            shaders: Mutex::new(SlotMap::new()),
-            pipelines: Mutex::new(SlotMap::new()),
+            buffers: Arc::new(Mutex::new(SlotMap::new())),
+            shaders: Arc::new(Mutex::new(SlotMap::new())),
+            pipelines: Arc::new(Mutex::new(SlotMap::new())),
+            lifetime: Arc::new(Mutex::new(CudaLifetimeState::default())),
         }))
     }
 }
@@ -221,6 +222,18 @@ struct CudaPipeline {
 // SAFETY: CUfunction is opaque; all access goes through ctx_lock.
 unsafe impl Send for CudaPipeline {}
 unsafe impl Sync for CudaPipeline {}
+
+enum DeferredCudaResource {
+    Buffer(u32, CudaBuffer),
+    Shader(u32, CudaShader),
+    Pipeline(u32),
+}
+
+#[derive(Default)]
+struct CudaLifetimeState {
+    in_flight: usize,
+    deferred: Vec<DeferredCudaResource>,
+}
 
 /// An opened CUDA device. Compute only: buffers, shaders and dispatch use the CUDA Driver API.
 ///
@@ -263,9 +276,10 @@ impl Drop for CudaShared {
 
 pub struct CudaDevice {
     shared: Arc<CudaShared>,
-    buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
-    shaders: Mutex<SlotMap<marker::Shader, CudaShader>>,
-    pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
+    buffers: Arc<Mutex<SlotMap<marker::Buffer, CudaBuffer>>>,
+    shaders: Arc<Mutex<SlotMap<marker::Shader, CudaShader>>>,
+    pipelines: Arc<Mutex<SlotMap<marker::Pipeline, CudaPipeline>>>,
+    lifetime: Arc<Mutex<CudaLifetimeState>>,
 }
 
 // SAFETY: see the CudaDevice doc comment above.
@@ -286,6 +300,10 @@ struct CudaSubmission {
     cycle_id: u64,
     shared: Arc<CudaShared>,
     event: Mutex<Option<sys::CUevent>>,
+    buffers: Arc<Mutex<SlotMap<marker::Buffer, CudaBuffer>>>,
+    shaders: Arc<Mutex<SlotMap<marker::Shader, CudaShader>>>,
+    pipelines: Arc<Mutex<SlotMap<marker::Pipeline, CudaPipeline>>>,
+    lifetime: Arc<Mutex<CudaLifetimeState>>,
 }
 
 // SAFETY: CUevent is opaque and every operation enters the serialized context.
@@ -293,6 +311,16 @@ unsafe impl Send for CudaSubmission {}
 unsafe impl Sync for CudaSubmission {}
 
 impl CudaSubmission {
+    fn release_in_flight(&self) {
+        release_cuda_in_flight(
+            &self.shared,
+            &self.buffers,
+            &self.shaders,
+            &self.pipelines,
+            &self.lifetime,
+        );
+    }
+
     fn query(&self) -> Result<SubmissionStatus> {
         let mut event = self.event.lock().map_err(|_| GpuError::DeviceLost)?;
         let Some(raw) = *event else {
@@ -305,6 +333,7 @@ impl CudaSubmission {
             self.shared
                 .with_context(|_| cu(unsafe { sys::cuEventDestroy_v2(raw) }))?;
             *event = None;
+            self.release_in_flight();
             Ok(SubmissionStatus::Complete)
         } else if code == sys::cudaError_enum_CUDA_ERROR_NOT_READY {
             Ok(SubmissionStatus::Pending)
@@ -352,14 +381,49 @@ impl Drop for CudaSubmission {
             cu(unsafe { sys::cuEventSynchronize(raw) })?;
             cu(unsafe { sys::cuEventDestroy_v2(raw) })
         });
+        self.release_in_flight();
+    }
+}
+
+fn release_cuda_in_flight(
+    shared: &CudaShared,
+    buffers: &Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
+    shaders: &Mutex<SlotMap<marker::Shader, CudaShader>>,
+    pipelines: &Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
+    lifetime: &Mutex<CudaLifetimeState>,
+) {
+    let deferred = {
+        let mut lifetime = lifetime.lock().unwrap();
+        debug_assert!(lifetime.in_flight > 0);
+        lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
+        if lifetime.in_flight == 0 {
+            std::mem::take(&mut lifetime.deferred)
+        } else {
+            Vec::new()
+        }
+    };
+    for resource in deferred {
+        match resource {
+            DeferredCudaResource::Buffer(index, buffer) => {
+                let _ = shared.with_context(|_| cu(unsafe { sys::cuMemFree_v2(buffer.ptr) }));
+                buffers.lock().unwrap().release_retired(index);
+            }
+            DeferredCudaResource::Shader(index, shader) => {
+                let _ = shared.with_context(|_| cu(unsafe { sys::cuModuleUnload(shader.module) }));
+                shaders.lock().unwrap().release_retired(index);
+            }
+            DeferredCudaResource::Pipeline(index) => {
+                pipelines.lock().unwrap().release_retired(index);
+            }
+        }
     }
 }
 
 impl Drop for CudaDevice {
     fn drop(&mut self) {
-        let buffers: Vec<CudaBuffer> = self.buffers.get_mut().unwrap().drain().collect();
-        let shaders: Vec<CudaShader> = self.shaders.get_mut().unwrap().drain().collect();
-        let pipelines: Vec<CudaPipeline> = self.pipelines.get_mut().unwrap().drain().collect();
+        let buffers: Vec<CudaBuffer> = self.buffers.lock().unwrap().drain().collect();
+        let shaders: Vec<CudaShader> = self.shaders.lock().unwrap().drain().collect();
+        let pipelines: Vec<CudaPipeline> = self.pipelines.lock().unwrap().drain().collect();
 
         let _ = self.shared.with_context(|handle| {
             cu(unsafe { sys::cuStreamSynchronize(self.shared.stream) })?;
@@ -407,19 +471,27 @@ impl GpuDevice for CudaDevice {
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
-        let cb = self
-            .buffers
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .get(buffer)
-            .copied()
-            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
-
-        if offset + data.len() as u64 > cb.len {
-            return Err(GpuError::Backend("cuda: write out of bounds".into()));
-        }
-
         self.with_context(|handle| {
+            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let cb = buffers
+                .get(buffer)
+                .copied()
+                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+            if self
+                .lifetime
+                .lock()
+                .map_err(|_| GpuError::DeviceLost)?
+                .in_flight
+                != 0
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "write_buffer cannot mutate buffers while an asynchronous submission is pending"
+                        .into(),
+                )));
+            }
+            if offset + data.len() as u64 > cb.len {
+                return Err(GpuError::Backend("cuda: write out of bounds".into()));
+            }
             // SAFETY: ptr/len from our buffer table; context is current.
             let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
             let view = dp.subslice(offset, offset + data.len() as u64);
@@ -428,19 +500,27 @@ impl GpuDevice for CudaDevice {
     }
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let cb = self
-            .buffers
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .get(buffer)
-            .copied()
-            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
-
-        if offset + len > cb.len {
-            return Err(GpuError::Backend("cuda: read out of bounds".into()));
-        }
-
         self.with_context(|handle| {
+            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let cb = buffers
+                .get(buffer)
+                .copied()
+                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+            if self
+                .lifetime
+                .lock()
+                .map_err(|_| GpuError::DeviceLost)?
+                .in_flight
+                != 0
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "read_buffer cannot observe buffers while an asynchronous submission is pending"
+                        .into(),
+                )));
+            }
+            if offset + len > cb.len {
+                return Err(GpuError::Backend("cuda: read out of bounds".into()));
+            }
             // SAFETY: ptr/len from our buffer table; context is current.
             let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
             let view = dp.subslice(offset, offset + len);
@@ -456,8 +536,19 @@ impl GpuDevice for CudaDevice {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
-        let (src_buf, dst_buf) = {
+        self.with_context(|handle| {
             let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            if self
+                .lifetime
+                .lock()
+                .map_err(|_| GpuError::DeviceLost)?
+                .in_flight
+                != 0
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "copy_buffer cannot run while an asynchronous submission is pending".into(),
+                )));
+            }
             let src_buf = buffers
                 .get(src)
                 .copied()
@@ -465,47 +556,44 @@ impl GpuDevice for CudaDevice {
             let dst_buf = buffers.get(dst).copied().ok_or_else(|| {
                 GpuError::Backend("cuda: invalid destination buffer handle".into())
             })?;
-            (src_buf, dst_buf)
-        };
-        if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
-            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                resource: "source buffer",
-                needed: "TRANSFER_SRC",
-            }));
-        }
-        if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
-            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                resource: "destination buffer",
-                needed: "TRANSFER_DST",
-            }));
-        }
-        if src == dst {
-            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "copy_buffer requires distinct source and destination buffers".into(),
-            )));
-        }
-        let src_end = src_offset.checked_add(len).ok_or_else(|| {
-            GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "source copy range overflows u64".into(),
-            ))
-        })?;
-        let dst_end = dst_offset.checked_add(len).ok_or_else(|| {
-            GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "destination copy range overflows u64".into(),
-            ))
-        })?;
-        if src_end > src_buf.len || dst_end > dst_buf.len {
-            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                format!(
-                    "copy ranges src {src_offset}..{src_end}/{} dst {dst_offset}..{dst_end}/{}",
-                    src_buf.len, dst_buf.len
-                ),
-            )));
-        }
-        if len == 0 {
-            return Ok(());
-        }
-        self.with_context(|handle| {
+            if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "source buffer",
+                    needed: "TRANSFER_SRC",
+                }));
+            }
+            if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "destination buffer",
+                    needed: "TRANSFER_DST",
+                }));
+            }
+            if src == dst {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "copy_buffer requires distinct source and destination buffers".into(),
+                )));
+            }
+            let src_end = src_offset.checked_add(len).ok_or_else(|| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "source copy range overflows u64".into(),
+                ))
+            })?;
+            let dst_end = dst_offset.checked_add(len).ok_or_else(|| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "destination copy range overflows u64".into(),
+                ))
+            })?;
+            if src_end > src_buf.len || dst_end > dst_buf.len {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!(
+                        "copy ranges src {src_offset}..{src_end}/{} dst {dst_offset}..{dst_end}/{}",
+                        src_buf.len, dst_buf.len
+                    ),
+                )));
+            }
+            if len == 0 {
+                return Ok(());
+            }
             let src_ptr =
                 unsafe { DevicePtr::from_raw_parts(handle.clone(), src_buf.ptr, src_buf.len) };
             let dst_ptr = unsafe { DevicePtr::from_raw_parts(handle, dst_buf.ptr, dst_buf.len) };
@@ -518,9 +606,25 @@ impl GpuDevice for CudaDevice {
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
-        let cb = match self.buffers.lock() {
-            Ok(mut g) => g.remove(buffer),
-            Err(_) => return,
+        let cb = {
+            let mut buffers = match self.buffers.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            let mut lifetime = match self.lifetime.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            if lifetime.in_flight != 0 {
+                if let Some(cb) = buffers.retire(buffer) {
+                    lifetime
+                        .deferred
+                        .push(DeferredCudaResource::Buffer(buffer.index(), cb));
+                }
+                None
+            } else {
+                buffers.remove(buffer)
+            }
         };
         if let Some(cb) = cb {
             let _ = self.with_context(|handle| {
@@ -585,9 +689,25 @@ impl GpuDevice for CudaDevice {
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
-        let cs = match self.shaders.lock() {
-            Ok(mut g) => g.remove(shader),
-            Err(_) => return,
+        let cs = {
+            let mut shaders = match self.shaders.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            let mut lifetime = match self.lifetime.lock() {
+                Ok(guard) => guard,
+                Err(_) => return,
+            };
+            if lifetime.in_flight != 0 {
+                if let Some(cs) = shaders.retire(shader) {
+                    lifetime
+                        .deferred
+                        .push(DeferredCudaResource::Shader(shader.index(), cs));
+                }
+                None
+            } else {
+                shaders.remove(shader)
+            }
         };
         if let Some(cs) = cs {
             let _ = self.with_context(|_handle| cu(unsafe { sys::cuModuleUnload(cs.module) }));
@@ -626,8 +746,20 @@ impl GpuDevice for CudaDevice {
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
-        if let Ok(mut g) = self.pipelines.lock() {
-            g.remove(pipeline);
+        let Ok(mut pipelines) = self.pipelines.lock() else {
+            return;
+        };
+        let Ok(mut lifetime) = self.lifetime.lock() else {
+            return;
+        };
+        if lifetime.in_flight != 0 {
+            if pipelines.retire(pipeline).is_some() {
+                lifetime
+                    .deferred
+                    .push(DeferredCudaResource::Pipeline(pipeline.index()));
+            }
+        } else {
+            pipelines.remove(pipeline);
         }
     }
 
@@ -660,6 +792,10 @@ impl GpuDevice for CudaDevice {
         const MAX_PARAMS: usize = 32;
 
         let stream = self.shared.stream;
+        self.lifetime
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .in_flight += 1;
         let event = self.with_context(|_handle| {
             for op in ops {
                 let cp = self
@@ -732,11 +868,29 @@ impl GpuDevice for CudaDevice {
                 return Err(e);
             }
             Ok(event)
-        })?;
+        });
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = self.with_context(|_| cu(unsafe { sys::cuStreamSynchronize(stream) }));
+                release_cuda_in_flight(
+                    &self.shared,
+                    &self.buffers,
+                    &self.shaders,
+                    &self.pipelines,
+                    &self.lifetime,
+                );
+                return Err(error);
+            }
+        };
         Ok(Box::new(CudaSubmission {
             cycle_id,
             shared: Arc::clone(&self.shared),
             event: Mutex::new(Some(event)),
+            buffers: Arc::clone(&self.buffers),
+            shaders: Arc::clone(&self.shaders),
+            pipelines: Arc::clone(&self.pipelines),
+            lifetime: Arc::clone(&self.lifetime),
         }))
     }
 }
@@ -1377,10 +1531,39 @@ mod tests {
             )
             .expect("submit_batch");
         assert_eq!(submission.cycle_id(), 77);
+        let second_out = device.create_buffer(gpu(size)).unwrap();
+        let second_submission = device
+            .submit(
+                78,
+                pipeline,
+                Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), second_out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                grid,
+            )
+            .unwrap();
+        assert!(device.write_buffer(buf_a, 0, &[0; 4]).is_err());
+        let retired_sum_index = buf_sum.index();
+        device.destroy_buffer(buf_sum);
+        device.destroy_pipeline(pipeline);
+        assert!(device.write_buffer(buf_sum, 0, &[0; 4]).is_err());
+        let allocated_while_pending = device.create_buffer(gpu(size)).unwrap();
+        assert_ne!(allocated_while_pending.index(), retired_sum_index);
         let zero_wait = submission.wait(Duration::ZERO);
         assert!(zero_wait.is_ok() || matches!(zero_wait, Err(GpuError::Timeout)));
         submission.wait(Duration::from_secs(5)).unwrap();
         assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
+        let allocated_after_first = device.create_buffer(gpu(size)).unwrap();
+        assert_ne!(allocated_after_first.index(), retired_sum_index);
+        second_submission.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            second_submission.poll().unwrap(),
+            SubmissionStatus::Complete
+        );
+        let allocated_after_completion = device.create_buffer(gpu(size)).unwrap();
+        assert_eq!(allocated_after_completion.index(), retired_sum_index);
 
         let raw = device.read_buffer(buf_out, 0, size).unwrap();
         for i in 0..N {
@@ -1392,11 +1575,14 @@ mod tests {
             );
         }
 
-        device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
         device.destroy_buffer(buf_a);
         device.destroy_buffer(buf_b);
         device.destroy_buffer(buf_sum);
         device.destroy_buffer(buf_out);
+        device.destroy_buffer(allocated_while_pending);
+        device.destroy_buffer(allocated_after_first);
+        device.destroy_buffer(allocated_after_completion);
+        device.destroy_buffer(second_out);
     }
 }

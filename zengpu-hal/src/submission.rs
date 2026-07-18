@@ -9,9 +9,12 @@ pub enum SubmissionStatus {
     Complete,
 }
 
-/// A submitted unit of GPU work. `cycle` is caller-supplied and never read by the backend;
-/// real-time code uses it to drop completions from older cycles. Referenced resources stay alive
-/// until [`SubmissionStatus::Complete`].
+/// The cycle id is caller-defined and never read by the backend. Real-time consumers use it to
+/// reject completions from an older cycle.
+///
+/// Backends keep native resources and descriptor slots alive until completion. Destroying a
+/// handle while work is pending invalidates it immediately, but native destruction and slot
+/// reuse may be deferred.
 pub trait GpuSubmission: Send + Sync {
     fn cycle_id(&self) -> u64;
 
