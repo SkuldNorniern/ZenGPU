@@ -40,6 +40,18 @@ pub trait GpuDevice: Send + Sync {
     /// have been created with [`crate::BufferUsage::READBACK`].
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Read bytes into caller-owned storage without requiring an allocation.
+    /// The buffer must have [`crate::BufferUsage::READBACK`]; the read range is
+    /// `offset..offset + dst.len()`.
+    ///
+    /// The default preserves compatibility by using [`Self::read_buffer`].
+    /// Real-time backends override this with a direct copy into `dst`.
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let bytes = self.read_buffer(buffer, offset, dst.len() as u64)?;
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Copy `len` bytes between buffers on this device. `src` must have
     /// [`crate::BufferUsage::TRANSFER_SRC`] and `dst` must have
     /// [`crate::BufferUsage::TRANSFER_DST`]. The call is synchronous: the

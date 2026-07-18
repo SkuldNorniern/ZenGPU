@@ -50,6 +50,15 @@ impl Device {
         self.inner.read_buffer(buffer, offset, len)
     }
 
+    pub fn read_buffer_into(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<()> {
+        self.inner.read_buffer_into(buffer, offset, dst)
+    }
+
     pub fn destroy_buffer(&self, buffer: BufferHandle) {
         self.inner.destroy_buffer(buffer)
     }
@@ -191,6 +200,10 @@ impl GpuDevice for Device {
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.inner.read_buffer(buffer, offset, len)
+    }
+
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.inner.read_buffer_into(buffer, offset, dst)
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {

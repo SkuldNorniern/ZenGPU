@@ -1536,6 +1536,44 @@ impl GpuDevice for VulkanDevice {
         Ok(out)
     }
 
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        if self.lifetime.lock().unwrap().in_flight != 0 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "read_buffer_into cannot observe buffers while an asynchronous submission is pending"
+                    .into(),
+            )));
+        }
+        if !buf.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
+        if buf.mapped.is_null() {
+            return Err(GpuError::Backend(
+                "read_buffer_into on non-host-visible buffer".to_string(),
+            ));
+        }
+        let start = offset as usize;
+        let end = start.checked_add(dst.len()).ok_or_else(|| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                "range {start}..overflow exceeds buffer size {}",
+                buf.size
+            )))
+        })?;
+        if end > buf.size as usize {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!("range {start}..{end} exceeds buffer size {}", buf.size),
+            )));
+        }
+        unsafe {
+            copy_nonoverlapping(buf.mapped.add(start), dst.as_mut_ptr(), dst.len());
+        }
+        Ok(())
+    }
+
     fn copy_buffer(
         &self,
         src: BufferHandle,

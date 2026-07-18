@@ -31,6 +31,7 @@ fn rw_desc(size: u64) -> BufferDesc {
 pub fn run_buffer_suite(label: &str, dev: &dyn GpuDevice) {
     buffer_roundtrip(label, dev);
     buffer_partial_read(label, dev);
+    buffer_read_into(label, dev);
     buffer_zero_init(label, dev);
     buffer_missing_readback_usage(label, dev);
     buffer_stale_after_destroy(label, dev);
@@ -132,6 +133,27 @@ fn buffer_multiple_allocs(label: &str, dev: &dyn GpuDevice) {
     for h in handles {
         dev.destroy_buffer(h);
     }
+}
+
+fn buffer_read_into(label: &str, dev: &dyn GpuDevice) {
+    let h = dev.create_buffer(rw_desc(8)).unwrap();
+    dev.write_buffer(h, 0, &[10, 20, 30, 40, 50, 60, 70, 80])
+        .unwrap();
+    let mut caller_owned = [0xAA; 6];
+    dev.read_buffer_into(h, 2, &mut caller_owned[1..5]).unwrap();
+    assert_eq!(
+        caller_owned,
+        [0xAA, 30, 40, 50, 60, 0xAA],
+        "[{label}] allocation-free caller-owned readback"
+    );
+    let err = dev
+        .read_buffer_into(h, 7, &mut caller_owned[..2])
+        .unwrap_err();
+    assert!(
+        matches!(err, GpuError::InvalidUsage(UsageError::BindingMismatch(_))),
+        "[{label}] read_buffer_into bounds: got {err}"
+    );
+    dev.destroy_buffer(h);
 }
 
 fn buffer_copy_ranges(label: &str, dev: &dyn GpuDevice) {

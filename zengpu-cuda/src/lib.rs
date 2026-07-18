@@ -535,6 +535,12 @@ impl GpuDevice for CudaDevice {
                 .get(buffer)
                 .copied()
                 .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+            if !cb.usage.contains(BufferUsage::READBACK) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "buffer",
+                    needed: "READBACK",
+                }));
+            }
             if self
                 .lifetime
                 .lock()
@@ -554,6 +560,56 @@ impl GpuDevice for CudaDevice {
             let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
             let view = dp.subslice(offset, offset + len);
             from_cuda(view.load())
+        })
+    }
+
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.with_context(|_handle| {
+            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let cb = buffers
+                .get(buffer)
+                .copied()
+                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+            if !cb.usage.contains(BufferUsage::READBACK) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "buffer",
+                    needed: "READBACK",
+                }));
+            }
+            if self
+                .lifetime
+                .lock()
+                .map_err(|_| GpuError::DeviceLost)?
+                .in_flight
+                != 0
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "read_buffer_into cannot observe buffers while an asynchronous submission is pending"
+                        .into(),
+                )));
+            }
+            let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "cuda: read range overflows u64".into(),
+                ))
+            })?;
+            if end > cb.len {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!("cuda: read range {offset}..{end} exceeds {}", cb.len),
+                )));
+            }
+            let byte_count = u32::try_from(dst.len()).map_err(|_| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "cuda: caller-owned readback exceeds driver byte-count range".into(),
+                ))
+            })?;
+            cu(unsafe {
+                sys::cuMemcpyDtoH_v2(
+                    dst.as_mut_ptr() as *mut c_void,
+                    cb.ptr + offset,
+                    byte_count,
+                )
+            })
         })
     }
 
@@ -1110,7 +1166,7 @@ mod tests {
         let buf = device
             .create_buffer(BufferDesc {
                 size: 256,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .expect("create_buffer failed");
@@ -1118,6 +1174,11 @@ mod tests {
         device.write_buffer(buf, 0, &data).expect("write failed");
         let read_back = device.read_buffer(buf, 0, 256).expect("read failed");
         assert_eq!(read_back, data);
+        let mut caller_owned = [0u8; 32];
+        device
+            .read_buffer_into(buf, 17, &mut caller_owned)
+            .expect("read into caller-owned storage failed");
+        assert_eq!(caller_owned.as_slice(), &data[17..49]);
         device.destroy_buffer(buf);
     }
 
@@ -1127,7 +1188,7 @@ mod tests {
         let buf = device
             .create_buffer(BufferDesc {
                 size: 512,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .expect("create_buffer");
@@ -1151,7 +1212,7 @@ mod tests {
         let Some(device) = cuda_device() else { return };
         let desc = BufferDesc {
             size: 128,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let a = device.create_buffer(desc).expect("create a");
@@ -1182,7 +1243,7 @@ mod tests {
         let buf = device
             .create_buffer(BufferDesc {
                 size: SIZE,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .expect("create 16 MiB buffer");
@@ -1234,21 +1295,21 @@ mod tests {
         let buf_a = device
             .create_buffer(BufferDesc {
                 size,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .unwrap();
         let buf_b = device
             .create_buffer(BufferDesc {
                 size,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .unwrap();
         let buf_out = device
             .create_buffer(BufferDesc {
                 size,
-                usage: zengpu_hal::BufferUsage::STORAGE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
                 memory: zengpu_hal::MemoryUsage::GpuOnly,
             })
             .unwrap();
@@ -1308,7 +1369,7 @@ mod tests {
         let size = (N * std::mem::size_of::<f32>()) as u64;
         let desc = BufferDesc {
             size,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let buf_a = device.create_buffer(desc).expect("create a");
@@ -1367,7 +1428,7 @@ mod tests {
         let size = (N * std::mem::size_of::<f32>()) as u64;
         let desc = BufferDesc {
             size,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let src = device.create_buffer(desc).expect("create source");
@@ -1422,7 +1483,7 @@ mod tests {
         let size = (N * std::mem::size_of::<u32>()) as u64;
         let desc = BufferDesc {
             size,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let src_u = device.create_buffer(desc).expect("create src_u");
@@ -1481,7 +1542,7 @@ mod tests {
         let size = std::mem::size_of_val(&input) as u64;
         let desc = BufferDesc {
             size,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let src = device.create_buffer(desc).expect("create source");
@@ -1538,7 +1599,7 @@ mod tests {
         let size = (N * std::mem::size_of::<f32>()) as u64;
         let gpu = |size| BufferDesc {
             size,
-            usage: zengpu_hal::BufferUsage::STORAGE,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
             memory: zengpu_hal::MemoryUsage::GpuOnly,
         };
         let buf_a = device.create_buffer(gpu(size)).unwrap();

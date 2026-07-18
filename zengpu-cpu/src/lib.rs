@@ -170,6 +170,26 @@ impl GpuDevice for CpuDevice {
         Ok(buf.data[start..end].to_vec())
     }
 
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let buffers = self.buffers.lock().unwrap();
+        let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        if !buf.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
+        let start = offset as usize;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or_else(|| out_of_bounds(start, usize::MAX, buf.data.len()))?;
+        if end > buf.data.len() {
+            return Err(out_of_bounds(start, end, buf.data.len()));
+        }
+        dst.copy_from_slice(&buf.data[start..end]);
+        Ok(())
+    }
+
     fn copy_buffer(
         &self,
         src: BufferHandle,
