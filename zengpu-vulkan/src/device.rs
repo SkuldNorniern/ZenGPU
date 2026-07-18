@@ -10,8 +10,8 @@ use std::{
 use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
-    CompareFn, ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, FilterMode, Format,
-    FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities,
+    CompareFn, ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, Features, FilterMode,
+    Format, FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities,
     MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
     SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
@@ -376,7 +376,7 @@ impl VulkanDevice {
     pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
-        _req: DeviceRequest,
+        req: DeviceRequest,
         extra_extensions: &[*const i8],
         needs_graphics: bool,
     ) -> Result<Self> {
@@ -392,6 +392,15 @@ impl VulkanDevice {
                 CStr::from_ptr(extension.extension_name.as_ptr()) == name
             })
         };
+        for &extension in extra_extensions {
+            let name = unsafe { CStr::from_ptr(extension) };
+            if !supports_extension(name) {
+                return Err(GpuError::Backend(format!(
+                    "required Vulkan device extension is unavailable: {}",
+                    name.to_string_lossy()
+                )));
+            }
+        }
         if supports_extension(khr::portability_subset::NAME) {
             extensions.push(khr::portability_subset::NAME.as_ptr());
         }
@@ -405,10 +414,7 @@ impl VulkanDevice {
             }
             extensions.push(khr::dynamic_rendering::NAME.as_ptr());
         }
-        let shader_atomic_float = supports_extension(ext::shader_atomic_float::NAME);
-        if shader_atomic_float {
-            extensions.push(ext::shader_atomic_float::NAME.as_ptr());
-        }
+        let shader_atomic_float_extension = supports_extension(ext::shader_atomic_float::NAME);
 
         let queue_family =
             queue_family(&shared.instance, physical, needs_graphics).ok_or_else(|| {
@@ -428,7 +434,58 @@ impl VulkanDevice {
             ..Default::default()
         };
 
-        let supported_features = unsafe { shared.instance.get_physical_device_features(physical) };
+        let mut supported_desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
+        let mut supported_dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+        let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+        supported_desc_idx.p_next = &mut supported_dynamic_rendering as *mut _ as *mut c_void;
+        supported_dynamic_rendering.p_next = &mut supported_atomic_float as *mut _ as *mut c_void;
+        let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut supported_desc_idx as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+        unsafe {
+            shared
+                .instance
+                .get_physical_device_features2(physical, &mut supported_features2);
+        }
+
+        let descriptor_indexing = supported_desc_idx
+            .shader_storage_buffer_array_non_uniform_indexing
+            == vk::TRUE
+            && supported_desc_idx.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+            && supported_desc_idx.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE
+            && supported_desc_idx.descriptor_binding_sampled_image_update_after_bind == vk::TRUE
+            && supported_desc_idx.descriptor_binding_partially_bound == vk::TRUE
+            && supported_desc_idx.runtime_descriptor_array == vk::TRUE;
+        if !descriptor_indexing {
+            return Err(GpuError::UnsupportedFeatures(Features::DESCRIPTOR_INDEXING));
+        }
+        if needs_graphics && supported_dynamic_rendering.dynamic_rendering != vk::TRUE {
+            return Err(GpuError::Unsupported(
+                "Vulkan dynamic rendering feature is unavailable".to_string(),
+            ));
+        }
+
+        // Only treat features the current backend actually exposes as
+        // available to DeviceRequest. This
+        // deliberately rejects hardware features whose HAL implementation is
+        // not present yet instead of silently accepting the request.
+        let mut available_features = Features::COMPUTE | Features::DESCRIPTOR_INDEXING;
+        if needs_graphics {
+            available_features |= Features::GRAPHICS;
+        }
+        let missing_required = req.required.difference(available_features);
+        if !missing_required.is_empty() {
+            return Err(GpuError::UnsupportedFeatures(missing_required));
+        }
+
+        let shader_atomic_float = shader_atomic_float_extension
+            && supported_atomic_float.shader_buffer_float32_atomic_add == vk::TRUE;
+        if shader_atomic_float {
+            extensions.push(ext::shader_atomic_float::NAME.as_ptr());
+        }
+
+        let supported_features = supported_features2.features;
         let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
         let fill_mode_non_solid =
             needs_graphics && supported_features.fill_mode_non_solid == vk::TRUE;
@@ -2663,6 +2720,87 @@ mod tests {
         let Some(dev) = try_device() else { return };
         assert!(!dev.capabilities().graphics);
         assert!(dev.capabilities().compute);
+    }
+
+    #[test]
+    fn required_unimplemented_feature_is_rejected() {
+        let _guard = crate::test_gpu_lock();
+        let Some(adapter) = VulkanInstance::new()
+            .ok()
+            .and_then(|instance| instance.request_vulkan_adapter())
+        else {
+            return;
+        };
+        let err = match adapter.open_headless(DeviceRequest {
+            required: Features::TIMESTAMPS,
+            ..Default::default()
+        }) {
+            Ok(_) => panic!("unsupported required feature unexpectedly succeeded"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            GpuError::UnsupportedFeatures(features) if features == Features::TIMESTAMPS
+        ));
+    }
+
+    #[test]
+    fn optional_unimplemented_feature_is_ignored() {
+        let _guard = crate::test_gpu_lock();
+        let Some(adapter) = VulkanInstance::new()
+            .ok()
+            .and_then(|instance| instance.request_vulkan_adapter())
+        else {
+            return;
+        };
+        let dev = adapter
+            .open_headless(DeviceRequest {
+                optional: Features::TIMESTAMPS,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(dev.capabilities().graphics);
+    }
+
+    #[test]
+    fn compute_device_rejects_required_graphics() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(instance) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let err = match adapter.open(DeviceRequest {
+            required: Features::GRAPHICS,
+            ..Default::default()
+        }) {
+            Ok(_) => panic!("compute-only device unexpectedly accepted graphics"),
+            Err(err) => err,
+        };
+        assert!(matches!(
+            err,
+            GpuError::UnsupportedFeatures(features) if features == Features::GRAPHICS
+        ));
+    }
+
+    #[test]
+    fn graphics_device_accepts_required_backend_features() {
+        let _guard = crate::test_gpu_lock();
+        let Some(adapter) = VulkanInstance::new()
+            .ok()
+            .and_then(|instance| instance.request_vulkan_adapter())
+        else {
+            return;
+        };
+        let dev = adapter
+            .open_headless(DeviceRequest {
+                required: Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(dev.capabilities().compute);
+        assert!(dev.capabilities().graphics);
     }
 
     #[test]
