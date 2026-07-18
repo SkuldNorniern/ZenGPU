@@ -10,7 +10,8 @@ use std::cell::UnsafeCell;
 use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 use std::rc::Rc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use cuda_oxide::{
     Cuda,
@@ -22,9 +23,9 @@ use cuda_oxide::{
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
-    GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, UsageError,
-    marker,
+    GpuInstance, GpuSubmission, HalCapabilities, PipelineHandle, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
+    SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 use error::{cu, from_cuda};
@@ -191,9 +192,11 @@ impl GpuAdapter for CudaAdapter {
             s
         };
         Ok(Box::new(CudaDevice {
-            ctx: UnsafeCell::new(ctx),
-            ctx_lock: Mutex::new(()),
-            stream,
+            shared: Arc::new(CudaShared {
+                ctx: UnsafeCell::new(ctx),
+                ctx_lock: Mutex::new(()),
+                stream,
+            }),
             buffers: Mutex::new(SlotMap::new()),
             shaders: Mutex::new(SlotMap::new()),
             pipelines: Mutex::new(SlotMap::new()),
@@ -246,12 +249,41 @@ unsafe impl Sync for CudaPipeline {}
 /// context: only one thread at a time ever touches `ctx`, and the
 /// `Rc<Handle>` is always created and destroyed within the same locked
 /// method call — it never crosses a thread boundary.
-pub struct CudaDevice {
+struct CudaShared {
     ctx: UnsafeCell<Context>,
     ctx_lock: Mutex<()>,
     /// Persistent compute stream — created once in `open()`, reused across all
     /// dispatches to eliminate per-kernel create/destroy overhead.
     stream: sys::CUstream,
+}
+
+// SAFETY: every context entry is serialized by ctx_lock.
+unsafe impl Send for CudaShared {}
+unsafe impl Sync for CudaShared {}
+
+impl CudaShared {
+    fn with_context<F, T>(&self, f: F) -> Result<T>
+    where
+        F: for<'h> FnOnce(Rc<Handle<'h>>) -> Result<T>,
+    {
+        let _guard = self.ctx_lock.lock().map_err(|_| GpuError::DeviceLost)?;
+        // SAFETY: ctx_lock is held; no other thread can enter this context.
+        let handle = from_cuda(unsafe { &mut *self.ctx.get() }.enter())?;
+        f(handle)
+    }
+}
+
+impl Drop for CudaShared {
+    fn drop(&mut self) {
+        if self.ctx.get_mut().enter().is_ok() {
+            unsafe { sys::cuStreamSynchronize(self.stream) };
+            unsafe { sys::cuStreamDestroy_v2(self.stream) };
+        }
+    }
+}
+
+pub struct CudaDevice {
+    shared: Arc<CudaShared>,
     buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
     shaders: Mutex<SlotMap<marker::Shader, CudaShader>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
@@ -268,10 +300,82 @@ impl CudaDevice {
     where
         F: for<'h> FnOnce(Rc<Handle<'h>>) -> Result<T>,
     {
-        let _guard = self.ctx_lock.lock().map_err(|_| GpuError::DeviceLost)?;
-        // SAFETY: `ctx_lock` is held; no other thread can reach this point.
-        let handle = from_cuda(unsafe { &mut *self.ctx.get() }.enter())?;
-        f(handle)
+        self.shared.with_context(f)
+    }
+}
+
+struct CudaSubmission {
+    cycle_id: u64,
+    shared: Arc<CudaShared>,
+    event: Mutex<Option<sys::CUevent>>,
+}
+
+// SAFETY: CUevent is opaque and every operation enters the serialized context.
+unsafe impl Send for CudaSubmission {}
+unsafe impl Sync for CudaSubmission {}
+
+impl CudaSubmission {
+    fn query(&self) -> Result<SubmissionStatus> {
+        let mut event = self.event.lock().map_err(|_| GpuError::DeviceLost)?;
+        let Some(raw) = *event else {
+            return Ok(SubmissionStatus::Complete);
+        };
+        let code = self
+            .shared
+            .with_context(|_| Ok(unsafe { sys::cuEventQuery(raw) }))?;
+        if code == 0 {
+            self.shared
+                .with_context(|_| cu(unsafe { sys::cuEventDestroy_v2(raw) }))?;
+            *event = None;
+            Ok(SubmissionStatus::Complete)
+        } else if code == sys::cudaError_enum_CUDA_ERROR_NOT_READY {
+            Ok(SubmissionStatus::Pending)
+        } else {
+            cu(code)?;
+            unreachable!()
+        }
+    }
+}
+
+impl GpuSubmission for CudaSubmission {
+    fn cycle_id(&self) -> u64 {
+        self.cycle_id
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        self.query()
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            if self.query()? == SubmissionStatus::Complete {
+                return Ok(());
+            }
+            if timeout == Duration::ZERO
+                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                return Err(GpuError::Timeout);
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+impl Drop for CudaSubmission {
+    fn drop(&mut self) {
+        let Ok(event) = self.event.get_mut() else {
+            return;
+        };
+        let Some(raw) = event.take() else {
+            return;
+        };
+        // Preserve the resource-lifetime contract even if a pending token is
+        // dropped: wait for its exact stream position, then destroy the event.
+        let _ = self.shared.with_context(|_| {
+            cu(unsafe { sys::cuEventSynchronize(raw) })?;
+            cu(unsafe { sys::cuEventDestroy_v2(raw) })
+        });
     }
 }
 
@@ -282,11 +386,10 @@ impl Drop for CudaDevice {
         let shaders: Vec<CudaShader> = self.shaders.get_mut().unwrap().drain().collect();
         let pipelines: Vec<CudaPipeline> = self.pipelines.get_mut().unwrap().drain().collect();
 
-        // UnsafeCell::get_mut is safe here because of the exclusive &mut self.
-        if let Ok(handle) = self.ctx.get_mut().enter() {
-            // Drain inflight work before tearing down the stream.
-            unsafe { sys::cuStreamSynchronize(self.stream) };
-            unsafe { sys::cuStreamDestroy_v2(self.stream) };
+        let _ = self.shared.with_context(|handle| {
+            // A device may be dropped before its submission handles. Drain
+            // work before freeing the resources owned by this device.
+            cu(unsafe { sys::cuStreamSynchronize(self.shared.stream) })?;
             for cb in buffers {
                 // SAFETY: ptr/len came from a DeviceBox we explicitly leaked.
                 let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
@@ -297,8 +400,8 @@ impl Drop for CudaDevice {
             for cs in shaders {
                 let _ = unsafe { sys::cuModuleUnload(cs.module) };
             }
-        }
-        // If enter() fails the device is already dead; resources are leaked.
+            Ok(())
+        });
     }
 }
 
@@ -573,8 +676,16 @@ impl GpuDevice for CudaDevice {
     }
 
     fn dispatch_batch(&self, ops: &[zengpu_hal::DispatchOp<'_>]) -> Result<()> {
+        self.submit_batch(0, ops)?.wait(Duration::MAX)
+    }
+
+    fn submit_batch(
+        &self,
+        cycle_id: u64,
+        ops: &[zengpu_hal::DispatchOp<'_>],
+    ) -> Result<Submission> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
 
         // Kernel parameters live in a fixed-size, per-op stack buffer — no
@@ -584,12 +695,12 @@ impl GpuDevice for CudaDevice {
         // signature declares for that parameter, so the unused tail is inert.
         const MAX_PARAMS: usize = 32;
 
-        let stream = self.stream;
+        let stream = self.shared.stream;
         // Same-stream launches execute and become globally visible in
         // submission order on the device, so a later op safely reads an
-        // earlier op's output with no explicit barrier — only the final
-        // sync is needed for the whole batch instead of one per dispatch.
-        self.with_context(|_handle| {
+        // earlier op's output with no explicit barrier. The event recorded
+        // after the final launch represents completion of the whole batch.
+        let event = self.with_context(|_handle| {
             for op in ops {
                 let cp = self
                     .pipelines
@@ -652,8 +763,21 @@ impl GpuDevice for CudaDevice {
                     )
                 })?;
             }
-            cu(unsafe { sys::cuStreamSynchronize(stream) })
-        })
+            let mut event: sys::CUevent = ptr::null_mut();
+            cu(unsafe {
+                sys::cuEventCreate(&mut event, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING)
+            })?;
+            if let Err(e) = cu(unsafe { sys::cuEventRecord(event, stream) }) {
+                unsafe { sys::cuEventDestroy_v2(event) };
+                return Err(e);
+            }
+            Ok(event)
+        })?;
+        Ok(Box::new(CudaSubmission {
+            cycle_id,
+            shared: Arc::clone(&self.shared),
+            event: Mutex::new(Some(event)),
+        }))
     }
 }
 
@@ -1247,7 +1371,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_batch_chains_ops_on_one_stream_sync() {
+    fn submission_batch_chains_ops_on_one_stream() {
         let Some(device) = cuda_device() else { return };
         const N: usize = 256;
         let a: Vec<f32> = (0..N).map(|i| i as f32).collect();
@@ -1283,28 +1407,36 @@ mod tests {
             .expect("create pipeline");
 
         let grid = [(N as u32).div_ceil(256), 1, 1];
-        device
-            .dispatch_batch(&[
-                zengpu_hal::DispatchOp {
-                    pipeline,
-                    bindings: Bindings {
-                        buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
-                        scalars: &[Scalar::U32(N as u32)],
-                        textures: &[],
+        let submission = device
+            .submit_batch(
+                77,
+                &[
+                    zengpu_hal::DispatchOp {
+                        pipeline,
+                        bindings: Bindings {
+                            buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
+                            scalars: &[Scalar::U32(N as u32)],
+                            textures: &[],
+                        },
+                        grid,
                     },
-                    grid,
-                },
-                zengpu_hal::DispatchOp {
-                    pipeline,
-                    bindings: Bindings {
-                        buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
-                        scalars: &[Scalar::U32(N as u32)],
-                        textures: &[],
+                    zengpu_hal::DispatchOp {
+                        pipeline,
+                        bindings: Bindings {
+                            buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
+                            scalars: &[Scalar::U32(N as u32)],
+                            textures: &[],
+                        },
+                        grid,
                     },
-                    grid,
-                },
-            ])
-            .expect("dispatch_batch");
+                ],
+            )
+            .expect("submit_batch");
+        assert_eq!(submission.cycle_id(), 77);
+        let zero_wait = submission.wait(Duration::ZERO);
+        assert!(zero_wait.is_ok() || matches!(zero_wait, Err(GpuError::Timeout)));
+        submission.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
 
         let raw = device.read_buffer(buf_out, 0, size).unwrap();
         for i in 0..N {
