@@ -129,6 +129,8 @@ pub(crate) struct VulkanDeviceInner {
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub queue_family: u32,
     pub queue: vk::Queue,
+    /// Queue needs external sync: every submit or present on `queue` holds this mutex.
+    pub queue_lock: Mutex<()>,
     pub dual_src_blend: bool,
     pub fill_mode_non_solid: bool,
     pub sampler_anisotropy: bool,
@@ -200,6 +202,7 @@ impl VulkanDevice {
     }
 
     pub fn wait_idle(&self) -> Result<()> {
+        let _queue = self.inner.queue_lock.lock().unwrap();
         unsafe {
             self.inner
                 .device
@@ -225,6 +228,7 @@ impl VulkanDevice {
             ..Default::default()
         };
         let mut submitted = false;
+        let _queue = self.inner.queue_lock.lock().unwrap();
         let submit_result = unsafe {
             self.inner
                 .device
@@ -478,6 +482,7 @@ impl VulkanDevice {
             memory_properties,
             queue_family,
             queue,
+            queue_lock: Mutex::new(()),
             dual_src_blend,
             fill_mode_non_solid,
             sampler_anisotropy,
@@ -581,6 +586,7 @@ impl VulkanDevice {
             ..Default::default()
         };
         let mut submitted = false;
+        let _queue = self.inner.queue_lock.lock().unwrap();
         let submit_result = unsafe {
             self.inner
                 .device
@@ -2615,6 +2621,80 @@ mod tests {
         dev.destroy_shader(add_shader);
         dev.destroy_pipeline(relu_pipeline);
         dev.destroy_shader(relu_shader);
+    }
+
+    #[test]
+    fn concurrent_dispatches_share_the_queue_safely() {
+        use std::sync::{Arc, Barrier};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL_ZSL: ZslShader = zsl!(
+            push P { value: f32 }
+            @workgroup_size(64)
+            kernel fill(out: device mut buffer<f32>, p: P, id: global_id) {
+                out[id.x] = p.value
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let dev: Arc<dyn GpuDevice> = Arc::from(dev);
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+
+        const THREADS: usize = 2;
+        const LEN: u64 = 256;
+        let desc = BufferDesc {
+            size: LEN * 4,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let outputs: Vec<_> = (0..THREADS)
+            .map(|_| dev.create_buffer(desc).unwrap())
+            .collect();
+        let start = Arc::new(Barrier::new(THREADS));
+        let workers: Vec<_> = outputs
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(worker, output)| {
+                let dev = Arc::clone(&dev);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let buffers = [output.index()];
+                    let scalars = [Scalar::F32(worker as f32 + 0.5)];
+                    start.wait();
+                    dev.dispatch(
+                        pipeline,
+                        Bindings {
+                            buffers: &buffers,
+                            textures: &[],
+                            scalars: &scalars,
+                        },
+                        [LEN.div_ceil(64) as u32, 1, 1],
+                    )
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("dispatch worker panicked").unwrap();
+        }
+
+        for (worker, output) in outputs.iter().copied().enumerate() {
+            let bytes = dev.read_buffer(output, 0, LEN * 4).unwrap();
+            let expected = worker as f32 + 0.5;
+            for value in bytes.chunks_exact(4) {
+                assert_eq!(f32::from_ne_bytes(value.try_into().unwrap()), expected);
+            }
+            dev.destroy_buffer(output);
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
     }
 
     #[test]

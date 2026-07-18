@@ -260,11 +260,14 @@ impl Swapchain {
             p_signal_semaphores: signal_semaphores.as_ptr(),
             ..Default::default()
         };
-        unsafe {
-            self.inner
-                .device
-                .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
-                .map_err(|e| map_vk_err("queue_submit", e))?;
+        {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            unsafe {
+                self.inner
+                    .device
+                    .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
+                    .map_err(|e| map_vk_err("queue_submit", e))?;
+            }
         }
 
         let mut res = self.resources.lock().unwrap();
@@ -278,10 +281,14 @@ impl Swapchain {
             p_image_indices: image_indices.as_ptr(),
             ..Default::default()
         };
-        let recreated = match unsafe {
-            self.swapchain_loader
-                .queue_present(self.inner.queue, &present_info)
-        } {
+        let present_result = {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            unsafe {
+                self.swapchain_loader
+                    .queue_present(self.inner.queue, &present_info)
+            }
+        };
+        let recreated = match present_result {
             Ok(_suboptimal) => false,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 let (w, h) = (res.extent.width, res.extent.height);
@@ -304,6 +311,7 @@ impl Swapchain {
 
     /// Recreate the swapchain and views in place, keeping surface, format and present mode.
     fn recreate(&self, res: &mut SwapchainResources, width: u32, height: u32) -> Result<()> {
+        let _queue = self.inner.queue_lock.lock().unwrap();
         unsafe {
             let _ = self.inner.device.device_wait_idle();
         }
@@ -389,6 +397,8 @@ impl DeviceContext {
         self.inner.physical
     }
 
+    /// Queue for submit and present. Raw: direct submitters must sync it themselves. ZenGPU's own
+    /// submits use the device queue lock.
     pub fn queue(&self) -> vk::Queue {
         self.inner.queue
     }
@@ -477,6 +487,7 @@ impl DeviceContext {
             unsafe { dev.destroy_command_pool(pool, None) };
             return Err(e);
         }
+        let _queue = self.inner.queue_lock.lock().unwrap();
         let submit_result = unsafe {
             dev.queue_submit(
                 self.inner.queue,
