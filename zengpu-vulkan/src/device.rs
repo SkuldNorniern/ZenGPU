@@ -10,10 +10,10 @@ use std::{
 use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
-    CompareFn, ComputePipelineDesc, CullMode, DeviceRequest, DispatchOp, Features, FilterMode,
-    Format, FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities,
-    MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
+    CompareFn, ComputePipelineDesc, CullMode, DeviceLimits, DeviceRequest, DispatchOp, Features,
+    FilterMode, Format, FrontFace, GpuDevice, GpuError, GraphicsDevice, GraphicsPipelineDesc,
+    HalCapabilities, MemoryUsage, PipelineHandle, PolygonMode, PrimitiveTopology, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, StepMode,
     SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
     VertexFormat, WindowHandles, marker,
 };
@@ -145,6 +145,8 @@ pub(crate) struct VulkanDeviceInner {
     /// Vulkan queues require external host synchronization. Every internal
     /// submit/present operation using `queue` must hold this mutex.
     pub queue_lock: Mutex<()>,
+    pub features: Features,
+    pub limits: DeviceLimits,
     pub graphics: bool,
     pub dual_src_blend: bool,
     pub fill_mode_non_solid: bool,
@@ -425,6 +427,7 @@ impl VulkanDevice {
                 };
                 GpuError::Backend(format!("no {kind} queue family"))
             })?;
+        let device_limits = physical_device_limits(&shared.instance, physical, queue_family);
 
         let queue_priorities = [1.0_f32];
         let queue_info = vk::DeviceQueueCreateInfo {
@@ -584,6 +587,8 @@ impl VulkanDevice {
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
+            features: available_features,
+            limits: device_limits,
             graphics: needs_graphics,
             dual_src_blend,
             fill_mode_non_solid,
@@ -885,7 +890,7 @@ pub(crate) fn hal_format_to_vk(format: Format) -> vk::Format {
     }
 }
 
-fn queue_family(
+pub(crate) fn queue_family(
     instance: &ash::Instance,
     physical: vk::PhysicalDevice,
     needs_graphics: bool,
@@ -919,6 +924,40 @@ fn queue_family(
                     .find(|(_, f)| supports(f, vk::QueueFlags::COMPUTE))
             })
             .map(|(i, _)| i as u32)
+    }
+}
+
+pub(crate) fn physical_device_limits(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    queue_family: u32,
+) -> DeviceLimits {
+    let mut descriptor = vk::PhysicalDeviceDescriptorIndexingProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2 {
+        p_next: &mut descriptor as *mut _ as *mut c_void,
+        ..Default::default()
+    };
+    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    let limits = properties.properties.limits;
+    let queues = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+    let timestamp_supported = queues
+        .get(queue_family as usize)
+        .is_some_and(|queue| queue.timestamp_valid_bits > 0);
+    DeviceLimits {
+        max_workgroup_size: limits.max_compute_work_group_size,
+        max_workgroup_invocations: limits.max_compute_work_group_invocations,
+        max_dispatch_size: limits.max_compute_work_group_count,
+        max_storage_buffer_range: u64::from(limits.max_storage_buffer_range),
+        max_push_constant_size: limits.max_push_constants_size,
+        max_storage_buffers: descriptor
+            .max_per_stage_descriptor_update_after_bind_storage_buffers
+            .min(descriptor.max_descriptor_set_update_after_bind_storage_buffers),
+        max_sampled_textures: descriptor
+            .max_per_stage_descriptor_update_after_bind_sampled_images
+            .min(descriptor.max_descriptor_set_update_after_bind_sampled_images),
+        max_memory_allocations: limits.max_memory_allocation_count,
+        timestamp_supported,
+        timestamp_period_ns: limits.timestamp_period,
     }
 }
 
@@ -996,7 +1035,12 @@ impl GpuDevice for VulkanDevice {
         HalCapabilities {
             graphics: self.inner.graphics,
             compute: true,
+            features: self.inner.features,
         }
+    }
+
+    fn limits(&self) -> DeviceLimits {
+        self.inner.limits
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
@@ -2720,6 +2764,18 @@ mod tests {
         let Some(dev) = try_device() else { return };
         assert!(!dev.capabilities().graphics);
         assert!(dev.capabilities().compute);
+        assert!(
+            dev.capabilities()
+                .features
+                .contains(Features::COMPUTE | Features::DESCRIPTOR_INDEXING)
+        );
+        let limits = dev.limits();
+        assert!(limits.max_workgroup_invocations >= 128);
+        assert!(limits.max_workgroup_size[0] >= 128);
+        assert!(limits.max_dispatch_size.iter().all(|value| *value > 0));
+        assert!(limits.max_storage_buffer_range > 0);
+        assert!(limits.max_push_constant_size >= COMPUTE_PUSH_CONSTANT_BYTES as u32);
+        assert!(limits.max_storage_buffers >= MAX_BINDLESS_BUFFERS);
     }
 
     #[test]

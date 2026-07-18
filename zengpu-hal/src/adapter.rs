@@ -7,7 +7,7 @@
 
 use crate::device::GpuDevice;
 use crate::error::Result;
-use crate::request::{AdapterRequest, DeviceRequest, HalCapabilities};
+use crate::request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities};
 use crate::types::BackendPreference;
 
 /// Physical device class reported by the driver.
@@ -46,6 +46,12 @@ pub trait GpuAdapter: Send + Sync {
 
     /// Which HAL shapes this adapter can expose.
     fn capabilities(&self) -> HalCapabilities;
+
+    /// Static physical-device limits. Backends should override this when
+    /// meaningful limits are available before logical-device creation.
+    fn limits(&self) -> DeviceLimits {
+        DeviceLimits::default()
+    }
 
     /// Open a logical [`GpuDevice`] from this adapter.
     ///

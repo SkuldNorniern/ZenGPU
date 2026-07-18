@@ -31,7 +31,7 @@ pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,
     RenderPassDesc, Surface, ViewportScissor,
 };
-pub use request::{AdapterRequest, DeviceRequest, HalCapabilities};
+pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities};
 pub use surface::WindowHandles;
 
 pub use desc::{
