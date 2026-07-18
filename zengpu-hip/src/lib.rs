@@ -984,7 +984,10 @@ void vec_add(const float* __restrict__ a,
         let dev0 = adapters[0].open(DeviceRequest::default()).unwrap();
         let dev1 = adapters[1].open(DeviceRequest::default()).unwrap();
         let values = [1.25f32, -2.5, 3.75, 1024.5, -0.125, 42.0];
-        let data: Vec<u8> = values.iter().flat_map(|value| value.to_ne_bytes()).collect();
+        let data: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect();
         let desc = BufferDesc {
             size: data.len() as u64,
             usage: BufferUsage::STORAGE | BufferUsage::READBACK,
@@ -999,10 +1002,13 @@ void vec_add(const float* __restrict__ a,
             "hip: GPU {} ← GPU {} peer copy: {}",
             dev0.device_ordinal(),
             dev1.device_ordinal(),
-            if direct { "P2P fast path" } else { "host-staging fallback" }
+            if direct {
+                "P2P fast path"
+            } else {
+                "host-staging fallback"
+            }
         );
-        dev0
-            .copy_from_peer(dst, dev1.as_ref(), src, data.len() as u64)
+        dev0.copy_from_peer(dst, dev1.as_ref(), src, data.len() as u64)
             .unwrap();
         let copied = dev0.read_buffer(dst, 0, data.len() as u64).unwrap();
         assert_eq!(copied, data, "peer buffer copy mismatch");

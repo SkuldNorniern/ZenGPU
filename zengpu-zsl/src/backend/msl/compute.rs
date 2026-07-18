@@ -47,7 +47,11 @@ pub fn lower_compute(module: &Module) -> MslShader {
     let _ = writeln!(s, "kernel void {ENTRY}(");
     let mut slot = 0u32;
     for b in &buffers {
-        let elem = if atomic_buffers.contains(b) { "atomic_float" } else { "float" };
+        let elem = if atomic_buffers.contains(b) {
+            "atomic_float"
+        } else {
+            "float"
+        };
         let _ = writeln!(s, "    device {elem}* {b} [[buffer({slot})]],");
         slot += 1;
     }

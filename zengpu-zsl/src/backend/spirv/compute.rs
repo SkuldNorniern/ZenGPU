@@ -389,7 +389,9 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
             let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
-            let pc_chain = ctx.spv.op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
+            let pc_chain = ctx
+                .spv
+                .op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
@@ -403,12 +405,15 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             // ScopeDevice = 1; MemorySemanticsRelaxed = 0.
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
-            ctx.spv.op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
+            ctx.spv
+                .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
             Ok(())
         }
 
         IrStmt::AssignShared { name, index, value } => {
-            let var = *ctx.shared.get(name)
+            let var = *ctx
+                .shared
+                .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ScalarTy::U32);
@@ -603,13 +608,18 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         }
 
         IrExpr::SharedLoad { name, index } => {
-            let var = *ctx.shared.get(name)
+            let var = *ctx
+                .shared
+                .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ScalarTy::U32);
             let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
             let id = ctx.spv.op_load(ctx.t_f32, ptr);
-            Ok(Val { id, ty: ScalarTy::F32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::F32,
+            })
         }
 
         IrExpr::GlobalId(component) => {
@@ -624,12 +634,18 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             })
         }
 
-
         IrExpr::LocalId(component) | IrExpr::GroupId(component) => {
-            let var = if matches!(expr, IrExpr::LocalId(_)) { ctx.lid_var } else { ctx.group_var };
+            let var = if matches!(expr, IrExpr::LocalId(_)) {
+                ctx.lid_var
+            } else {
+                ctx.group_var
+            };
             let id3 = ctx.spv.op_load(ctx.t_uvec3, var);
             let id = ctx.spv.op_composite_extract(ctx.t_u32, id3, &[*component]);
-            Ok(Val { id, ty: ScalarTy::U32 })
+            Ok(Val {
+                id,
+                ty: ScalarTy::U32,
+            })
         }
 
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
