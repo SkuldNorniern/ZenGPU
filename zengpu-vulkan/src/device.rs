@@ -2817,4 +2817,79 @@ mod tests {
         dev.destroy_buffer(out_u);
         dev.destroy_buffer(out_i);
     }
+
+    #[test]
+    fn zsl_finite_classification_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FINITE_ZSL: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len {
+                    let x = src[i]
+                    if isfinite(x) {
+                        out[i] = 1
+                    } else {
+                        if isnan(x) {
+                            out[i] = 2
+                        } else {
+                            if isinf(x) { out[i] = 3 } else { out[i] = 4 }
+                        }
+                    }
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let input = [0.0f32, -12.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let expected = [1u32, 1, 2, 3, 3];
+        let size = std::mem::size_of_val(&input) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let src = dev.create_buffer(desc).unwrap();
+        let out = dev.create_buffer(desc).unwrap();
+        dev.write_buffer(
+            src,
+            0,
+            u32s_to_bytes(unsafe {
+                std::slice::from_raw_parts(input.as_ptr() as *const u32, input.len())
+            }),
+        )
+        .unwrap();
+
+        let shader = dev.create_shader(FINITE_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[src.index(), out.index()],
+                scalars: &[Scalar::U32(input.len() as u32)],
+                textures: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+
+        let raw = dev.read_buffer(out, 0, size).unwrap();
+        let actual: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(src);
+        dev.destroy_buffer(out);
+    }
 }

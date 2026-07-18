@@ -68,6 +68,8 @@ mod op {
     pub const FORD_LESS_THAN_EQ: u32 = 188;
     pub const FORD_GREATER_THAN_EQ: u32 = 190;
     pub const FLESS_THAN: u32 = 185;
+    pub const IS_NAN: u32 = 156;
+    pub const IS_INF: u32 = 157;
     pub const COMPOSITE_CONSTRUCT: u32 = 80;
     pub const COMPOSITE_EXTRACT: u32 = 81;
     pub const CONVERT_F_TO_U: u32 = 109;
@@ -86,6 +88,7 @@ mod op {
     pub const DOT: u32 = 148;
     pub const LOGICAL_OR: u32 = 166;
     pub const LOGICAL_AND: u32 = 167;
+    pub const LOGICAL_NOT: u32 = 168;
     pub const IEQUAL: u32 = 170;
     pub const INOT_EQUAL: u32 = 171;
     pub const FORD_EQUAL: u32 = 180;
@@ -756,6 +759,18 @@ impl SpvBuilder {
         id
     }
 
+    pub fn op_is_nan(&mut self, bool_ty: Id, value: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::IS_NAN, &[bool_ty.0, id.0, value.0]);
+        id
+    }
+
+    pub fn op_is_inf(&mut self, bool_ty: Id, value: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::IS_INF, &[bool_ty.0, id.0, value.0]);
+        id
+    }
+
     pub fn op_convert_u_to_f(&mut self, f32_ty: Id, val: Id) -> Id {
         let id = self.fresh_id();
         emit(
@@ -879,6 +894,16 @@ impl SpvBuilder {
             &mut self.functions,
             op::LOGICAL_OR,
             &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_logical_not(&mut self, bool_ty: Id, value: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::LOGICAL_NOT,
+            &[bool_ty.0, id.0, value.0],
         );
         id
     }
