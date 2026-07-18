@@ -1299,6 +1299,9 @@ fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "sin" => BuiltinFn::Sin,
         "cos" => BuiltinFn::Cos,
         "tan" => BuiltinFn::Tan,
+        "isnan" => BuiltinFn::IsNan,
+        "isinf" => BuiltinFn::IsInf,
+        "isfinite" => BuiltinFn::IsFinite,
         "log" => BuiltinFn::Log,
         "sqrt" => BuiltinFn::Sqrt,
         "floor" => BuiltinFn::Floor,
@@ -1330,6 +1333,7 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
         IrExpr::SharedLoad { .. } => ScalarTy::F32,
         IrExpr::Builtin { func, .. } => match func {
             BuiltinFn::U32 => ScalarTy::U32,
+            BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => ScalarTy::Bool,
             _ => ScalarTy::F32,
         },
         IrExpr::Neg(e) => infer_ty(e, ctx),
