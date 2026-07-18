@@ -180,12 +180,13 @@ mod tests {
     fn make_ctx() -> Option<DeviceContext> {
         let inst = VulkanInstance::new().ok()?;
         let adapter = inst.request_vulkan_adapter()?;
-        let dev = adapter.open_with_surface(DeviceRequest::default()).ok()?;
+        let dev = adapter.open_headless(DeviceRequest::default()).ok()?;
         Some(dev.context())
     }
 
     #[test]
     fn depth_target_resize() {
+        let _guard = crate::test_gpu_lock();
         let Some(ctx) = make_ctx() else { return };
         let mut depth = DepthTarget::new(&ctx, 64, 32).unwrap();
         assert_eq!(depth.extent(), (64, 32));

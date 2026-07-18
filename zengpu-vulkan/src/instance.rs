@@ -22,6 +22,8 @@ unsafe extern "system" fn vulkan_debug_callback(
     _user: *mut c_void,
 ) -> vk::Bool32 {
     let msg = unsafe { CStr::from_ptr((*data).p_message) }.to_string_lossy();
+    #[cfg(test)]
+    eprintln!("[Vulkan validation] {msg}");
     if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
         log::error!("[Vulkan] {msg}");
     } else {

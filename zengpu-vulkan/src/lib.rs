@@ -22,6 +22,15 @@ pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 
 use ash::vk;
 
+#[cfg(test)]
+pub(crate) fn test_gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    // Most unit tests need their own logical device. Keep those heavyweight
+    // fixtures sequential inside one test process; explicit same-device tests
+    // still exercise queue and command-recording concurrency directly.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 // ── Format conversion ─────────────────────────────────────────────────────────
 
 /// Convert a HAL [`zengpu_hal::Format`] to the matching `vk::Format`.
