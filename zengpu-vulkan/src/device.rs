@@ -2749,4 +2749,72 @@ mod tests {
         dev.destroy_buffer(src);
         dev.destroy_buffer(out);
     }
+
+    #[test]
+    fn zsl_integer_buffers_round_trip_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const TYPED_ZSL: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len {
+                    out_u[i] = src_u[i]
+                    out_i[i] = src_i[i]
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 128u32;
+        let size = u64::from(n) * 4;
+        let desc = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let src_u = dev.create_buffer(desc).unwrap();
+        let src_i = dev.create_buffer(desc).unwrap();
+        let out_u = dev.create_buffer(desc).unwrap();
+        let out_i = dev.create_buffer(desc).unwrap();
+        let input_u: Vec<u32> = (0..n)
+            .map(|value| value.wrapping_mul(2_654_435_761))
+            .collect();
+        let input_i: Vec<i32> = (0..n as i32).map(|value| value - 64).collect();
+        let bytes_u = u32s_to_bytes(&input_u);
+        let bytes_i = u32s_to_bytes(unsafe {
+            std::slice::from_raw_parts(input_i.as_ptr() as *const u32, input_i.len())
+        });
+        dev.write_buffer(src_u, 0, bytes_u).unwrap();
+        dev.write_buffer(src_i, 0, bytes_i).unwrap();
+
+        let shader = dev.create_shader(TYPED_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[src_u.index(), src_i.index(), out_u.index(), out_i.index()],
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+
+        assert_eq!(dev.read_buffer(out_u, 0, size).unwrap(), bytes_u);
+        assert_eq!(dev.read_buffer(out_i, 0, size).unwrap(), bytes_i);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(src_u);
+        dev.destroy_buffer(src_i);
+        dev.destroy_buffer(out_u);
+        dev.destroy_buffer(out_i);
+    }
 }

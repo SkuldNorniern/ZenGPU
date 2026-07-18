@@ -286,6 +286,35 @@ mod phase_z_tests {
         }
     "#;
 
+    const TYPED_BUFFERS: &str = r#"
+        @workgroup_size(64)
+        kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, id: global_id) {
+            out_u[id.x] = src_u[id.x]
+            out_i[id.x] = src_i[id.x]
+        }
+    "#;
+
+    #[test]
+    fn integer_storage_buffers_lower_on_all_compute_backends() {
+        let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
+        let hip_source = hip::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).source;
+        assert!(hip_source.contains("const unsigned int* __restrict__ src_u"));
+        assert!(hip_source.contains("const int* __restrict__ src_i"));
+        assert!(hip_source.contains("unsigned int* __restrict__ out_u"));
+        assert!(hip_source.contains("int* __restrict__ out_i"));
+        assert!(cuda_source.contains("const unsigned int* __restrict__ src_u"));
+        assert!(cuda_source.contains("const int* __restrict__ src_i"));
+        assert!(cuda_source.contains("unsigned int* __restrict__ out_u"));
+        assert!(cuda_source.contains("int* __restrict__ out_i"));
+        assert!(msl_source.contains("device uint* src_u"));
+        assert!(msl_source.contains("device int* src_i"));
+        assert!(msl_source.contains("device uint* out_u"));
+        assert!(msl_source.contains("device int* out_i"));
+        spirv::lower_compute(&module).expect("lower typed buffers to SPIR-V");
+    }
+
     #[test]
     fn trigonometry_lowers_on_all_compute_backends() {
         let module = parse_compute(TRIG).expect("parse trigonometry");
