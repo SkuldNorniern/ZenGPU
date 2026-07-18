@@ -3,7 +3,7 @@
 
 use crate::device::GpuDevice;
 use crate::error::Result;
-use crate::request::{AdapterRequest, DeviceRequest, HalCapabilities};
+use crate::request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities};
 use crate::types::BackendPreference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -32,6 +32,11 @@ pub trait GpuAdapter: Send + Sync {
     fn info(&self) -> &AdapterInfo;
 
     fn capabilities(&self) -> HalCapabilities;
+
+    /// Backends override this when limits are known before device creation.
+    fn limits(&self) -> DeviceLimits {
+        DeviceLimits::default()
+    }
 
     /// Opens a logical device for this adapter.
     ///

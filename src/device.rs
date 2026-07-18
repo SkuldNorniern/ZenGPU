@@ -2,9 +2,9 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, GpuDevice, HalCapabilities,
-    PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, TextureDesc,
-    TextureHandle,
+    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, GpuDevice,
+    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
+    TextureDesc, TextureHandle,
 };
 
 impl Debug for Device {
@@ -26,6 +26,10 @@ pub struct Device {
 impl Device {
     pub fn capabilities(&self) -> HalCapabilities {
         self.inner.capabilities()
+    }
+
+    pub fn limits(&self) -> DeviceLimits {
+        self.inner.limits()
     }
 
     pub fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
@@ -137,6 +141,10 @@ impl GpuDevice for Device {
 
     fn capabilities(&self) -> HalCapabilities {
         self.inner.capabilities()
+    }
+
+    fn limits(&self) -> DeviceLimits {
+        self.inner.limits()
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {

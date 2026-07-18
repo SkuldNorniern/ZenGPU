@@ -7,7 +7,7 @@ use crate::command::{Bindings, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
-use crate::request::HalCapabilities;
+use crate::request::{DeviceLimits, HalCapabilities};
 use crate::types::Features;
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
@@ -17,6 +17,10 @@ pub trait GpuDevice: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn capabilities(&self) -> HalCapabilities;
+
+    fn limits(&self) -> DeviceLimits {
+        DeviceLimits::default()
+    }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 

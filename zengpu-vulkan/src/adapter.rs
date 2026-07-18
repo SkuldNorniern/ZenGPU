@@ -2,9 +2,11 @@
 use std::sync::Arc;
 
 use ash::vk;
-use zengpu_hal::{AdapterInfo, DeviceRequest, GpuAdapter, GpuDevice, HalCapabilities};
+use zengpu_hal::{
+    AdapterInfo, DeviceLimits, DeviceRequest, Features, GpuAdapter, GpuDevice, HalCapabilities,
+};
 
-use crate::device::VulkanDevice;
+use crate::device::{VulkanDevice, physical_device_limits, queue_family};
 use crate::instance::VulkanShared;
 
 /// Wraps a `VkPhysicalDevice`.
@@ -37,7 +39,13 @@ impl GpuAdapter for VulkanAdapter {
     }
 
     fn capabilities(&self) -> HalCapabilities {
-        HalCapabilities::all()
+        HalCapabilities::all().with_features(Features::DESCRIPTOR_INDEXING)
+    }
+
+    fn limits(&self) -> DeviceLimits {
+        queue_family(&self.shared.instance, self.physical, false)
+            .map(|family| physical_device_limits(&self.shared.instance, self.physical, family))
+            .unwrap_or_default()
     }
 
     /// Opens a compute-only device (no swapchain extension).
