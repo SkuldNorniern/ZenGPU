@@ -303,7 +303,11 @@ impl SpvBuilder {
 
     pub fn type_array(&mut self, elem: Id, len: Id) -> Id {
         let id = self.fresh_id();
-        emit(&mut self.constants_globals, op::TYPE_ARRAY, &[id.0, elem.0, len.0]);
+        emit(
+            &mut self.constants_globals,
+            op::TYPE_ARRAY,
+            &[id.0, elem.0, len.0],
+        );
         id
     }
 
