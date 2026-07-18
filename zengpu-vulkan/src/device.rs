@@ -28,6 +28,10 @@ const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
 const MAX_BINDLESS_TEXTURES: u32 = 1024;
 
+/// Keep compute's push-constant ABI at the 128-byte Vulkan minimum, so conforming devices are
+/// not rejected.
+const COMPUTE_PUSH_CONSTANT_BYTES: usize = 128;
+
 struct BindlessState {
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
@@ -131,6 +135,7 @@ pub(crate) struct VulkanDeviceInner {
     pub queue: vk::Queue,
     /// Queue needs external sync: every submit or present on `queue` holds this mutex.
     pub queue_lock: Mutex<()>,
+    pub graphics: bool,
     pub dual_src_blend: bool,
     pub fill_mode_non_solid: bool,
     pub sampler_anisotropy: bool,
@@ -364,12 +369,14 @@ impl VulkanDevice {
         if supports_extension(khr::portability_subset::NAME) {
             extensions.push(khr::portability_subset::NAME.as_ptr());
         }
-        if !supports_extension(khr::dynamic_rendering::NAME) {
-            return Err(GpuError::Backend(
-                "GPU does not support VK_KHR_dynamic_rendering".to_string(),
-            ));
+        if needs_graphics {
+            if !supports_extension(khr::dynamic_rendering::NAME) {
+                return Err(GpuError::Backend(
+                    "GPU does not support VK_KHR_dynamic_rendering".to_string(),
+                ));
+            }
+            extensions.push(khr::dynamic_rendering::NAME.as_ptr());
         }
-        extensions.push(khr::dynamic_rendering::NAME.as_ptr());
         let shader_atomic_float = supports_extension(ext::shader_atomic_float::NAME);
         if shader_atomic_float {
             extensions.push(ext::shader_atomic_float::NAME.as_ptr());
@@ -394,9 +401,11 @@ impl VulkanDevice {
         };
 
         let supported_features = unsafe { shared.instance.get_physical_device_features(physical) };
-        let dual_src_blend = supported_features.dual_src_blend == vk::TRUE;
-        let fill_mode_non_solid = supported_features.fill_mode_non_solid == vk::TRUE;
-        let sampler_anisotropy = supported_features.sampler_anisotropy == vk::TRUE;
+        let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
+        let fill_mode_non_solid =
+            needs_graphics && supported_features.fill_mode_non_solid == vk::TRUE;
+        let sampler_anisotropy =
+            needs_graphics && supported_features.sampler_anisotropy == vk::TRUE;
         let max_sampler_anisotropy = unsafe {
             shared
                 .instance
@@ -422,10 +431,16 @@ impl VulkanDevice {
             shader_buffer_float32_atomic_add: vk::TRUE,
             ..Default::default()
         };
-        if shader_atomic_float {
+        if shader_atomic_float && needs_graphics {
             dynamic_rendering_feat.p_next = &mut atomic_float_feat as *mut _ as *mut c_void;
         }
-        desc_idx.p_next = &mut dynamic_rendering_feat as *mut _ as *mut c_void;
+        desc_idx.p_next = if needs_graphics {
+            &mut dynamic_rendering_feat as *mut _ as *mut c_void
+        } else if shader_atomic_float {
+            &mut atomic_float_feat as *mut _ as *mut c_void
+        } else {
+            null_mut()
+        };
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
@@ -483,6 +498,7 @@ impl VulkanDevice {
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
+            graphics: needs_graphics,
             dual_src_blend,
             fill_mode_non_solid,
             sampler_anisotropy,
@@ -892,7 +908,10 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn capabilities(&self) -> HalCapabilities {
-        HalCapabilities::all()
+        HalCapabilities {
+            graphics: self.inner.graphics,
+            compute: true,
+        }
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
@@ -1452,7 +1471,7 @@ impl GpuDevice for VulkanDevice {
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             offset: 0,
-            size: 256,
+            size: COMPUTE_PUSH_CONSTANT_BYTES as u32,
         };
         let layout = unsafe {
             self.inner
@@ -1539,7 +1558,13 @@ impl GpuDevice for VulkanDevice {
         }
 
         #[allow(clippy::type_complexity)]
-        let resolved: Vec<(vk::Pipeline, vk::PipelineLayout, [u8; 128], usize, [u32; 3])> = {
+        let resolved: Vec<(
+            vk::Pipeline,
+            vk::PipelineLayout,
+            [u8; COMPUTE_PUSH_CONSTANT_BYTES],
+            usize,
+            [u32; 3],
+        )> = {
             let pipelines = self.pipelines.lock().unwrap();
             let mut out = Vec::with_capacity(ops.len());
             for op in ops {
@@ -1561,7 +1586,7 @@ impl GpuDevice for VulkanDevice {
                     }
                 };
 
-                let mut pc = [0u8; 128];
+                let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
                 let mut pc_len = 0usize;
                 let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
                     if pc_len + 4 > pc.len() {
@@ -2396,6 +2421,11 @@ mod tests {
     }
 
     #[test]
+    fn compute_push_constant_abi_uses_vulkan_portable_minimum() {
+        assert_eq!(COMPUTE_PUSH_CONSTANT_BYTES, 128);
+    }
+
+    #[test]
     fn buffer_roundtrip() {
         let Some(dev) = try_device() else { return };
         let h = dev.create_buffer(rw_desc(4)).unwrap();
@@ -2487,9 +2517,9 @@ mod tests {
     }
 
     #[test]
-    fn reports_graphics_and_compute() {
+    fn trait_open_reports_compute_only() {
         let Some(dev) = try_device() else { return };
-        assert!(dev.capabilities().graphics);
+        assert!(!dev.capabilities().graphics);
         assert!(dev.capabilities().compute);
     }
 
