@@ -11,8 +11,8 @@ use std::{
 use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     AddressMode, Bindings, BlendMode, BorderColor, BufferDesc, BufferHandle, BufferUsage,
-    CompareFn, ComputePipelineDesc, CullMode, DeviceLimits, DeviceRequest, DispatchOp, Features,
-    FilterMode, Format, FrontFace, GpuDevice, GpuError, GpuSubmission, GraphicsDevice,
+    CompareFn, ComputeOp, ComputePipelineDesc, CullMode, DeviceLimits, DeviceRequest, DispatchOp,
+    Features, FilterMode, Format, FrontFace, GpuDevice, GpuError, GpuSubmission, GraphicsDevice,
     GraphicsPipelineDesc, HalCapabilities, MemoryUsage, PipelineHandle, PolygonMode,
     PrimitiveTopology, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
     ShaderSource, SlotMap, StepMode, Submission, SubmissionStatus, SurfaceConfig, TargetHandle,
@@ -2292,9 +2292,261 @@ impl GpuDevice for VulkanDevice {
     fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
         self.submit_compute_batch_async(cycle_id, ops)
     }
+
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        self.submit_mixed_compute_async(cycle_id, ops)
+    }
 }
 
 impl VulkanDevice {
+    fn submit_mixed_compute_async(
+        &self,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+    ) -> Result<Submission> {
+        if ops.is_empty() {
+            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
+        }
+
+        enum ResolvedOp {
+            Copy {
+                src: vk::Buffer,
+                src_offset: u64,
+                dst: vk::Buffer,
+                dst_offset: u64,
+                len: u64,
+            },
+            Dispatch {
+                pipeline: vk::Pipeline,
+                layout: vk::PipelineLayout,
+                pc: [u8; COMPUTE_PUSH_CONSTANT_BYTES],
+                pc_len: usize,
+                grid: [u32; 3],
+            },
+        }
+
+        let buffers = self.buffers.lock().unwrap();
+        let textures = self.textures.lock().unwrap();
+        let bound_textures = self.bindless.bound_textures.lock().unwrap();
+        let pipelines = self.pipelines.lock().unwrap();
+        let samplers = self.samplers.lock().unwrap();
+        let mut resolved = Vec::with_capacity(ops.len());
+
+        for op in ops {
+            match op {
+                ComputeOp::CopyBuffer(copy) => {
+                    let src = buffers
+                        .get(copy.src)
+                        .ok_or_else(|| stale(copy.src, &buffers))?;
+                    let dst = buffers
+                        .get(copy.dst)
+                        .ok_or_else(|| stale(copy.dst, &buffers))?;
+                    if copy.src == copy.dst {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            "copy_buffer requires distinct source and destination buffers".into(),
+                        )));
+                    }
+                    if !src.usage.contains(BufferUsage::TRANSFER_SRC) {
+                        return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                            resource: "source buffer",
+                            needed: "TRANSFER_SRC",
+                        }));
+                    }
+                    if !dst.usage.contains(BufferUsage::TRANSFER_DST) {
+                        return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                            resource: "destination buffer",
+                            needed: "TRANSFER_DST",
+                        }));
+                    }
+                    let src_end = copy.src_offset.checked_add(copy.len).ok_or_else(|| {
+                        GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            "source copy range overflows u64".into(),
+                        ))
+                    })?;
+                    let dst_end = copy.dst_offset.checked_add(copy.len).ok_or_else(|| {
+                        GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            "destination copy range overflows u64".into(),
+                        ))
+                    })?;
+                    if src_end > src.size || dst_end > dst.size {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!(
+                                "copy ranges src {}..{src_end}/{} dst {}..{dst_end}/{}",
+                                copy.src_offset, src.size, copy.dst_offset, dst.size
+                            ),
+                        )));
+                    }
+                    resolved.push(ResolvedOp::Copy {
+                        src: src.buffer,
+                        src_offset: copy.src_offset,
+                        dst: dst.buffer,
+                        dst_offset: copy.dst_offset,
+                        len: copy.len,
+                    });
+                }
+                ComputeOp::Dispatch(op) => {
+                    if op.grid.contains(&0)
+                        || op
+                            .grid
+                            .iter()
+                            .zip(self.inner.limits.max_dispatch_size)
+                            .any(|(requested, limit)| *requested > limit)
+                    {
+                        return Err(GpuError::Dispatch(format!(
+                            "invalid dispatch grid {:?}; device limit {:?}",
+                            op.grid, self.inner.limits.max_dispatch_size
+                        )));
+                    }
+                    for &idx in op.bindings.buffers {
+                        let buffer = buffers.get_by_slot_index(idx).ok_or_else(|| {
+                            GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                                "buffer binding index {idx} is not live"
+                            )))
+                        })?;
+                        if idx >= self.bindless.buffer_capacity {
+                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                format!("buffer binding index {idx} exceeds bindless capacity"),
+                            )));
+                        }
+                        if !buffer.usage.contains(BufferUsage::STORAGE) {
+                            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                                resource: "bound buffer",
+                                needed: "STORAGE",
+                            }));
+                        }
+                    }
+                    for &idx in op.bindings.textures {
+                        if idx >= self.bindless.texture_capacity
+                            || textures.get_by_slot_index(idx).is_none()
+                            || !bound_textures[idx as usize]
+                        {
+                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                format!("texture binding index {idx} is not live and bound"),
+                            )));
+                        }
+                    }
+                    let (pipeline, layout) = match pipelines
+                        .get(op.pipeline)
+                        .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?
+                    {
+                        VulkanPipeline::Compute { layout, pipeline } => (*pipeline, *layout),
+                        VulkanPipeline::Graphics { .. } => {
+                            return Err(GpuError::Dispatch(
+                                "dispatch called with a graphics pipeline handle".into(),
+                            ));
+                        }
+                    };
+                    let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
+                    let mut pc_len = 0usize;
+                    for bytes in op.bindings.buffers.iter().map(|v| v.to_ne_bytes()).chain(
+                        op.bindings.scalars.iter().map(|scalar| match scalar {
+                            Scalar::U32(v) => v.to_ne_bytes(),
+                            Scalar::I32(v) => v.to_ne_bytes(),
+                            Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+                        }),
+                    ) {
+                        if pc_len + 4 > pc.len() {
+                            return Err(GpuError::Dispatch(format!(
+                                "push constants exceed {} bytes",
+                                pc.len()
+                            )));
+                        }
+                        pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
+                        pc_len += 4;
+                    }
+                    resolved.push(ResolvedOp::Dispatch {
+                        pipeline,
+                        layout,
+                        pc,
+                        pc_len,
+                        grid: op.grid,
+                    });
+                }
+            }
+        }
+
+        let bindless_set = self.bindless.set;
+        let submission = self.one_shot_submit_async(cycle_id, move |dev, cmd| {
+            let barrier = vk::MemoryBarrier {
+                src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+                ..Default::default()
+            };
+            unsafe {
+                for (index, op) in resolved.iter().enumerate() {
+                    if index != 0 {
+                        dev.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::COMPUTE_SHADER
+                                | vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::COMPUTE_SHADER
+                                | vk::PipelineStageFlags::TRANSFER,
+                            vk::DependencyFlags::empty(),
+                            &[barrier],
+                            &[],
+                            &[],
+                        );
+                    }
+                    match op {
+                        ResolvedOp::Copy {
+                            src,
+                            src_offset,
+                            dst,
+                            dst_offset,
+                            len,
+                        } => {
+                            if *len != 0 {
+                                dev.cmd_copy_buffer(
+                                    cmd,
+                                    *src,
+                                    *dst,
+                                    &[vk::BufferCopy {
+                                        src_offset: *src_offset,
+                                        dst_offset: *dst_offset,
+                                        size: *len,
+                                    }],
+                                );
+                            }
+                        }
+                        ResolvedOp::Dispatch {
+                            pipeline,
+                            layout,
+                            pc,
+                            pc_len,
+                            grid,
+                        } => {
+                            dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
+                            dev.cmd_bind_descriptor_sets(
+                                cmd,
+                                vk::PipelineBindPoint::COMPUTE,
+                                *layout,
+                                0,
+                                &[bindless_set],
+                                &[],
+                            );
+                            if *pc_len != 0 {
+                                dev.cmd_push_constants(
+                                    cmd,
+                                    *layout,
+                                    vk::ShaderStageFlags::COMPUTE,
+                                    0,
+                                    &pc[..*pc_len],
+                                );
+                            }
+                            dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        drop(samplers);
+        submission
+    }
+
     fn submit_compute_batch_async(
         &self,
         cycle_id: u64,
@@ -3684,6 +3936,108 @@ mod tests {
             .unwrap();
         dev.generate_mipmaps(tex).unwrap();
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn mixed_copy_dispatch_submission_round_trips_device_local_data() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const DOUBLE_ZSL: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel double(inp: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len { out[i] = inp[i] + inp[i] }
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        let shader = dev.create_shader(DOUBLE_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        const N: u32 = 64;
+        let size = N as u64 * 4;
+        let upload = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let input = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let output = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let readback = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        let values: Vec<f32> = (0..N).map(|i| i as f32 - 17.0).collect();
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+        dev.write_buffer(upload, 0, bytes).unwrap();
+        let submission = dev
+            .submit_compute_ops(
+                0x4d_49_58_45_44,
+                &[
+                    ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                        src: upload,
+                        src_offset: 0,
+                        dst: input,
+                        dst_offset: 0,
+                        len: size,
+                    }),
+                    ComputeOp::Dispatch(DispatchOp {
+                        pipeline,
+                        bindings: Bindings {
+                            buffers: &[input.index(), output.index()],
+                            textures: &[],
+                            scalars: &[Scalar::U32(N)],
+                        },
+                        grid: [1, 1, 1],
+                    }),
+                    ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                        src: output,
+                        src_offset: 0,
+                        dst: readback,
+                        dst_offset: 0,
+                        len: size,
+                    }),
+                ],
+            )
+            .unwrap();
+        assert_eq!(submission.cycle_id(), 0x4d_49_58_45_44);
+        submission.wait(Duration::from_secs(5)).unwrap();
+        let actual = dev.read_buffer(readback, 0, size).unwrap();
+        for (index, bytes) in actual.chunks_exact(4).enumerate() {
+            assert_eq!(
+                f32::from_ne_bytes(bytes.try_into().unwrap()),
+                values[index] * 2.0
+            );
+        }
+        dev.destroy_buffer(upload);
+        dev.destroy_buffer(input);
+        dev.destroy_buffer(output);
+        dev.destroy_buffer(readback);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
     }
 
     #[test]

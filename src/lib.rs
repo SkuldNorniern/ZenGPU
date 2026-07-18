@@ -72,15 +72,15 @@ pub use zengpu_spirv::ZslShader;
 // rather than `zengpu::hal::BufferHandle`.
 pub use zengpu_hal::{
     Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,
-    BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputePipelineDesc, DType,
-    DepthAttachment, DepthState, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, Features,
-    FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
-    GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp, MemoryUsage, PipelineHandle,
-    PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc,
-    RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
-    StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig, SurfaceError, TargetHandle,
-    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexAttribute, VertexFormat,
-    VertexLayout, Viewport, ViewportScissor, WindowHandles,
+    BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputeOp,
+    ComputePipelineDesc, DType, DepthAttachment, DepthState, DeviceLimits, DeviceRequest,
+    DeviceType, DispatchOp, Features, FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp,
+    MemoryUsage, PipelineHandle, PowerPreference, PresentMode, PrimitiveTopology, Rect,
+    RenderCommands, RenderPassDesc, RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig,
+    SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
 // ── Flat re-exports for the most commonly used extension types ────────────────

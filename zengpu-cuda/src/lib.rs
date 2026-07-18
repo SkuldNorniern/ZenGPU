@@ -22,8 +22,8 @@ use cuda_oxide::{
 };
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
-    GpuInstance, GpuSubmission, HalCapabilities, PipelineHandle, Result, SamplerDesc,
+    BufferUsage, ComputeOp, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
+    GpuError, GpuInstance, GpuSubmission, HalCapabilities, PipelineHandle, Result, SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
     SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
@@ -991,6 +991,177 @@ impl GpuDevice for CudaDevice {
             lifetime: Arc::clone(&self.lifetime),
         }))
     }
+
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        if ops.is_empty() {
+            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
+        }
+
+        const MAX_PARAMS: usize = 32;
+        let stream = self.shared.stream;
+        self.lifetime
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .in_flight += 1;
+        let event = self.with_context(|_handle| {
+            for op in ops {
+                match op {
+                    ComputeOp::CopyBuffer(copy) => {
+                        let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+                        let src = buffers.get(copy.src).copied().ok_or_else(|| {
+                            GpuError::Backend("cuda: invalid source buffer handle".into())
+                        })?;
+                        let dst = buffers.get(copy.dst).copied().ok_or_else(|| {
+                            GpuError::Backend("cuda: invalid destination buffer handle".into())
+                        })?;
+                        if copy.src == copy.dst {
+                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                "copy_buffer requires distinct source and destination buffers"
+                                    .into(),
+                            )));
+                        }
+                        if !src.usage.contains(BufferUsage::TRANSFER_SRC) {
+                            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                                resource: "source buffer",
+                                needed: "TRANSFER_SRC",
+                            }));
+                        }
+                        if !dst.usage.contains(BufferUsage::TRANSFER_DST) {
+                            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                                resource: "destination buffer",
+                                needed: "TRANSFER_DST",
+                            }));
+                        }
+                        let src_end = copy.src_offset.checked_add(copy.len).ok_or_else(|| {
+                            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                "source copy range overflows u64".into(),
+                            ))
+                        })?;
+                        let dst_end = copy.dst_offset.checked_add(copy.len).ok_or_else(|| {
+                            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                "destination copy range overflows u64".into(),
+                            ))
+                        })?;
+                        if src_end > src.len || dst_end > dst.len {
+                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                "cuda: mixed-submission copy range exceeds buffer".into(),
+                            )));
+                        }
+                        if copy.len != 0 {
+                            let byte_count = u32::try_from(copy.len).map_err(|_| {
+                                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                    "cuda: copy exceeds driver byte-count range".into(),
+                                ))
+                            })?;
+                            cu(unsafe {
+                                sys::cuMemcpyDtoDAsync_v2(
+                                    dst.ptr + copy.dst_offset,
+                                    src.ptr + copy.src_offset,
+                                    byte_count,
+                                    stream,
+                                )
+                            })?;
+                        }
+                    }
+                    ComputeOp::Dispatch(op) => {
+                        let cp = self
+                            .pipelines
+                            .lock()
+                            .map_err(|_| GpuError::DeviceLost)?
+                            .get(op.pipeline)
+                            .copied()
+                            .ok_or_else(|| {
+                                GpuError::Backend("cuda: invalid pipeline handle".into())
+                            })?;
+                        let mut storage = [[0u8; 8]; MAX_PARAMS];
+                        let mut n_params = 0usize;
+                        {
+                            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+                            for &slot in op.bindings.buffers {
+                                if n_params >= MAX_PARAMS {
+                                    return Err(GpuError::Dispatch(format!(
+                                        "dispatch: more than {MAX_PARAMS} kernel parameters"
+                                    )));
+                                }
+                                let buffer = buffers.get_by_slot_index(slot).ok_or_else(|| {
+                                    GpuError::Backend(
+                                        "cuda: invalid buffer slot in bindings".into(),
+                                    )
+                                })?;
+                                storage[n_params] = buffer.ptr.to_le_bytes();
+                                n_params += 1;
+                            }
+                        }
+                        for scalar in op.bindings.scalars {
+                            if n_params >= MAX_PARAMS {
+                                return Err(GpuError::Dispatch(format!(
+                                    "dispatch: more than {MAX_PARAMS} kernel parameters"
+                                )));
+                            }
+                            let bytes = match scalar {
+                                Scalar::U32(v) => v.to_le_bytes(),
+                                Scalar::I32(v) => v.to_le_bytes(),
+                                Scalar::F32(v) => v.to_bits().to_le_bytes(),
+                            };
+                            storage[n_params][..4].copy_from_slice(&bytes);
+                            n_params += 1;
+                        }
+                        let mut params = [ptr::null_mut(); MAX_PARAMS];
+                        for (index, slot) in storage.iter_mut().take(n_params).enumerate() {
+                            params[index] = slot.as_mut_ptr() as *mut c_void;
+                        }
+                        cu(unsafe {
+                            sys::cuLaunchKernel(
+                                cp.func,
+                                op.grid[0],
+                                op.grid[1],
+                                op.grid[2],
+                                cp.block[0],
+                                cp.block[1],
+                                cp.block[2],
+                                0,
+                                stream,
+                                params.as_mut_ptr(),
+                                ptr::null_mut(),
+                            )
+                        })?;
+                    }
+                }
+            }
+            let mut event = ptr::null_mut();
+            cu(unsafe {
+                sys::cuEventCreate(&mut event, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING)
+            })?;
+            if let Err(error) = cu(unsafe { sys::cuEventRecord(event, stream) }) {
+                unsafe { sys::cuEventDestroy_v2(event) };
+                return Err(error);
+            }
+            Ok(event)
+        });
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                let _ = self.with_context(|_| cu(unsafe { sys::cuStreamSynchronize(stream) }));
+                release_cuda_in_flight(
+                    &self.shared,
+                    &self.buffers,
+                    &self.shaders,
+                    &self.pipelines,
+                    &self.lifetime,
+                );
+                return Err(error);
+            }
+        };
+        Ok(Box::new(CudaSubmission {
+            cycle_id,
+            shared: Arc::clone(&self.shared),
+            event: Mutex::new(Some(event)),
+            buffers: Arc::clone(&self.buffers),
+            shaders: Arc::clone(&self.shaders),
+            pipelines: Arc::clone(&self.pipelines),
+            lifetime: Arc::clone(&self.lifetime),
+        }))
+    }
 }
 
 // ── PTX kernels ───────────────────────────────────────────────────────────────
@@ -1585,6 +1756,105 @@ mod tests {
         device.destroy_shader(shader);
         device.destroy_buffer(src);
         device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn mixed_copy_dispatch_submission_round_trips_device_local_data() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * 4) as u64;
+        let upload = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: zengpu_hal::MemoryUsage::Upload,
+            })
+            .unwrap();
+        let gpu_input = |size| BufferDesc {
+            size,
+            usage: BufferUsage::TRANSFER_DST | BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let a = device.create_buffer(gpu_input(size)).unwrap();
+        let b = device.create_buffer(gpu_input(size)).unwrap();
+        let output = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let readback = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::Readback,
+            })
+            .unwrap();
+        let values: Vec<f32> = (0..N).map(|i| i as f32 - 31.0).collect();
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        device.write_buffer(upload, 0, &bytes).unwrap();
+        let shader = device.create_shader(ShaderDesc::ptx(VEC_ADD_PTX)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .unwrap();
+        let copy_to = |dst| {
+            ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                src: upload,
+                src_offset: 0,
+                dst,
+                dst_offset: 0,
+                len: size,
+            })
+        };
+        let submission = device
+            .submit_compute_ops(
+                0x4d_49_58_45_44,
+                &[
+                    copy_to(a),
+                    copy_to(b),
+                    ComputeOp::Dispatch(zengpu_hal::DispatchOp {
+                        pipeline,
+                        bindings: Bindings {
+                            buffers: &[a.index(), b.index(), output.index()],
+                            scalars: &[Scalar::U32(N as u32)],
+                            textures: &[],
+                        },
+                        grid: [1, 1, 1],
+                    }),
+                    ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                        src: output,
+                        src_offset: 0,
+                        dst: readback,
+                        dst_offset: 0,
+                        len: size,
+                    }),
+                ],
+            )
+            .unwrap();
+        assert_eq!(submission.cycle_id(), 0x4d_49_58_45_44);
+        submission.wait(Duration::from_secs(5)).unwrap();
+        let actual = device.read_buffer(readback, 0, size).unwrap();
+        for (index, bytes) in actual.chunks_exact(4).enumerate() {
+            assert_eq!(
+                f32::from_le_bytes(bytes.try_into().unwrap()),
+                values[index] * 2.0
+            );
+        }
+        device.destroy_buffer(upload);
+        device.destroy_buffer(a);
+        device.destroy_buffer(b);
+        device.destroy_buffer(output);
+        device.destroy_buffer(readback);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
     }
 
     #[test]
