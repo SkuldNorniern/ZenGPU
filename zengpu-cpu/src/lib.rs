@@ -170,6 +170,57 @@ impl GpuDevice for CpuDevice {
         Ok(buf.data[start..end].to_vec())
     }
 
+    fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let mut buffers = self.buffers.lock().unwrap();
+        let src_buf = buffers.get(src).ok_or_else(|| stale(src, &buffers))?;
+        if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "source buffer",
+                needed: "TRANSFER_SRC",
+            }));
+        }
+        let src_start = src_offset as usize;
+        let src_end = src_start
+            .checked_add(len as usize)
+            .ok_or_else(|| out_of_bounds(src_start, usize::MAX, src_buf.data.len()))?;
+        if src_end > src_buf.data.len() {
+            return Err(out_of_bounds(src_start, src_end, src_buf.data.len()));
+        }
+        let bytes = src_buf.data[src_start..src_end].to_vec();
+
+        if src == dst {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "copy_buffer requires distinct source and destination buffers".into(),
+            )));
+        }
+        if buffers.get(dst).is_none() {
+            return Err(stale(dst, &buffers));
+        }
+        let dst_buf = buffers.get_mut(dst).unwrap();
+        if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "destination buffer",
+                needed: "TRANSFER_DST",
+            }));
+        }
+        let dst_start = dst_offset as usize;
+        let dst_end = dst_start
+            .checked_add(len as usize)
+            .ok_or_else(|| out_of_bounds(dst_start, usize::MAX, dst_buf.data.len()))?;
+        if dst_end > dst_buf.data.len() {
+            return Err(out_of_bounds(dst_start, dst_end, dst_buf.data.len()));
+        }
+        dst_buf.data[dst_start..dst_end].copy_from_slice(&bytes);
+        Ok(())
+    }
+
     fn destroy_buffer(&self, buffer: BufferHandle) {
         self.buffers.lock().unwrap().remove(buffer);
     }

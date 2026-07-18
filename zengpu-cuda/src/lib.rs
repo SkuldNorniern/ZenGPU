@@ -21,9 +21,10 @@ use cuda_oxide::{
 };
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance,
-    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
-    ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, marker,
+    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, UsageError,
+    marker,
 };
 
 use error::{cu, from_cuda};
@@ -206,6 +207,7 @@ impl GpuAdapter for CudaAdapter {
 struct CudaBuffer {
     ptr: u64,
     len: u64,
+    usage: BufferUsage,
 }
 
 // ── CudaShader ────────────────────────────────────────────────────────────────
@@ -321,7 +323,11 @@ impl GpuDevice for CudaDevice {
                 .buffers
                 .lock()
                 .map_err(|_| GpuError::DeviceLost)?
-                .insert(CudaBuffer { ptr, len });
+                .insert(CudaBuffer {
+                    ptr,
+                    len,
+                    usage: desc.usage,
+                });
             Ok(bh)
         })
     }
@@ -365,6 +371,75 @@ impl GpuDevice for CudaDevice {
             let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
             let view = dp.subslice(offset, offset + len);
             from_cuda(view.load())
+        })
+    }
+
+    fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let (src_buf, dst_buf) = {
+            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            let src_buf = buffers
+                .get(src)
+                .copied()
+                .ok_or_else(|| GpuError::Backend("cuda: invalid source buffer handle".into()))?;
+            let dst_buf = buffers.get(dst).copied().ok_or_else(|| {
+                GpuError::Backend("cuda: invalid destination buffer handle".into())
+            })?;
+            (src_buf, dst_buf)
+        };
+        if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "source buffer",
+                needed: "TRANSFER_SRC",
+            }));
+        }
+        if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "destination buffer",
+                needed: "TRANSFER_DST",
+            }));
+        }
+        if src == dst {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "copy_buffer requires distinct source and destination buffers".into(),
+            )));
+        }
+        let src_end = src_offset.checked_add(len).ok_or_else(|| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "source copy range overflows u64".into(),
+            ))
+        })?;
+        let dst_end = dst_offset.checked_add(len).ok_or_else(|| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "destination copy range overflows u64".into(),
+            ))
+        })?;
+        if src_end > src_buf.len || dst_end > dst_buf.len {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "copy ranges src {src_offset}..{src_end}/{} dst {dst_offset}..{dst_end}/{}",
+                    src_buf.len, dst_buf.len
+                ),
+            )));
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        self.with_context(|handle| {
+            let src_ptr =
+                unsafe { DevicePtr::from_raw_parts(handle.clone(), src_buf.ptr, src_buf.len) };
+            let dst_ptr = unsafe { DevicePtr::from_raw_parts(handle, dst_buf.ptr, dst_buf.len) };
+            from_cuda(
+                src_ptr
+                    .subslice(src_offset, src_end)
+                    .copy_to(&dst_ptr.subslice(dst_offset, dst_end)),
+            )
         })
     }
 
@@ -836,6 +911,34 @@ mod tests {
         let rb = device.read_buffer(buf, 0, SIZE).expect("read 16 MiB");
         assert_eq!(rb, data, "16 MiB round-trip mismatch");
         device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn device_to_device_buffer_copy_round_trip() {
+        const SIZE: usize = 4 * 1024 * 1024;
+        let Some(dev) = cuda_device() else { return };
+        let src = dev
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let dst = dev
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..SIZE)
+            .map(|i| (i as u32).wrapping_mul(17).wrapping_add(3) as u8)
+            .collect();
+        dev.write_buffer(src, 0, &data).unwrap();
+        dev.copy_buffer(src, 0, dst, 0, SIZE as u64).unwrap();
+        assert_eq!(dev.read_buffer(dst, 0, SIZE as u64).unwrap(), data);
+        dev.destroy_buffer(src);
+        dev.destroy_buffer(dst);
     }
 
     /// CPU-vs-CUDA conformance: `c[i] = a[i] + b[i]` on 1024 f32 elements.

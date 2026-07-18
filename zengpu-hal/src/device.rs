@@ -34,6 +34,26 @@ pub trait GpuDevice: Send + Sync {
     /// have been created with [`crate::BufferUsage::READBACK`].
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Copy `len` bytes between buffers on this device. `src` must have
+    /// [`crate::BufferUsage::TRANSFER_SRC`] and `dst` must have
+    /// [`crate::BufferUsage::TRANSFER_DST`]. The call is synchronous: the
+    /// copied bytes are available to subsequent device or host operations
+    /// when it returns.
+    ///
+    /// Copies within the same buffer are rejected so every backend has the
+    /// same overlap semantics. A zero-length copy is a no-op after handle and
+    /// usage validation.
+    fn copy_buffer(
+        &self,
+        _src: BufferHandle,
+        _src_offset: u64,
+        _dst: BufferHandle,
+        _dst_offset: u64,
+        _len: u64,
+    ) -> Result<()> {
+        Err(GpuError::Unsupported("buffer copy".into()))
+    }
+
     /// Backend device ordinal, or `-1` when the backend does not expose one.
     fn device_ordinal(&self) -> i32 {
         -1
