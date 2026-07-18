@@ -68,6 +68,7 @@ pub struct DeviceLimits {
     pub max_push_constant_size: u32,
     pub max_storage_buffers: u32,
     pub max_sampled_textures: u32,
+    pub max_update_after_bind_descriptors: u32,
     pub max_memory_allocations: u32,
     pub timestamp_supported: bool,
     /// Nanoseconds per timestamp tick.

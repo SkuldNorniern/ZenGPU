@@ -40,6 +40,9 @@ struct BindlessState {
     layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
+    buffer_capacity: u32,
+    texture_capacity: u32,
+    bound_textures: Mutex<Vec<bool>>,
 }
 
 // SAFETY: the contained Vulkan handles are all u64 values; we control their
@@ -597,7 +600,7 @@ impl VulkanDevice {
             dynamic_rendering,
         });
 
-        let bindless = create_bindless(&inner.device)?;
+        let bindless = create_bindless(&inner.device, inner.limits)?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
         let fence_pool = FencePool::new(Arc::clone(&inner));
         let pipeline_cache = unsafe {
@@ -723,6 +726,7 @@ impl VulkanDevice {
     /// Register a STORAGE buffer in the bindless SSBO table at its slot index.
     /// Called automatically by `create_buffer` for `STORAGE`-flagged buffers.
     fn bind_buffer_to_bindless(&self, slot: u32, buffer: vk::Buffer, size: u64) {
+        debug_assert!(slot < self.bindless.buffer_capacity);
         let info = vk::DescriptorBufferInfo {
             buffer,
             offset: 0,
@@ -750,6 +754,9 @@ impl VulkanDevice {
     /// [`GpuDevice::upload_texture_data`], or after a render pass with
     /// [`zengpu_hal::ColorAttachment::sample_after`] for a render-target texture.
     pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
+        if texture.index() >= self.bindless.texture_capacity {
+            return None;
+        }
         let view = self.textures.lock().unwrap().get(texture)?.view;
         let vk_sampler = *self.samplers.lock().unwrap().get(sampler)?;
         let info = vk::DescriptorImageInfo {
@@ -769,23 +776,42 @@ impl VulkanDevice {
         unsafe {
             self.inner.device.update_descriptor_sets(&[write], &[]);
         }
+        self.bindless.bound_textures.lock().unwrap()[texture.index() as usize] = true;
         Some(texture.index())
     }
 }
 
-fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
+fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
+    let total = limits.max_update_after_bind_descriptors;
+    let buffer_capacity = MAX_BINDLESS_BUFFERS
+        .min(limits.max_storage_buffers)
+        .min(total.saturating_sub(1));
+    let texture_capacity = MAX_BINDLESS_TEXTURES
+        .min(limits.max_sampled_textures)
+        .min(total.saturating_sub(buffer_capacity));
+    if buffer_capacity == 0 || texture_capacity == 0 {
+        return Err(GpuError::Unsupported(format!(
+            "bindless descriptor limits are too small: storage={}, textures={}, total={total}",
+            limits.max_storage_buffers, limits.max_sampled_textures
+        )));
+    }
+    Ok((buffer_capacity, texture_capacity))
+}
+
+fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
+    let (buffer_capacity, texture_capacity) = bindless_capacities(limits)?;
     let bindings = [
         vk::DescriptorSetLayoutBinding {
             binding: 0,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: MAX_BINDLESS_BUFFERS,
+            descriptor_count: buffer_capacity,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         },
         vk::DescriptorSetLayoutBinding {
             binding: 1,
             descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: MAX_BINDLESS_TEXTURES,
+            descriptor_count: texture_capacity,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         },
@@ -814,11 +840,11 @@ fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
     let pool_sizes = [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: MAX_BINDLESS_BUFFERS,
+            descriptor_count: buffer_capacity,
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: MAX_BINDLESS_TEXTURES,
+            descriptor_count: texture_capacity,
         },
     ];
     let pool = unsafe {
@@ -852,7 +878,14 @@ fn create_bindless(dev: &ash::Device) -> Result<BindlessState> {
         })?[0]
     };
 
-    Ok(BindlessState { layout, pool, set })
+    Ok(BindlessState {
+        layout,
+        pool,
+        set,
+        buffer_capacity,
+        texture_capacity,
+        bound_textures: Mutex::new(vec![false; texture_capacity as usize]),
+    })
 }
 
 fn filter_to_vk(f: FilterMode) -> vk::Filter {
@@ -955,6 +988,8 @@ pub(crate) fn physical_device_limits(
         max_sampled_textures: descriptor
             .max_per_stage_descriptor_update_after_bind_sampled_images
             .min(descriptor.max_descriptor_set_update_after_bind_sampled_images),
+        max_update_after_bind_descriptors: descriptor
+            .max_update_after_bind_descriptors_in_all_pools,
         max_memory_allocations: limits.max_memory_allocation_count,
         timestamp_supported,
         timestamp_period_ns: limits.timestamp_period,
@@ -1044,6 +1079,16 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
+        if desc.usage.contains(BufferUsage::STORAGE)
+            && desc.size > self.inner.limits.max_storage_buffer_range
+        {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "storage buffer size {} exceeds device limit {}",
+                    desc.size, self.inner.limits.max_storage_buffer_range
+                ),
+            )));
+        }
         let vk_usage = buffer_usage_to_vk(desc.usage);
         let buffer_info = vk::BufferCreateInfo {
             size: desc.size,
@@ -1124,13 +1169,32 @@ impl GpuDevice for VulkanDevice {
         };
 
         let vk_buf = buffer; // Copy before moving into struct
-        let handle = self.buffers.lock().unwrap().insert(VulkanBuffer {
+        let mut buffers = self.buffers.lock().unwrap();
+        if desc.usage.contains(BufferUsage::STORAGE)
+            && buffers.next_index() >= self.bindless.buffer_capacity
+        {
+            unsafe {
+                if !mapped.is_null() {
+                    self.inner.device.unmap_memory(memory);
+                }
+                self.inner.device.destroy_buffer(buffer, None);
+                self.inner.device.free_memory(memory, None);
+            }
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "storage buffer slot exceeds bindless capacity {}",
+                    self.bindless.buffer_capacity
+                ),
+            )));
+        }
+        let handle = buffers.insert(VulkanBuffer {
             buffer: vk_buf,
             memory,
             size: desc.size,
             usage: desc.usage,
             mapped,
         });
+        drop(buffers);
         if desc.usage.contains(BufferUsage::STORAGE) {
             self.bind_buffer_to_bindless(handle.index(), vk_buf, desc.size);
         }
@@ -1466,6 +1530,9 @@ impl GpuDevice for VulkanDevice {
     fn destroy_texture(&self, texture: TextureHandle) {
         let mut textures = self.textures.lock().unwrap();
         if let Some(tex) = textures.remove(texture) {
+            if texture.index() < self.bindless.texture_capacity {
+                self.bindless.bound_textures.lock().unwrap()[texture.index() as usize] = false;
+            }
             unsafe {
                 self.inner.device.destroy_image_view(tex.view, None);
                 self.inner.device.destroy_image(tex.image, None);
@@ -1694,8 +1761,17 @@ impl GpuDevice for VulkanDevice {
             return Ok(());
         }
 
+        // Keep every resolved resource locked through fence completion. This
+        // both validates raw bindless indices and prevents concurrent destroy
+        // from invalidating descriptors or pipeline handles in this synchronous
+        // submission path.
+        let buffers = self.buffers.lock().unwrap();
+        let textures = self.textures.lock().unwrap();
+        let bound_textures = self.bindless.bound_textures.lock().unwrap();
+        let pipelines = self.pipelines.lock().unwrap();
+
         // Resolve pipeline handles and pack push constants for every op up
-        // front (one descriptor-table lock acquisition for the whole batch).
+        // front.
         #[allow(clippy::type_complexity)]
         let resolved: Vec<(
             vk::Pipeline,
@@ -1704,7 +1780,6 @@ impl GpuDevice for VulkanDevice {
             usize,
             [u32; 3],
         )> = {
-            let pipelines = self.pipelines.lock().unwrap();
             let mut out = Vec::with_capacity(ops.len());
             for op in ops {
                 if op.grid.contains(&0) {
@@ -1712,6 +1787,53 @@ impl GpuDevice for VulkanDevice {
                         "dispatch grid dimensions must be non-zero, got {:?}",
                         op.grid
                     )));
+                }
+                if op
+                    .grid
+                    .iter()
+                    .zip(self.inner.limits.max_dispatch_size)
+                    .any(|(requested, limit)| *requested > limit)
+                {
+                    return Err(GpuError::Dispatch(format!(
+                        "dispatch grid {:?} exceeds device limit {:?}",
+                        op.grid, self.inner.limits.max_dispatch_size
+                    )));
+                }
+                for &idx in op.bindings.buffers {
+                    if idx >= self.bindless.buffer_capacity {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!(
+                                "buffer binding index {idx} exceeds bindless capacity {}",
+                                self.bindless.buffer_capacity
+                            ),
+                        )));
+                    }
+                    let buffer = buffers.get_by_slot_index(idx).ok_or_else(|| {
+                        GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                            "buffer binding index {idx} is not live"
+                        )))
+                    })?;
+                    if !buffer.usage.contains(BufferUsage::STORAGE) {
+                        return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                            resource: "bound buffer",
+                            needed: "STORAGE",
+                        }));
+                    }
+                }
+                for &idx in op.bindings.textures {
+                    if idx >= self.bindless.texture_capacity {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!(
+                                "texture binding index {idx} exceeds bindless capacity {}",
+                                self.bindless.texture_capacity
+                            ),
+                        )));
+                    }
+                    if textures.get_by_slot_index(idx).is_none() || !bound_textures[idx as usize] {
+                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                            format!("texture binding index {idx} is not live and bound"),
+                        )));
+                    }
                 }
                 let p = pipelines
                     .get(op.pipeline)
@@ -1757,7 +1879,7 @@ impl GpuDevice for VulkanDevice {
 
         let bindless_set = self.bindless.set;
         let last = resolved.len() - 1;
-        self.one_shot_submit(move |dev, cmd| {
+        let result = self.one_shot_submit(move |dev, cmd| {
             // A later op in the batch may read a buffer an earlier op wrote
             // (e.g. `relu(add(a, b))`); a barrier between dispatches makes
             // those writes visible instead of relying on submission order
@@ -1802,7 +1924,12 @@ impl GpuDevice for VulkanDevice {
                 }
             }
             Ok(())
-        })
+        });
+        drop(pipelines);
+        drop(bound_textures);
+        drop(textures);
+        drop(buffers);
+        result
     }
 }
 
@@ -2632,6 +2759,26 @@ mod tests {
     }
 
     #[test]
+    fn bindless_capacities_respect_each_device_limit() {
+        let limits = DeviceLimits {
+            max_storage_buffers: 16,
+            max_sampled_textures: 8,
+            max_update_after_bind_descriptors: 12,
+            ..Default::default()
+        };
+        assert_eq!(bindless_capacities(limits).unwrap(), (11, 1));
+        assert!(
+            bindless_capacities(DeviceLimits {
+                max_storage_buffers: 1,
+                max_sampled_textures: 1,
+                max_update_after_bind_descriptors: 1,
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
     #[ignore = "explicit NVIDIA/Vulkan logical-device churn stress test"]
     fn repeated_device_create_use_drop_stress() {
         let _guard = crate::test_gpu_lock();
@@ -3113,6 +3260,156 @@ mod tests {
         dev.destroy_shader(add_shader);
         dev.destroy_pipeline(relu_pipeline);
         dev.destroy_shader(relu_shader);
+    }
+
+    #[test]
+    fn dispatch_rejects_invalid_bindless_buffer_indices() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL_ZSL: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel fill(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = 1.0
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+
+        let non_storage = dev.create_buffer(rw_desc(4)).unwrap();
+        let err = dev
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[non_storage.index()],
+                    ..Default::default()
+                },
+                [1, 1, 1],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "STORAGE",
+                ..
+            })
+        ));
+        dev.destroy_buffer(non_storage);
+
+        let storage = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let stale_index = storage.index();
+        dev.destroy_buffer(storage);
+        let err = dev
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[stale_index],
+                    ..Default::default()
+                },
+                [1, 1, 1],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::BindingMismatch(message))
+                if message.contains("not live")
+        ));
+
+        let err = dev
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[dev.limits().max_storage_buffers],
+                    ..Default::default()
+                },
+                [1, 1, 1],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::BindingMismatch(message))
+                if message.contains("capacity") || message.contains("not live")
+        ));
+
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+    }
+
+    #[test]
+    fn dispatch_rejects_destroyed_bound_texture_index() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL_ZSL: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel fill(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = 1.0
+            }
+        );
+
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        let output = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let texture = dev
+            .create_texture(tex_desc(zengpu_hal::TexDim::D2))
+            .unwrap();
+        let sampler = dev.create_sampler(SamplerDesc::default()).unwrap();
+        let device = dev
+            .dev
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("graphics helper must contain VulkanDevice");
+        let texture_index = device.bind_texture(texture, sampler).unwrap();
+        dev.destroy_texture(texture);
+
+        let err = dev
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[output.index()],
+                    textures: &[texture_index],
+                    scalars: &[],
+                },
+                [1, 1, 1],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::BindingMismatch(message))
+                if message.contains("not live and bound")
+        ));
+
+        dev.destroy_sampler(sampler);
+        dev.destroy_buffer(output);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
     }
 
     #[test]
