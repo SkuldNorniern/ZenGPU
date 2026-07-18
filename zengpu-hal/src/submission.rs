@@ -15,8 +15,10 @@ pub enum SubmissionStatus {
 ///
 /// The cycle identifier is supplied by the caller and is never interpreted by
 /// the backend. Real-time consumers use it to reject a completion belonging to
-/// an older control cycle. Resources referenced by a submission must remain
-/// alive until it reports [`SubmissionStatus::Complete`].
+/// an older control cycle. Backends must keep referenced native resources and
+/// descriptor slots alive until completion. A destroy request made while work
+/// is pending invalidates the public handle immediately but may defer native
+/// destruction and slot reuse.
 pub trait GpuSubmission: Send + Sync {
     /// Caller-defined control-cycle identifier associated with this work.
     fn cycle_id(&self) -> u64;

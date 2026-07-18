@@ -62,6 +62,19 @@ struct VulkanSubmissionState {
     cmd: Option<vk::CommandBuffer>,
 }
 
+enum DeferredVulkanResource {
+    Buffer(u32, VulkanBuffer),
+    Texture(u32, VulkanTexture),
+    Sampler(u32, vk::Sampler),
+    Pipeline(u32, VulkanPipeline),
+}
+
+#[derive(Default)]
+struct VulkanLifetimeState {
+    in_flight: usize,
+    deferred: Vec<DeferredVulkanResource>,
+}
+
 /// Fence-backed Vulkan submission. Completion releases its pooled fence and
 /// command buffer exactly once; a timed-out wait leaves both owned by this
 /// handle so a later poll/wait is safe.
@@ -70,6 +83,11 @@ struct VulkanSubmission {
     inner: Arc<VulkanDeviceInner>,
     fence_pool: Arc<FencePool>,
     cmd_pool: Arc<CmdListPool>,
+    buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
+    textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
+    samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
+    pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
+    lifetime: Arc<Mutex<VulkanLifetimeState>>,
     state: Mutex<VulkanSubmissionState>,
 }
 
@@ -81,10 +99,32 @@ impl VulkanSubmission {
         if let Some(cmd) = state.cmd.take() {
             self.cmd_pool.release(cmd);
         }
+        self.release_in_flight();
     }
 
     fn timeout_ns(timeout: Duration) -> u64 {
         timeout.as_nanos().min(u128::from(u64::MAX)) as u64
+    }
+
+    fn release_in_flight(&self) {
+        let deferred = {
+            let mut lifetime = self.lifetime.lock().unwrap();
+            debug_assert!(lifetime.in_flight > 0);
+            lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
+            if lifetime.in_flight == 0 {
+                std::mem::take(&mut lifetime.deferred)
+            } else {
+                Vec::new()
+            }
+        };
+        destroy_deferred_vulkan(
+            &self.inner,
+            &self.buffers,
+            &self.textures,
+            &self.samplers,
+            &self.pipelines,
+            deferred,
+        );
     }
 }
 
@@ -159,6 +199,7 @@ impl Drop for VulkanSubmission {
             }
             state.cmd.take();
         }
+        self.release_in_flight();
     }
 }
 
@@ -307,12 +348,56 @@ pub(crate) struct VulkanTexture {
 unsafe impl Send for VulkanTexture {}
 unsafe impl Sync for VulkanTexture {}
 
+fn destroy_deferred_vulkan(
+    inner: &VulkanDeviceInner,
+    buffers: &Mutex<SlotMap<marker::Buffer, VulkanBuffer>>,
+    textures: &Mutex<SlotMap<marker::Texture, VulkanTexture>>,
+    samplers: &Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
+    pipelines: &Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>,
+    deferred: Vec<DeferredVulkanResource>,
+) {
+    for resource in deferred {
+        match resource {
+            DeferredVulkanResource::Buffer(index, buffer) => {
+                unsafe {
+                    if !buffer.mapped.is_null() {
+                        inner.device.unmap_memory(buffer.memory);
+                    }
+                    inner.device.destroy_buffer(buffer.buffer, None);
+                    inner.device.free_memory(buffer.memory, None);
+                }
+                buffers.lock().unwrap().release_retired(index);
+            }
+            DeferredVulkanResource::Texture(index, texture) => {
+                unsafe {
+                    inner.device.destroy_image_view(texture.view, None);
+                    inner.device.destroy_image(texture.image, None);
+                    inner.device.free_memory(texture.memory, None);
+                }
+                textures.lock().unwrap().release_retired(index);
+            }
+            DeferredVulkanResource::Sampler(index, sampler) => {
+                unsafe { inner.device.destroy_sampler(sampler, None) };
+                samplers.lock().unwrap().release_retired(index);
+            }
+            DeferredVulkanResource::Pipeline(index, pipeline) => {
+                let (pipeline, layout) = pipeline.handles();
+                unsafe {
+                    inner.device.destroy_pipeline(pipeline, None);
+                    inner.device.destroy_pipeline_layout(layout, None);
+                }
+                pipelines.lock().unwrap().release_retired(index);
+            }
+        }
+    }
+}
+
 /// Vulkan logical device implementing [`GpuDevice`].
 pub struct VulkanDevice {
     pub(crate) inner: Arc<VulkanDeviceInner>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
-    samplers: Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
+    samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
     shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     /// Render targets (swapchain images, offscreen textures) recordable
@@ -322,6 +407,7 @@ pub struct VulkanDevice {
     pipeline_cache: vk::PipelineCache,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
     fence_pool: Arc<FencePool>,
+    lifetime: Arc<Mutex<VulkanLifetimeState>>,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -721,7 +807,7 @@ impl VulkanDevice {
             inner,
             buffers: Arc::new(Mutex::new(SlotMap::new())),
             textures: Arc::new(Mutex::new(SlotMap::new())),
-            samplers: Mutex::new(SlotMap::new()),
+            samplers: Arc::new(Mutex::new(SlotMap::new())),
             shaders: Mutex::new(SlotMap::new()),
             pipelines: Arc::new(Mutex::new(SlotMap::new())),
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
@@ -729,6 +815,7 @@ impl VulkanDevice {
             pipeline_cache,
             cmd_list_pool,
             fence_pool,
+            lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
         })
     }
 
@@ -855,6 +942,10 @@ impl VulkanDevice {
             p_command_buffers: &cmd,
             ..Default::default()
         };
+        {
+            let mut lifetime = self.lifetime.lock().unwrap();
+            lifetime.in_flight += 1;
+        }
         let submit_result = {
             let _queue = self.inner.queue_lock.lock().unwrap();
             unsafe {
@@ -865,6 +956,7 @@ impl VulkanDevice {
             }
         };
         if let Err(e) = submit_result {
+            self.lifetime.lock().unwrap().in_flight -= 1;
             self.fence_pool.release(fence);
             self.cmd_list_pool.release(cmd);
             return Err(e);
@@ -875,6 +967,11 @@ impl VulkanDevice {
             inner: Arc::clone(&self.inner),
             fence_pool: Arc::clone(&self.fence_pool),
             cmd_pool: Arc::clone(&self.cmd_list_pool),
+            buffers: Arc::clone(&self.buffers),
+            textures: Arc::clone(&self.textures),
+            samplers: Arc::clone(&self.samplers),
+            pipelines: Arc::clone(&self.pipelines),
+            lifetime: Arc::clone(&self.lifetime),
             state: Mutex::new(VulkanSubmissionState {
                 fence: Some(fence),
                 cmd: Some(cmd),
@@ -916,8 +1013,14 @@ impl VulkanDevice {
         if texture.index() >= self.bindless.texture_capacity {
             return None;
         }
-        let view = self.textures.lock().unwrap().get(texture)?.view;
-        let vk_sampler = *self.samplers.lock().unwrap().get(sampler)?;
+        let textures = self.textures.lock().unwrap();
+        let view = textures.get(texture)?.view;
+        let samplers = self.samplers.lock().unwrap();
+        let vk_sampler = *samplers.get(sampler)?;
+        let lifetime = self.lifetime.lock().unwrap();
+        if lifetime.in_flight != 0 {
+            return None;
+        }
         let info = vk::DescriptorImageInfo {
             sampler: vk_sampler,
             image_view: view,
@@ -1363,6 +1466,12 @@ impl GpuDevice for VulkanDevice {
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        if self.lifetime.lock().unwrap().in_flight != 0 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "write_buffer cannot mutate buffers while an asynchronous submission is pending"
+                    .into(),
+            )));
+        }
 
         if buf.mapped.is_null() {
             return Err(GpuError::Backend(
@@ -1390,6 +1499,12 @@ impl GpuDevice for VulkanDevice {
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        if self.lifetime.lock().unwrap().in_flight != 0 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "read_buffer cannot observe buffers while an asynchronous submission is pending"
+                    .into(),
+            )));
+        }
 
         if !buf.usage.contains(BufferUsage::READBACK) {
             return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
@@ -1429,8 +1544,13 @@ impl GpuDevice for VulkanDevice {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
+        let buffers = self.buffers.lock().unwrap();
+        if self.lifetime.lock().unwrap().in_flight != 0 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "copy_buffer cannot run while an asynchronous submission is pending".into(),
+            )));
+        }
         let (src_buffer, dst_buffer) = {
-            let buffers = self.buffers.lock().unwrap();
             let src_buf = buffers.get(src).ok_or_else(|| stale(src, &buffers))?;
             let dst_buf = buffers.get(dst).ok_or_else(|| stale(dst, &buffers))?;
             if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
@@ -1473,7 +1593,7 @@ impl GpuDevice for VulkanDevice {
         if len == 0 {
             return Ok(());
         }
-        self.one_shot_submit(|dev, cmd| {
+        let result = self.one_shot_submit(|dev, cmd| {
             unsafe {
                 dev.cmd_copy_buffer(
                     cmd,
@@ -1487,12 +1607,21 @@ impl GpuDevice for VulkanDevice {
                 );
             }
             Ok(())
-        })
+        });
+        drop(buffers);
+        result
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
         let mut buffers = self.buffers.lock().unwrap();
-        if let Some(buf) = buffers.remove(buffer) {
+        let mut lifetime = self.lifetime.lock().unwrap();
+        if lifetime.in_flight != 0 {
+            if let Some(buf) = buffers.retire(buffer) {
+                lifetime
+                    .deferred
+                    .push(DeferredVulkanResource::Buffer(buffer.index(), buf));
+            }
+        } else if let Some(buf) = buffers.remove(buffer) {
             unsafe {
                 if !buf.mapped.is_null() {
                     self.inner.device.unmap_memory(buf.memory);
@@ -1688,10 +1817,25 @@ impl GpuDevice for VulkanDevice {
 
     fn destroy_texture(&self, texture: TextureHandle) {
         let mut textures = self.textures.lock().unwrap();
-        if let Some(tex) = textures.remove(texture) {
-            if texture.index() < self.bindless.texture_capacity {
-                self.bindless.bound_textures.lock().unwrap()[texture.index() as usize] = false;
+        let mut bound_textures = self.bindless.bound_textures.lock().unwrap();
+        let mut lifetime = self.lifetime.lock().unwrap();
+        let (removed, tex) = if lifetime.in_flight != 0 {
+            if let Some(tex) = textures.retire(texture) {
+                lifetime
+                    .deferred
+                    .push(DeferredVulkanResource::Texture(texture.index(), tex));
+                (true, None)
+            } else {
+                (false, None)
             }
+        } else {
+            let tex = textures.remove(texture);
+            (tex.is_some(), tex)
+        };
+        if removed && texture.index() < self.bindless.texture_capacity {
+            bound_textures[texture.index() as usize] = false;
+        }
+        if let Some(tex) = tex {
             unsafe {
                 self.inner.device.destroy_image_view(tex.view, None);
                 self.inner.device.destroy_image(tex.image, None);
@@ -1745,7 +1889,14 @@ impl GpuDevice for VulkanDevice {
 
     fn destroy_sampler(&self, sampler: SamplerHandle) {
         let mut samplers = self.samplers.lock().unwrap();
-        if let Some(s) = samplers.remove(sampler) {
+        let mut lifetime = self.lifetime.lock().unwrap();
+        if lifetime.in_flight != 0 {
+            if let Some(s) = samplers.retire(sampler) {
+                lifetime
+                    .deferred
+                    .push(DeferredVulkanResource::Sampler(sampler.index(), s));
+            }
+        } else if let Some(s) = samplers.remove(sampler) {
             unsafe { self.inner.device.destroy_sampler(s, None) };
         }
     }
@@ -1893,7 +2044,14 @@ impl GpuDevice for VulkanDevice {
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
         let mut pipelines = self.pipelines.lock().unwrap();
-        if let Some(p) = pipelines.remove(pipeline) {
+        let mut lifetime = self.lifetime.lock().unwrap();
+        if lifetime.in_flight != 0 {
+            if let Some(p) = pipelines.retire(pipeline) {
+                lifetime
+                    .deferred
+                    .push(DeferredVulkanResource::Pipeline(pipeline.index(), p));
+            }
+        } else if let Some(p) = pipelines.remove(pipeline) {
             let (pipeline, layout) = p.handles();
             unsafe {
                 self.inner.device.destroy_pipeline(pipeline, None);
@@ -1928,6 +2086,7 @@ impl GpuDevice for VulkanDevice {
         let textures = self.textures.lock().unwrap();
         let bound_textures = self.bindless.bound_textures.lock().unwrap();
         let pipelines = self.pipelines.lock().unwrap();
+        let samplers = self.samplers.lock().unwrap();
 
         // Resolve pipeline handles and pack push constants for every op up
         // front.
@@ -2084,6 +2243,7 @@ impl GpuDevice for VulkanDevice {
             }
             Ok(())
         });
+        drop(samplers);
         drop(pipelines);
         drop(bound_textures);
         drop(textures);
@@ -2113,6 +2273,7 @@ impl VulkanDevice {
         let textures = self.textures.lock().unwrap();
         let bound_textures = self.bindless.bound_textures.lock().unwrap();
         let pipelines = self.pipelines.lock().unwrap();
+        let samplers = self.samplers.lock().unwrap();
 
         #[allow(clippy::type_complexity)]
         let resolved: Vec<(
@@ -2219,7 +2380,7 @@ impl VulkanDevice {
 
         let bindless_set = self.bindless.set;
         let last = resolved.len() - 1;
-        self.one_shot_submit_async(cycle_id, move |dev, cmd| {
+        let submission = self.one_shot_submit_async(cycle_id, move |dev, cmd| {
             let barrier = vk::MemoryBarrier {
                 src_access_mask: vk::AccessFlags::SHADER_WRITE,
                 dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
@@ -2260,7 +2421,9 @@ impl VulkanDevice {
                 }
             }
             Ok(())
-        })
+        });
+        drop(samplers);
+        submission
     }
 
     /// Shared upload path for [`GpuDevice::upload_texture_data`] (mip `0`,
@@ -3584,22 +3747,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(submission.cycle_id(), 0x4d_50_50_49);
+        let second_out = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        let second_submission = dev
+            .submit(
+                0x4d_50_50_4a,
+                relu_pipeline,
+                Bindings {
+                    buffers: &[a.index(), second_out.index()],
+                    textures: &[],
+                    scalars: &[Scalar::U32(n)],
+                },
+                [n.div_ceil(64), 1, 1],
+            )
+            .unwrap();
+        assert!(dev.write_buffer(a, 0, &[0; 4]).is_err());
+        // Destruction while pending invalidates handles immediately but must
+        // not recycle descriptor/pipeline slots until this token completes.
+        let retired_sum_index = sum.index();
+        dev.destroy_buffer(sum);
+        dev.destroy_pipeline(add_pipeline);
+        assert!(dev.read_buffer(sum, 0, 4).is_err());
+        let allocated_while_pending = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        assert_ne!(allocated_while_pending.index(), retired_sum_index);
         // A zero-duration wait is always bounded. A sufficiently fast GPU may
         // already be complete; otherwise timeout is distinct and retryable.
         let zero_wait = submission.wait(Duration::ZERO);
         assert!(zero_wait.is_ok() || matches!(zero_wait, Err(GpuError::Timeout)));
         submission.wait(Duration::from_secs(5)).unwrap();
         assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
+        let allocated_after_first = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        assert_ne!(allocated_after_first.index(), retired_sum_index);
+        second_submission.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            second_submission.poll().unwrap(),
+            SubmissionStatus::Complete
+        );
+        let allocated_after_completion = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
+        assert_eq!(allocated_after_completion.index(), retired_sum_index);
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
         let result: &[f32] =
             unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };
         assert_eq!(result, &[0.0; 8]);
 
-        dev.destroy_pipeline(add_pipeline);
         dev.destroy_shader(add_shader);
         dev.destroy_pipeline(relu_pipeline);
         dev.destroy_shader(relu_shader);
+        dev.destroy_buffer(allocated_while_pending);
+        dev.destroy_buffer(allocated_after_first);
+        dev.destroy_buffer(allocated_after_completion);
+        dev.destroy_buffer(second_out);
     }
 
     #[test]

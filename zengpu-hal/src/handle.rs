@@ -60,6 +60,7 @@ impl<K> Handle<K> {
 struct Slot<V> {
     generation: u32,
     value: Option<V>,
+    reusable: bool,
 }
 
 /// A generational-index slotmap: keys are typed [`Handle<K>`], values are `V`.
@@ -71,6 +72,7 @@ struct Slot<V> {
 pub struct SlotMap<K, V> {
     slots: Vec<Slot<V>>,
     free: Vec<u32>,
+    live: usize,
     _tag: PhantomData<fn() -> K>,
 }
 
@@ -80,6 +82,7 @@ impl<K, V> SlotMap<K, V> {
         Self {
             slots: Vec::new(),
             free: Vec::new(),
+            live: 0,
             _tag: PhantomData,
         }
     }
@@ -89,6 +92,8 @@ impl<K, V> SlotMap<K, V> {
         if let Some(idx) = self.free.pop() {
             let slot = &mut self.slots[idx as usize];
             slot.value = Some(value);
+            slot.reusable = false;
+            self.live += 1;
             Handle {
                 idx,
                 generation: slot.generation,
@@ -99,7 +104,9 @@ impl<K, V> SlotMap<K, V> {
             self.slots.push(Slot {
                 generation: 0,
                 value: Some(value),
+                reusable: false,
             });
+            self.live += 1;
             Handle {
                 idx,
                 generation: 0,
@@ -142,9 +149,44 @@ impl<K, V> SlotMap<K, V> {
         let value = slot.value.take();
         if value.is_some() {
             slot.generation = slot.generation.wrapping_add(1);
+            slot.reusable = true;
             self.free.push(handle.idx);
+            self.live -= 1;
         }
         value
+    }
+
+    /// Remove a value and invalidate its handle without making the slot
+    /// reusable. Backends use this when destruction is requested while GPU
+    /// work may still reference the slot or its bindless descriptor.
+    /// [`Self::release_retired`] makes the index reusable after completion.
+    pub fn retire(&mut self, handle: Handle<K>) -> Option<V> {
+        let slot = self.slots.get_mut(handle.idx as usize)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        let value = slot.value.take();
+        if value.is_some() {
+            slot.generation = slot.generation.wrapping_add(1);
+            slot.reusable = false;
+            self.live -= 1;
+        }
+        value
+    }
+
+    /// Release a previously retired slot for reuse. Returns `true` only for a
+    /// valid retired slot; live, already-free, and out-of-range slots return
+    /// `false` and do not alter the free list.
+    pub fn release_retired(&mut self, index: u32) -> bool {
+        let Some(slot) = self.slots.get_mut(index as usize) else {
+            return false;
+        };
+        if slot.value.is_some() || slot.reusable {
+            return false;
+        }
+        slot.reusable = true;
+        self.free.push(index);
+        true
     }
 
     /// Whether `handle` still refers to a live value.
@@ -174,7 +216,7 @@ impl<K, V> SlotMap<K, V> {
 
     /// Number of live values.
     pub fn len(&self) -> usize {
-        self.slots.len() - self.free.len()
+        self.live
     }
 
     /// Whether there are no live values.
@@ -189,7 +231,9 @@ impl<K, V> SlotMap<K, V> {
         // Reset free list to cover every slot so len() == 0 after draining.
         self.free.clear();
         self.free.extend(0..self.slots.len() as u32);
+        self.live = 0;
         self.slots.iter_mut().filter_map(|slot| {
+            slot.reusable = true;
             let value = slot.value.take()?;
             slot.generation = slot.generation.wrapping_add(1);
             Some(value)
@@ -264,6 +308,26 @@ mod tests {
         assert_eq!(map.next_index(), 1);
         map.remove(first);
         assert_eq!(map.next_index(), first.index());
+    }
+
+    #[test]
+    fn retired_slot_is_stale_but_not_reused_until_release() {
+        let mut map = Map::new();
+        let retired = map.insert(10);
+        assert_eq!(map.retire(retired), Some(10));
+        assert_eq!(map.get(retired), None);
+        assert!(map.is_empty());
+
+        let second = map.insert(20);
+        assert_ne!(second.index(), retired.index());
+        assert!(!map.release_retired(second.index()));
+        assert!(map.release_retired(retired.index()));
+        assert!(!map.release_retired(retired.index()));
+
+        let reused = map.insert(30);
+        assert_eq!(reused.index(), retired.index());
+        assert_ne!(reused.generation(), retired.generation());
+        assert_eq!(map.len(), 2);
     }
 
     #[test]
