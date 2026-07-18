@@ -683,6 +683,26 @@ mod tests {
         }
     );
 
+    const FINITE_ZSL: ZslShader = zsl!(
+        push P { len: u32 }
+        @workgroup_size(64)
+        kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.len {
+                let x = src[i]
+                if isfinite(x) {
+                    out[i] = 1
+                } else {
+                    if isnan(x) {
+                        out[i] = 2
+                    } else {
+                        if isinf(x) { out[i] = 3 } else { out[i] = 4 }
+                    }
+                }
+            }
+        }
+    );
+
     #[test]
     fn instance_constructs_without_panic() {
         let inst = CudaInstance::new();
@@ -1068,6 +1088,59 @@ mod tests {
         device.destroy_buffer(src_i);
         device.destroy_buffer(out_u);
         device.destroy_buffer(out_i);
+    }
+
+    #[test]
+    fn zsl_finite_classification_runs_through_cuda() {
+        let Some(device) = cuda_device() else { return };
+        let input = [0.0f32, -12.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        let expected = [1u32, 1, 2, 3, 3];
+        let size = std::mem::size_of_val(&input) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let src = device.create_buffer(desc).expect("create source");
+        let out = device.create_buffer(desc).expect("create output");
+        let bytes: Vec<u8> = input.iter().flat_map(|value| value.to_le_bytes()).collect();
+        device.write_buffer(src, 0, &bytes).expect("upload values");
+
+        let (shader_desc, entry) = FINITE_ZSL.for_backend(BackendPreference::Cuda);
+        let shader = device
+            .create_shader(shader_desc)
+            .expect("compile finite ZSL CUDA");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .expect("create finite CUDA pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[src.index(), out.index()],
+                    scalars: &[Scalar::U32(input.len() as u32)],
+                    textures: &[],
+                },
+                [1, 1, 1],
+            )
+            .expect("dispatch finite CUDA kernel");
+
+        let raw = device
+            .read_buffer(out, 0, size)
+            .expect("read classifications");
+        let actual: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, expected);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(src);
+        device.destroy_buffer(out);
     }
 
     #[test]

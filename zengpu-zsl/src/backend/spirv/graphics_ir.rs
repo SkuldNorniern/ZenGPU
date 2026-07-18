@@ -672,7 +672,10 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
 fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal> {
     let name = func.name();
     match func {
-        BuiltinFn::U32 => Err("u32() is only available in compute shaders".into()),
+        BuiltinFn::U32 | BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => Err(format!(
+            "{}() is only available in compute shaders",
+            func.name()
+        )),
         BuiltinFn::Abs
         | BuiltinFn::Sign
         | BuiltinFn::Exp

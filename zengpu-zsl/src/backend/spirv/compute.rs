@@ -782,6 +782,32 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 ty: ScalarTy::U32,
             })
         }
+        BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {name}() takes 1 arg"));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            if value.ty != ScalarTy::F32 {
+                return Err(format!("ZSL: {name}() requires f32"));
+            }
+            let id = match func {
+                BuiltinFn::IsNan => ctx.spv.op_is_nan(ctx.t_bool, value.id),
+                BuiltinFn::IsInf => ctx.spv.op_is_inf(ctx.t_bool, value.id),
+                BuiltinFn::IsFinite => {
+                    // OpIsFinite is not accepted consistently by Vulkan shader
+                    // drivers. The equivalent predicate uses core shader ops.
+                    let is_nan = ctx.spv.op_is_nan(ctx.t_bool, value.id);
+                    let is_inf = ctx.spv.op_is_inf(ctx.t_bool, value.id);
+                    let non_finite = ctx.spv.op_logical_or(ctx.t_bool, is_nan, is_inf);
+                    ctx.spv.op_logical_not(ctx.t_bool, non_finite)
+                }
+                _ => unreachable!(),
+            };
+            Ok(Val {
+                id,
+                ty: ScalarTy::Bool,
+            })
+        }
         // Unary GLSL builtins: f32 → f32
         BuiltinFn::Abs
         | BuiltinFn::Sign

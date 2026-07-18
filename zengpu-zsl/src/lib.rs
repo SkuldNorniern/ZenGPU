@@ -294,6 +294,36 @@ mod phase_z_tests {
         }
     "#;
 
+    const FINITE_CLASSIFY: &str = r#"
+        @workgroup_size(64)
+        kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, id: global_id) {
+            let x = src[id.x]
+            if isfinite(x) {
+                out[id.x] = 1
+            } else {
+                if isnan(x) {
+                    out[id.x] = 2
+                } else {
+                    if isinf(x) { out[id.x] = 3 } else { out[id.x] = 4 }
+                }
+            }
+        }
+    "#;
+
+    #[test]
+    fn finite_number_builtins_lower_on_all_compute_backends() {
+        let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
+        let hip_source = hip::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).source;
+        for source in [&hip_source, &cuda_source, &msl_source] {
+            assert!(source.contains("isfinite(x)"));
+            assert!(source.contains("isnan(x)"));
+            assert!(source.contains("isinf(x)"));
+        }
+        spirv::lower_compute(&module).expect("lower finite classification to SPIR-V");
+    }
+
     #[test]
     fn integer_storage_buffers_lower_on_all_compute_backends() {
         let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
