@@ -5,7 +5,10 @@
 
 mod error;
 
+use std::any::Any;
 use std::cell::UnsafeCell;
+use std::ffi::{CString, c_char, c_void};
+use std::ptr;
 use std::rc::Rc;
 use std::sync::Mutex;
 
@@ -14,6 +17,7 @@ use cuda_oxide::{
     context::{Context, Handle},
     device::Device,
     mem::{DeviceBox, DevicePtr},
+    sys,
 };
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
@@ -26,53 +30,53 @@ use error::{cu, from_cuda};
 
 // ── NVRTC bindings ────────────────────────────────────────────────────────────
 
-type NvrtcProgram = *mut std::ffi::c_void;
+type NvrtcProgram = *mut c_void;
 
 #[link(name = "nvrtc")]
 unsafe extern "C" {
     fn nvrtcCreateProgram(
         prog: *mut NvrtcProgram,
-        src: *const std::ffi::c_char,
-        name: *const std::ffi::c_char,
+        src: *const c_char,
+        name: *const c_char,
         num_headers: i32,
-        headers: *const *const std::ffi::c_char,
-        include_names: *const *const std::ffi::c_char,
+        headers: *const *const c_char,
+        include_names: *const *const c_char,
     ) -> i32;
     fn nvrtcCompileProgram(
         prog: NvrtcProgram,
         num_opts: i32,
-        opts: *const *const std::ffi::c_char,
+        opts: *const *const c_char,
     ) -> i32;
     fn nvrtcGetPTXSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
-    fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut std::ffi::c_char) -> i32;
+    fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut c_char) -> i32;
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
     fn nvrtcGetProgramLogSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
-    fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut std::ffi::c_char) -> i32;
+    fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut c_char) -> i32;
 }
 
 const NVRTC_SUCCESS: i32 = 0;
 
 fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
-    let src_cstr = std::ffi::CString::new(src)
+    let src_cstr = CString::new(src)
         .map_err(|_| GpuError::Backend("nvrtc: CUDA C++ source contains NUL byte".into()))?;
-    let name_cstr = std::ffi::CString::new("zsl_kernel.cu").unwrap();
+    let name_cstr = CString::new("zsl_kernel.cu").unwrap();
 
-    let mut prog: NvrtcProgram = std::ptr::null_mut();
+    let mut prog: NvrtcProgram = ptr::null_mut();
     let r = unsafe {
         nvrtcCreateProgram(
             &mut prog,
             src_cstr.as_ptr(),
             name_cstr.as_ptr(),
             0,
-            std::ptr::null(),
-            std::ptr::null(),
+            ptr::null(),
+            ptr::null(),
         )
     };
     if r != NVRTC_SUCCESS {
         return Err(GpuError::Backend(format!("nvrtcCreateProgram failed: {r}")));
     }
 
-    let r = unsafe { nvrtcCompileProgram(prog, 0, std::ptr::null()) };
+    let r = unsafe { nvrtcCompileProgram(prog, 0, ptr::null()) };
     if r != NVRTC_SUCCESS {
         let log = unsafe {
             let mut log_size = 0usize;
@@ -183,11 +187,11 @@ impl GpuAdapter for CudaAdapter {
         let mut ctx = from_cuda(Context::new(&self.dev))?;
         let stream = {
             let _handle = from_cuda(ctx.enter())?;
-            let mut s: cuda_oxide::sys::CUstream = std::ptr::null_mut();
+            let mut s: sys::CUstream = ptr::null_mut();
             cu(unsafe {
-                cuda_oxide::sys::cuStreamCreate(
+                sys::cuStreamCreate(
                     &mut s,
-                    cuda_oxide::sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
+                    sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING,
                 )
             })?;
             s
@@ -214,7 +218,7 @@ struct CudaBuffer {
 // ── CudaShader ────────────────────────────────────────────────────────────────
 
 struct CudaShader {
-    module: cuda_oxide::sys::CUmodule,
+    module: sys::CUmodule,
     // Keep the null-terminated PTX alive for the module's lifetime.
     _ptx: Vec<u8>,
 }
@@ -227,7 +231,7 @@ unsafe impl Sync for CudaShader {}
 
 #[derive(Clone, Copy)]
 struct CudaPipeline {
-    func: cuda_oxide::sys::CUfunction,
+    func: sys::CUfunction,
     block: [u32; 3],
 }
 
@@ -252,7 +256,7 @@ pub struct CudaDevice {
     ctx_lock: Mutex<()>,
     /// Persistent compute stream — created once in `open()`, reused across all
     /// dispatches to eliminate per-kernel create/destroy overhead.
-    stream: cuda_oxide::sys::CUstream,
+    stream: sys::CUstream,
     buffers: Mutex<SlotMap<marker::Buffer, CudaBuffer>>,
     shaders: Mutex<SlotMap<marker::Shader, CudaShader>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, CudaPipeline>>,
@@ -286,8 +290,8 @@ impl Drop for CudaDevice {
         // UnsafeCell::get_mut is safe here because of the exclusive &mut self.
         if let Ok(handle) = self.ctx.get_mut().enter() {
             // Drain inflight work before tearing down the stream.
-            unsafe { cuda_oxide::sys::cuStreamSynchronize(self.stream) };
-            unsafe { cuda_oxide::sys::cuStreamDestroy_v2(self.stream) };
+            unsafe { sys::cuStreamSynchronize(self.stream) };
+            unsafe { sys::cuStreamDestroy_v2(self.stream) };
             for cb in buffers {
                 // SAFETY: ptr/len came from a DeviceBox we explicitly leaked.
                 let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
@@ -296,7 +300,7 @@ impl Drop for CudaDevice {
             }
             let _ = pipelines; // CUfunction handles are owned by their modules; no explicit free.
             for cs in shaders {
-                let _ = unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) };
+                let _ = unsafe { sys::cuModuleUnload(cs.module) };
             }
         }
         // If enter() fails the device is already dead; resources are leaked.
@@ -304,7 +308,7 @@ impl Drop for CudaDevice {
 }
 
 impl GpuDevice for CudaDevice {
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn as_any(&self) -> &dyn Any {
         self
     }
 
@@ -424,11 +428,11 @@ impl GpuDevice for CudaDevice {
             ptx_vec.push(0);
         }
         let module = self.with_context(|_handle| {
-            let mut m: cuda_oxide::sys::CUmodule = std::ptr::null_mut();
+            let mut m: sys::CUmodule = ptr::null_mut();
             cu(unsafe {
-                cuda_oxide::sys::cuModuleLoadData(
+                sys::cuModuleLoadData(
                     &mut m,
-                    ptx_vec.as_ptr() as *const std::ffi::c_void,
+                    ptx_vec.as_ptr() as *const c_void,
                 )
             })?;
             Ok(m)
@@ -451,7 +455,7 @@ impl GpuDevice for CudaDevice {
         };
         if let Some(cs) = cs {
             let _ = self
-                .with_context(|_handle| cu(unsafe { cuda_oxide::sys::cuModuleUnload(cs.module) }));
+                .with_context(|_handle| cu(unsafe { sys::cuModuleUnload(cs.module) }));
         }
     }
 
@@ -464,12 +468,12 @@ impl GpuDevice for CudaDevice {
             .map(|s| s.module)
             .ok_or_else(|| GpuError::Backend("cuda: invalid shader handle".into()))?;
 
-        let entry = std::ffi::CString::new(desc.entry)
+        let entry = CString::new(desc.entry)
             .map_err(|_| GpuError::Backend("cuda: entry point name contains NUL byte".into()))?;
 
         let func = self.with_context(|_handle| {
-            let mut f: cuda_oxide::sys::CUfunction = std::ptr::null_mut();
-            cu(unsafe { cuda_oxide::sys::cuModuleGetFunction(&mut f, module, entry.as_ptr()) })?;
+            let mut f: sys::CUfunction = ptr::null_mut();
+            cu(unsafe { sys::cuModuleGetFunction(&mut f, module, entry.as_ptr()) })?;
             Ok(f)
         })?;
 
@@ -565,14 +569,14 @@ impl GpuDevice for CudaDevice {
                     n_params += 1;
                 }
 
-                let mut kernel_params: [*mut std::ffi::c_void; MAX_PARAMS] =
-                    [std::ptr::null_mut(); MAX_PARAMS];
+                let mut kernel_params: [*mut c_void; MAX_PARAMS] =
+                    [ptr::null_mut(); MAX_PARAMS];
                 for (i, slot) in storage.iter_mut().take(n_params).enumerate() {
-                    kernel_params[i] = slot.as_mut_ptr() as *mut std::ffi::c_void;
+                    kernel_params[i] = slot.as_mut_ptr() as *mut c_void;
                 }
 
                 cu(unsafe {
-                    cuda_oxide::sys::cuLaunchKernel(
+                    sys::cuLaunchKernel(
                         cp.func,
                         op.grid[0],
                         op.grid[1],
@@ -583,11 +587,11 @@ impl GpuDevice for CudaDevice {
                         0,
                         stream,
                         kernel_params.as_mut_ptr(),
-                        std::ptr::null_mut(),
+                        ptr::null_mut(),
                     )
                 })?;
             }
-            cu(unsafe { cuda_oxide::sys::cuStreamSynchronize(stream) })
+            cu(unsafe { sys::cuStreamSynchronize(stream) })
         })
     }
 }
