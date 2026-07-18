@@ -1078,6 +1078,75 @@ impl GpuDevice for VulkanDevice {
         Ok(out)
     }
 
+    fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        let (src_buffer, dst_buffer) = {
+            let buffers = self.buffers.lock().unwrap();
+            let src_buf = buffers.get(src).ok_or_else(|| stale(src, &buffers))?;
+            let dst_buf = buffers.get(dst).ok_or_else(|| stale(dst, &buffers))?;
+            if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "source buffer",
+                    needed: "TRANSFER_SRC",
+                }));
+            }
+            if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "destination buffer",
+                    needed: "TRANSFER_DST",
+                }));
+            }
+            if src == dst {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "copy_buffer requires distinct source and destination buffers".into(),
+                )));
+            }
+            let src_end = src_offset.checked_add(len).ok_or_else(|| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "source copy range overflows u64".into(),
+                ))
+            })?;
+            let dst_end = dst_offset.checked_add(len).ok_or_else(|| {
+                GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "destination copy range overflows u64".into(),
+                ))
+            })?;
+            if src_end > src_buf.size || dst_end > dst_buf.size {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!(
+                        "copy ranges src {src_offset}..{src_end}/{} dst {dst_offset}..{dst_end}/{}",
+                        src_buf.size, dst_buf.size
+                    ),
+                )));
+            }
+            (src_buf.buffer, dst_buf.buffer)
+        };
+        if len == 0 {
+            return Ok(());
+        }
+        self.one_shot_submit(|dev, cmd| {
+            unsafe {
+                dev.cmd_copy_buffer(
+                    cmd,
+                    src_buffer,
+                    dst_buffer,
+                    &[vk::BufferCopy {
+                        src_offset,
+                        dst_offset,
+                        size: len,
+                    }],
+                );
+            }
+            Ok(())
+        })
+    }
+
     fn destroy_buffer(&self, buffer: BufferHandle) {
         let mut buffers = self.buffers.lock().unwrap();
         if let Some(buf) = buffers.remove(buffer) {
@@ -2398,6 +2467,45 @@ mod tests {
         dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
         assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [1, 2, 3, 4]);
         assert_eq!(dev.read_buffer(h, 2, 2).unwrap(), [3, 4]);
+    }
+
+    #[test]
+    fn device_local_buffer_staging_round_trip() {
+        const SIZE: usize = 4 * 1024 * 1024;
+        let Some(dev) = try_device() else { return };
+        let upload = dev
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let gpu = dev
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let readback = dev
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..SIZE)
+            .map(|i| (i as u32).wrapping_mul(31).wrapping_add(7) as u8)
+            .collect();
+        dev.write_buffer(upload, 0, &data).unwrap();
+        assert!(dev.write_buffer(gpu, 0, &[1]).is_err());
+        dev.copy_buffer(upload, 0, gpu, 0, SIZE as u64).unwrap();
+        dev.copy_buffer(gpu, 0, readback, 0, SIZE as u64).unwrap();
+        assert_eq!(dev.read_buffer(readback, 0, SIZE as u64).unwrap(), data);
+
+        dev.destroy_buffer(upload);
+        dev.destroy_buffer(gpu);
+        dev.destroy_buffer(readback);
     }
 
     #[test]

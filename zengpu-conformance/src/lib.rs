@@ -19,7 +19,7 @@ use zengpu_hal::{
 fn rw_desc(size: u64) -> BufferDesc {
     BufferDesc {
         size,
-        usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+        usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
         memory: MemoryUsage::Upload,
     }
 }
@@ -36,6 +36,8 @@ pub fn run_buffer_suite(label: &str, dev: &dyn GpuDevice) {
     buffer_stale_after_destroy(label, dev);
     buffer_out_of_bounds_write(label, dev);
     buffer_multiple_allocs(label, dev);
+    buffer_copy_ranges(label, dev);
+    buffer_copy_validates_usage(label, dev);
 }
 
 fn buffer_roundtrip(label: &str, dev: &dyn GpuDevice) {
@@ -130,6 +132,45 @@ fn buffer_multiple_allocs(label: &str, dev: &dyn GpuDevice) {
     for h in handles {
         dev.destroy_buffer(h);
     }
+}
+
+fn buffer_copy_ranges(label: &str, dev: &dyn GpuDevice) {
+    let src = dev.create_buffer(rw_desc(16)).unwrap();
+    let dst = dev.create_buffer(rw_desc(16)).unwrap();
+    dev.write_buffer(src, 0, &(0u8..16).collect::<Vec<_>>())
+        .unwrap();
+    dev.copy_buffer(src, 3, dst, 7, 6).unwrap();
+    assert_eq!(
+        dev.read_buffer(dst, 0, 16).unwrap(),
+        [0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8, 0, 0, 0],
+        "[{label}] buffer_copy_ranges"
+    );
+    dev.destroy_buffer(src);
+    dev.destroy_buffer(dst);
+}
+
+fn buffer_copy_validates_usage(label: &str, dev: &dyn GpuDevice) {
+    let src = dev
+        .create_buffer(BufferDesc {
+            size: 4,
+            usage: BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        })
+        .unwrap();
+    let dst = dev.create_buffer(rw_desc(4)).unwrap();
+    let err = dev.copy_buffer(src, 0, dst, 0, 4).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "TRANSFER_SRC",
+                ..
+            })
+        ),
+        "[{label}] copy usage: expected MissingUsage, got {err}"
+    );
+    dev.destroy_buffer(src);
+    dev.destroy_buffer(dst);
 }
 
 // ── Cross-backend comparison ──────────────────────────────────────────────────
