@@ -30,6 +30,16 @@ pub trait GpuDevice: Send + Sync {
     /// Requires `BufferUsage::READBACK`.
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Starts an async read into `dst` from `offset`. Requires `READBACK`, and the range is
+    /// `offset..offset + dst.len()`.
+    ///
+    /// Real-time backends copy straight into `dst`. The default goes through `read_buffer`.
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let bytes = self.read_buffer(buffer, offset, dst.len() as u64)?;
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Copies a range from `src` to `dst`, synchronously. Bytes are visible to later ops on return.
     /// `src` needs `TRANSFER_SRC` and `dst` needs `TRANSFER_DST`. Same-buffer copies are rejected.
     /// A zero length is a no-op after validation.
