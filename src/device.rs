@@ -2,9 +2,9 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, GpuDevice,
+    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, DispatchOp, GpuDevice,
     HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
-    TextureDesc, TextureHandle,
+    Submission, TextureDesc, TextureHandle,
 };
 
 impl Debug for Device {
@@ -101,6 +101,20 @@ impl Device {
         grid: [u32; 3],
     ) -> Result<()> {
         self.inner.dispatch(pipeline, bindings, grid)
+    }
+
+    pub fn submit(
+        &self,
+        cycle_id: u64,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<Submission> {
+        self.inner.submit(cycle_id, pipeline, bindings, grid)
+    }
+
+    pub fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.inner.submit_batch(cycle_id, ops)
     }
 
     // ── Backend downcast ──────────────────────────────────────────────────────
@@ -226,5 +240,19 @@ impl GpuDevice for Device {
         grid: [u32; 3],
     ) -> Result<()> {
         self.inner.dispatch(pipeline, bindings, grid)
+    }
+
+    fn submit(
+        &self,
+        cycle_id: u64,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<Submission> {
+        self.inner.submit(cycle_id, pipeline, bindings, grid)
+    }
+
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.inner.submit_batch(cycle_id, ops)
     }
 }

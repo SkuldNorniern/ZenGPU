@@ -12,6 +12,7 @@ use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, Text
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, HalCapabilities};
+use crate::submission::{CompletedSubmission, Submission};
 use crate::types::Features;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
@@ -165,7 +166,7 @@ pub trait GpuDevice: Send + Sync {
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
 
     /// Synchronously dispatch a compute pipeline. Blocks until GPU work
-    /// completes. Asynchronous dispatch is deferred.
+    /// completes. Use [`Self::submit`] for pollable, bounded completion.
     ///
     /// `bindings.buffers` contains slot indices into the bindless SSBO
     /// table; the shader indexes them with `nonuniformEXT`. `bindings.scalars`
@@ -195,5 +196,38 @@ pub trait GpuDevice: Send + Sync {
             self.dispatch(op.pipeline, op.bindings, op.grid)?;
         }
         Ok(())
+    }
+
+    /// Submit one compute dispatch and return a pollable completion handle.
+    ///
+    /// `cycle_id` is opaque backend metadata used by real-time callers to
+    /// reject late completions. The default implementation dispatches
+    /// synchronously and returns an already-complete handle.
+    fn submit(
+        &self,
+        cycle_id: u64,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        grid: [u32; 3],
+    ) -> Result<Submission> {
+        self.submit_batch(
+            cycle_id,
+            &[DispatchOp {
+                pipeline,
+                bindings,
+                grid,
+            }],
+        )
+    }
+
+    /// Submit a compute batch and return a pollable completion handle.
+    ///
+    /// A timeout reported by [`crate::GpuSubmission::wait`] never implies
+    /// cancellation. The caller must retain the handle and all referenced
+    /// resources until completion. Backends without asynchronous submission
+    /// use the synchronous default implementation.
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.dispatch_batch(ops)?;
+        Ok(Box::new(CompletedSubmission::new(cycle_id)))
     }
 }
