@@ -671,6 +671,18 @@ mod tests {
         }
     );
 
+    const TYPED_BUFFER_ZSL: ZslShader = zsl!(
+        push P { len: u32 }
+        @workgroup_size(64)
+        kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.len {
+                out_u[i] = src_u[i]
+                out_i[i] = src_i[i]
+            }
+        }
+    );
+
     #[test]
     fn instance_constructs_without_panic() {
         let inst = CudaInstance::new();
@@ -994,6 +1006,68 @@ mod tests {
         device.destroy_shader(shader);
         device.destroy_buffer(src);
         device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn zsl_integer_buffers_round_trip_through_cuda() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 128;
+        let input_u: Vec<u32> = (0..N as u32)
+            .map(|value| value.wrapping_mul(2_654_435_761))
+            .collect();
+        let input_i: Vec<i32> = (0..N as i32).map(|value| value - 64).collect();
+        let size = (N * std::mem::size_of::<u32>()) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let src_u = device.create_buffer(desc).expect("create src_u");
+        let src_i = device.create_buffer(desc).expect("create src_i");
+        let out_u = device.create_buffer(desc).expect("create out_u");
+        let out_i = device.create_buffer(desc).expect("create out_i");
+        let bytes_u: Vec<u8> = input_u
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let bytes_i: Vec<u8> = input_i
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        device.write_buffer(src_u, 0, &bytes_u).expect("upload u32");
+        device.write_buffer(src_i, 0, &bytes_i).expect("upload i32");
+
+        let (shader_desc, entry) = TYPED_BUFFER_ZSL.for_backend(BackendPreference::Cuda);
+        let shader = device
+            .create_shader(shader_desc)
+            .expect("compile typed ZSL CUDA");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .expect("create typed CUDA pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[src_u.index(), src_i.index(), out_u.index(), out_i.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                },
+                [(N as u32).div_ceil(64), 1, 1],
+            )
+            .expect("dispatch typed CUDA kernel");
+
+        assert_eq!(device.read_buffer(out_u, 0, size).unwrap(), bytes_u);
+        assert_eq!(device.read_buffer(out_i, 0, size).unwrap(), bytes_i);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(src_u);
+        device.destroy_buffer(src_i);
+        device.destroy_buffer(out_u);
+        device.destroy_buffer(out_i);
     }
 
     #[test]

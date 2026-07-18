@@ -3,7 +3,7 @@ use std::fmt::Write;
 
 use crate::backend::cuda::{CudaShader, ENTRY};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{EntryKind, Module, Mutability, ParamKind, ScalarTy};
+use crate::ir::{BufElem, EntryKind, Module, Mutability, ParamKind, ScalarTy};
 
 pub fn lower_compute(module: &Module) -> CudaShader {
     let e = &module.entry;
@@ -11,11 +11,11 @@ pub fn lower_compute(module: &Module) -> CudaShader {
 
     let locals: HashMap<&str, ScalarTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
 
-    let buffers: Vec<(&str, Mutability)> = e
+    let buffers: Vec<(&str, Mutability, BufElem)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { mutability, .. } => Some((p.name.as_str(), *mutability)),
+            ParamKind::Buffer { elem, mutability } => Some((p.name.as_str(), *mutability, *elem)),
             _ => None,
         })
         .collect();
@@ -35,7 +35,7 @@ pub fn lower_compute(module: &Module) -> CudaShader {
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
 
-    for (i, (name, mutability)) in buffers.iter().enumerate() {
+    for (i, (name, mutability, elem)) in buffers.iter().enumerate() {
         let comma = if i + 1 < buffers.len() + scalars.len() {
             ","
         } else {
@@ -43,10 +43,12 @@ pub fn lower_compute(module: &Module) -> CudaShader {
         };
         match mutability {
             Mutability::Read => {
-                let _ = writeln!(s, "    const float* __restrict__ {name}{comma}");
+                let ty = cuda_buffer_elem(*elem);
+                let _ = writeln!(s, "    const {ty}* __restrict__ {name}{comma}");
             }
             Mutability::ReadWrite => {
-                let _ = writeln!(s, "    float* __restrict__ {name}{comma}");
+                let ty = cuda_buffer_elem(*elem);
+                let _ = writeln!(s, "    {ty}* __restrict__ {name}{comma}");
             }
         }
     }
@@ -107,8 +109,18 @@ fn indent(s: &mut String, depth: usize) {
 fn cuda_scalar(ty: ScalarTy) -> &'static str {
     match ty {
         ScalarTy::U32 => "unsigned int",
+        ScalarTy::I32 => "int",
         ScalarTy::F32 => "float",
         ScalarTy::Bool => "bool",
+    }
+}
+
+fn cuda_buffer_elem(elem: BufElem) -> &'static str {
+    match elem {
+        BufElem::F32 => "float",
+        BufElem::U32 => "unsigned int",
+        BufElem::I32 => "int",
+        _ => unreachable!("unsupported compute buffer element"),
     }
 }
 

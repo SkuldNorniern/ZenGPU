@@ -11,8 +11,7 @@ pub mod node;
 
 use node::{IrExpr, IrStmt};
 
-/// Element type of a `buffer<T>`. The current backends only handle `F32`; the
-/// remaining variants exist for the `zen.md` type model and future widening.
+/// Element type of a `buffer<T>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum BufElem {
@@ -31,6 +30,7 @@ pub enum BufElem {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarTy {
     U32,
+    I32,
     F32,
     Bool,
 }
@@ -56,9 +56,7 @@ pub enum ParamKind {
     /// are carried for reflection and the MSL backend; the SPIR-V backend only
     /// handles `f32` and enforces writability in `ir::build`.
     Buffer {
-        #[allow(dead_code)]
         elem: BufElem,
-        #[allow(dead_code)]
         mutability: Mutability,
     },
     /// A push-constant scalar (`u32`/`f32`).

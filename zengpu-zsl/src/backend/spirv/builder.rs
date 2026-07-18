@@ -53,12 +53,16 @@ mod op {
     pub const IMUL: u32 = 132;
     pub const FMUL: u32 = 133;
     pub const UDIV: u32 = 134;
+    pub const SDIV: u32 = 135;
     pub const FDIV: u32 = 136;
     pub const ULESS_THAN: u32 = 176;
     pub const ULESS_THAN_EQ: u32 = 178;
     pub const UGREATER_THAN: u32 = 172;
     pub const UGREATER_THAN_EQ: u32 = 174;
+    pub const SGREATER_THAN_EQ: u32 = 175;
     pub const SLESS_THAN: u32 = 177;
+    pub const SLESS_THAN_EQ: u32 = 179;
+    pub const SGREATER_THAN: u32 = 173;
     pub const FORD_LESS_THAN: u32 = 184;
     pub const FORD_GREATER_THAN: u32 = 186;
     pub const FORD_LESS_THAN_EQ: u32 = 188;
@@ -67,6 +71,8 @@ mod op {
     pub const COMPOSITE_CONSTRUCT: u32 = 80;
     pub const COMPOSITE_EXTRACT: u32 = 81;
     pub const CONVERT_F_TO_U: u32 = 109;
+    pub const CONVERT_F_TO_S: u32 = 110;
+    pub const CONVERT_S_TO_F: u32 = 111;
     pub const CONVERT_U_TO_F: u32 = 112;
     pub const BITCAST: u32 = 124;
     pub const SNEGATE: u32 = 126;
@@ -612,6 +618,12 @@ impl SpvBuilder {
         id
     }
 
+    pub fn op_sdiv(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::SDIV, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
     pub fn op_fnegate(&mut self, ty: Id, val: Id) -> Id {
         let id = self.fresh_id();
         emit(&mut self.functions, op::FNEGATE, &[ty.0, id.0, val.0]);
@@ -674,6 +686,36 @@ impl SpvBuilder {
         id
     }
 
+    pub fn op_sle(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SLESS_THAN_EQ,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_sgt(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SGREATER_THAN,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_sge(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SGREATER_THAN_EQ,
+            &[bool_ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
     pub fn op_ford_lt(&mut self, bool_ty: Id, a: Id, b: Id) -> Id {
         let id = self.fresh_id();
         emit(
@@ -730,6 +772,36 @@ impl SpvBuilder {
             &mut self.functions,
             op::CONVERT_F_TO_U,
             &[u32_ty.0, id.0, val.0],
+        );
+        id
+    }
+
+    pub fn op_convert_s_to_f(&mut self, f32_ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::CONVERT_S_TO_F,
+            &[f32_ty.0, id.0, val.0],
+        );
+        id
+    }
+
+    pub fn op_convert_f_to_s(&mut self, i32_ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::CONVERT_F_TO_S,
+            &[i32_ty.0, id.0, val.0],
+        );
+        id
+    }
+
+    pub fn op_bitcast(&mut self, result_ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::BITCAST,
+            &[result_ty.0, id.0, val.0],
         );
         id
     }
