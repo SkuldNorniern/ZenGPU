@@ -1,6 +1,6 @@
 //! Command-recording value types, consumed by backends when recording a dispatch or draw.
 
-use crate::handle::PipelineHandle;
+use crate::handle::{BufferHandle, PipelineHandle};
 
 /// Scalar arguments, kept push-constant sized.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,6 +25,21 @@ pub struct DispatchOp<'a> {
     pub pipeline: PipelineHandle,
     pub bindings: Bindings<'a>,
     pub grid: [u32; 3],
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BufferCopyOp {
+    pub src: BufferHandle,
+    pub src_offset: u64,
+    pub dst: BufferHandle,
+    pub dst_offset: u64,
+    pub len: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ComputeOp<'a> {
+    CopyBuffer(BufferCopyOp),
+    Dispatch(DispatchOp<'a>),
 }
 
 #[cfg(test)]
