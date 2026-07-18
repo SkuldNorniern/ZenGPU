@@ -2,9 +2,9 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, DispatchOp, GpuDevice,
-    HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
-    Submission, TextureDesc, TextureHandle,
+    Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
+    GpuDevice, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc,
+    ShaderHandle, Submission, TextureDesc, TextureHandle,
 };
 
 impl Debug for Device {
@@ -57,6 +57,18 @@ impl Device {
         dst: &mut [u8],
     ) -> Result<()> {
         self.inner.read_buffer_into(buffer, offset, dst)
+    }
+
+    pub fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.inner
+            .copy_buffer(src, src_offset, dst, dst_offset, len)
     }
 
     pub fn destroy_buffer(&self, buffer: BufferHandle) {
@@ -124,6 +136,10 @@ impl Device {
 
     pub fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
         self.inner.submit_batch(cycle_id, ops)
+    }
+
+    pub fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        self.inner.submit_compute_ops(cycle_id, ops)
     }
 
     // ── Backend downcast ──────────────────────────────────────────────────────
@@ -206,6 +222,18 @@ impl GpuDevice for Device {
         self.inner.read_buffer_into(buffer, offset, dst)
     }
 
+    fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.inner
+            .copy_buffer(src, src_offset, dst, dst_offset, len)
+    }
+
     fn destroy_buffer(&self, buffer: BufferHandle) {
         self.inner.destroy_buffer(buffer)
     }
@@ -267,5 +295,9 @@ impl GpuDevice for Device {
 
     fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
         self.inner.submit_batch(cycle_id, ops)
+    }
+
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        self.inner.submit_compute_ops(cycle_id, ops)
     }
 }

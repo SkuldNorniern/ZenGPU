@@ -7,7 +7,7 @@
 
 use core::any::Any;
 
-use crate::command::{Bindings, DispatchOp};
+use crate::command::{Bindings, ComputeOp, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
@@ -240,6 +240,27 @@ pub trait GpuDevice: Send + Sync {
     /// use the synchronous default implementation.
     fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
         self.dispatch_batch(ops)?;
+        Ok(Box::new(CompletedSubmission::new(cycle_id)))
+    }
+
+    /// Submit ordered device-local copies and compute dispatches as one unit.
+    /// A later operation observes writes made by every earlier operation.
+    /// Backends without native mixed batching execute synchronously.
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        for op in ops {
+            match op {
+                ComputeOp::CopyBuffer(copy) => self.copy_buffer(
+                    copy.src,
+                    copy.src_offset,
+                    copy.dst,
+                    copy.dst_offset,
+                    copy.len,
+                )?,
+                ComputeOp::Dispatch(dispatch) => {
+                    self.dispatch(dispatch.pipeline, dispatch.bindings, dispatch.grid)?
+                }
+            }
+        }
         Ok(Box::new(CompletedSubmission::new(cycle_id)))
     }
 }

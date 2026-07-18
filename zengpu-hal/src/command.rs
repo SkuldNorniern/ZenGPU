@@ -1,7 +1,7 @@
 //! Command-recording value types — bindless bindings and inline scalars
 //! Backends consume these when recording a dispatch or draw.
 
-use crate::handle::PipelineHandle;
+use crate::handle::{BufferHandle, PipelineHandle};
 
 /// An inline scalar argument passed to a pipeline (push-constant-sized).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -32,6 +32,23 @@ pub struct DispatchOp<'a> {
     pub pipeline: PipelineHandle,
     pub bindings: Bindings<'a>,
     pub grid: [u32; 3],
+}
+
+/// One device-local buffer copy inside a mixed compute submission.
+#[derive(Debug, Clone, Copy)]
+pub struct BufferCopyOp {
+    pub src: BufferHandle,
+    pub src_offset: u64,
+    pub dst: BufferHandle,
+    pub dst_offset: u64,
+    pub len: u64,
+}
+
+/// An ordered operation in one transfer/compute submission.
+#[derive(Debug, Clone, Copy)]
+pub enum ComputeOp<'a> {
+    CopyBuffer(BufferCopyOp),
+    Dispatch(DispatchOp<'a>),
 }
 
 #[cfg(test)]
