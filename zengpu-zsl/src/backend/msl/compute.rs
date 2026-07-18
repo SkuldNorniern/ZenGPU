@@ -4,18 +4,18 @@ use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
 
 pub fn lower_compute(module: &Module) -> MslShader {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
     let locals: HashMap<&str, ScalarTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
-    let buffers: Vec<&str> = e
+    let buffers: Vec<(&str, BufElem)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { .. } => Some(p.name.as_str()),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
             _ => None,
         })
         .collect();
@@ -44,11 +44,11 @@ pub fn lower_compute(module: &Module) -> MslShader {
 
     let _ = writeln!(s, "kernel void {ENTRY}(");
     let mut slot = 0u32;
-    for b in &buffers {
+    for (b, buffer_elem) in &buffers {
         let elem = if atomic_buffers.contains(b) {
             "atomic_float"
         } else {
-            "float"
+            msl_buffer_elem(*buffer_elem)
         };
         let _ = writeln!(s, "    device {elem}* {b} [[buffer({slot})]],");
         slot += 1;
@@ -241,8 +241,18 @@ fn binop(op: IrBinOp) -> &'static str {
 fn msl_scalar(t: ScalarTy) -> &'static str {
     match t {
         ScalarTy::U32 => "uint",
+        ScalarTy::I32 => "int",
         ScalarTy::F32 => "float",
         ScalarTy::Bool => "bool",
+    }
+}
+
+fn msl_buffer_elem(elem: BufElem) -> &'static str {
+    match elem {
+        BufElem::F32 => "float",
+        BufElem::U32 => "uint",
+        BufElem::I32 => "int",
+        _ => unreachable!("unsupported compute buffer element"),
     }
 }
 

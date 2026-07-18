@@ -5,8 +5,6 @@ pub mod node;
 
 use node::{IrExpr, IrStmt};
 
-/// Element type of `buffer<T>`. Backends support only `F32`. The other variants are reserved for
-/// wider element types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum BufElem {
@@ -25,6 +23,7 @@ pub enum BufElem {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ScalarTy {
     U32,
+    I32,
     F32,
     Bool,
 }
@@ -48,9 +47,7 @@ pub enum ParamKind {
     /// SPIR-V supports only `f32`. Writability is checked in `ir::build`. `elem` and `mutability`
     /// are kept for reflection and MSL.
     Buffer {
-        #[allow(dead_code)]
         elem: BufElem,
-        #[allow(dead_code)]
         mutability: Mutability,
     },
     /// A push-constant scalar of type `u32` or `f32`.

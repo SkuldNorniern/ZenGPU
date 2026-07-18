@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
 
 pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let entry = &module.entry;
@@ -47,14 +47,15 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
     let t_u32 = spv.type_int(32, false);
+    let t_i32 = spv.type_int(32, true);
     let t_f32 = spv.type_float(32);
     let t_uvec3 = spv.type_vector(t_u32, 3);
 
-    let buf_params: Vec<&str> = entry
+    let buf_params: Vec<(&str, BufElem)> = entry
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { .. } => Some(p.name.as_str()),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
             _ => None,
         })
         .collect();
@@ -83,11 +84,12 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let n_buf_params = buf_params.len() as u32;
     let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
         let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
-        pc_members.extend(
-            scalar_params
-                .iter()
-                .map(|(_, ty)| if *ty == ScalarTy::U32 { t_u32 } else { t_f32 }),
-        );
+        pc_members.extend(scalar_params.iter().map(|(_, ty)| match ty {
+            ScalarTy::U32 => t_u32,
+            ScalarTy::I32 => t_i32,
+            ScalarTy::F32 => t_f32,
+            ScalarTy::Bool => t_u32,
+        }));
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
         for i in 0..pc_members.len() {
@@ -127,14 +129,27 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     let buf_param_map: HashMap<String, BufInfo> = buf_params
         .iter()
         .enumerate()
-        .map(|(i, name)| (name.to_string(), BufInfo { pc_index: i as u32 }))
+        .map(|(i, (name, elem))| {
+            (
+                name.to_string(),
+                BufInfo {
+                    pc_index: i as u32,
+                    elem: *elem,
+                },
+            )
+        })
         .collect();
 
     let scalar_param_map: HashMap<String, ScalarInfo> = scalar_params
         .iter()
         .enumerate()
         .map(|(i, (name, ty))| {
-            let ty_id = if *ty == ScalarTy::U32 { t_u32 } else { t_f32 };
+            let ty_id = match ty {
+                ScalarTy::U32 => t_u32,
+                ScalarTy::I32 => t_i32,
+                ScalarTy::F32 => t_f32,
+                ScalarTy::Bool => t_bool,
+            };
             (
                 name.to_string(),
                 ScalarInfo {
@@ -149,6 +164,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     spv.label();
 
     let mut ptr_func_u32 = Id(0);
+    let mut ptr_func_i32 = Id(0);
     let mut ptr_func_f32 = Id(0);
     let mut ptr_func_bool = Id(0);
 
@@ -156,6 +172,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     for (name, sty) in &entry.locals {
         let (ptr_ty_slot, spv_elem) = match sty {
             ScalarTy::U32 => (&mut ptr_func_u32, t_u32),
+            ScalarTy::I32 => (&mut ptr_func_i32, t_i32),
             ScalarTy::F32 => (&mut ptr_func_f32, t_f32),
             ScalarTy::Bool => (&mut ptr_func_bool, t_bool),
         };
@@ -174,6 +191,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     }
 
     let mut t_ptr_pc_u32 = Id(0);
+    let mut t_ptr_pc_i32 = Id(0);
     let mut t_ptr_pc_f32 = Id(0);
     if pc_var.is_some() {
         if n_buf_params > 0 {
@@ -183,6 +201,9 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
             match ty {
                 ScalarTy::U32 if t_ptr_pc_u32 == Id(0) => {
                     t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
+                }
+                ScalarTy::I32 if t_ptr_pc_i32 == Id(0) => {
+                    t_ptr_pc_i32 = spv.type_pointer(sc::PUSH_CONSTANT, t_i32);
                 }
                 ScalarTy::F32 if t_ptr_pc_f32 == Id(0) => {
                     t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
@@ -196,6 +217,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
         spv: &mut spv,
         t_bool,
         t_u32,
+        t_i32,
         t_f32,
         t_uvec3,
         g_bufs_var,
@@ -213,6 +235,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
         const_0_u32,
         locals,
         t_ptr_pc_u32,
+        t_ptr_pc_i32,
         t_ptr_pc_f32,
     };
 
@@ -224,8 +247,10 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
     Ok(spv.finish())
 }
 
+#[derive(Clone, Copy)]
 struct BufInfo {
     pc_index: u32,
+    elem: BufElem,
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +276,7 @@ struct LowerCtx<'a> {
     spv: &'a mut SpvBuilder,
     t_bool: Id,
     t_u32: Id,
+    t_i32: Id,
     t_f32: Id,
     t_uvec3: Id,
     t_ptr_ssbo_f32: Id,
@@ -269,6 +295,7 @@ struct LowerCtx<'a> {
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
     t_ptr_pc_u32: Id,
+    t_ptr_pc_i32: Id,
     t_ptr_pc_f32: Id,
 }
 
@@ -276,6 +303,7 @@ impl LowerCtx<'_> {
     fn spv_ty(&self, sty: ScalarTy) -> Id {
         match sty {
             ScalarTy::U32 => self.t_u32,
+            ScalarTy::I32 => self.t_i32,
             ScalarTy::F32 => self.t_f32,
             ScalarTy::Bool => self.t_bool,
         }
@@ -328,16 +356,15 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
         }
 
         IrStmt::AssignBuffer { buf, index, value } => {
-            let buf_pc_index = ctx
+            let info = *ctx
                 .buf_params
                 .get(buf)
-                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
-                .pc_index;
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
             let g_bufs = ctx.g_bufs_var;
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
-            let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
+            let pc_field = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
             let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
             let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
@@ -349,8 +376,8 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .spv
                 .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let rhs = lower_expr(ctx, value)?;
-            let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
-            ctx.spv.op_store(ptr_elem, rhs_id);
+            let storage_value = value_to_storage(ctx, rhs, info.elem);
+            ctx.spv.op_store(ptr_elem, storage_value);
             Ok(())
         }
 
@@ -525,11 +552,12 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
-            let is_u32 = info.ty == ctx.t_u32;
-            let pc_ptr_ty = if is_u32 {
-                ctx.t_ptr_pc_u32
+            let (pc_ptr_ty, ty) = if info.ty == ctx.t_u32 {
+                (ctx.t_ptr_pc_u32, ScalarTy::U32)
+            } else if info.ty == ctx.t_i32 {
+                (ctx.t_ptr_pc_i32, ScalarTy::I32)
             } else {
-                ctx.t_ptr_pc_f32
+                (ctx.t_ptr_pc_f32, ScalarTy::F32)
             };
             if pc_ptr_ty == Id(0) {
                 return Err("ZSL: push-constant pointer type not allocated".to_string());
@@ -538,21 +566,19 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let pc_idx = ctx.spv.constant_u32(ctx.t_u32, actual_idx);
             let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
             let id = ctx.spv.op_load(info.ty, chain);
-            let ty = if is_u32 { ScalarTy::U32 } else { ScalarTy::F32 };
             Ok(Val { id, ty })
         }
 
         IrExpr::BufferLoad { buf, index } => {
-            let buf_pc_index = ctx
+            let info = *ctx
                 .buf_params
                 .get(buf)
-                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
-                .pc_index;
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
             let g_bufs = ctx.g_bufs_var;
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
-            let pc_field = ctx.spv.constant_u32(ctx.t_u32, buf_pc_index);
+            let pc_field = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
             let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
             let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
@@ -563,12 +589,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let ptr_elem = ctx
                 .spv
                 .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
-            let t_f32 = ctx.t_f32;
-            let id = ctx.spv.op_load(t_f32, ptr_elem);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            let raw = ctx.spv.op_load(ctx.t_f32, ptr_elem);
+            Ok(storage_to_value(ctx, raw, info.elem))
         }
 
         IrExpr::SharedLoad { name, index } => {
@@ -646,7 +668,17 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
         IrBinOp::Add => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fadd, SpvBuilder::op_iadd),
         IrBinOp::Sub => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fsub, SpvBuilder::op_isub),
         IrBinOp::Mul => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fmul, SpvBuilder::op_imul),
-        IrBinOp::Div => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fdiv, SpvBuilder::op_udiv),
+        IrBinOp::Div => {
+            let (lhs, rhs) = unify(ctx, lhs, rhs);
+            let ty = ctx.spv_ty(lhs.ty);
+            let id = match lhs.ty {
+                ScalarTy::F32 => ctx.spv.op_fdiv(ty, lhs.id, rhs.id),
+                ScalarTy::I32 => ctx.spv.op_sdiv(ty, lhs.id, rhs.id),
+                ScalarTy::U32 => ctx.spv.op_udiv(ty, lhs.id, rhs.id),
+                ScalarTy::Bool => return Err("ZSL: division is not supported on bool".into()),
+            };
+            Ok(Val { id, ty: lhs.ty })
+        }
         IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne => {
             let (lhs, rhs) = unify(ctx, lhs, rhs);
             let bool_ty = ctx.t_bool;
@@ -663,6 +695,12 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 (IrBinOp::Ge, ScalarTy::U32) => ctx.spv.op_uge(bool_ty, lhs.id, rhs.id),
                 (IrBinOp::Eq, ScalarTy::U32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
                 (IrBinOp::Ne, ScalarTy::U32) => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Lt, ScalarTy::I32) => ctx.spv.op_slt(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Le, ScalarTy::I32) => ctx.spv.op_sle(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Gt, ScalarTy::I32) => ctx.spv.op_sgt(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Ge, ScalarTy::I32) => ctx.spv.op_sge(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Eq, ScalarTy::I32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
+                (IrBinOp::Ne, ScalarTy::I32) => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
                 _ => {
                     return Err("ZSL: comparisons not supported on bool".into());
                 }
@@ -819,6 +857,36 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
     }
 }
 
+fn buffer_scalar(elem: BufElem) -> ScalarTy {
+    match elem {
+        BufElem::F32 => ScalarTy::F32,
+        BufElem::U32 => ScalarTy::U32,
+        BufElem::I32 => ScalarTy::I32,
+        _ => unreachable!("unsupported compute buffer element"),
+    }
+}
+
+fn storage_to_value(ctx: &mut LowerCtx<'_>, raw_f32: Id, elem: BufElem) -> Val {
+    let ty = buffer_scalar(elem);
+    let id = match ty {
+        ScalarTy::F32 => raw_f32,
+        ScalarTy::U32 => ctx.spv.op_bitcast(ctx.t_u32, raw_f32),
+        ScalarTy::I32 => ctx.spv.op_bitcast(ctx.t_i32, raw_f32),
+        ScalarTy::Bool => unreachable!(),
+    };
+    Val { id, ty }
+}
+
+fn value_to_storage(ctx: &mut LowerCtx<'_>, value: Val, elem: BufElem) -> Id {
+    let ty = buffer_scalar(elem);
+    let value = coerce(ctx, value, ty);
+    match ty {
+        ScalarTy::F32 => value,
+        ScalarTy::U32 | ScalarTy::I32 => ctx.spv.op_bitcast(ctx.t_f32, value),
+        ScalarTy::Bool => unreachable!(),
+    }
+}
+
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: ScalarTy) -> Id {
     if val.ty == target {
         return val.id;
@@ -832,6 +900,16 @@ fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: ScalarTy) -> Id {
             let u32_ty = ctx.t_u32;
             ctx.spv.op_convert_f_to_u(u32_ty, val.id)
         }
+        (ScalarTy::I32, ScalarTy::F32) => {
+            let f32_ty = ctx.t_f32;
+            ctx.spv.op_convert_s_to_f(f32_ty, val.id)
+        }
+        (ScalarTy::F32, ScalarTy::I32) => {
+            let i32_ty = ctx.t_i32;
+            ctx.spv.op_convert_f_to_s(i32_ty, val.id)
+        }
+        (ScalarTy::U32, ScalarTy::I32) => ctx.spv.op_bitcast(ctx.t_i32, val.id),
+        (ScalarTy::I32, ScalarTy::U32) => ctx.spv.op_bitcast(ctx.t_u32, val.id),
         _ => val.id,
     }
 }
@@ -842,6 +920,8 @@ fn unify(ctx: &mut LowerCtx<'_>, lhs: Val, rhs: Val) -> (Val, Val) {
     }
     let target = if lhs.ty == ScalarTy::F32 || rhs.ty == ScalarTy::F32 {
         ScalarTy::F32
+    } else if lhs.ty == ScalarTy::I32 || rhs.ty == ScalarTy::I32 {
+        ScalarTy::I32
     } else {
         ScalarTy::U32
     };

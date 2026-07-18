@@ -70,7 +70,7 @@ struct Parser<'a> {
 }
 
 struct Ctx {
-    buffers: HashMap<String, bool>,
+    buffers: HashMap<String, BufferSymbol>,
     scalars: HashMap<String, ScalarTy>,
     push_param: Option<String>,
     id_param: Option<String>,
@@ -78,6 +78,12 @@ struct Ctx {
     locals_order: Vec<(String, ScalarTy)>,
     shared: HashMap<String, SharedDecl>,
     shared_order: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct BufferSymbol {
+    writable: bool,
+    elem: BufElem,
 }
 
 struct GfxCtx {
@@ -279,10 +285,11 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         match name.as_str() {
             "u32" => Ok(ScalarTy::U32),
+            "i32" => Ok(ScalarTy::I32),
             "f32" => Ok(ScalarTy::F32),
             "bool" => Ok(ScalarTy::Bool),
             other => self.err(format!(
-                "unsupported scalar type `{other}`; use u32, f32, or bool"
+                "unsupported scalar type `{other}`; use u32, i32, f32, or bool"
             )),
         }
     }
@@ -339,14 +346,18 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Lt, "`<` in buffer<…>")?;
             let elem = self.parse_scalar_type()?;
             self.expect(&Tok::Gt, "`>` in buffer<…>")?;
-            if elem != ScalarTy::F32 {
-                return self.err("only buffer<f32> is supported");
-            }
-            ctx.buffers.insert(name.to_string(), writable);
+            let elem = match elem {
+                ScalarTy::F32 => BufElem::F32,
+                ScalarTy::U32 => BufElem::U32,
+                ScalarTy::I32 => BufElem::I32,
+                ScalarTy::Bool => return self.err("buffer<bool> is not supported"),
+            };
+            ctx.buffers
+                .insert(name.to_string(), BufferSymbol { writable, elem });
             params.push(Param {
                 name: name.to_string(),
                 kind: ParamKind::Buffer {
-                    elem: BufElem::F32,
+                    elem,
                     mutability: if writable {
                         Mutability::ReadWrite
                     } else {
@@ -468,10 +479,16 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Comma, "`,` after atomic_add index")?;
             let value = self.parse_expr(ctx)?;
             self.expect(&Tok::RParen, "`)` after atomic_add arguments")?;
-            if !*ctx.buffers.get(&buf).unwrap_or(&false) {
+            let Some(buffer) = ctx.buffers.get(&buf).copied() else {
+                return self.err(format!("`{buf}` is not a device buffer"));
+            };
+            if !buffer.writable {
                 return self.err(format!(
                     "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
                 ));
+            }
+            if buffer.elem != BufElem::F32 {
+                return self.err("atomic_add currently requires buffer<f32>");
             }
             let index_ty = infer_ty(&index, ctx);
             if index_ty != ScalarTy::U32 && index_ty != ScalarTy::F32 {
@@ -488,10 +505,18 @@ impl<'a> Parser<'a> {
             match lhs {
                 IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
                 IrExpr::BufferLoad { buf, index } => {
-                    let writable = *ctx.buffers.get(&buf).unwrap_or(&false);
-                    if !writable {
+                    let Some(buffer) = ctx.buffers.get(&buf).copied() else {
+                        return self.err(format!("`{buf}` is not a device buffer"));
+                    };
+                    if !buffer.writable {
                         return self.err(format!(
                             "`{buf}` is read-only; declare it `device mut buffer`"
+                        ));
+                    }
+                    if infer_ty(&rhs, ctx) != scalar_for_buffer(buffer.elem) {
+                        return self.err(format!(
+                            "assignment to buffer<{}> has incompatible value type",
+                            buffer_elem_name(buffer.elem)
                         ));
                     }
                     Ok(IrStmt::AssignBuffer {
@@ -1297,7 +1322,11 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(ScalarTy::F32),
         IrExpr::GlobalId(_) => ScalarTy::U32,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => ScalarTy::U32,
-        IrExpr::BufferLoad { .. } => ScalarTy::F32,
+        IrExpr::BufferLoad { buf, .. } => ctx
+            .buffers
+            .get(buf)
+            .map(|buffer| scalar_for_buffer(buffer.elem))
+            .unwrap_or(ScalarTy::F32),
         IrExpr::SharedLoad { .. } => ScalarTy::F32,
         IrExpr::Builtin { func, .. } => match func {
             BuiltinFn::U32 => ScalarTy::U32,
@@ -1318,12 +1347,32 @@ fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
                 let r = infer_ty(rhs, ctx);
                 if l == ScalarTy::F32 || r == ScalarTy::F32 {
                     ScalarTy::F32
+                } else if l == ScalarTy::I32 || r == ScalarTy::I32 {
+                    ScalarTy::I32
                 } else {
                     ScalarTy::U32
                 }
             }
         },
         _ => ScalarTy::U32,
+    }
+}
+
+fn scalar_for_buffer(elem: BufElem) -> ScalarTy {
+    match elem {
+        BufElem::F32 => ScalarTy::F32,
+        BufElem::U32 => ScalarTy::U32,
+        BufElem::I32 => ScalarTy::I32,
+        _ => unreachable!("non-scalar buffer element reached compute parser"),
+    }
+}
+
+fn buffer_elem_name(elem: BufElem) -> &'static str {
+    match elem {
+        BufElem::F32 => "f32",
+        BufElem::U32 => "u32",
+        BufElem::I32 => "i32",
+        _ => "unsupported",
     }
 }
 
