@@ -11,7 +11,7 @@ use crate::command::{Bindings, DispatchOp};
 use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
-use crate::request::HalCapabilities;
+use crate::request::{DeviceLimits, HalCapabilities};
 use crate::types::Features;
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
@@ -23,6 +23,11 @@ pub trait GpuDevice: Send + Sync {
 
     /// Which HAL capabilities this backend implements.
     fn capabilities(&self) -> HalCapabilities;
+
+    /// Limits of the created logical device and selected queue path.
+    fn limits(&self) -> DeviceLimits {
+        DeviceLimits::default()
+    }
 
     /// Create a buffer. The returned handle is generational.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;

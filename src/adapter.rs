@@ -1,6 +1,6 @@
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
-use zengpu_hal::{AdapterInfo, DeviceRequest, GpuAdapter, HalCapabilities, Result};
+use zengpu_hal::{AdapterInfo, DeviceLimits, DeviceRequest, GpuAdapter, HalCapabilities, Result};
 
 use crate::device::Device;
 
@@ -19,6 +19,11 @@ impl Adapter {
     /// Which HAL shapes (graphics / compute) this adapter can expose.
     pub fn capabilities(&self) -> HalCapabilities {
         self.inner.capabilities()
+    }
+
+    /// Portable physical-device limits reported by the backend.
+    pub fn limits(&self) -> DeviceLimits {
+        self.inner.limits()
     }
 
     /// Open a logical [`Device`] from this adapter.
