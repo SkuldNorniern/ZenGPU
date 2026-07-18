@@ -67,7 +67,12 @@ impl CmdListPool {
     /// Acquire a command buffer — reused from the free list if one is
     /// available, otherwise freshly allocated — and begin recording.
     pub(crate) fn acquire(&self) -> Result<vk::CommandBuffer> {
-        let (cmd, reused) = match self.free.lock().unwrap().pop() {
+        // Allocation and command-buffer reset both externally synchronize on
+        // the VkCommandPool. Keep the pool mutex held for either operation;
+        // recording can proceed concurrently once each caller owns a distinct
+        // command buffer.
+        let mut free = self.free.lock().unwrap();
+        let (cmd, reused) = match free.pop() {
             Some(cmd) => (cmd, true),
             None => {
                 let bufs = unsafe {
@@ -91,6 +96,9 @@ impl CmdListPool {
                     .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
                     .map_err(|e| GpuError::Backend(format!("reset command buffer: {e}")))?;
             }
+        }
+        drop(free);
+        unsafe {
             self.inner.device.begin_command_buffer(
                 cmd,
                 &vk::CommandBufferBeginInfo {
