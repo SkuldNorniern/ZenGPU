@@ -19,5 +19,8 @@ workspace = true
 zengpu-hal.workspace = true
 log.workspace = true
 
+[build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 zengpu-spirv.workspace = true

@@ -1,27 +1,57 @@
 /// Build script for zengpu-hip.
 ///
 /// 1. Locates the ROCm installation (ROCM_PATH env → /opt/rocm scan).
-/// 2. Emits link flags for libamdhip64 and libhiprtc.
+/// 2. Emits link flags for libamdhip64 and libhiprtc, or — when neither is
+///    found on the search path — compiles link-only stubs so the crate still
+///    links on machines without ROCm installed (mirrors zengpu-cuda's
+///    cuda_stub.c/nvrtc_stub.c fallback).
 /// 3. Probes `hip_version.h` → emits `cfg(rocm_major="N")` / `cfg(rocm_minor="N")`
 ///    so the crate can gate features on ROCm version at compile time.
 /// 4. Compiles a tiny C probe to measure `hipDeviceProp_t` field offsets,
 ///    which shifted between major ROCm releases.  Falls back to ROCm 6/7
 ///    x86-64 defaults when cross-compiling or when no AMD compiler is present.
+use cc::Build;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
 
     // ── Link flags ────────────────────────────────────────────────────────────
-    println!("cargo:rustc-link-search=native={rocm_path}/lib");
+    let lib_dirs = [
+        PathBuf::from(format!("{rocm_path}/lib")),
+        PathBuf::from(format!("{rocm_path}/lib/x64")),
+        PathBuf::from(format!("{rocm_path}/lib64")),
+    ];
+    for dir in &lib_dirs {
+        if dir.exists() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+
+    let has_hip = lib_dirs
+        .iter()
+        .any(|dir| has_library(dir, &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"]));
+    if !has_hip {
+        Build::new().file("src/hip_stub.c").compile("amdhip64");
+    }
+
+    let has_hiprtc = lib_dirs
+        .iter()
+        .any(|dir| has_library(dir, &["libhiprtc.so", "libhiprtc.dylib", "hiprtc.lib"]));
+    if !has_hiprtc {
+        Build::new().file("src/hiprtc_stub.c").compile("hiprtc");
+    }
+
     println!("cargo:rustc-link-lib=amdhip64");
     println!("cargo:rustc-link-lib=hiprtc");
 
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/hip_stub.c");
+    println!("cargo:rerun-if-changed=src/hiprtc_stub.c");
 
     // ── ROCm version detection ────────────────────────────────────────────────
     let (major, minor) = detect_rocm_version(&rocm_path);
@@ -196,4 +226,8 @@ int main(void) {
         }
     }
     Err("no suitable compiler found".into())
+}
+
+fn has_library(dir: &Path, names: &[&str]) -> bool {
+    names.iter().any(|name| dir.join(name).exists())
 }
