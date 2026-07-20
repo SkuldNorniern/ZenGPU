@@ -166,6 +166,13 @@ impl Device {
         self.inner.as_any().downcast_ref()
     }
 
+    /// Downcast to [`zengpu_cuda::CudaDevice`] for CUDA-specific work.
+    /// Returns `None` when the underlying backend is not CUDA.
+    #[cfg(feature = "cuda")]
+    pub fn as_cuda(&self) -> Option<&zengpu_cuda::CudaDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
     /// Downcast to [`zengpu_metal::MetalDevice`] for Metal-specific work.
     /// Returns `None` when the underlying backend is not Metal.
     #[cfg(feature = "metal")]
