@@ -765,6 +765,24 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 ty: ScalarTy::Bool,
             })
         }
+        IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
+            if lhs.ty != ScalarTy::U32 || rhs.ty != ScalarTy::U32 {
+                return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` currently require u32 operands".into());
+            }
+            let ty = ctx.spv_ty(ScalarTy::U32);
+            let id = match op {
+                IrBinOp::BitAnd => ctx.spv.op_bitwise_and(ty, lhs.id, rhs.id),
+                IrBinOp::BitOr => ctx.spv.op_bitwise_or(ty, lhs.id, rhs.id),
+                IrBinOp::BitXor => ctx.spv.op_bitwise_xor(ty, lhs.id, rhs.id),
+                IrBinOp::Shl => ctx.spv.op_shift_left_logical(ty, lhs.id, rhs.id),
+                IrBinOp::Shr => ctx.spv.op_shift_right_logical(ty, lhs.id, rhs.id),
+                _ => unreachable!(),
+            };
+            Ok(Val {
+                id,
+                ty: ScalarTy::U32,
+            })
+        }
     }
 }
 

@@ -289,6 +289,15 @@ fn emit_expr(e: &IrExpr) -> String {
                 IrBinOp::Ne => "!=",
                 IrBinOp::And => "&&",
                 IrBinOp::Or => "||",
+                // Not yet supported on this backend; see the SPIR-V-only note
+                // on `IrBinOp`. Emits a deliberately invalid marker so any
+                // attempt to actually compile this source fails loudly
+                // instead of silently producing wrong CUDA code.
+                IrBinOp::BitAnd
+                | IrBinOp::BitOr
+                | IrBinOp::BitXor
+                | IrBinOp::Shl
+                | IrBinOp::Shr => "/* UNSUPPORTED_BITWISE_OP_ON_CUDA_BACKEND */",
             };
             format!("({} {} {})", emit_expr(lhs), op_s, emit_expr(rhs))
         }
