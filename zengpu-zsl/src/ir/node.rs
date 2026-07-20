@@ -145,4 +145,11 @@ pub enum IrBinOp {
     Ne,
     And,
     Or,
+    /// Unsigned-only: `&`, `|`, `^`, `<<`, `>>` (logical shift). SPIR-V only; other backends
+    /// reject them.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }

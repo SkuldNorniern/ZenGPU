@@ -287,6 +287,11 @@ fn emit_expr(e: &IrExpr) -> String {
                 IrBinOp::Ne => "!=",
                 IrBinOp::And => "&&",
                 IrBinOp::Or => "||",
+                IrBinOp::BitAnd
+                | IrBinOp::BitOr
+                | IrBinOp::BitXor
+                | IrBinOp::Shl
+                | IrBinOp::Shr => "/* UNSUPPORTED_BITWISE_OP_ON_CUDA_BACKEND */",
             };
             format!("({} {} {})", emit_expr(lhs), op_s, emit_expr(rhs))
         }

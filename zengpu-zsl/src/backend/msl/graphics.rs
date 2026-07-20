@@ -238,6 +238,9 @@ fn binop(op: IrBinOp) -> &'static str {
         IrBinOp::Ne => "!=",
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
+        IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
+            "/* UNSUPPORTED_BITWISE_OP_ON_MSL_BACKEND */"
+        }
     }
 }
 
