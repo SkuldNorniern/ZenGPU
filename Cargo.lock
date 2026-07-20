@@ -1907,6 +1907,7 @@ dependencies = [
 name = "zengpu-hip"
 version = "0.0.1"
 dependencies = [
+ "cc",
  "log",
  "zengpu-hal",
  "zengpu-spirv",
