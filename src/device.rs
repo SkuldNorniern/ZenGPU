@@ -150,6 +150,12 @@ impl Device {
         self.inner.as_any().downcast_ref()
     }
 
+    /// `CudaDevice`, or `None` if not CUDA.
+    #[cfg(feature = "cuda")]
+    pub fn as_cuda(&self) -> Option<&zengpu_cuda::CudaDevice> {
+        self.inner.as_any().downcast_ref()
+    }
+
     /// `MetalDevice`, or `None` if not Metal.
     #[cfg(feature = "metal")]
     pub fn as_metal(&self) -> Option<&zengpu_metal::MetalDevice> {

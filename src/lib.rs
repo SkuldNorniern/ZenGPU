@@ -1,4 +1,4 @@
-//! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
+//! ZenGPU: native-first GPU runtime for Rust (graphics and compute).
 //!
 //! # Quick start
 //!
@@ -34,12 +34,15 @@
 //! | `blas`    | yes     | GEMM kernel on top of `compute`. |
 //! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
+//! | `metal`   | no      | Metal backend (Apple, compute only: no graphics pipeline yet). |
+//! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
+//! | `dx12`    | no      | DirectX 12 backend (Windows): not yet implemented. |
 //!
 //! # Backend-specific access
 //!
-//! [`Device::as_vulkan`] gives `&VulkanDevice` for swapchain and frame-graph work.
+//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain and frame-graph work.
 //! `Device::as_cpu` gives the CPU conformance oracle. Sub-crates are re-exported under
-//! [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`.
+//! [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`, [`metal`], `hip`, `dx12`.
 
 pub mod adapter;
 pub mod detect;
