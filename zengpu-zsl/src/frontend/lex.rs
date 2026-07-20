@@ -36,6 +36,11 @@ pub enum Tok {
     Eq,
     AndAnd,
     OrOr,
+    Amp,    // &
+    Pipe,   // |
+    Caret,  // ^
+    Shl,    // <<
+    Shr,    // >>
     Arrow,  // ->
     DotDot, // ..
 
@@ -210,6 +215,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             (b'!', Some((_, b'='))) => (Tok::Ne, 2),
             (b'&', Some((_, b'&'))) => (Tok::AndAnd, 2),
             (b'|', Some((_, b'|'))) => (Tok::OrOr, 2),
+            (b'<', Some((_, b'<'))) => (Tok::Shl, 2),
+            (b'>', Some((_, b'>'))) => (Tok::Shr, 2),
             (b'-', Some((_, b'>'))) => (Tok::Arrow, 2),
             (b'.', Some((_, b'.'))) => (Tok::DotDot, 2),
             (b'+', _) => (Tok::Plus, 1),
@@ -218,6 +225,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             (b'/', _) => (Tok::Slash, 1),
             (b'<', _) => (Tok::Lt, 1),
             (b'>', _) => (Tok::Gt, 1),
+            (b'&', _) => (Tok::Amp, 1),
+            (b'|', _) => (Tok::Pipe, 1),
+            (b'^', _) => (Tok::Caret, 1),
             (b'=', _) => (Tok::Eq, 1),
             (b'.', _) => (Tok::Dot, 1),
             (b',', _) => (Tok::Comma, 1),

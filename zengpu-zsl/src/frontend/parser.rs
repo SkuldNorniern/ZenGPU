@@ -74,6 +74,31 @@ struct Parser<'a> {
     /// Push-block definitions: struct name → ordered (field, type). Stored as
     /// the graphics-superset [`GfxTy`]; compute narrows to scalar fields.
     pushes: HashMap<String, Vec<(String, GfxTy)>>,
+    /// Compute-only helper `fn` definitions, always fully inlined at each call
+    /// site (see `parse_fn_call_stmt`) — the SPIR-V backend never sees a call.
+    functions: HashMap<String, FunctionDef>,
+    /// Bumped per call site to keep inlined locals from different calls (or
+    /// repeated calls to the same function) from colliding.
+    call_counter: u32,
+}
+
+/// One scalar `fn` parameter: `name: ty` (in, by value) or `out name: ty`
+/// (out — the call-site argument must be a plain pre-declared local; writes
+/// to the parameter inside the body become writes to that local).
+#[derive(Clone)]
+struct FnParamDef {
+    name: String,
+    is_out: bool,
+    ty: ScalarTy,
+}
+
+/// A parsed helper function, ready to be inlined by name-substitution at each
+/// call site. `locals` are the function's own `let`/`for`-loop-var locals
+/// (not its params), each renamed fresh per call to avoid collisions.
+struct FunctionDef {
+    params: Vec<FnParamDef>,
+    locals: Vec<(String, ScalarTy)>,
+    body: Vec<IrStmt>,
 }
 
 /// Resolved symbol tables for the compute body being parsed.
@@ -110,6 +135,8 @@ impl<'a> Parser<'a> {
             toks,
             pos: 0,
             pushes: HashMap::new(),
+            functions: HashMap::new(),
+            call_counter: 0,
         }
     }
 
@@ -188,6 +215,11 @@ impl<'a> Parser<'a> {
         // Push blocks.
         while self.at_kw("push") {
             self.parse_push_block()?;
+        }
+
+        // Helper `fn` definitions (compute only; each may call earlier ones).
+        while self.at_kw("fn") {
+            self.parse_fn_item()?;
         }
 
         // Attributes (only @workgroup_size today, for compute).
@@ -294,6 +326,57 @@ impl<'a> Parser<'a> {
             }
         }
         self.pushes.insert(name, fields);
+        Ok(())
+    }
+
+    /// `fn name(("out")? ident ":" scalar, ...) block` — scalar-only helper,
+    /// no buffers/shared/global_id/push. May call any `fn` declared earlier.
+    fn parse_fn_item(&mut self) -> Result<(), ParseError> {
+        self.eat_kw("fn");
+        let name = self.ident()?;
+        if self.functions.contains_key(&name) || self.pushes.contains_key(&name) {
+            return self.err(format!("duplicate symbol `{name}`"));
+        }
+        self.expect(&Tok::LParen, "`(` after fn name")?;
+        let mut ctx = Ctx {
+            buffers: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            id_param: None,
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+            shared: HashMap::new(),
+            shared_order: Vec::new(),
+        };
+        let mut params = Vec::new();
+        while !self.eat(&Tok::RParen) {
+            let is_out = self.eat_kw("out");
+            let pname = self.ident()?;
+            if ctx.locals.contains_key(&pname) {
+                return self.err(format!("duplicate parameter `{pname}`"));
+            }
+            self.expect(&Tok::Colon, "`:` after fn parameter name")?;
+            let ty = self.parse_scalar_type()?;
+            ctx.locals.insert(pname.clone(), ty);
+            params.push(FnParamDef {
+                name: pname,
+                is_out,
+                ty,
+            });
+            self.eat(&Tok::Comma); // optional/trailing
+            if self.peek().is_none() {
+                return self.err("unterminated fn parameter list");
+            }
+        }
+        let body = self.parse_block(&mut ctx)?;
+        self.functions.insert(
+            name,
+            FunctionDef {
+                params,
+                locals: ctx.locals_order,
+                body,
+            },
+        );
         Ok(())
     }
 
@@ -440,7 +523,7 @@ impl<'a> Parser<'a> {
             if self.eat_kw("shared") {
                 self.parse_shared(ctx)?;
             } else {
-                stmts.push(self.parse_stmt(ctx)?);
+                stmts.extend(self.parse_stmt(ctx)?);
             }
         }
         Ok(stmts)
@@ -479,20 +562,20 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_stmt(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
+    fn parse_stmt(&mut self, ctx: &mut Ctx) -> Result<Vec<IrStmt>, ParseError> {
         if self.eat_kw("let") {
-            return self.parse_let(ctx);
+            return Ok(vec![self.parse_let(ctx)?]);
         }
         if self.eat_kw("if") {
-            return self.parse_if(ctx);
+            return Ok(vec![self.parse_if(ctx)?]);
         }
         if self.eat_kw("for") {
-            return self.parse_for(ctx);
+            return Ok(vec![self.parse_for(ctx)?]);
         }
         if self.eat_kw("barrier") {
             self.expect(&Tok::LParen, "`(` after barrier")?;
             self.expect(&Tok::RParen, "`)` after barrier(")?;
-            return Ok(IrStmt::Barrier);
+            return Ok(vec![IrStmt::Barrier]);
         }
         if self.eat_kw("atomic_add") {
             self.expect(&Tok::LParen, "`(` after atomic_add")?;
@@ -520,14 +603,24 @@ impl<'a> Parser<'a> {
             if infer_ty(&value, ctx) != ScalarTy::F32 {
                 return self.err("atomic_add value must be an f32-typed expression");
             }
-            return Ok(IrStmt::AtomicAdd { buf, index, value });
+            return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
+        }
+        // A call to a user-defined `fn`, always inlined here (see
+        // `parse_fn_call_stmt`); recognized before falling into the general
+        // expression parser, since it isn't an expression (it returns via
+        // `out` parameters, if any, not a value).
+        if let Some(Tok::Ident(name)) = self.peek() {
+            let name = name.clone();
+            if self.functions.contains_key(&name) {
+                return self.parse_fn_call_stmt(&name, ctx);
+            }
         }
         // Expression statement or assignment.
         let lhs = self.parse_expr(ctx)?;
         if self.eat(&Tok::Eq) {
             let rhs = self.parse_expr(ctx)?;
-            match lhs {
-                IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
+            let stmt = match lhs {
+                IrExpr::Local(name) => IrStmt::AssignLocal { name, value: rhs },
                 IrExpr::BufferLoad { buf, index } => {
                     let Some(buffer) = ctx.buffers.get(&buf).copied() else {
                         return self.err(format!("`{buf}` is not a device buffer"));
@@ -543,27 +636,98 @@ impl<'a> Parser<'a> {
                             buffer_elem_name(buffer.elem)
                         ));
                     }
-                    Ok(IrStmt::AssignBuffer {
+                    IrStmt::AssignBuffer {
                         buf,
                         index: *index,
                         value: rhs,
-                    })
+                    }
                 }
                 IrExpr::SharedLoad { name, index } => {
                     if !ctx.shared.contains_key(&name) {
                         return self.err(format!("`{name}` is not a declared shared array"));
                     }
-                    Ok(IrStmt::AssignShared {
+                    IrStmt::AssignShared {
                         name,
                         index: *index,
                         value: rhs,
-                    })
+                    }
                 }
-                _ => self.err("invalid assignment target; use a local, buffer[i], or shared[i]"),
-            }
+                _ => {
+                    return self
+                        .err("invalid assignment target; use a local, buffer[i], or shared[i]");
+                }
+            };
+            Ok(vec![stmt])
         } else {
-            Ok(IrStmt::Eval(lhs))
+            Ok(vec![IrStmt::Eval(lhs)])
         }
+    }
+
+    /// Inline a call to a user-defined `fn` at the current statement position:
+    /// bind each `in` argument to a fresh local, alias each `out` argument's
+    /// name directly to the caller-supplied local, rename the function's own
+    /// locals fresh, and splice the (renamed) body in as the call's expansion.
+    fn parse_fn_call_stmt(&mut self, name: &str, ctx: &mut Ctx) -> Result<Vec<IrStmt>, ParseError> {
+        self.pos += 1; // the function name identifier, already peeked
+        self.expect(&Tok::LParen, "`(` after function name")?;
+        let params = self.functions[name].params.clone();
+        self.call_counter += 1;
+        let call_id = self.call_counter;
+        let mut rename: HashMap<String, String> = HashMap::new();
+        let mut prelude: Vec<IrStmt> = Vec::new();
+        for (index, param) in params.iter().enumerate() {
+            if index > 0 {
+                self.expect(&Tok::Comma, "`,` between function call arguments")?;
+            }
+            if param.is_out {
+                let arg_name = self.ident()?;
+                let Some(&arg_ty) = ctx.locals.get(&arg_name) else {
+                    return self.err(format!(
+                        "`{arg_name}` is not a declared local; `out` arguments must be a pre-declared local variable"
+                    ));
+                };
+                if arg_ty != param.ty {
+                    return self.err(format!(
+                        "`out` argument `{arg_name}` does not match parameter `{}`'s type",
+                        param.name
+                    ));
+                }
+                rename.insert(param.name.clone(), arg_name);
+            } else {
+                let arg_expr = self.parse_expr(ctx)?;
+                if infer_ty(&arg_expr, ctx) != param.ty {
+                    return self.err(format!(
+                        "argument for parameter `{}` has the wrong type",
+                        param.name
+                    ));
+                }
+                let fresh = format!("__call{call_id}_{}", param.name);
+                ctx.locals.insert(fresh.clone(), param.ty);
+                ctx.locals_order.push((fresh.clone(), param.ty));
+                prelude.push(IrStmt::Let {
+                    name: fresh.clone(),
+                    init: arg_expr,
+                });
+                rename.insert(param.name.clone(), fresh);
+            }
+        }
+        self.expect(&Tok::RParen, "`)` after function call arguments")?;
+
+        let def_locals = self.functions[name].locals.clone();
+        for (local_name, ty) in &def_locals {
+            let fresh = format!("__call{call_id}_{local_name}");
+            ctx.locals.insert(fresh.clone(), *ty);
+            ctx.locals_order.push((fresh.clone(), *ty));
+            rename.insert(local_name.clone(), fresh);
+        }
+
+        let inlined: Vec<IrStmt> = self.functions[name]
+            .body
+            .iter()
+            .map(|stmt| rename_stmt(stmt, &rename))
+            .collect();
+        prelude.extend(inlined);
+        Ok(prelude)
     }
 
     fn parse_let(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
@@ -638,7 +802,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_cmp(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
-        let lhs = self.parse_add(ctx)?;
+        let lhs = self.parse_bitor(ctx)?;
         let op = match self.peek() {
             Some(Tok::Lt) => IrBinOp::Lt,
             Some(Tok::Le) => IrBinOp::Le,
@@ -649,8 +813,50 @@ impl<'a> Parser<'a> {
             _ => return Ok(lhs),
         };
         self.pos += 1;
-        let rhs = self.parse_add(ctx)?;
+        let rhs = self.parse_bitor(ctx)?;
         Ok(bin(op, lhs, rhs))
+    }
+
+    fn parse_bitor(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_bitxor(ctx)?;
+        while self.eat(&Tok::Pipe) {
+            let rhs = self.parse_bitxor(ctx)?;
+            lhs = bin(IrBinOp::BitOr, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitxor(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_bitand(ctx)?;
+        while self.eat(&Tok::Caret) {
+            let rhs = self.parse_bitand(ctx)?;
+            lhs = bin(IrBinOp::BitXor, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_bitand(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_shift(ctx)?;
+        while self.eat(&Tok::Amp) {
+            let rhs = self.parse_shift(ctx)?;
+            lhs = bin(IrBinOp::BitAnd, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    fn parse_shift(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_add(ctx)?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Shl) => IrBinOp::Shl,
+                Some(Tok::Shr) => IrBinOp::Shr,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_add(ctx)?;
+            lhs = bin(op, lhs, rhs);
+        }
+        Ok(lhs)
     }
 
     fn parse_add(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
@@ -1332,6 +1538,101 @@ fn bin(op: IrBinOp, lhs: IrExpr, rhs: IrExpr) -> IrExpr {
     }
 }
 
+/// Rebuild `expr` with every `Local` name rewritten per `map` (identity for
+/// names not present). Used to inline a `fn` body at a call site: every
+/// parameter and internal local is renamed fresh before splicing.
+fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExpr {
+    let renamed = |name: &String| map.get(name).cloned().unwrap_or_else(|| name.clone());
+    match expr {
+        IrExpr::LitU32(v) => IrExpr::LitU32(*v),
+        IrExpr::LitF32(v) => IrExpr::LitF32(*v),
+        IrExpr::Local(name) => IrExpr::Local(renamed(name)),
+        IrExpr::ScalarParam(name) => IrExpr::ScalarParam(name.clone()),
+        IrExpr::BufferLoad { buf, index } => IrExpr::BufferLoad {
+            buf: buf.clone(),
+            index: Box::new(rename_expr(index, map)),
+        },
+        IrExpr::SharedLoad { name, index } => IrExpr::SharedLoad {
+            name: name.clone(),
+            index: Box::new(rename_expr(index, map)),
+        },
+        IrExpr::GlobalId(c) => IrExpr::GlobalId(*c),
+        IrExpr::LocalId(c) => IrExpr::LocalId(*c),
+        IrExpr::GroupId(c) => IrExpr::GroupId(*c),
+        IrExpr::Input(name) => IrExpr::Input(name.clone()),
+        IrExpr::FieldAccess { base, component } => IrExpr::FieldAccess {
+            base: Box::new(rename_expr(base, map)),
+            component: *component,
+        },
+        IrExpr::VecConstruct { dim, args } => IrExpr::VecConstruct {
+            dim: *dim,
+            args: args.iter().map(|a| rename_expr(a, map)).collect(),
+        },
+        IrExpr::Extend { base, scalar } => IrExpr::Extend {
+            base: Box::new(rename_expr(base, map)),
+            scalar: Box::new(rename_expr(scalar, map)),
+        },
+        IrExpr::Dot { a, b } => IrExpr::Dot {
+            a: Box::new(rename_expr(a, map)),
+            b: Box::new(rename_expr(b, map)),
+        },
+        IrExpr::Builtin { func, args } => IrExpr::Builtin {
+            func: *func,
+            args: args.iter().map(|a| rename_expr(a, map)).collect(),
+        },
+        IrExpr::Neg(inner) => IrExpr::Neg(Box::new(rename_expr(inner, map))),
+        IrExpr::Binary { op, lhs, rhs } => IrExpr::Binary {
+            op: *op,
+            lhs: Box::new(rename_expr(lhs, map)),
+            rhs: Box::new(rename_expr(rhs, map)),
+        },
+    }
+}
+
+fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStmt {
+    let renamed = |name: &String| map.get(name).cloned().unwrap_or_else(|| name.clone());
+    match stmt {
+        IrStmt::Let { name, init } => IrStmt::Let {
+            name: renamed(name),
+            init: rename_expr(init, map),
+        },
+        IrStmt::AssignLocal { name, value } => IrStmt::AssignLocal {
+            name: renamed(name),
+            value: rename_expr(value, map),
+        },
+        IrStmt::AssignBuffer { buf, index, value } => IrStmt::AssignBuffer {
+            buf: buf.clone(),
+            index: rename_expr(index, map),
+            value: rename_expr(value, map),
+        },
+        IrStmt::AtomicAdd { buf, index, value } => IrStmt::AtomicAdd {
+            buf: buf.clone(),
+            index: rename_expr(index, map),
+            value: rename_expr(value, map),
+        },
+        IrStmt::AssignShared { name, index, value } => IrStmt::AssignShared {
+            name: name.clone(),
+            index: rename_expr(index, map),
+            value: rename_expr(value, map),
+        },
+        IrStmt::Barrier => IrStmt::Barrier,
+        IrStmt::If { cond, then, else_ } => IrStmt::If {
+            cond: rename_expr(cond, map),
+            then: then.iter().map(|s| rename_stmt(s, map)).collect(),
+            else_: else_
+                .as_ref()
+                .map(|stmts| stmts.iter().map(|s| rename_stmt(s, map)).collect()),
+        },
+        IrStmt::For { var, lo, hi, body } => IrStmt::For {
+            var: renamed(var),
+            lo: rename_expr(lo, map),
+            hi: rename_expr(hi, map),
+            body: body.iter().map(|s| rename_stmt(s, map)).collect(),
+        },
+        IrStmt::Eval(e) => IrStmt::Eval(rename_expr(e, map)),
+    }
+}
+
 fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "u32" => BuiltinFn::U32,
@@ -1642,5 +1943,238 @@ mod tests {
             }
         "#;
         assert!(parse_compute(src).is_err());
+    }
+
+    #[test]
+    fn fn_with_in_and_out_params_inlines_and_lowers() {
+        let src = r#"
+            fn add_one(x: u32, out result: u32) {
+                result = x + 1
+            }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                let out: u32 = 0
+                add_one(id.x, out)
+                dst[id.x] = out
+            }
+        "#;
+        let words = lower(src);
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    #[test]
+    fn fn_can_call_an_earlier_declared_fn() {
+        let src = r#"
+            fn inc(x: u32, out result: u32) {
+                result = x + 1
+            }
+            fn inc_twice(x: u32, out result: u32) {
+                let once: u32 = 0
+                inc(x, once)
+                inc(once, result)
+            }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                let out: u32 = 0
+                inc_twice(id.x, out)
+                dst[id.x] = out
+            }
+        "#;
+        lower(src);
+    }
+
+    #[test]
+    fn fn_call_before_declaration_is_rejected() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                let out: u32 = 0
+                not_yet_declared(id.x, out)
+                dst[id.x] = out
+            }
+            fn not_yet_declared(x: u32, out result: u32) {
+                result = x
+            }
+        "#;
+        // `fn` items must precede the kernel; a call inside the kernel to a
+        // name declared afterward is just an unknown identifier.
+        assert!(parse_compute(src).is_err());
+    }
+
+    #[test]
+    fn duplicate_fn_name_is_rejected() {
+        let src = r#"
+            fn dup(x: u32, out result: u32) { result = x }
+            fn dup(x: u32, out result: u32) { result = x }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                dst[id.x] = id.x
+            }
+        "#;
+        let e = parse_compute(src).unwrap_err();
+        assert!(e.msg.contains("duplicate symbol"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn fn_out_argument_must_be_a_declared_local() {
+        let src = r#"
+            fn set(out result: u32) { result = 1 }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                set(undeclared)
+                dst[id.x] = undeclared
+            }
+        "#;
+        let e = parse_compute(src).unwrap_err();
+        assert!(e.msg.contains("not a declared local"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn fn_out_argument_type_mismatch_is_rejected() {
+        let src = r#"
+            fn set(out result: u32) { result = 1 }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<f32>, id: global_id) {
+                let out: f32 = 0.0
+                set(out)
+                dst[id.x] = out
+            }
+        "#;
+        let e = parse_compute(src).unwrap_err();
+        assert!(e.msg.contains("does not match"), "got: {}", e.msg);
+    }
+
+    #[test]
+    fn fn_body_cannot_reference_kernel_buffers() {
+        let src = r#"
+            fn leaks(out result: u32) {
+                result = x[0]
+            }
+            @workgroup_size(1)
+            kernel k(x: device buffer<u32>, dst: device mut buffer<u32>, id: global_id) {
+                let out: u32 = 0
+                leaks(out)
+                dst[id.x] = out
+            }
+        "#;
+        assert!(parse_compute(src).is_err());
+    }
+
+    #[test]
+    fn repeated_calls_to_the_same_fn_do_not_collide() {
+        let src = r#"
+            fn inc(x: u32, out result: u32) {
+                let bumped = x + 1
+                result = bumped
+            }
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                let a: u32 = 0
+                let b: u32 = 0
+                inc(id.x, a)
+                inc(a, b)
+                dst[id.x] = a + b
+            }
+        "#;
+        lower(src);
+    }
+
+    #[test]
+    fn bitwise_operators_parse_and_lower_to_spirv() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<u32>, id: global_id) {
+                let a = id.x & 255
+                let b = a | 16
+                let c = b ^ a
+                let d = c << 2
+                let e = d >> 1
+                dst[id.x] = a + b + c + d + e
+            }
+        "#;
+        let words = lower(src);
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    #[test]
+    fn bitwise_operators_reject_non_u32_operands() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel k(dst: device mut buffer<f32>, id: global_id) {
+                let x: f32 = 1.0
+                dst[id.x] = x & 1
+            }
+        "#;
+        // The parser accepts any numeric operands for `&` (the same
+        // `infer_ty` fallback arithmetic ops use); the u32-only restriction
+        // is enforced by the SPIR-V backend during lowering.
+        let module = parse_compute(src).expect("parse");
+        let err = crate::backend::spirv::lower_compute(&module).unwrap_err();
+        assert!(err.contains("u32 operands"), "got: {err}");
+    }
+
+    /// The actual xytron_mppi use case: a SplitMix64-style hash (mix64) built
+    /// from a 32x32->64 multiply (mulhi + native low-word wraparound), all
+    /// via `fn`, `out` params, and the new bitwise operators. Must parse and
+    /// lower; numeric correctness against the CPU reference is verified by
+    /// the Vulkan-backed test in `zengpu-conformance`, not here.
+    #[test]
+    fn mix64_style_hash_helper_lowers_to_spirv() {
+        let src = r#"
+            fn mulhi_u32(u: u32, v: u32, out result: u32) {
+                let u0 = u & 65535
+                let u1 = u >> 16
+                let v0 = v & 65535
+                let v1 = v >> 16
+
+                let t = u0 * v0
+                let k = t >> 16
+
+                t = u1 * v0 + k
+                let w1 = t & 65535
+                let w2 = t >> 16
+
+                t = u0 * v1 + w1
+                k = t >> 16
+
+                result = u1 * v1 + w2 + k
+            }
+
+            fn mix64(hi: u32, lo: u32, out out_hi: u32, out out_lo: u32) {
+                // value ^= value >> 30 (as a 64-bit shift: only `hi` feeds
+                // into the low word's top bits, so lo's contribution from a
+                // >>30 shift comes from hi's low two bits).
+                let shifted_lo: u32 = (hi << 2) | (lo >> 30)
+                let shifted_hi: u32 = hi >> 30
+                let v_lo = lo ^ shifted_lo
+                let v_hi = hi ^ shifted_hi
+
+                // value = value.wrapping_mul(C1), C1 = 0xbf58_476d_1ce4_e5b9
+                let c1_hi: u32 = 3210089581
+                let c1_lo: u32 = 483266489
+                let low_lo = v_lo * c1_lo
+                let cross: u32 = 0
+                mulhi_u32(v_lo, c1_lo, cross)
+                let hi_mul = v_hi * c1_lo + v_lo * c1_hi + cross
+
+                out_lo = low_lo
+                out_hi = hi_mul
+            }
+
+            @workgroup_size(64)
+            kernel hash(
+                in_hi: device buffer<u32>, in_lo: device buffer<u32>,
+                out_hi: device mut buffer<u32>, out_lo: device mut buffer<u32>,
+                id: global_id,
+            ) {
+                let h: u32 = 0
+                let l: u32 = 0
+                mix64(in_hi[id.x], in_lo[id.x], h, l)
+                out_hi[id.x] = h
+                out_lo[id.x] = l
+            }
+        "#;
+        let words = lower(src);
+        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
     }
 }

@@ -93,6 +93,11 @@ mod op {
     pub const INOT_EQUAL: u32 = 171;
     pub const FORD_EQUAL: u32 = 180;
     pub const FORD_NOT_EQUAL: u32 = 182;
+    pub const SHIFT_RIGHT_LOGICAL: u32 = 194;
+    pub const SHIFT_LEFT_LOGICAL: u32 = 196;
+    pub const BITWISE_OR: u32 = 197;
+    pub const BITWISE_XOR: u32 = 198;
+    pub const BITWISE_AND: u32 = 199;
     pub const EXT_INST: u32 = 12;
 }
 
@@ -908,6 +913,54 @@ impl SpvBuilder {
             &mut self.functions,
             op::LOGICAL_NOT,
             &[bool_ty.0, id.0, value.0],
+        );
+        id
+    }
+
+    pub fn op_bitwise_and(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::BITWISE_AND,
+            &[ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_bitwise_or(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::BITWISE_OR, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    pub fn op_bitwise_xor(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::BITWISE_XOR,
+            &[ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    /// `OpShiftLeftLogical` — shift amount (`b`) must be the same integer type as `a`.
+    pub fn op_shift_left_logical(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SHIFT_LEFT_LOGICAL,
+            &[ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    /// `OpShiftRightLogical` — zero-fills, correct for unsigned `u32` shifts.
+    pub fn op_shift_right_logical(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SHIFT_RIGHT_LOGICAL,
+            &[ty.0, id.0, a.0, b.0],
         );
         id
     }
