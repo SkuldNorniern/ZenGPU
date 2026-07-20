@@ -34,13 +34,17 @@
 //! | `blas`    | yes     | GEMM kernel on top of `compute`. |
 //! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
+//! | `metal`   | no      | Metal backend (Apple, compute only — no graphics pipeline yet). |
+//! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
+//! | `dx12`    | no      | DirectX 12 backend (Windows) — not yet implemented. |
 //!
 //! # Backend-specific access
 //!
 //! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain / frame-graph
 //! work; [`Device::as_cpu`] gives access to the CPU conformance oracle.
 //! The sub-crates are re-exported under [`vulkan`], [`compute`], [`blas`],
-//! [`cpu`], [`cuda`] for power users who need their full surface.
+//! [`cpu`], [`cuda`], [`metal`], [`hip`], [`dx12`] for power users who need
+//! their full surface.
 
 pub mod adapter;
 pub mod detect;
