@@ -1,5 +1,7 @@
 //! Adapter/device request and capability descriptors.
 
+use std::path::PathBuf;
+
 use crate::types::{BackendPreference, Features, PowerPreference};
 
 /// What to ask an adapter for during selection.
@@ -11,7 +13,7 @@ pub struct AdapterRequest {
 }
 
 /// What to ask a device for at creation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceRequest {
     pub backend: BackendPreference,
     pub power: PowerPreference,
@@ -19,6 +21,9 @@ pub struct DeviceRequest {
     pub required: Features,
     /// Features to enable if available, ignored if not.
     pub optional: Features,
+    /// Optional path used by supporting backends to load and persist compiled
+    /// pipeline cache data across device lifetimes.
+    pub pipeline_cache_path: Option<PathBuf>,
 }
 
 /// Which HAL capabilities a backend implements. A backend may provide

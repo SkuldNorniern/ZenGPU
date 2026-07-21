@@ -3,7 +3,10 @@
 use std::{
     any::Any,
     ffi::{CStr, CString, c_void},
+    fs,
+    io::ErrorKind,
     mem,
+    path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut},
     sync::{Arc, Mutex},
     time::Duration,
@@ -427,6 +430,7 @@ pub struct VulkanDevice {
     pub(crate) query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
     bindless: BindlessState,
     pipeline_cache: vk::PipelineCache,
+    pipeline_cache_path: Option<PathBuf>,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
     fence_pool: Arc<FencePool>,
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
@@ -443,6 +447,7 @@ impl VulkanDevice {
         extra_extensions: &[*const i8],
         needs_graphics: bool,
     ) -> Result<Self> {
+        let pipeline_cache_path = req.pipeline_cache_path.clone();
         let mut extensions = extra_extensions.to_vec();
         let available_extensions = unsafe {
             shared
@@ -665,11 +670,41 @@ impl VulkanDevice {
         let bindless = create_bindless(&inner.device, inner.limits)?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
         let fence_pool = Arc::new(FencePool::new(Arc::clone(&inner)));
-        let pipeline_cache = unsafe {
-            inner
-                .device
-                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        let initial_cache_data =
+            pipeline_cache_path
+                .as_deref()
+                .and_then(|path| match fs::read(path) {
+                    Ok(data) if !data.is_empty() => Some(data),
+                    Ok(_) => None,
+                    Err(e) if e.kind() == ErrorKind::NotFound => None,
+                    Err(e) => {
+                        log::warn!(
+                            "[zengpu-vulkan] failed to read pipeline cache {}: {e}",
+                            path.display()
+                        );
+                        None
+                    }
+                });
+        let cache_info = initial_cache_data
+            .as_deref()
+            .map_or_else(vk::PipelineCacheCreateInfo::default, |data| {
+                vk::PipelineCacheCreateInfo::default().initial_data(data)
+            });
+        let pipeline_cache = match unsafe { inner.device.create_pipeline_cache(&cache_info, None) }
+        {
+            Ok(cache) => cache,
+            Err(e) if initial_cache_data.is_some() => {
+                log::warn!(
+                    "[zengpu-vulkan] persisted pipeline cache was rejected ({e}); starting empty"
+                );
+                unsafe {
+                    inner
+                        .device
+                        .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+                }
                 .map_err(|e| GpuError::Backend(format!("vkCreatePipelineCache: {e}")))?
+            }
+            Err(e) => return Err(GpuError::Backend(format!("vkCreatePipelineCache: {e}"))),
         };
 
         Ok(Self {
@@ -683,6 +718,7 @@ impl VulkanDevice {
             query_pools: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
             pipeline_cache,
+            pipeline_cache_path,
             cmd_list_pool,
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
@@ -1061,6 +1097,26 @@ impl Drop for VulkanDevice {
             unsafe { self.inner.device.destroy_query_pool(query_pool.pool, None) };
         }
         unsafe {
+            if let Some(path) = &self.pipeline_cache_path {
+                match self
+                    .inner
+                    .device
+                    .get_pipeline_cache_data(self.pipeline_cache)
+                {
+                    Ok(data) => {
+                        if let Err(e) = fs::write(path, data) {
+                            log::warn!(
+                                "[zengpu-vulkan] failed to persist pipeline cache {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                    Err(e) => log::warn!(
+                        "[zengpu-vulkan] failed to retrieve pipeline cache data for {}: {e}",
+                        path.display()
+                    ),
+                }
+            }
             self.inner
                 .device
                 .destroy_pipeline_cache(self.pipeline_cache, None);
@@ -1077,7 +1133,7 @@ impl Drop for VulkanDevice {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Deref;
+    use std::{env, ops::Deref, process};
 
     use super::*;
     use crate::instance::VulkanInstance;
@@ -1228,6 +1284,52 @@ mod tests {
         let timestamps = device.resolve_query_pool(pool).unwrap();
         assert_eq!(timestamps.len(), 1);
         assert_ne!(timestamps[0], 0);
+    }
+
+    #[test]
+    fn pipeline_cache_is_persisted_to_disk() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const CACHE_TEST_ZSL: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel cache_test() {}
+        );
+
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!(
+            "zengpu-pipeline-cache-{}-{unique}.bin",
+            process::id()
+        ));
+        let Ok(device) = adapter.open_headless(DeviceRequest {
+            pipeline_cache_path: Some(path.clone()),
+            ..Default::default()
+        }) else {
+            return;
+        };
+        let shader = device.create_shader(CACHE_TEST_ZSL.spirv_desc()).unwrap();
+        device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        drop(device);
+
+        let metadata = fs::metadata(&path).unwrap();
+        assert!(metadata.len() > 0);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
