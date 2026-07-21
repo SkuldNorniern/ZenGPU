@@ -102,10 +102,18 @@ pub(crate) fn memory_usage_fallback(usage: MemoryUsage) -> Option<vk::MemoryProp
 
 pub(crate) fn vertex_format_to_vk(f: VertexFormat) -> vk::Format {
     match f {
+        VertexFormat::Float16x2 => vk::Format::R16G16_SFLOAT,
+        VertexFormat::Float16x4 => vk::Format::R16G16B16A16_SFLOAT,
         VertexFormat::Float32 => vk::Format::R32_SFLOAT,
         VertexFormat::Float32x2 => vk::Format::R32G32_SFLOAT,
         VertexFormat::Float32x3 => vk::Format::R32G32B32_SFLOAT,
         VertexFormat::Float32x4 => vk::Format::R32G32B32A32_SFLOAT,
+        VertexFormat::Snorm8x4 => vk::Format::R8G8B8A8_SNORM,
+        VertexFormat::Unorm16x2 => vk::Format::R16G16_UNORM,
+        VertexFormat::Unorm16x4 => vk::Format::R16G16B16A16_UNORM,
+        VertexFormat::Sint32x2 => vk::Format::R32G32_SINT,
+        VertexFormat::Sint32x3 => vk::Format::R32G32B32_SINT,
+        VertexFormat::Sint32x4 => vk::Format::R32G32B32A32_SINT,
         VertexFormat::Uint32 => vk::Format::R32_UINT,
         VertexFormat::Uint8x4Unorm => vk::Format::R8G8B8A8_UNORM,
     }
