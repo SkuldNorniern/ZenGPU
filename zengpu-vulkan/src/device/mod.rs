@@ -2,6 +2,7 @@
 use std::{
     any::Any,
     ffi::{CStr, CString, c_void},
+    mem,
     ptr::{copy_nonoverlapping, null, null_mut},
     sync::{Arc, Mutex},
     time::Duration,
@@ -113,7 +114,7 @@ impl VulkanSubmission {
             debug_assert!(lifetime.in_flight > 0);
             lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
             if lifetime.in_flight == 0 {
-                std::mem::take(&mut lifetime.deferred)
+                mem::take(&mut lifetime.deferred)
             } else {
                 Vec::new()
             }
