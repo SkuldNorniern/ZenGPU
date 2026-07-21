@@ -4,8 +4,8 @@
 use ash::vk;
 use zengpu_hal::{
     AddressMode, BlendComponent, BlendFactor, BlendOp, BorderColor, BufferUsage, CompareFn,
-    CullMode, FilterMode, Format, FrontFace, MemoryUsage, PolygonMode, PrimitiveTopology, StepMode,
-    VertexFormat,
+    CullMode, FilterMode, Format, FrontFace, MemoryUsage, PolygonMode, PrimitiveTopology,
+    StencilOp, StepMode, VertexFormat,
 };
 
 pub(crate) fn filter_to_vk(f: FilterMode) -> vk::Filter {
@@ -189,6 +189,19 @@ pub(crate) fn compare_fn_to_vk(c: CompareFn) -> vk::CompareOp {
         CompareFn::GreaterEqual => vk::CompareOp::GREATER_OR_EQUAL,
         CompareFn::NotEqual => vk::CompareOp::NOT_EQUAL,
         CompareFn::Always => vk::CompareOp::ALWAYS,
+    }
+}
+
+pub(crate) fn stencil_op_to_vk(op: StencilOp) -> vk::StencilOp {
+    match op {
+        StencilOp::Keep => vk::StencilOp::KEEP,
+        StencilOp::Zero => vk::StencilOp::ZERO,
+        StencilOp::Replace => vk::StencilOp::REPLACE,
+        StencilOp::IncrementClamp => vk::StencilOp::INCREMENT_AND_CLAMP,
+        StencilOp::DecrementClamp => vk::StencilOp::DECREMENT_AND_CLAMP,
+        StencilOp::Invert => vk::StencilOp::INVERT,
+        StencilOp::IncrementWrap => vk::StencilOp::INCREMENT_AND_WRAP,
+        StencilOp::DecrementWrap => vk::StencilOp::DECREMENT_AND_WRAP,
     }
 }
 

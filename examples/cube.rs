@@ -229,6 +229,7 @@ impl CubeRenderState {
                 write: true,
                 compare: CompareFn::default(),
             },
+            stencil: None,
             raster: RasterState::default(),
             samples: 1,
         })?;
