@@ -40,6 +40,12 @@ pub(crate) struct VulkanShared {
     debug_utils: Option<(ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
 }
 
+impl VulkanShared {
+    pub(crate) fn debug_utils_enabled(&self) -> bool {
+        self.debug_utils.is_some()
+    }
+}
+
 unsafe impl Send for VulkanShared {}
 unsafe impl Sync for VulkanShared {}
 

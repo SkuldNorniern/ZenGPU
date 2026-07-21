@@ -169,6 +169,15 @@ pub trait Frame {
 /// in order; no intermediate command list is built. `&mut self` is the only
 /// synchronization needed — different lists record independently on any thread.
 pub trait RenderCommands {
+    /// Begin a named debug group in GPU debugging and profiling tools.
+    fn push_debug_group(&mut self, label: &str);
+
+    /// End the current named debug group.
+    fn pop_debug_group(&mut self);
+
+    /// Insert a named marker in GPU debugging and profiling tools.
+    fn insert_debug_label(&mut self, label: &str);
+
     /// Begin a render pass over the given attachments.
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>);
 
