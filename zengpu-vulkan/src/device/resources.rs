@@ -81,12 +81,25 @@ impl VulkanDevice {
         offscreen: &OffscreenTarget,
         buffer: BufferHandle,
     ) -> Result<()> {
-        let image = offscreen.image();
-        let extent = offscreen.raw_extent();
+        GpuDevice::copy_texture_to_buffer(self, offscreen.texture_handle(), buffer)
+    }
+
+    pub(super) fn copy_texture_to_buffer_impl(
+        &self,
+        texture: TextureHandle,
+        buffer: BufferHandle,
+    ) -> Result<()> {
+        let (image, extent) = {
+            let textures = self.textures.lock().unwrap();
+            let texture = textures.get(texture).ok_or_else(|| {
+                GpuError::Backend("copy_texture_to_buffer: stale texture handle".to_string())
+            })?;
+            (texture.image, texture.extent)
+        };
         let vk_buffer = {
             let buffers = self.buffers.lock().unwrap();
             buffers.get(buffer).map(|b| b.buffer).ok_or_else(|| {
-                GpuError::Backend("copy_offscreen_to_buffer: stale buffer handle".to_string())
+                GpuError::Backend("copy_texture_to_buffer: stale buffer handle".to_string())
             })?
         };
         self.one_shot_submit(|dev, cmd| {
