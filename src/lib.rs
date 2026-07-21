@@ -74,9 +74,10 @@ pub use zengpu_hal::{
     GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp, MemoryUsage, PipelineHandle,
     PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc,
     RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
-    StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig, SurfaceError, TargetHandle,
-    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexAttribute, VertexFormat,
-    VertexLayout, Viewport, ViewportScissor, WindowHandles,
+    StencilFaceState, StencilOp, StencilState, StepMode, Submission, SubmissionStatus, Surface,
+    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage,
+    UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor,
+    WindowHandles,
 };
 
 #[cfg(feature = "compute")]

@@ -357,6 +357,34 @@ pub struct DepthState {
     pub compare: CompareFn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StencilOp {
+    Keep,
+    Zero,
+    Replace,
+    IncrementClamp,
+    DecrementClamp,
+    Invert,
+    IncrementWrap,
+    DecrementWrap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilFaceState {
+    pub compare: CompareFn,
+    pub fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilState {
+    pub front: StencilFaceState,
+    pub back: StencilFaceState,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,
@@ -369,6 +397,7 @@ pub struct GraphicsPipelineDesc<'a> {
     pub color_targets: &'a [ColorTargetState],
     pub depth_format: Option<Format>,
     pub depth: DepthState,
+    pub stencil: Option<StencilState>,
     pub raster: RasterState,
     /// MSAA sample count. `1` means no multisampling.
     pub samples: u32,
