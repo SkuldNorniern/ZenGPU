@@ -15,10 +15,13 @@ use std::{
 use ash::vk;
 use zengpu_hal::{
     Bindings, BufferHandle, ColorAttachment, DepthAttachment, GpuError, LoadOp, PipelineHandle,
-    RenderCommands, RenderPassDesc, Result, Scalar, SlotMap, TargetHandle, ViewportScissor, marker,
+    QueryPoolHandle, RenderCommands, RenderPassDesc, Result, Scalar, SlotMap, TargetHandle,
+    ViewportScissor, marker,
 };
 
-use crate::device::{VulkanBuffer, VulkanDeviceInner, VulkanPipeline, VulkanRenderTarget};
+use crate::device::{
+    VulkanBuffer, VulkanDeviceInner, VulkanPipeline, VulkanQueryPool, VulkanRenderTarget,
+};
 
 pub(crate) const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
     aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -190,6 +193,7 @@ pub struct VulkanCommandList {
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
+    pub(crate) query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
     pub(crate) bindless_set: vk::DescriptorSet,
     current_pipeline: Option<PipelineHandle>,
     /// Pipeline layout of the currently bound graphics pipeline, used to
@@ -205,6 +209,7 @@ pub struct VulkanCommandList {
 impl VulkanCommandList {
     /// Construct a command list around an already-recording `cmd` buffer,
     /// sharing the device's resource slotmaps for handle resolution.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Arc<VulkanDeviceInner>,
         pool: Arc<CmdListPool>,
@@ -212,6 +217,7 @@ impl VulkanCommandList {
         pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
         render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
         buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
+        query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
         bindless_set: vk::DescriptorSet,
     ) -> Self {
         Self {
@@ -221,6 +227,7 @@ impl VulkanCommandList {
             pipelines,
             render_targets,
             buffers,
+            query_pools,
             bindless_set,
             current_pipeline: None,
             current_layout: None,
@@ -421,6 +428,24 @@ impl RenderCommands for VulkanCommandList {
             ..Default::default()
         };
         unsafe { debug_utils.cmd_insert_debug_utils_label(self.cmd, &info) };
+    }
+
+    fn write_timestamp(&mut self, pool: QueryPoolHandle, index: u32) {
+        let query_pools = self.query_pools.lock().unwrap();
+        let Some(query_pool) = query_pools.get(pool) else {
+            return;
+        };
+        if index >= query_pool.count {
+            return;
+        }
+        unsafe {
+            self.inner.device.cmd_write_timestamp(
+                self.cmd,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                query_pool.pool,
+                index,
+            );
+        }
     }
 
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {

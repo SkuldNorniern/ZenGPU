@@ -322,6 +322,37 @@ impl GraphicsDevice for VulkanDevice {
         self.create_command_list_impl()
     }
 
+    fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle> {
+        if count == 0 {
+            return Err(GpuError::Backend(
+                "timestamp query pool count must be non-zero".to_string(),
+            ));
+        }
+        let pool = unsafe {
+            self.inner.device.create_query_pool(
+                &vk::QueryPoolCreateInfo {
+                    query_type: vk::QueryType::TIMESTAMP,
+                    query_count: count,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        .map_err(|e| GpuError::Backend(format!("vkCreateQueryPool: {e}")))?;
+        if let Err(e) = self.one_shot_submit(|device, cmd| {
+            unsafe { device.cmd_reset_query_pool(cmd, pool, 0, count) };
+            Ok(())
+        }) {
+            unsafe { self.inner.device.destroy_query_pool(pool, None) };
+            return Err(e);
+        }
+        Ok(self
+            .query_pools
+            .lock()
+            .unwrap()
+            .insert(VulkanQueryPool { pool, count }))
+    }
+
     fn supports_dual_source_blending(&self) -> bool {
         self.inner.dual_src_blend
     }

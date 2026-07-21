@@ -14,9 +14,10 @@ use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, BufferUsage, CompareFn, ComputeOp, ComputePipelineDesc,
     DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, GpuDevice, GpuError,
     GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage,
-    PipelineHandle, PolygonMode, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
-    ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, SurfaceConfig, TargetHandle,
-    TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, WindowHandles, marker,
+    PipelineHandle, PolygonMode, QueryPoolHandle, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, SurfaceConfig,
+    TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, WindowHandles,
+    marker,
 };
 
 mod dispatch;
@@ -292,6 +293,11 @@ pub(crate) struct VulkanRenderTarget {
     pub layout: vk::ImageLayout,
 }
 
+pub(crate) struct VulkanQueryPool {
+    pub pool: vk::QueryPool,
+    pub count: u32,
+}
+
 /// Shared logical device state — owned by `Arc` so swapchains can hold a ref.
 pub(crate) struct VulkanDeviceInner {
     pub shared: Arc<VulkanShared>,
@@ -418,6 +424,7 @@ pub struct VulkanDevice {
     /// Render targets (swapchain images, offscreen textures) recordable
     /// commands can attach to. Shared with [`VulkanCommandList`](VulkanCommandList).
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
+    pub(crate) query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
     bindless: BindlessState,
     pipeline_cache: vk::PipelineCache,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
@@ -673,6 +680,7 @@ impl VulkanDevice {
             shaders: Mutex::new(SlotMap::new()),
             pipelines: Arc::new(Mutex::new(SlotMap::new())),
             render_targets: Arc::new(Mutex::new(SlotMap::new())),
+            query_pools: Arc::new(Mutex::new(SlotMap::new())),
             bindless,
             pipeline_cache,
             cmd_list_pool,
@@ -742,6 +750,28 @@ impl VulkanDevice {
             .filter_map(|index| buffers.get_by_slot_index(index))
             .filter(|buffer| buffer.usage.contains(BufferUsage::STORAGE))
             .count() as u32
+    }
+
+    /// Resolve every timestamp in `pool`, waiting for the GPU results to become
+    /// available. Returns an error for a stale query-pool handle.
+    pub fn resolve_query_pool(&self, pool: QueryPoolHandle) -> Result<Vec<u64>> {
+        let query_pools = self.query_pools.lock().unwrap();
+        let query_pool = query_pools
+            .get(pool)
+            .ok_or_else(|| GpuError::Backend("stale query pool handle".to_string()))?;
+        let mut timestamps = vec![0; query_pool.count as usize];
+        unsafe {
+            self.inner
+                .device
+                .get_query_pool_results(
+                    query_pool.pool,
+                    0,
+                    &mut timestamps,
+                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+                )
+                .map_err(|e| GpuError::Backend(format!("vkGetQueryPoolResults: {e}")))?;
+        }
+        Ok(timestamps)
     }
 }
 
@@ -958,6 +988,9 @@ impl Drop for VulkanDevice {
             if Arc::strong_count(&self.render_targets) > 1 {
                 outstanding.push("render_targets");
             }
+            if Arc::strong_count(&self.query_pools) > 1 {
+                outstanding.push("query_pools");
+            }
             if Arc::strong_count(&self.cmd_list_pool) > 1 {
                 outstanding.push("cmd_list_pool");
             }
@@ -1023,6 +1056,10 @@ impl Drop for VulkanDevice {
                 self.inner.device.destroy_pipeline_layout(layout, None);
             }
         }
+        let mut query_pools = self.query_pools.lock().unwrap();
+        for query_pool in query_pools.drain() {
+            unsafe { self.inner.device.destroy_query_pool(query_pool.pool, None) };
+        }
         unsafe {
             self.inner
                 .device
@@ -1046,6 +1083,7 @@ mod tests {
     use crate::instance::VulkanInstance;
     use zengpu_hal::{
         AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuInstance,
+        RenderCommands,
     };
 
     struct TestDevice {
@@ -1167,6 +1205,29 @@ mod tests {
         device.destroy_sampler(sampler);
         device.destroy_texture(texture);
         assert_eq!(device.bindless_buffer_used(), 0);
+    }
+
+    #[test]
+    fn timestamp_query_pool_writes_and_resolves() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+
+        let pool = device.create_query_pool(1).unwrap();
+        let mut commands = device.create_command_list().unwrap();
+        commands.write_timestamp(pool, 0);
+        device.submit_and_wait(commands).unwrap();
+
+        let timestamps = device.resolve_query_pool(pool).unwrap();
+        assert_eq!(timestamps.len(), 1);
+        assert_ne!(timestamps[0], 0);
     }
 
     #[test]

@@ -629,6 +629,7 @@ impl VulkanDevice {
             Arc::clone(&self.pipelines),
             Arc::clone(&self.render_targets),
             Arc::clone(&self.buffers),
+            Arc::clone(&self.query_pools),
             self.bindless.set,
         ))
     }
