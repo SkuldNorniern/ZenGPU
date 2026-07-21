@@ -615,9 +615,7 @@ impl RenderCommands for VulkanCommandList {
     }
 
     fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle) {
-        if let Some(current) = self.current_vertex_buffers.get(slot as usize)
-            && *current == Some(buffer)
-        {
+        if self.current_vertex_buffers.get(slot as usize) == Some(&Some(buffer)) {
             return;
         }
         let buffers = self.buffers.lock().unwrap();
