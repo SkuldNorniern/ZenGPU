@@ -381,6 +381,10 @@ fn destroy_deferred_vulkan(
     }
 }
 
+/// Vulkan logical device.
+///
+/// Drop every surface, offscreen target and command list from this device before the device. Debug
+/// builds panic on a violation. Release builds silently destroy shared resources under survivors.
 pub struct VulkanDevice {
     pub(crate) inner: Arc<VulkanDeviceInner>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
@@ -863,6 +867,44 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut outstanding = Vec::new();
+            if Arc::strong_count(&self.inner) > 3 {
+                outstanding.push("inner");
+            }
+            if Arc::strong_count(&self.buffers) > 1 {
+                outstanding.push("buffers");
+            }
+            if Arc::strong_count(&self.textures) > 1 {
+                outstanding.push("textures");
+            }
+            if Arc::strong_count(&self.samplers) > 1 {
+                outstanding.push("samplers");
+            }
+            if Arc::strong_count(&self.pipelines) > 1 {
+                outstanding.push("pipelines");
+            }
+            if Arc::strong_count(&self.render_targets) > 1 {
+                outstanding.push("render_targets");
+            }
+            if Arc::strong_count(&self.cmd_list_pool) > 1 {
+                outstanding.push("cmd_list_pool");
+            }
+            if Arc::strong_count(&self.fence_pool) > 1 {
+                outstanding.push("fence_pool");
+            }
+            if Arc::strong_count(&self.lifetime) > 1 {
+                outstanding.push("lifetime");
+            }
+            if !outstanding.is_empty() {
+                panic!(
+                    "VulkanDevice dropped with outstanding shared owners of {}: drop Surface, OffscreenTarget, and command-list handles before dropping the device",
+                    outstanding.join(", ")
+                );
+            }
+        }
+
         let _queue = self
             .inner
             .queue_lock

@@ -28,7 +28,7 @@ impl Frame for VulkanFrame {
     }
 }
 
-/// Presentable surface over [`Swapchain`], implementing [`zengpu_hal::Surface`].
+/// Presentable surface over [`Swapchain`]. Drop before its `VulkanDevice`.
 pub struct VulkanSurface {
     inner: Arc<VulkanDeviceInner>,
     swapchain: Swapchain,

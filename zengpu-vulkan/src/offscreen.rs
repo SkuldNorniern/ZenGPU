@@ -9,12 +9,11 @@ use zengpu_hal::{
 use crate::VulkanDevice;
 use crate::device::{VulkanDeviceInner, VulkanRenderTarget, VulkanTexture};
 
-/// Fixed-size, device-local color image used as both render target and sampled texture.
+/// Fixed-size device-local color image, usable as a render target and a sampled texture. No raw
+/// Vulkan types are public.
 ///
-/// Wraps the HAL [`TextureHandle`]/[`TargetHandle`] pair, so no raw Vulkan types are exposed.
-///
-/// Render into `offscreen.target_handle()` with `sample_after: true`, then sample it with
-/// `device.bind_texture(offscreen.texture_handle(), sampler)`.
+/// Render into `target_handle()` with `sample_after: true`, then bind `texture_handle()`. Drop it
+/// before its `VulkanDevice`.
 pub struct OffscreenTarget {
     inner: Arc<VulkanDeviceInner>,
     textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
