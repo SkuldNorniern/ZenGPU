@@ -271,6 +271,96 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+/// One blend-factor pair and the operation combining them, for one channel
+/// group (RGB or alpha) of a color attachment's blend state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendComponent {
+    pub src_factor: BlendFactor,
+    pub dst_factor: BlendFactor,
+    pub op: BlendOp,
+}
+
+/// Standard Vulkan/wgpu-shaped blend factors.
+///
+/// This is a portable subset containing only factors every backend can express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    DstColor,
+    OneMinusDstColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstAlpha,
+    OneMinusDstAlpha,
+    Src1Color,
+    OneMinusSrc1Color,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+/// Full blend state for one color attachment, with separate RGB and alpha
+/// components.
+///
+/// `None` on [`ColorTargetState::blend`] disables blending and performs an
+/// opaque write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendState {
+    pub color: BlendComponent,
+    pub alpha: BlendComponent,
+}
+
+impl BlendState {
+    /// Standard non-premultiplied source-over blending.
+    pub const ALPHA_BLEND: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            op: BlendOp::Add,
+        },
+        alpha: BlendComponent {
+            src_factor: BlendFactor::One,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            op: BlendOp::Add,
+        },
+    };
+
+    /// Dual-source blend for coverage-based text rendering: the fragment
+    /// shader writes a second color output (`layout(location = 0, index = 1)`)
+    /// used as the source-blend factor. Requires
+    /// [`GraphicsDevice::supports_dual_source_blending`](crate::graphics::GraphicsDevice::supports_dual_source_blending).
+    pub const DUAL_SOURCE_ALPHA: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::Src1Color,
+            dst_factor: BlendFactor::OneMinusSrc1Color,
+            op: BlendOp::Add,
+        },
+        alpha: BlendComponent {
+            src_factor: BlendFactor::Src1Alpha,
+            dst_factor: BlendFactor::OneMinusSrc1Alpha,
+            op: BlendOp::Add,
+        },
+    };
+}
+
+/// One color attachment's pipeline-side format and blend state.
+#[derive(Debug, Clone, Copy)]
+pub struct ColorTargetState {
+    pub format: Format,
+    pub blend: Option<BlendState>,
+}
+
 /// Backface culling mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CullMode {
@@ -340,7 +430,7 @@ pub struct DepthState {
     pub compare: CompareFn,
 }
 
-/// Describes a graphics pipeline with 3D support.
+/// Describes a graphics pipeline with 3D and multiple color-target support.
 #[derive(Debug, Clone, Copy)]
 pub struct GraphicsPipelineDesc<'a> {
     pub vertex_shader: ShaderHandle,
@@ -352,12 +442,11 @@ pub struct GraphicsPipelineDesc<'a> {
     /// with differing [`VertexLayout::step_mode`].
     pub vertex_layouts: &'a [VertexLayout<'a>],
     pub topology: PrimitiveTopology,
-    /// Color attachment format.
-    pub color_format: Format,
+    /// Pipeline-side format and blend state for each color attachment.
+    pub color_targets: &'a [ColorTargetState],
     /// Depth attachment format, if any.
     pub depth_format: Option<Format>,
     pub depth: DepthState,
-    pub blend: BlendMode,
     pub raster: RasterState,
     /// MSAA sample count; `1` means no multisampling.
     pub samples: u32,

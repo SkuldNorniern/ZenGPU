@@ -14,7 +14,7 @@ use winit::window::{Window, WindowId};
 use zengpu::hal::{CompareFn, RasterState};
 use zengpu::vulkan::{DepthTarget, VulkanSurface};
 use zengpu::{
-    Acquire, Bindings, BlendMode, BufferDesc, BufferHandle, BufferUsage, ColorAttachment,
+    Acquire, Bindings, BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ColorTargetState,
     DepthAttachment, DepthState, DeviceRequest, Format, Frame, GpuDevice, GraphicsDevice,
     GraphicsPipelineDesc, LoadOp, MemoryUsage, PipelineHandle, PresentMode, PrimitiveTopology,
     Rect, RenderCommands, RenderPassDesc, Scalar, ShaderDesc, Surface, SurfaceConfig, TargetHandle,
@@ -219,14 +219,16 @@ impl CubeRenderState {
                 ..Default::default()
             }],
             topology: PrimitiveTopology::TriangleList,
-            color_format: config.format,
+            color_targets: &[ColorTargetState {
+                format: config.format,
+                blend: None,
+            }],
             depth_format: Some(Format::Depth32Float),
             depth: DepthState {
                 test: true,
                 write: true,
                 compare: CompareFn::default(),
             },
-            blend: BlendMode::default(),
             raster: RasterState::default(),
             samples: 1,
         })?;

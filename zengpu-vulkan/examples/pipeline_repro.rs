@@ -9,8 +9,9 @@
 //! Run: cargo run -p zengpu-vulkan --example pipeline_repro
 
 use zengpu_hal::{
-    BlendMode, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc,
-    PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat, VertexLayout,
+    ColorTargetState, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice,
+    GraphicsPipelineDesc, PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat,
+    VertexLayout,
 };
 use zengpu_spirv::{ZslShader, zsl};
 use zengpu_vulkan::{DepthTarget, OffscreenTarget, VulkanInstance};
@@ -83,14 +84,16 @@ fn main() {
         fragment_shader: fs,
         vertex_layouts: &[LAYOUT],
         topology: PrimitiveTopology::TriangleList,
-        color_format: Format::Rgba8Unorm,
+        color_targets: &[ColorTargetState {
+            format: Format::Rgba8Unorm,
+            blend: None,
+        }],
         depth_format: Some(Format::Depth32Float),
         depth: DepthState {
             test: true,
             write: true,
             ..Default::default()
         },
-        blend: BlendMode::Opaque,
         raster: Default::default(),
         samples: 1,
     });
