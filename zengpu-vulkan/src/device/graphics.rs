@@ -103,6 +103,24 @@ impl VulkanDevice {
             ..Default::default()
         };
 
+        let stencil_face_to_vk =
+            |face: zengpu_hal::StencilFaceState, read_mask, write_mask| vk::StencilOpState {
+                fail_op: stencil_op_to_vk(face.fail_op),
+                pass_op: stencil_op_to_vk(face.pass_op),
+                depth_fail_op: stencil_op_to_vk(face.depth_fail_op),
+                compare_op: compare_fn_to_vk(face.compare),
+                compare_mask: read_mask,
+                write_mask,
+                reference: 0,
+            };
+        let (stencil_test_enable, front, back) = match desc.stencil {
+            Some(stencil) => (
+                vk::TRUE,
+                stencil_face_to_vk(stencil.front, stencil.read_mask, stencil.write_mask),
+                stencil_face_to_vk(stencil.back, stencil.read_mask, stencil.write_mask),
+            ),
+            None => (vk::FALSE, Default::default(), Default::default()),
+        };
         let depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
             depth_test_enable: if desc.depth.test { vk::TRUE } else { vk::FALSE },
             depth_write_enable: if desc.depth.write {
@@ -111,6 +129,9 @@ impl VulkanDevice {
                 vk::FALSE
             },
             depth_compare_op: compare_fn_to_vk(desc.depth.compare),
+            stencil_test_enable,
+            front,
+            back,
             ..Default::default()
         };
 

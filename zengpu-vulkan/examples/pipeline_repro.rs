@@ -94,6 +94,7 @@ fn main() {
             write: true,
             ..Default::default()
         },
+        stencil: None,
         raster: Default::default(),
         samples: 1,
     });
