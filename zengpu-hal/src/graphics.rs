@@ -138,6 +138,20 @@ pub trait RenderCommands {
 
     fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>);
 
+    /// Layout of `VkDrawIndirectCommand`: four `u32`s, [vertex_count, instance_count, first_vertex,
+    /// first_instance]. 16 bytes. `stride` 0 means tightly packed.
+    fn draw_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32);
+
+    /// Layout of `VkDrawIndexedIndirectCommand`: `u32` index_count, instance_count, first_index,
+    /// `i32` vertex_offset, `u32` first_instance. 20 bytes. `stride` 0 means tightly packed.
+    fn draw_indexed_indirect(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    );
+
     fn end_render_pass(&mut self);
 }
 
