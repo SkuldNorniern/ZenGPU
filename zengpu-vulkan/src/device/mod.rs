@@ -314,6 +314,9 @@ pub(crate) struct VulkanDeviceInner {
     /// records render passes via `cmd_begin_rendering`/`cmd_end_rendering`,
     /// with no `vk::RenderPass`/`vk::Framebuffer` objects.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
+    /// Device-level `VK_EXT_debug_utils` commands, when the instance enabled
+    /// the extension for validation and debugging.
+    pub debug_utils: Option<ext::debug_utils::Device>,
 }
 
 // ash::Device is Send + Sync; vk::PhysicalDevice is a u64.
@@ -630,6 +633,9 @@ impl VulkanDevice {
                 .get_physical_device_memory_properties(physical)
         };
 
+        let debug_utils = shared
+            .debug_utils_enabled()
+            .then(|| ext::debug_utils::Device::new(&shared.instance, &device));
         let inner = Arc::new(VulkanDeviceInner {
             shared,
             device,
@@ -646,6 +652,7 @@ impl VulkanDevice {
             sampler_anisotropy,
             max_sampler_anisotropy,
             dynamic_rendering,
+            debug_utils,
         });
 
         let bindless = create_bindless(&inner.device, inner.limits)?;

@@ -5,6 +5,7 @@
 //! intermediate command list, no per-frame allocation after warmup.
 
 use std::{
+    ffi::CString,
     mem,
     ops::Range,
     ptr,
@@ -386,6 +387,42 @@ impl VulkanCommandList {
 }
 
 impl RenderCommands for VulkanCommandList {
+    fn push_debug_group(&mut self, label: &str) {
+        let Some(debug_utils) = &self.inner.debug_utils else {
+            return;
+        };
+        let Ok(label) = CString::new(label) else {
+            return;
+        };
+        let info = vk::DebugUtilsLabelEXT {
+            p_label_name: label.as_ptr(),
+            color: [0.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        unsafe { debug_utils.cmd_begin_debug_utils_label(self.cmd, &info) };
+    }
+
+    fn pop_debug_group(&mut self) {
+        if let Some(debug_utils) = &self.inner.debug_utils {
+            unsafe { debug_utils.cmd_end_debug_utils_label(self.cmd) };
+        }
+    }
+
+    fn insert_debug_label(&mut self, label: &str) {
+        let Some(debug_utils) = &self.inner.debug_utils else {
+            return;
+        };
+        let Ok(label) = CString::new(label) else {
+            return;
+        };
+        let info = vk::DebugUtilsLabelEXT {
+            p_label_name: label.as_ptr(),
+            color: [0.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        unsafe { debug_utils.cmd_insert_debug_utils_label(self.cmd, &info) };
+    }
+
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         assert!(
             desc.color.len() <= MAX_COLOR_ATTACHMENTS,
