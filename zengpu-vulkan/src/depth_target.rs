@@ -177,17 +177,20 @@ mod tests {
     use crate::{VulkanInstance, swapchain::DeviceContext};
     use zengpu_hal::DeviceRequest;
 
-    fn make_ctx() -> Option<DeviceContext> {
+    fn make_device_and_ctx() -> Option<(crate::VulkanDevice, DeviceContext)> {
         let inst = VulkanInstance::new().ok()?;
         let adapter = inst.request_vulkan_adapter()?;
         let dev = adapter.open_headless(DeviceRequest::default()).ok()?;
-        Some(dev.context())
+        let ctx = dev.context();
+        Some((dev, ctx))
     }
 
     #[test]
     fn depth_target_resize() {
         let _guard = crate::test_gpu_lock();
-        let Some(ctx) = make_ctx() else { return };
+        let Some((_dev, ctx)) = make_device_and_ctx() else {
+            return;
+        };
         let mut depth = DepthTarget::new(&ctx, 64, 32).unwrap();
         assert_eq!(depth.extent(), (64, 32));
         depth.resize(&ctx, 128, 96).unwrap();

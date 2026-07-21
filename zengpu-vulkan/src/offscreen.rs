@@ -17,6 +17,8 @@ use crate::device::{VulkanDeviceInner, VulkanRenderTarget, VulkanTexture};
 /// 1. Render into this target: `ColorAttachment { target: offscreen.target_handle(), ... }`
 /// 2. Set `sample_after: true` on the attachment to transition to shader-readable.
 /// 3. Sample it: `device.bind_texture(offscreen.texture_handle(), sampler) -> slot`
+///
+/// Must be dropped before the [`VulkanDevice`] from which it was created.
 pub struct OffscreenTarget {
     inner: Arc<VulkanDeviceInner>,
     textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
