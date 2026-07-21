@@ -72,6 +72,17 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::Unsupported("buffer copy".into()))
     }
 
+    /// Copy the contents of `texture` (mip 0, layer 0) into `buffer` starting
+    /// at byte 0. Synchronous: bytes are available to subsequent device/host
+    /// operations when this returns. `texture` must have sampled/render-target
+    /// usage as required by the backend; `buffer` must have
+    /// [`crate::BufferUsage::TRANSFER_DST`] (or [`crate::BufferUsage::READBACK`]
+    /// for host reads). Backends without a texture-to-buffer copy path return
+    /// [`GpuError::Unsupported`] by default.
+    fn copy_texture_to_buffer(&self, _texture: TextureHandle, _buffer: BufferHandle) -> Result<()> {
+        Err(GpuError::Unsupported("texture-to-buffer copy".into()))
+    }
+
     /// Backend device ordinal, or `-1` when the backend does not expose one.
     fn device_ordinal(&self) -> i32 {
         -1

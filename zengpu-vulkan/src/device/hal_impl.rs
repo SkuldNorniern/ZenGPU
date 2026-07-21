@@ -502,6 +502,10 @@ impl GpuDevice for VulkanDevice {
         self.upload_texture_data_impl(texture, 0, 0, data)
     }
 
+    fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
+        self.copy_texture_to_buffer_impl(texture, buffer)
+    }
+
     fn upload_texture_data_region(
         &self,
         texture: TextureHandle,
