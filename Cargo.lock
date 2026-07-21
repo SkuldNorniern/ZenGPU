@@ -1824,7 +1824,6 @@ version = "0.1.0"
 name = "zengpu"
 version = "0.0.1"
 dependencies = [
- "ash",
  "log",
  "raw-window-handle",
  "winit",
