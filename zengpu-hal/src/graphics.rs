@@ -193,6 +193,27 @@ pub trait RenderCommands {
     /// Draw `indices` (indexed) for each instance in `instances`.
     fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>);
 
+    /// Issue `draw_count` non-indexed indirect draws from `buffer`, beginning
+    /// at `offset` bytes with entries `stride` bytes apart. Each entry has the
+    /// `VkDrawIndirectCommand` layout `[vertex_count, instance_count,
+    /// first_vertex, first_instance]` of `u32`s (16 bytes). Pass a zero stride
+    /// for tightly packed entries.
+    fn draw_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32);
+
+    /// Issue `draw_count` indexed indirect draws from `buffer`, beginning at
+    /// `offset` bytes with entries `stride` bytes apart. Each entry has the
+    /// `VkDrawIndexedIndirectCommand` layout `[index_count, instance_count,
+    /// first_index, vertex_offset, first_instance]` (20 bytes), where
+    /// `vertex_offset` is a signed `i32` and the other fields are `u32`. Pass a
+    /// zero stride for tightly packed entries.
+    fn draw_indexed_indirect(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    );
+
     /// End the current render pass.
     fn end_render_pass(&mut self);
 }

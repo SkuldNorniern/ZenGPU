@@ -617,6 +617,50 @@ impl RenderCommands for VulkanCommandList {
         }
     }
 
+    fn draw_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32) {
+        let buffers = self.buffers.lock().unwrap();
+        let Some(buf) = buffers.get(buffer) else {
+            return;
+        };
+        let vk_buf = buf.buffer;
+        drop(buffers);
+        let stride = if stride == 0 {
+            mem::size_of::<vk::DrawIndirectCommand>() as u32
+        } else {
+            stride
+        };
+        unsafe {
+            self.inner
+                .device
+                .cmd_draw_indirect(self.cmd, vk_buf, offset, draw_count, stride);
+        }
+    }
+
+    fn draw_indexed_indirect(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        draw_count: u32,
+        stride: u32,
+    ) {
+        let buffers = self.buffers.lock().unwrap();
+        let Some(buf) = buffers.get(buffer) else {
+            return;
+        };
+        let vk_buf = buf.buffer;
+        drop(buffers);
+        let stride = if stride == 0 {
+            mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32
+        } else {
+            stride
+        };
+        unsafe {
+            self.inner
+                .device
+                .cmd_draw_indexed_indirect(self.cmd, vk_buf, offset, draw_count, stride);
+        }
+    }
+
     fn end_render_pass(&mut self) {
         unsafe {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
