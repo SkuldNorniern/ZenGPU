@@ -1,4 +1,6 @@
 
+use std::path::PathBuf;
+
 use crate::types::{BackendPreference, Features, PowerPreference};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8,7 +10,7 @@ pub struct AdapterRequest {
     pub power: PowerPreference,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceRequest {
     pub backend: BackendPreference,
     pub power: PowerPreference,
@@ -16,6 +18,8 @@ pub struct DeviceRequest {
     pub required: Features,
     /// Features to enable if available, ignored if not.
     pub optional: Features,
+    /// Optional pipeline cache file, loaded and saved across device lifetimes.
+    pub pipeline_cache_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
