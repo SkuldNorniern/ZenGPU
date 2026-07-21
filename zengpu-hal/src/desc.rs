@@ -207,10 +207,18 @@ pub enum PrimitiveTopology {
 /// Per-attribute vertex format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexFormat {
+    Float16x2,
+    Float16x4,
     Float32,
     Float32x2,
     Float32x3,
     Float32x4,
+    Snorm8x4,
+    Unorm16x2,
+    Unorm16x4,
+    Sint32x2,
+    Sint32x3,
+    Sint32x4,
     Uint32,
     Uint8x4Unorm,
 }
@@ -219,10 +227,18 @@ impl VertexFormat {
     /// Size of one attribute in bytes.
     pub const fn size_bytes(self) -> u32 {
         match self {
-            VertexFormat::Float32 | VertexFormat::Uint32 | VertexFormat::Uint8x4Unorm => 4,
-            VertexFormat::Float32x2 => 8,
-            VertexFormat::Float32x3 => 12,
-            VertexFormat::Float32x4 => 16,
+            VertexFormat::Float16x2
+            | VertexFormat::Float32
+            | VertexFormat::Snorm8x4
+            | VertexFormat::Unorm16x2
+            | VertexFormat::Uint32
+            | VertexFormat::Uint8x4Unorm => 4,
+            VertexFormat::Float16x4
+            | VertexFormat::Float32x2
+            | VertexFormat::Unorm16x4
+            | VertexFormat::Sint32x2 => 8,
+            VertexFormat::Float32x3 | VertexFormat::Sint32x3 => 12,
+            VertexFormat::Float32x4 | VertexFormat::Sint32x4 => 16,
         }
     }
 }
@@ -496,6 +512,14 @@ mod tests {
 
     #[test]
     fn vertex_format_sizes() {
+        assert_eq!(VertexFormat::Float16x2.size_bytes(), 4);
+        assert_eq!(VertexFormat::Float16x4.size_bytes(), 8);
+        assert_eq!(VertexFormat::Snorm8x4.size_bytes(), 4);
+        assert_eq!(VertexFormat::Unorm16x2.size_bytes(), 4);
+        assert_eq!(VertexFormat::Unorm16x4.size_bytes(), 8);
+        assert_eq!(VertexFormat::Sint32x2.size_bytes(), 8);
+        assert_eq!(VertexFormat::Sint32x3.size_bytes(), 12);
+        assert_eq!(VertexFormat::Sint32x4.size_bytes(), 16);
         assert_eq!(VertexFormat::Float32x3.size_bytes(), 12);
         assert_eq!(VertexFormat::Uint8x4Unorm.size_bytes(), 4);
     }
