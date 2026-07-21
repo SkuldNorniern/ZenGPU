@@ -15,9 +15,8 @@ use zengpu_hal::{
     DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, GpuDevice, GpuError,
     GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage,
     PipelineHandle, PolygonMode, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
-    ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, SurfaceConfig,
-    TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, WindowHandles,
-    marker,
+    ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, SurfaceConfig, TargetHandle,
+    TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, WindowHandles, marker,
 };
 
 mod dispatch;
@@ -134,7 +133,6 @@ impl VulkanSubmission {
             deferred,
         );
     }
-
 }
 
 impl GpuSubmission for VulkanSubmission {
@@ -705,6 +703,39 @@ impl VulkanDevice {
             true,
         )
     }
+    /// Total texture slots available to consumers sharing this device's
+    /// bindless budget, capped by [`MAX_BINDLESS_TEXTURES`].
+    pub fn bindless_texture_capacity(&self) -> u32 {
+        self.bindless.texture_capacity
+    }
+
+    /// Texture slots currently used by consumers sharing this device's
+    /// bindless budget; compare with [`MAX_BINDLESS_TEXTURES`].
+    pub fn bindless_texture_used(&self) -> u32 {
+        self.bindless
+            .bound_textures
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|&&bound| bound)
+            .count() as u32
+    }
+
+    /// Total storage-buffer slots available to consumers sharing this device's
+    /// bindless budget, capped by [`MAX_BINDLESS_BUFFERS`].
+    pub fn bindless_buffer_capacity(&self) -> u32 {
+        self.bindless.buffer_capacity
+    }
+
+    /// Live storage-buffer slots used by consumers sharing this device's
+    /// bindless budget; compare with [`MAX_BINDLESS_BUFFERS`].
+    pub fn bindless_buffer_used(&self) -> u32 {
+        let buffers = self.buffers.lock().unwrap();
+        (0..self.bindless.buffer_capacity)
+            .filter_map(|index| buffers.get_by_slot_index(index))
+            .filter(|buffer| buffer.usage.contains(BufferUsage::STORAGE))
+            .count() as u32
+    }
 }
 
 fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
@@ -1006,7 +1037,9 @@ mod tests {
 
     use super::*;
     use crate::instance::VulkanInstance;
-    use zengpu_hal::{AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuInstance};
+    use zengpu_hal::{
+        AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuInstance,
+    };
 
     struct TestDevice {
         dev: Box<dyn GpuDevice>,
@@ -1077,6 +1110,56 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn bindless_usage_tracks_bound_textures_and_storage_buffers() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+
+        assert!(device.bindless_texture_capacity() > 0);
+        assert!(device.bindless_buffer_capacity() > 0);
+        assert_eq!(device.bindless_texture_used(), 0);
+        assert_eq!(device.bindless_buffer_used(), 0);
+
+        let texture = device
+            .create_texture(TextureDesc {
+                width: 1,
+                height: 1,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let sampler = device.create_sampler(SamplerDesc::default()).unwrap();
+        assert_eq!(device.bind_texture(texture, sampler), Some(texture.index()));
+        assert_eq!(device.bindless_texture_used(), 1);
+
+        let buffer = device
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        assert_eq!(device.bindless_buffer_used(), 1);
+
+        device.destroy_buffer(buffer);
+        device.destroy_sampler(sampler);
+        device.destroy_texture(texture);
+        assert_eq!(device.bindless_buffer_used(), 0);
     }
 
     #[test]
