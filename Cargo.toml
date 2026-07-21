@@ -94,7 +94,6 @@ zengpu-spirv.workspace = true
 log.workspace = true
 
 [dev-dependencies]
-ash = "0.38"
 winit = "0.30"
 # Examples bridge winit's raw-window-handle into zen-window-handle; the library
 # crates themselves depend only on zen-window-handle.

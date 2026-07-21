@@ -415,7 +415,7 @@ impl DeviceContext {
     }
 
     /// Logical device — create render passes, pipelines, framebuffers, images.
-    pub fn device(&self) -> &ash::Device {
+    pub(crate) fn device(&self) -> &ash::Device {
         &self.inner.device
     }
 

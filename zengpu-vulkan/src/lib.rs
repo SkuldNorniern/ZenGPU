@@ -34,7 +34,7 @@ pub(crate) fn test_gpu_lock() -> std::sync::MutexGuard<'static, ()> {
 // ── Format conversion ─────────────────────────────────────────────────────────
 
 /// Convert a HAL [`zengpu_hal::Format`] to the matching `vk::Format`.
-pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
+pub(crate) fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
     use zengpu_hal::Format;
     match f {
         Format::Rgba8Unorm => vk::Format::R8G8B8A8_UNORM,
@@ -49,7 +49,7 @@ pub fn to_vk_format(f: zengpu_hal::Format) -> vk::Format {
 
 /// Convert a `vk::Format` back to the HAL [`zengpu_hal::Format`], or `None`
 /// for Vulkan formats that have no HAL counterpart.
-pub fn from_vk_format(f: vk::Format) -> Option<zengpu_hal::Format> {
+pub(crate) fn from_vk_format(f: vk::Format) -> Option<zengpu_hal::Format> {
     use zengpu_hal::Format;
     Some(match f {
         vk::Format::R8G8B8A8_UNORM => Format::Rgba8Unorm,
