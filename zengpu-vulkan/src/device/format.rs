@@ -3,8 +3,9 @@
 
 use ash::vk;
 use zengpu_hal::{
-    AddressMode, BlendMode, BorderColor, BufferUsage, CompareFn, CullMode, FilterMode, Format,
-    FrontFace, MemoryUsage, PolygonMode, PrimitiveTopology, StepMode, VertexFormat,
+    AddressMode, BlendComponent, BlendFactor, BlendOp, BorderColor, BufferUsage, CompareFn,
+    CullMode, FilterMode, Format, FrontFace, MemoryUsage, PolygonMode, PrimitiveTopology, StepMode,
+    VertexFormat,
 };
 
 pub(crate) fn filter_to_vk(f: FilterMode) -> vk::Filter {
@@ -126,33 +127,33 @@ pub(crate) fn topology_to_vk(t: PrimitiveTopology) -> vk::PrimitiveTopology {
     }
 }
 
-pub(crate) fn blend_mode_to_vk(b: BlendMode) -> vk::PipelineColorBlendAttachmentState {
-    match b {
-        BlendMode::Opaque => vk::PipelineColorBlendAttachmentState {
-            color_write_mask: vk::ColorComponentFlags::RGBA,
-            ..Default::default()
-        },
-        BlendMode::AlphaBlend => vk::PipelineColorBlendAttachmentState {
-            blend_enable: vk::TRUE,
-            src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
-            dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
-            color_blend_op: vk::BlendOp::ADD,
-            src_alpha_blend_factor: vk::BlendFactor::ONE,
-            dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
-            alpha_blend_op: vk::BlendOp::ADD,
-            color_write_mask: vk::ColorComponentFlags::RGBA,
-        },
-        BlendMode::DualSourceAlpha => vk::PipelineColorBlendAttachmentState {
-            blend_enable: vk::TRUE,
-            src_color_blend_factor: vk::BlendFactor::SRC1_COLOR,
-            dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
-            color_blend_op: vk::BlendOp::ADD,
-            src_alpha_blend_factor: vk::BlendFactor::SRC1_ALPHA,
-            dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
-            alpha_blend_op: vk::BlendOp::ADD,
-            color_write_mask: vk::ColorComponentFlags::RGBA,
-        },
-    }
+pub(crate) fn blend_component_to_vk(
+    c: BlendComponent,
+) -> (vk::BlendFactor, vk::BlendFactor, vk::BlendOp) {
+    let factor = |factor| match factor {
+        BlendFactor::Zero => vk::BlendFactor::ZERO,
+        BlendFactor::One => vk::BlendFactor::ONE,
+        BlendFactor::SrcColor => vk::BlendFactor::SRC_COLOR,
+        BlendFactor::OneMinusSrcColor => vk::BlendFactor::ONE_MINUS_SRC_COLOR,
+        BlendFactor::DstColor => vk::BlendFactor::DST_COLOR,
+        BlendFactor::OneMinusDstColor => vk::BlendFactor::ONE_MINUS_DST_COLOR,
+        BlendFactor::SrcAlpha => vk::BlendFactor::SRC_ALPHA,
+        BlendFactor::OneMinusSrcAlpha => vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        BlendFactor::DstAlpha => vk::BlendFactor::DST_ALPHA,
+        BlendFactor::OneMinusDstAlpha => vk::BlendFactor::ONE_MINUS_DST_ALPHA,
+        BlendFactor::Src1Color => vk::BlendFactor::SRC1_COLOR,
+        BlendFactor::OneMinusSrc1Color => vk::BlendFactor::ONE_MINUS_SRC1_COLOR,
+        BlendFactor::Src1Alpha => vk::BlendFactor::SRC1_ALPHA,
+        BlendFactor::OneMinusSrc1Alpha => vk::BlendFactor::ONE_MINUS_SRC1_ALPHA,
+    };
+    let op = match c.op {
+        BlendOp::Add => vk::BlendOp::ADD,
+        BlendOp::Subtract => vk::BlendOp::SUBTRACT,
+        BlendOp::ReverseSubtract => vk::BlendOp::REVERSE_SUBTRACT,
+        BlendOp::Min => vk::BlendOp::MIN,
+        BlendOp::Max => vk::BlendOp::MAX,
+    };
+    (factor(c.src_factor), factor(c.dst_factor), op)
 }
 
 pub(crate) fn cull_mode_to_vk(c: CullMode) -> vk::CullModeFlags {

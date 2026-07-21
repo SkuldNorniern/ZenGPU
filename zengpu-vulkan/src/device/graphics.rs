@@ -114,10 +114,39 @@ impl VulkanDevice {
             ..Default::default()
         };
 
-        let blend_att = blend_mode_to_vk(desc.blend);
+        let color_formats: Vec<vk::Format> = desc
+            .color_targets
+            .iter()
+            .map(|target| hal_format_to_vk(target.format))
+            .collect();
+        let blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = desc
+            .color_targets
+            .iter()
+            .map(|target| match target.blend {
+                Some(blend) => {
+                    let (src_color, dst_color, color_op) = blend_component_to_vk(blend.color);
+                    let (src_alpha, dst_alpha, alpha_op) = blend_component_to_vk(blend.alpha);
+                    vk::PipelineColorBlendAttachmentState {
+                        blend_enable: vk::TRUE,
+                        src_color_blend_factor: src_color,
+                        dst_color_blend_factor: dst_color,
+                        color_blend_op: color_op,
+                        src_alpha_blend_factor: src_alpha,
+                        dst_alpha_blend_factor: dst_alpha,
+                        alpha_blend_op: alpha_op,
+                        color_write_mask: vk::ColorComponentFlags::RGBA,
+                    }
+                }
+                None => vk::PipelineColorBlendAttachmentState {
+                    blend_enable: vk::FALSE,
+                    color_write_mask: vk::ColorComponentFlags::RGBA,
+                    ..Default::default()
+                },
+            })
+            .collect();
         let color_blend = vk::PipelineColorBlendStateCreateInfo {
-            attachment_count: 1,
-            p_attachments: &blend_att,
+            attachment_count: blend_attachments.len() as u32,
+            p_attachments: blend_attachments.as_ptr(),
             ..Default::default()
         };
 
@@ -128,14 +157,13 @@ impl VulkanDevice {
             ..Default::default()
         };
 
-        let color_format = hal_format_to_vk(desc.color_format);
         let depth_format = desc
             .depth_format
             .map(hal_format_to_vk)
             .unwrap_or(vk::Format::UNDEFINED);
         let rendering_info = vk::PipelineRenderingCreateInfo {
-            color_attachment_count: 1,
-            p_color_attachment_formats: &color_format,
+            color_attachment_count: color_formats.len() as u32,
+            p_color_attachment_formats: color_formats.as_ptr(),
             depth_attachment_format: depth_format,
             ..Default::default()
         };

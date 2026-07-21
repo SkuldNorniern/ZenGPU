@@ -37,10 +37,11 @@ pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionS
 pub use surface::WindowHandles;
 
 pub use desc::{
-    AddressMode, BlendMode, BorderColor, BufferDesc, CompareFn, ComputePipelineDesc, CullMode,
-    DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology,
-    RasterState, RenderTargetDesc, SamplerDesc, ShaderDesc, ShaderSource, StepMode, SurfaceConfig,
-    TexDim, TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
+    AddressMode, BlendComponent, BlendFactor, BlendMode, BlendOp, BlendState, BorderColor,
+    BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, CullMode, DepthState, FilterMode,
+    FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology, RasterState, RenderTargetDesc,
+    SamplerDesc, ShaderDesc, ShaderSource, StepMode, SurfaceConfig, TexDim, TextureDesc,
+    VertexAttribute, VertexFormat, VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{
