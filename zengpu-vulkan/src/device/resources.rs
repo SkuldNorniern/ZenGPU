@@ -8,6 +8,11 @@ impl VulkanDevice {
     /// in that layout by the time it is sampled — true after
     /// [`GpuDevice::upload_texture_data`], or after a render pass with
     /// [`zengpu_hal::ColorAttachment::sample_after`] for a render-target texture.
+    ///
+    /// That readiness guarantee applies only to same-device, same-queue
+    /// submission ordering; this API exposes no cross-submission semaphore or
+    /// fence. External queues, independent devices, and out-of-order submission
+    /// patterns require caller-managed synchronization.
     pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
         if texture.index() >= self.bindless.texture_capacity {
             return None;
