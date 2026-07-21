@@ -66,16 +66,17 @@ pub use zengpu_spirv::zsl;
 pub use zengpu_spirv::ZslShader;
 
 pub use zengpu_hal::{
-    Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendMode,
-    BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ComputeOp,
-    ComputePipelineDesc, DType, DepthAttachment, DepthState, DeviceLimits, DeviceRequest,
-    DeviceType, DispatchOp, Features, FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError,
-    GpuInstance, GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp,
-    MemoryUsage, PipelineHandle, PowerPreference, PresentMode, PrimitiveTopology, Rect,
-    RenderCommands, RenderPassDesc, RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig,
-    SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage, UsageError,
-    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles,
+    Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendComponent,
+    BlendFactor, BlendMode, BlendOp, BlendState, BufferCopyOp, BufferDesc, BufferHandle,
+    BufferUsage, ColorAttachment, ColorTargetState, ComputeOp, ComputePipelineDesc, DType,
+    DepthAttachment, DepthState, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, Features,
+    FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
+    GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp, MemoryUsage, PipelineHandle,
+    PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc,
+    RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
+    StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig, SurfaceError, TargetHandle,
+    TextureDesc, TextureHandle, TextureUsage, UsageError, VertexAttribute, VertexFormat,
+    VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
 #[cfg(feature = "compute")]

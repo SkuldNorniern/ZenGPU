@@ -226,6 +226,83 @@ pub enum BlendMode {
     DualSourceAlpha,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendComponent {
+    pub src_factor: BlendFactor,
+    pub dst_factor: BlendFactor,
+    pub op: BlendOp,
+}
+
+/// Portable subset: only the factors every backend can express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendFactor {
+    Zero,
+    One,
+    SrcColor,
+    OneMinusSrcColor,
+    DstColor,
+    OneMinusDstColor,
+    SrcAlpha,
+    OneMinusSrcAlpha,
+    DstAlpha,
+    OneMinusDstAlpha,
+    Src1Color,
+    OneMinusSrc1Color,
+    Src1Alpha,
+    OneMinusSrc1Alpha,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlendOp {
+    Add,
+    Subtract,
+    ReverseSubtract,
+    Min,
+    Max,
+}
+
+/// `None` in `ColorTargetState::blend` means an opaque write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlendState {
+    pub color: BlendComponent,
+    pub alpha: BlendComponent,
+}
+
+impl BlendState {
+    pub const ALPHA_BLEND: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::SrcAlpha,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            op: BlendOp::Add,
+        },
+        alpha: BlendComponent {
+            src_factor: BlendFactor::One,
+            dst_factor: BlendFactor::OneMinusSrcAlpha,
+            op: BlendOp::Add,
+        },
+    };
+
+    /// Dual-source blend factor. Needs `GraphicsDevice::supports_dual_source_blending`.
+    pub const DUAL_SOURCE_ALPHA: Self = Self {
+        color: BlendComponent {
+            src_factor: BlendFactor::Src1Color,
+            dst_factor: BlendFactor::OneMinusSrc1Color,
+            op: BlendOp::Add,
+        },
+        alpha: BlendComponent {
+            src_factor: BlendFactor::Src1Alpha,
+            dst_factor: BlendFactor::OneMinusSrc1Alpha,
+            op: BlendOp::Add,
+        },
+    };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ColorTargetState {
+    pub format: Format,
+    pub blend: Option<BlendState>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CullMode {
     #[default]
@@ -289,10 +366,9 @@ pub struct GraphicsPipelineDesc<'a> {
     /// per-vertex and per-instance data, list both, with differing `step_mode`.
     pub vertex_layouts: &'a [VertexLayout<'a>],
     pub topology: PrimitiveTopology,
-    pub color_format: Format,
+    pub color_targets: &'a [ColorTargetState],
     pub depth_format: Option<Format>,
     pub depth: DepthState,
-    pub blend: BlendMode,
     pub raster: RasterState,
     /// MSAA sample count. `1` means no multisampling.
     pub samples: u32,
