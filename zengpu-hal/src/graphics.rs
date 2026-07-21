@@ -37,8 +37,9 @@ pub struct ColorAttachment {
     pub load: LoadOp,
     /// `false` means a DONT_CARE store.
     pub store: bool,
-    /// When `true`, transitions the target to a shader-readable layout at pass end, so a later pass
-    /// can sample it bindlessly.
+    /// `true` transitions to shader-readable at pass end, for a later bindless sample. This covers
+    /// same-device, same-queue ordering only. External queues, other devices, and out-of-order
+    /// submissions need caller sync.
     pub sample_after: bool,
 }
 

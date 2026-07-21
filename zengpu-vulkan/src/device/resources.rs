@@ -1,14 +1,16 @@
 use super::*;
 
 impl VulkanDevice {
-    /// Registers `texture` with `sampler` in the bindless combined-image-sampler table, at
-    /// its slot index.
+    /// Register `texture` (sampled with `sampler`) in the bindless combined-image-sampler table, at
+    /// its own slot index, for use as a [`Bindings::textures`] index in
+    /// [`RenderCommands::bind`](zengpu_hal::RenderCommands::bind). The descriptor declares
+    /// `SHADER_READ_ONLY_OPTIMAL`, so the image must be in that layout when sampled. That holds
+    /// after [`GpuDevice::upload_texture_data`], or after a pass with
+    /// [`zengpu_hal::ColorAttachment::sample_after`] for a render target.
     ///
-    /// Pass the index as a [`Bindings::textures`] entry to
-    /// [`RenderCommands::bind`](zengpu_hal::RenderCommands::bind). The descriptor uses
-    /// `SHADER_READ_ONLY_OPTIMAL`, so the image must already be in that layout when
-    /// sampled. That holds after [`GpuDevice::upload_texture_data`], or after a pass
-    /// with [`zengpu_hal::ColorAttachment::sample_after`].
+    /// The guarantee covers same-device, same-queue ordering only. There is no cross-submission
+    /// semaphore or fence here. External queues, other devices and out-of-order submission need
+    /// caller-managed sync.
     pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
         if texture.index() >= self.bindless.texture_capacity {
             return None;
