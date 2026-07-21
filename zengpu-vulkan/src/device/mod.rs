@@ -134,6 +134,7 @@ impl VulkanSubmission {
             deferred,
         );
     }
+
 }
 
 impl GpuSubmission for VulkanSubmission {
@@ -401,6 +402,11 @@ fn destroy_deferred_vulkan(
 }
 
 /// Vulkan logical device implementing [`GpuDevice`].
+///
+/// Drop every [`VulkanSurface`], [`OffscreenTarget`], and outstanding command
+/// list derived from this device before dropping the device itself. Debug
+/// builds panic on a violation; release builds silently destroy shared Vulkan
+/// resources out from under any survivor, which is a real use-after-free.
 pub struct VulkanDevice {
     pub(crate) inner: Arc<VulkanDeviceInner>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
@@ -699,7 +705,6 @@ impl VulkanDevice {
             true,
         )
     }
-
 }
 
 fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
@@ -892,6 +897,46 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        {
+            let mut outstanding = Vec::new();
+            // `inner` is also retained by the device-owned command-list and
+            // fence pools, so its no-external-owner baseline is three.
+            if Arc::strong_count(&self.inner) > 3 {
+                outstanding.push("inner");
+            }
+            if Arc::strong_count(&self.buffers) > 1 {
+                outstanding.push("buffers");
+            }
+            if Arc::strong_count(&self.textures) > 1 {
+                outstanding.push("textures");
+            }
+            if Arc::strong_count(&self.samplers) > 1 {
+                outstanding.push("samplers");
+            }
+            if Arc::strong_count(&self.pipelines) > 1 {
+                outstanding.push("pipelines");
+            }
+            if Arc::strong_count(&self.render_targets) > 1 {
+                outstanding.push("render_targets");
+            }
+            if Arc::strong_count(&self.cmd_list_pool) > 1 {
+                outstanding.push("cmd_list_pool");
+            }
+            if Arc::strong_count(&self.fence_pool) > 1 {
+                outstanding.push("fence_pool");
+            }
+            if Arc::strong_count(&self.lifetime) > 1 {
+                outstanding.push("lifetime");
+            }
+            if !outstanding.is_empty() {
+                panic!(
+                    "VulkanDevice dropped with outstanding shared owners of {}: drop Surface, OffscreenTarget, and command-list handles before dropping the device",
+                    outstanding.join(", ")
+                );
+            }
+        }
+
         // Resources referenced by submitted work must not be destroyed until
         // the device is idle. Synchronous HAL calls normally guarantee this,
         // but graphics/raw-context users and error paths may still have work
