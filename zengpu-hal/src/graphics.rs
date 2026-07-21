@@ -13,7 +13,7 @@ use core::ops::Range;
 use crate::command::Bindings;
 use crate::desc::{GraphicsPipelineDesc, SurfaceConfig};
 use crate::error::Result;
-use crate::handle::{BufferHandle, PipelineHandle, TargetHandle};
+use crate::handle::{BufferHandle, PipelineHandle, QueryPoolHandle, TargetHandle};
 use crate::surface::WindowHandles;
 use crate::types::{Rect, Viewport};
 
@@ -111,6 +111,9 @@ pub trait GraphicsDevice: crate::GpuDevice {
     /// allocation.
     fn create_command_list(&self) -> Result<Self::CommandList>;
 
+    /// Create a pool containing `count` GPU timestamp queries.
+    fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle>;
+
     /// Whether the device supports [`BlendMode::DualSourceAlpha`](crate::desc::BlendMode::DualSourceAlpha)
     /// (`dualSrcBlend`). Coverage-based text rendering falls back to
     /// [`BlendMode::AlphaBlend`](crate::desc::BlendMode::AlphaBlend) where this is `false`.
@@ -177,6 +180,9 @@ pub trait RenderCommands {
 
     /// Insert a named marker in GPU debugging and profiling tools.
     fn insert_debug_label(&mut self, label: &str);
+
+    /// Write a GPU timestamp into query `index` of `pool`.
+    fn write_timestamp(&mut self, pool: QueryPoolHandle, index: u32);
 
     /// Begin a render pass over the given attachments.
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>);

@@ -45,8 +45,8 @@ pub use desc::{
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{
-    BufferHandle, Handle, PipelineHandle, SamplerHandle, ShaderHandle, SlotMap, SurfaceHandle,
-    TargetHandle, TextureHandle, marker,
+    BufferHandle, Handle, PipelineHandle, QueryPoolHandle, SamplerHandle, ShaderHandle, SlotMap,
+    SurfaceHandle, TargetHandle, TextureHandle, marker,
 };
 pub use types::{
     BackendPreference, BufferUsage, DType, Features, Format, MemoryUsage, PowerPreference,

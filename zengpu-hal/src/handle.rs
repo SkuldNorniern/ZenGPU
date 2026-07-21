@@ -263,6 +263,8 @@ pub mod marker {
     pub enum Surface {}
     /// Marker for render-target handles.
     pub enum RenderTarget {}
+    /// Marker for query-pool handles.
+    pub enum QueryPool {}
 }
 
 /// Handle to a GPU buffer.
@@ -279,6 +281,8 @@ pub type PipelineHandle = Handle<marker::Pipeline>;
 pub type SurfaceHandle = Handle<marker::Surface>;
 /// Handle to a render target (swapchain image or offscreen texture).
 pub type TargetHandle = Handle<marker::RenderTarget>;
+/// Handle to a GPU query pool.
+pub type QueryPoolHandle = Handle<marker::QueryPool>;
 
 #[cfg(test)]
 mod tests {
