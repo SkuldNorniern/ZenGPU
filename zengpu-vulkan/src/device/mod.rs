@@ -296,6 +296,8 @@ pub(crate) struct VulkanDeviceInner {
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
+    /// `VK_EXT_debug_utils` commands, if the instance enabled it.
+    pub debug_utils: Option<ext::debug_utils::Device>,
 }
 
 unsafe impl Send for VulkanDeviceInner {}
@@ -601,6 +603,9 @@ impl VulkanDevice {
                 .get_physical_device_memory_properties(physical)
         };
 
+        let debug_utils = shared
+            .debug_utils_enabled()
+            .then(|| ext::debug_utils::Device::new(&shared.instance, &device));
         let inner = Arc::new(VulkanDeviceInner {
             shared,
             device,
@@ -617,6 +622,7 @@ impl VulkanDevice {
             sampler_anisotropy,
             max_sampler_anisotropy,
             dynamic_rendering,
+            debug_utils,
         });
 
         let bindless = create_bindless(&inner.device, inner.limits)?;

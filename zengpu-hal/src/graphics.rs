@@ -122,6 +122,12 @@ pub trait Frame {
 ///
 /// Separate lists can record on any thread.
 pub trait RenderCommands {
+    fn push_debug_group(&mut self, label: &str);
+
+    fn pop_debug_group(&mut self);
+
+    fn insert_debug_label(&mut self, label: &str);
+
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>);
 
     fn set_pipeline(&mut self, pipeline: PipelineHandle);
