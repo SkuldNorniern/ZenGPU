@@ -598,7 +598,7 @@ impl GpuDevice for CudaDevice {
                     format!("cuda: read range {offset}..{end} exceeds {}", cb.len),
                 )));
             }
-            let byte_count = u32::try_from(dst.len()).map_err(|_| {
+            let byte_count = sys::size_t::try_from(dst.len()).map_err(|_| {
                 GpuError::InvalidUsage(UsageError::BindingMismatch(
                     "cuda: caller-owned readback exceeds driver byte-count range".into(),
                 ))
@@ -1048,7 +1048,7 @@ impl GpuDevice for CudaDevice {
                             )));
                         }
                         if copy.len != 0 {
-                            let byte_count = u32::try_from(copy.len).map_err(|_| {
+                            let byte_count = sys::size_t::try_from(copy.len).map_err(|_| {
                                 GpuError::InvalidUsage(UsageError::BindingMismatch(
                                     "cuda: copy exceeds driver byte-count range".into(),
                                 ))
