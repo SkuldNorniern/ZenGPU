@@ -54,6 +54,10 @@ pub struct ColorAttachment {
     pub store: bool,
     /// If `true`, transition this target to a shader-readable layout when the
     /// pass ends, so a later pass can sample it as a bindless texture.
+    /// This guarantee covers same-device, same-queue submission ordering only;
+    /// no cross-submission semaphore or fence is exposed. Render-then-sample
+    /// back-to-back is safe, while external queues, independent devices, and
+    /// out-of-order submissions require caller-managed synchronization.
     pub sample_after: bool,
 }
 
