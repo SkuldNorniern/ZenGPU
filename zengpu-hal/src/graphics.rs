@@ -7,7 +7,7 @@ use core::ops::Range;
 use crate::command::Bindings;
 use crate::desc::{GraphicsPipelineDesc, SurfaceConfig};
 use crate::error::Result;
-use crate::handle::{BufferHandle, PipelineHandle, TargetHandle};
+use crate::handle::{BufferHandle, PipelineHandle, QueryPoolHandle, TargetHandle};
 use crate::surface::WindowHandles;
 use crate::types::{Rect, Viewport};
 
@@ -80,6 +80,8 @@ pub trait GraphicsDevice: crate::GpuDevice {
     /// Pooled list that records straight into the backend command buffer.
     fn create_command_list(&self) -> Result<Self::CommandList>;
 
+    fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle>;
+
     /// `dualSrcBlend` support. Text falls back to `AlphaBlend` when `false`.
     fn supports_dual_source_blending(&self) -> bool;
 
@@ -127,6 +129,8 @@ pub trait RenderCommands {
     fn pop_debug_group(&mut self);
 
     fn insert_debug_label(&mut self, label: &str);
+
+    fn write_timestamp(&mut self, pool: QueryPoolHandle, index: u32);
 
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>);
 

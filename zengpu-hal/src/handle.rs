@@ -235,6 +235,7 @@ pub mod marker {
     pub enum Pipeline {}
     pub enum Surface {}
     pub enum RenderTarget {}
+    pub enum QueryPool {}
 }
 
 pub type BufferHandle = Handle<marker::Buffer>;
@@ -244,6 +245,7 @@ pub type ShaderHandle = Handle<marker::Shader>;
 pub type PipelineHandle = Handle<marker::Pipeline>;
 pub type SurfaceHandle = Handle<marker::Surface>;
 pub type TargetHandle = Handle<marker::RenderTarget>;
+pub type QueryPoolHandle = Handle<marker::QueryPool>;
 
 #[cfg(test)]
 mod tests {
