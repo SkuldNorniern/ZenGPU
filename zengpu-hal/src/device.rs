@@ -54,6 +54,14 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::Unsupported("buffer copy".into()))
     }
 
+    /// Copies mip 0, layer 0 of a texture into `buffer` at byte 0, synchronously. `buffer` needs
+    /// `TRANSFER_DST`, or `READBACK` for host reads.
+    ///
+    /// The default returns `GpuError::Unsupported`.
+    fn copy_texture_to_buffer(&self, _texture: TextureHandle, _buffer: BufferHandle) -> Result<()> {
+        Err(GpuError::Unsupported("texture-to-buffer copy".into()))
+    }
+
     /// Backend device ordinal, or `-1` when the backend does not expose one.
     fn device_ordinal(&self) -> i32 {
         -1
