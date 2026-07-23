@@ -14,6 +14,14 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["spirv"]
+spirv = ["zengpu-zsl/spirv"]
+hip = ["zengpu-zsl/hip"]
+cuda = ["zengpu-zsl/cuda"]
+metal = ["zengpu-zsl/metal"]
+dx = ["zengpu-zsl/dx"]
+
 [dependencies]
 zengpu-zsl = { path = "../zengpu-zsl", version = "0.0.1" }
 zengpu-hal.workspace = true

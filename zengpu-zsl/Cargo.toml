@@ -14,6 +14,17 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["spirv"]
+spirv = []
+hip = []
+cuda = []
+metal = []
+dx = []
+# Enables every emitter — used by this crate's own test suite so `cargo test -p zengpu-zsl`
+# exercises spirv+hip+cuda+metal without extra flags.
+test-all-backends = ["spirv", "hip", "cuda", "metal"]
+
 [lib]
 proc-macro = true
 
