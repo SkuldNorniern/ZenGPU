@@ -58,15 +58,19 @@ pub struct Param {
 /// What an entry-point parameter binds to.
 #[derive(Debug)]
 pub enum ParamKind {
-    /// `device buffer<elem>` — a bindless storage buffer. `elem`/`mutability`
-    /// are carried for reflection and the MSL backend; the SPIR-V backend only
-    /// handles `f32` and enforces writability in `ir::build`.
+    /// `device buffer<elem>` — a bindless storage buffer. `elem` is interned
+    /// in the owning [`Module`]'s `types` arena (via `TypeArena::
+    /// intern_buf_elem`); backends convert back via `TypeArena::buf_elem_of`
+    /// at their own boundary. `mutability` is carried for reflection and the
+    /// MSL backend; the SPIR-V backend only handles `f32` and enforces
+    /// writability in `ir::build`.
     Buffer {
-        elem: BufElem,
+        elem: TypeId,
         mutability: Mutability,
     },
-    /// A push-constant scalar (`u32`/`f32`).
-    Scalar(ScalarTy),
+    /// A push-constant scalar (`u32`/`f32`), interned via `TypeArena::
+    /// intern_scalar`; backends convert back via `TypeArena::scalar_ty_of`.
+    Scalar(TypeId),
 }
 
 /// The kind of entry point, plus stage-specific facts.

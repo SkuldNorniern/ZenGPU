@@ -22,7 +22,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), module.types.buf_elem_of(*elem))),
             _ => None,
         })
         .collect();
@@ -30,7 +30,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(t) => Some((p.name.as_str(), *t)),
+            ParamKind::Scalar(t) => Some((p.name.as_str(), module.types.scalar_ty_of(*t))),
             _ => None,
         })
         .collect();

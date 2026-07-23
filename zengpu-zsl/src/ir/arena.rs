@@ -88,6 +88,42 @@ impl TypeArena {
         }
     }
 
+    /// The reverse of [`TypeArena::intern_buf_elem`]: recover the `BufElem` a
+    /// previously-interned `TypeId` came from. Used at backend boundaries
+    /// that still work in terms of `BufElem` (every compute backend's buffer
+    /// parameter handling), so `ParamKind::Buffer.elem` can hold `TypeId`
+    /// without requiring every backend to be rewritten in the same commit.
+    /// Panics if `id` does not resolve to a type `intern_buf_elem` produces —
+    /// every `TypeId` reachable from `ParamKind::Buffer.elem` today is
+    /// guaranteed to be one, since only `intern_buf_elem` builds it in
+    /// `frontend::parser`.
+    pub fn buf_elem_of(&self, id: TypeId) -> BufElem {
+        match self.get(id) {
+            Type::Float {
+                format: FloatFormat::F32,
+            } => BufElem::F32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => BufElem::U32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Signed,
+            } => BufElem::I32,
+            Type::Vector { lanes, .. } => match lanes {
+                2 => BufElem::Vec2,
+                3 => BufElem::Vec3,
+                _ => BufElem::Vec4,
+            },
+            Type::Matrix { rows, .. } => match rows {
+                2 => BufElem::Mat2,
+                3 => BufElem::Mat3,
+                _ => BufElem::Mat4,
+            },
+            other => panic!("TypeArena::buf_elem_of: {other:?} is not a buffer element type"),
+        }
+    }
+
     /// Lossless conversion from today's graphics-only [`GfxTy`]. Vector/matrix
     /// variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
@@ -274,6 +310,25 @@ mod tests {
         for ty in [ScalarTy::Bool, ScalarTy::U32, ScalarTy::I32, ScalarTy::F32] {
             let id = arena.intern_scalar(ty);
             assert_eq!(arena.scalar_ty_of(id), ty);
+        }
+    }
+
+    #[test]
+    fn buf_elem_of_round_trips_every_buf_elem() {
+        let mut arena = TypeArena::new();
+        for elem in [
+            BufElem::F32,
+            BufElem::U32,
+            BufElem::I32,
+            BufElem::Vec2,
+            BufElem::Vec3,
+            BufElem::Vec4,
+            BufElem::Mat2,
+            BufElem::Mat3,
+            BufElem::Mat4,
+        ] {
+            let id = arena.intern_buf_elem(elem);
+            assert_eq!(arena.buf_elem_of(id), elem);
         }
     }
 }
