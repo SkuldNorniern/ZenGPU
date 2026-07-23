@@ -1,7 +1,7 @@
-//! Shader macro that compiles native ZSL to SPIR-V, HIP C++, MSL and CUDA C++ at build time.
+//! Shader macro that compiles native ZSL to every backend at build time.
 //!
-//! [`zsl!`] gives a [`ZslShader`] with all four forms from one source. Pick one at runtime with
-//! [`ZslShader::for_backend`].
+//! [`zsl!`] gives a [`ZslShader`] with SPIR-V (Vulkan), HIP C++ (ROCm), MSL (Metal) and CUDA C++
+//! (NVIDIA) from one source. Pick a form at runtime with [`ZslShader::for_backend`].
 //!
 //! ```ignore
 //! use zengpu_spirv::{zsl, ZslShader};
@@ -15,6 +15,10 @@
 //!     }
 //! );
 //! ```
+//!
+//! [`ZslShader::into_compiled`] bridges to [`CompiledModule`] and [`BackendArtifact`], which holds
+//! any set of backends. A missing backend is a typed [`BackendUnavailable`] error, never a silent
+//! SPIR-V substitute.
 
 use std::slice;
 
@@ -54,6 +58,109 @@ impl ZslShader {
         let bytes =
             unsafe { slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4) };
         ShaderDesc::spirv(bytes)
+    }
+}
+
+/// ZSL lowering target. Variants are ordered so `CompiledModule::artifacts` iterates stably; the
+/// order carries no other meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BackendId {
+    Spirv,
+    Hip,
+    Cuda,
+    Metal,
+    Dx,
+}
+
+impl BackendId {
+    /// Cargo feature for this backend's emitter, named in `BackendUnavailable`.
+    pub fn required_cargo_feature(self) -> &'static str {
+        match self {
+            BackendId::Spirv => "spirv",
+            BackendId::Hip => "hip",
+            BackendId::Cuda => "cuda",
+            BackendId::Metal => "metal",
+            BackendId::Dx => "dx",
+        }
+    }
+}
+
+/// Output of one backend. `DxHlsl` and `Dxil` are placeholders that no emitter produces.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendArtifact {
+    /// SPIR-V words for Vulkan (and any other SPIR-V consumer).
+    Spirv(Vec<u32>),
+    /// HIP C++ source for AMD ROCm (compiled at runtime via hipRTC).
+    HipSource(String),
+    /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
+    CudaSource(String),
+    /// Metal Shading Language source for Apple Metal.
+    MetalSource(String),
+    /// HLSL source for DirectX. Placeholder, no emitter.
+    DxHlsl(String),
+    /// DXIL for DirectX 12. Placeholder, no emitter.
+    Dxil(Vec<u8>),
+}
+
+/// No artifact for the requested backend: feature off, or nothing for this stage (graphics has no
+/// HIP). Never substitutes another backend's artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendUnavailable {
+    pub backend: BackendId,
+    pub required_cargo_feature: &'static str,
+}
+
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no {:?} artifact available (enable the \"{}\" cargo feature, and confirm this shader targets that backend)",
+            self.backend, self.required_cargo_feature
+        )
+    }
+}
+
+impl std::error::Error for BackendUnavailable {}
+
+/// Any set of backend artifacts for one ZSL module. Unlike the fixed fields of `ZslShader`, adding
+/// a backend needs no caller changes.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledModule {
+    pub artifacts: std::collections::BTreeMap<BackendId, BackendArtifact>,
+}
+
+impl CompiledModule {
+    /// Returns the artifact for `backend`. Never substitutes another backend's output. Ask for a
+    /// fallback explicitly.
+    pub fn artifact(&self, backend: BackendId) -> Result<&BackendArtifact, BackendUnavailable> {
+        self.artifacts
+            .get(&backend)
+            .ok_or_else(|| BackendUnavailable {
+                backend,
+                required_cargo_feature: backend.required_cargo_feature(),
+            })
+    }
+}
+
+impl ZslShader {
+    /// Converts to a [`CompiledModule`].
+    ///
+    /// An artifact is included only when its `ZslShader` field is non-empty. An empty `hip`, `msl`
+    /// or `cuda` field means the feature is off, or the shader is a graphics module that backend
+    /// skips. `spv` is always included.
+    pub fn into_compiled(&self) -> CompiledModule {
+        let mut artifacts = std::collections::BTreeMap::new();
+        artifacts.insert(BackendId::Spirv, BackendArtifact::Spirv(self.spv.to_vec()));
+        if !self.hip.is_empty() {
+            artifacts.insert(BackendId::Hip, BackendArtifact::HipSource(self.hip.to_string()));
+        }
+        if !self.cuda.is_empty() {
+            artifacts.insert(BackendId::Cuda, BackendArtifact::CudaSource(self.cuda.to_string()));
+        }
+        if !self.msl.is_empty() {
+            artifacts.insert(BackendId::Metal, BackendArtifact::MetalSource(self.msl.to_string()));
+        }
+        CompiledModule { artifacts }
     }
 }
 
