@@ -1,4 +1,8 @@
-//! Proc-macro internals. Use `zengpu_spirv` or `zengpu`, not this crate directly.
+//! ZenGPU shader proc-macro internals. Import `zengpu_spirv` or `zengpu` and use the
+//! `zengpu_spirv!` macro; this crate is not for direct use.
+//!
+//! Legacy syntax (`push P { ... }`, `device mut buffer<T>`, `shared name: array<T, N>`,
+//! `barrier()`) is accepted. A later release warns on it, then removes it.
 
 extern crate proc_macro;
 

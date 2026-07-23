@@ -1,7 +1,8 @@
-//! Shader macro that compiles native ZSL to every backend at build time.
+//! ZenGPU shader macro: compiles native ZSL to all backends at build time.
 //!
-//! [`zsl!`] gives a [`ZslShader`] with SPIR-V (Vulkan), HIP C++ (ROCm), MSL (Metal) and CUDA C++
-//! (NVIDIA) from one source. Pick a form at runtime with [`ZslShader::for_backend`].
+//! [`zsl!`] produces a [`ZslShader`] with SPIR-V (Vulkan), HIP C++ (ROCm), MSL (Metal) and CUDA C++
+//! (NVIDIA), compiled at build time from the same ZSL source. At runtime,
+//! [`ZslShader::for_backend`] picks the form for the device.
 //!
 //! ```ignore
 //! use zengpu_spirv::{zsl, ZslShader};
@@ -16,9 +17,15 @@
 //! );
 //! ```
 //!
-//! [`ZslShader::into_compiled`] bridges to [`CompiledModule`] and [`BackendArtifact`], which holds
-//! any set of backends. A missing backend is a typed [`BackendUnavailable`] error, never a silent
-//! SPIR-V substitute.
+//! [`ZslShader::into_compiled`] converts to the [`CompiledModule`] API. That API holds
+//! [`BackendArtifact`]s for any set of backends (DirectX can be added later), instead of a fixed
+//! four-field struct. A missing backend is reported as a typed [`BackendUnavailable`] error, not
+//! silently replaced with SPIR-V.
+//!
+//! `ZslShader`, [`ZslShader::for_backend`] and the current native ZSL source syntax are accepted in
+//! this release. A later release will warn on both, then remove them together in favor of
+//! [`CompiledModule`] and the ZSL syntax changes. Code should prefer `CompiledModule` over
+//! `ZslShader` where practical.
 
 use std::slice;
 
