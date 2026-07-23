@@ -174,8 +174,16 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
 
     #[cfg(feature = "metal")]
     let msl_src = match &shader {
-        Shader::Compute(m) => backend::msl::lower_compute(m).source,
-        Shader::Graphics(m) => backend::msl::lower_graphics(m).source,
+        // See the `hip_src`/`cuda_src` arms above: a `Diagnostic` here means
+        // this shader uses a construct MSL cannot lower, not that something
+        // is broken — no MSL artifact for this shader, not a hard
+        // macro-compile failure.
+        Shader::Compute(m) => backend::msl::lower_compute(m)
+            .map(|shader| shader.source)
+            .unwrap_or_default(),
+        Shader::Graphics(m) => backend::msl::lower_graphics(m)
+            .map(|shader| shader.source)
+            .unwrap_or_default(),
     };
     #[cfg(not(feature = "metal"))]
     let msl_src = String::new();
@@ -340,7 +348,7 @@ mod phase_z_tests {
         let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
         let hip_source = hip::lower_compute(&module).expect("lower finite classification to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower finite classification to CUDA").source;
-        let msl_source = msl::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).expect("lower finite classification to MSL").source;
         for source in [&hip_source, &cuda_source, &msl_source] {
             assert!(source.contains("isfinite(x)"));
             assert!(source.contains("isnan(x)"));
@@ -354,7 +362,7 @@ mod phase_z_tests {
         let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
         let hip_source = hip::lower_compute(&module).expect("lower typed buffers to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower typed buffers to CUDA").source;
-        let msl_source = msl::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).expect("lower typed buffers to MSL").source;
         assert!(hip_source.contains("const unsigned int* __restrict__ src_u"));
         assert!(hip_source.contains("const int* __restrict__ src_i"));
         assert!(hip_source.contains("unsigned int* __restrict__ out_u"));
@@ -375,7 +383,7 @@ mod phase_z_tests {
         let module = parse_compute(TRIG).expect("parse trigonometry");
         let hip_source = hip::lower_compute(&module).expect("lower trigonometry to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower trigonometry to CUDA").source;
-        let msl_source = msl::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).expect("lower trigonometry to MSL").source;
         assert!(hip_source.contains("sinf(x)"));
         assert!(hip_source.contains("cosf(x)"));
         assert!(hip_source.contains("tanf(x)"));
@@ -447,7 +455,7 @@ mod phase_z_tests {
                 .source
                 .contains("(unsigned int)")
         );
-        assert!(msl::lower_compute(&module).source.contains("uint("));
+        assert!(msl::lower_compute(&module).expect("lower u32 cast to MSL").source.contains("uint("));
         spirv::lower_compute(&module).expect("lower u32 cast to SPIR-V");
     }
 
@@ -456,7 +464,7 @@ mod phase_z_tests {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
         let hip_source = hip::lower_compute(&module).expect("lower scatter_add to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower scatter_add to CUDA").source;
-        let msl_source = msl::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).expect("lower scatter_add to MSL").source;
         assert!(hip_source.contains("atomicAdd(&out["));
         assert!(cuda_source.contains("atomicAdd(&out["));
         assert!(msl_source.contains("device atomic_float* out"));
@@ -594,7 +602,7 @@ int main() {{
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
         assert_eq!(module.entry.shared.len(), 2);
         let cuda_source = cuda::lower_compute(&module).expect("lower tiled GEMM to CUDA").source;
-        let msl_source = msl::lower_compute(&module).source;
+        let msl_source = msl::lower_compute(&module).expect("lower tiled GEMM to MSL").source;
         assert!(cuda_source.contains("__shared__ float as_tile[256]"));
         assert!(cuda_source.contains("threadIdx.x") && cuda_source.contains("blockIdx.y"));
         assert!(cuda_source.contains("__syncthreads()"));
