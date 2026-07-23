@@ -7,7 +7,9 @@
 //! This slice models the compute entry point. Graphics (vertex/fragment,
 //! varyings, vertex input/output structs) extends `EntryKind`/`Param` next.
 
+pub mod arena;
 pub mod node;
+pub mod types;
 pub mod validate;
 
 use node::{IrExpr, IrStmt};
