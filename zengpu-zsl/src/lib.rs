@@ -182,7 +182,13 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
 
     #[cfg(feature = "cuda")]
     let cuda_src = match &shader {
-        Shader::Compute(m) => backend::cuda::lower_compute(m).source,
+        // See the `hip_src` arm above: a `Diagnostic` here means this shader
+        // uses a construct CUDA cannot lower (e.g. bitwise operators,
+        // SPIR-V-only today), not that something is broken — no CUDA
+        // artifact for this shader, not a hard macro-compile failure.
+        Shader::Compute(m) => backend::cuda::lower_compute(m)
+            .map(|shader| shader.source)
+            .unwrap_or_default(),
         Shader::Graphics(_) => String::new(),
     };
     #[cfg(not(feature = "cuda"))]
@@ -333,7 +339,7 @@ mod phase_z_tests {
     fn finite_number_builtins_lower_on_all_compute_backends() {
         let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
         let hip_source = hip::lower_compute(&module).expect("lower finite classification to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower finite classification to CUDA").source;
         let msl_source = msl::lower_compute(&module).source;
         for source in [&hip_source, &cuda_source, &msl_source] {
             assert!(source.contains("isfinite(x)"));
@@ -347,7 +353,7 @@ mod phase_z_tests {
     fn integer_storage_buffers_lower_on_all_compute_backends() {
         let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
         let hip_source = hip::lower_compute(&module).expect("lower typed buffers to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower typed buffers to CUDA").source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("const unsigned int* __restrict__ src_u"));
         assert!(hip_source.contains("const int* __restrict__ src_i"));
@@ -368,7 +374,7 @@ mod phase_z_tests {
     fn trigonometry_lowers_on_all_compute_backends() {
         let module = parse_compute(TRIG).expect("parse trigonometry");
         let hip_source = hip::lower_compute(&module).expect("lower trigonometry to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower trigonometry to CUDA").source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("sinf(x)"));
         assert!(hip_source.contains("cosf(x)"));
@@ -437,6 +443,7 @@ mod phase_z_tests {
         );
         assert!(
             cuda::lower_compute(&module)
+                .expect("lower u32 cast to CUDA")
                 .source
                 .contains("(unsigned int)")
         );
@@ -448,7 +455,7 @@ mod phase_z_tests {
     fn scatter_add_lowers_on_all_backends_and_has_spirv_atomic_extension() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
         let hip_source = hip::lower_compute(&module).expect("lower scatter_add to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower scatter_add to CUDA").source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("atomicAdd(&out["));
         assert!(cuda_source.contains("atomicAdd(&out["));
@@ -586,7 +593,7 @@ int main() {{
     fn tiled_gemm_spirv_has_workgroup_memory_and_barrier() {
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
         assert_eq!(module.entry.shared.len(), 2);
-        let cuda_source = cuda::lower_compute(&module).source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower tiled GEMM to CUDA").source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(cuda_source.contains("__shared__ float as_tile[256]"));
         assert!(cuda_source.contains("threadIdx.x") && cuda_source.contains("blockIdx.y"));
