@@ -17,6 +17,12 @@
 //!     }
 //! );
 //! ```
+//!
+//! [`ZslShader::into_compiled`] bridges to the newer [`CompiledModule`]/
+//! [`BackendArtifact`] API, which represents an arbitrary set of compiled
+//! backends (including a future DirectX target) instead of a fixed 4-field
+//! struct, and reports a missing backend as a typed [`BackendUnavailable`]
+//! error instead of silently substituting SPIR-V.
 
 use std::slice;
 
@@ -61,6 +67,129 @@ impl ZslShader {
         let bytes =
             unsafe { slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4) };
         ShaderDesc::spirv(bytes)
+    }
+}
+
+/// Identifies one ZSL lowering target.
+///
+/// Ordered so `CompiledModule::artifacts` (a `BTreeMap`) iterates in a stable,
+/// predictable sequence; the order itself carries no other meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BackendId {
+    Spirv,
+    Hip,
+    Cuda,
+    Metal,
+    Dx,
+}
+
+impl BackendId {
+    /// The `zengpu-zsl`/`zengpu-spirv` cargo feature that must be enabled to
+    /// compile this backend's emitter. Used in [`BackendUnavailable`] so a
+    /// caller knows exactly what to turn on.
+    pub fn required_cargo_feature(self) -> &'static str {
+        match self {
+            BackendId::Spirv => "spirv",
+            BackendId::Hip => "hip",
+            BackendId::Cuda => "cuda",
+            BackendId::Metal => "metal",
+            BackendId::Dx => "dx",
+        }
+    }
+}
+
+/// One backend's compiled output.
+///
+/// `DxHlsl`/`Dxil` are placeholders: no `zengpu-zsl` backend emits them yet, so
+/// no `CompiledModule` in this codebase constructs those variants today.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendArtifact {
+    /// SPIR-V words for Vulkan (and any other SPIR-V consumer).
+    Spirv(Vec<u32>),
+    /// HIP C++ source for AMD ROCm (compiled at runtime via hipRTC).
+    HipSource(String),
+    /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
+    CudaSource(String),
+    /// Metal Shading Language source for Apple Metal.
+    MetalSource(String),
+    /// HLSL source for DirectX (compiled offline/at-runtime via DXC/FXC).
+    /// Not produced by any backend yet.
+    DxHlsl(String),
+    /// Compiled DXIL bytecode for DirectX 12. Not produced by any backend yet.
+    Dxil(Vec<u8>),
+}
+
+/// Returned when a [`CompiledModule`] is asked for a backend it does not have
+/// an artifact for — either because that emitter wasn't compiled in (cargo
+/// feature off) or because this particular shader has nothing for that stage
+/// (e.g. a graphics module has no HIP output). Never silently substitutes
+/// another backend's artifact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendUnavailable {
+    pub backend: BackendId,
+    pub required_cargo_feature: &'static str,
+}
+
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no {:?} artifact available (enable the \"{}\" cargo feature, and confirm this shader targets that backend)",
+            self.backend, self.required_cargo_feature
+        )
+    }
+}
+
+impl std::error::Error for BackendUnavailable {}
+
+/// An arbitrary set of compiled backend artifacts for one ZSL module.
+///
+/// Unlike [`ZslShader`]'s fixed 4 fields, this can represent any subset of
+/// backends (including a future DX one) without every caller needing to know
+/// about every backend up front.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledModule {
+    pub artifacts: std::collections::BTreeMap<BackendId, BackendArtifact>,
+}
+
+impl CompiledModule {
+    /// Look up the compiled artifact for `backend`.
+    ///
+    /// Returns [`BackendUnavailable`] rather than substituting a different
+    /// backend's output — callers that want a fallback must ask for one
+    /// explicitly.
+    pub fn artifact(&self, backend: BackendId) -> Result<&BackendArtifact, BackendUnavailable> {
+        self.artifacts
+            .get(&backend)
+            .ok_or_else(|| BackendUnavailable {
+                backend,
+                required_cargo_feature: backend.required_cargo_feature(),
+            })
+    }
+}
+
+impl ZslShader {
+    /// Bridge to the new [`CompiledModule`] API.
+    ///
+    /// An artifact is included only when its `ZslShader` field is non-empty —
+    /// today an empty `hip`/`msl`/`cuda` string legitimately means either that
+    /// backend's cargo feature was off, or this particular shader is a
+    /// graphics module that backend doesn't lower (matching existing
+    /// `compile_zsl_all` behavior). `spv` is always included since SPIR-V is
+    /// always compiled by default.
+    pub fn into_compiled(&self) -> CompiledModule {
+        let mut artifacts = std::collections::BTreeMap::new();
+        artifacts.insert(BackendId::Spirv, BackendArtifact::Spirv(self.spv.to_vec()));
+        if !self.hip.is_empty() {
+            artifacts.insert(BackendId::Hip, BackendArtifact::HipSource(self.hip.to_string()));
+        }
+        if !self.cuda.is_empty() {
+            artifacts.insert(BackendId::Cuda, BackendArtifact::CudaSource(self.cuda.to_string()));
+        }
+        if !self.msl.is_empty() {
+            artifacts.insert(BackendId::Metal, BackendArtifact::MetalSource(self.msl.to_string()));
+        }
+        CompiledModule { artifacts }
     }
 }
 
