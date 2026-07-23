@@ -2106,4 +2106,147 @@ mod tests {
         let words = lower(src);
         assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
     }
+
+    #[test]
+    fn standalone_checker_matches_infer_ty_for_local_and_literal() {
+        let mut ctx = Ctx {
+            buffers: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            id_param: None,
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+            shared: HashMap::new(),
+            shared_order: Vec::new(),
+        };
+        ctx.locals.insert("x".to_string(), ScalarTy::F32);
+
+        let local_expr = IrExpr::Local("x".to_string());
+        let old_ty = infer_ty(&local_expr, &ctx);
+
+        let mut arena = crate::ir::arena::TypeArena::new();
+        let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+        new_ctx.locals.insert("x".to_string(), ScalarTy::F32);
+        let new_ty = crate::ir::typeck::type_of_compute_expr(&local_expr, &new_ctx, &mut arena);
+
+        assert_eq!(new_ty, arena.intern_scalar(old_ty));
+    }
+
+    #[test]
+    fn standalone_checker_matches_infer_ty_for_comparison_and_arithmetic() {
+        let ctx = Ctx {
+            buffers: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            id_param: None,
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+            shared: HashMap::new(),
+            shared_order: Vec::new(),
+        };
+        let cmp = IrExpr::Binary {
+            op: IrBinOp::Lt,
+            lhs: Box::new(IrExpr::LitU32(1)),
+            rhs: Box::new(IrExpr::LitU32(2)),
+        };
+        let arith = IrExpr::Binary {
+            op: IrBinOp::Add,
+            lhs: Box::new(IrExpr::LitU32(1)),
+            rhs: Box::new(IrExpr::LitF32(2.0)),
+        };
+
+        let mut arena = crate::ir::arena::TypeArena::new();
+        let new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+
+        let old_cmp_ty = infer_ty(&cmp, &ctx);
+        let new_cmp_ty = crate::ir::typeck::type_of_compute_expr(&cmp, &new_ctx, &mut arena);
+        assert_eq!(new_cmp_ty, arena.intern_scalar(old_cmp_ty));
+
+        let old_arith_ty = infer_ty(&arith, &ctx);
+        let new_arith_ty = crate::ir::typeck::type_of_compute_expr(&arith, &new_ctx, &mut arena);
+        assert_eq!(new_arith_ty, arena.intern_scalar(old_arith_ty));
+    }
+
+    #[test]
+    fn standalone_checker_matches_infer_ty_for_buffer_load() {
+        let mut ctx = Ctx {
+            buffers: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            id_param: None,
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+            shared: HashMap::new(),
+            shared_order: Vec::new(),
+        };
+        ctx.buffers.insert(
+            "buf".to_string(),
+            BufferSymbol {
+                writable: false,
+                elem: BufElem::I32,
+            },
+        );
+        let load = IrExpr::BufferLoad {
+            buf: "buf".to_string(),
+            index: Box::new(IrExpr::LitU32(0)),
+        };
+        let old_ty = infer_ty(&load, &ctx);
+
+        let mut arena = crate::ir::arena::TypeArena::new();
+        let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+        new_ctx.buffers.insert("buf".to_string(), BufElem::I32);
+        let new_ty = crate::ir::typeck::type_of_compute_expr(&load, &new_ctx, &mut arena);
+
+        assert_eq!(new_ty, arena.intern_scalar(old_ty));
+    }
+
+    #[test]
+    fn standalone_checker_matches_infer_gfx_ty_for_mat4_vec4_promotion() {
+        let mut ctx = GfxCtx {
+            inputs: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            buffers: HashMap::new(),
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+        };
+        ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
+
+        let vec4 = IrExpr::VecConstruct {
+            dim: 4,
+            args: vec![
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(1.0),
+            ],
+        };
+        let mat_mul = IrExpr::Binary {
+            op: IrBinOp::Mul,
+            lhs: Box::new(IrExpr::ScalarParam("mvp".to_string())),
+            rhs: Box::new(vec4),
+        };
+        let old_ty = infer_gfx_ty(&mat_mul, &ctx);
+
+        let mut arena = crate::ir::arena::TypeArena::new();
+        let mut new_ctx = crate::ir::typeck::GraphicsTypeCtx::default();
+        new_ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
+        let new_vec4 = IrExpr::VecConstruct {
+            dim: 4,
+            args: vec![
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(0.0),
+                IrExpr::LitF32(1.0),
+            ],
+        };
+        let new_mat_mul = IrExpr::Binary {
+            op: IrBinOp::Mul,
+            lhs: Box::new(IrExpr::ScalarParam("mvp".to_string())),
+            rhs: Box::new(new_vec4),
+        };
+        let new_ty = crate::ir::typeck::type_of_graphics_expr(&new_mat_mul, &new_ctx, &mut arena);
+
+        assert_eq!(new_ty, arena.intern_gfx_ty(old_ty));
+    }
 }
