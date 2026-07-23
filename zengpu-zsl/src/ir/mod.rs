@@ -48,16 +48,15 @@ pub struct Param {
 
 #[derive(Debug)]
 pub enum ParamKind {
-    /// Bindless storage buffer (`device buffer<elem>`).
-    ///
-    /// SPIR-V supports only `f32`. Writability is checked in `ir::build`. `elem` and `mutability`
-    /// are kept for reflection and MSL.
+    /// `device buffer<elem>`: bindless storage buffer. `elem` is a `TypeId` in the module's `types`
+    /// arena. `mutability` is for reflection and MSL. SPIR-V only handles `f32` and checks
+    /// writability in `ir::build`.
     Buffer {
-        elem: BufElem,
+        elem: TypeId,
         mutability: Mutability,
     },
-    /// A push-constant scalar of type `u32` or `f32`.
-    Scalar(ScalarTy),
+    /// Push-constant scalar (`u32`/`f32`). Backends convert with `scalar_ty_of`.
+    Scalar(TypeId),
 }
 
 #[derive(Debug)]

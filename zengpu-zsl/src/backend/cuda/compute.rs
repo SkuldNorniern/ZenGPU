@@ -20,7 +20,9 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, mutability } => Some((p.name.as_str(), *mutability, *elem)),
+            ParamKind::Buffer { elem, mutability } => {
+                Some((p.name.as_str(), *mutability, module.types.buf_elem_of(*elem)))
+            }
             _ => None,
         })
         .collect();
@@ -29,7 +31,7 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(t) => Some((p.name.as_str(), *t)),
+            ParamKind::Scalar(t) => Some((p.name.as_str(), module.types.scalar_ty_of(*t))),
             _ => None,
         })
         .collect();

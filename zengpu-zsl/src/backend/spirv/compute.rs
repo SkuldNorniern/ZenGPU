@@ -60,7 +60,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), module.types.buf_elem_of(*elem))),
             _ => None,
         })
         .collect();
@@ -68,7 +68,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(ty) => Some((p.name.as_str(), *ty)),
+            ParamKind::Scalar(ty) => Some((p.name.as_str(), module.types.scalar_ty_of(*ty))),
             _ => None,
         })
         .collect();

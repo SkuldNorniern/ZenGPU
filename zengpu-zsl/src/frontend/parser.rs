@@ -115,6 +115,20 @@ struct PendingShared {
     len: u32,
 }
 
+/// Parser-side compute param, type interned later in `parse_kernel_rest`. Public: `ir::Param`.
+struct PendingParam {
+    name: String,
+    kind: PendingParamKind,
+}
+
+enum PendingParamKind {
+    Buffer {
+        elem: BufElem,
+        mutability: Mutability,
+    },
+    Scalar(ScalarTy),
+}
+
 struct GfxCtx {
     inputs: HashMap<String, GfxTy>,
     scalars: HashMap<String, GfxTy>,
@@ -252,6 +266,20 @@ impl<'a> Parser<'a> {
         let body = self.parse_block(&mut ctx)?;
 
         let mut types = crate::ir::arena::TypeArena::new();
+
+        let params = params
+            .into_iter()
+            .map(|p| Param {
+                name: p.name,
+                kind: match p.kind {
+                    PendingParamKind::Buffer { elem, mutability } => ParamKind::Buffer {
+                        elem: types.intern_buf_elem(elem),
+                        mutability,
+                    },
+                    PendingParamKind::Scalar(ty) => ParamKind::Scalar(types.intern_scalar(ty)),
+                },
+            })
+            .collect();
 
         let shared = ctx
             .shared_order
@@ -411,7 +439,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_params(&mut self, ctx: &mut Ctx) -> Result<Vec<Param>, ParseError> {
+    fn parse_params(&mut self, ctx: &mut Ctx) -> Result<Vec<PendingParam>, ParseError> {
         self.expect(&Tok::LParen, "`(` after kernel name")?;
         let mut params = Vec::new();
         while !self.eat(&Tok::RParen) {
@@ -430,7 +458,7 @@ impl<'a> Parser<'a> {
         &mut self,
         ctx: &mut Ctx,
         name: &str,
-        params: &mut Vec<Param>,
+        params: &mut Vec<PendingParam>,
     ) -> Result<(), ParseError> {
         if self.eat_kw("device") {
             let writable = self.eat_kw("mut");
@@ -448,9 +476,9 @@ impl<'a> Parser<'a> {
             };
             ctx.buffers
                 .insert(name.to_string(), BufferSymbol { writable, elem });
-            params.push(Param {
+            params.push(PendingParam {
                 name: name.to_string(),
-                kind: ParamKind::Buffer {
+                kind: PendingParamKind::Buffer {
                     elem,
                     mutability: if writable {
                         Mutability::ReadWrite
@@ -492,9 +520,9 @@ impl<'a> Parser<'a> {
                     }
                 };
                 ctx.scalars.insert(field.clone(), ty);
-                params.push(Param {
+                params.push(PendingParam {
                     name: field,
-                    kind: ParamKind::Scalar(ty),
+                    kind: PendingParamKind::Scalar(ty),
                 });
             }
             Ok(())

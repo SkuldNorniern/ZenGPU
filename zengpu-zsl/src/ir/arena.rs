@@ -74,6 +74,35 @@ impl TypeArena {
         }
     }
 
+    /// Inverse of `intern_buf_elem`; panics on other ids. Backends still take `BufElem`, so
+    /// `ParamKind::Buffer.elem` holds `TypeId` until they change.
+    pub fn buf_elem_of(&self, id: TypeId) -> BufElem {
+        match self.get(id) {
+            Type::Float {
+                format: FloatFormat::F32,
+            } => BufElem::F32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => BufElem::U32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Signed,
+            } => BufElem::I32,
+            Type::Vector { lanes, .. } => match lanes {
+                2 => BufElem::Vec2,
+                3 => BufElem::Vec3,
+                _ => BufElem::Vec4,
+            },
+            Type::Matrix { rows, .. } => match rows {
+                2 => BufElem::Mat2,
+                3 => BufElem::Mat3,
+                _ => BufElem::Mat4,
+            },
+            other => panic!("TypeArena::buf_elem_of: {other:?} is not a buffer element type"),
+        }
+    }
+
     /// Lossless from [`GfxTy`]. Vector/matrix variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
         match ty {
@@ -256,6 +285,25 @@ mod tests {
         for ty in [ScalarTy::Bool, ScalarTy::U32, ScalarTy::I32, ScalarTy::F32] {
             let id = arena.intern_scalar(ty);
             assert_eq!(arena.scalar_ty_of(id), ty);
+        }
+    }
+
+    #[test]
+    fn buf_elem_of_round_trips_every_buf_elem() {
+        let mut arena = TypeArena::new();
+        for elem in [
+            BufElem::F32,
+            BufElem::U32,
+            BufElem::I32,
+            BufElem::Vec2,
+            BufElem::Vec3,
+            BufElem::Vec4,
+            BufElem::Mat2,
+            BufElem::Mat3,
+            BufElem::Mat4,
+        ] {
+            let id = arena.intern_buf_elem(elem);
+            assert_eq!(arena.buf_elem_of(id), elem);
         }
     }
 }
