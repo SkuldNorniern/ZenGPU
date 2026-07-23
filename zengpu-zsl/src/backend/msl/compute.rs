@@ -3,10 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
+use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
 
-pub fn lower_compute(module: &Module) -> MslShader {
+pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
@@ -48,7 +49,7 @@ pub fn lower_compute(module: &Module) -> MslShader {
         let elem = if atomic_buffers.contains(b) {
             "atomic_float"
         } else {
-            msl_buffer_elem(*buffer_elem)
+            msl_buffer_elem(*buffer_elem)?
         };
         let _ = writeln!(s, "    device {elem}* {b} [[buffer({slot})]],");
         slot += 1;
@@ -66,17 +67,17 @@ pub fn lower_compute(module: &Module) -> MslShader {
 
     let ctx = Ctx { locals };
     for st in &e.body {
-        emit_stmt(&mut s, &ctx, st, 1);
+        emit_stmt(&mut s, &ctx, st, 1)?;
     }
     s.push_str("}\n");
 
-    MslShader {
+    Ok(MslShader {
         source: s,
         entry: ENTRY,
         buffer_count: buffers.len() as u32,
         has_push,
         local_size,
-    }
+    })
 }
 
 struct Ctx<'a> {
@@ -107,7 +108,7 @@ fn indent(s: &mut String, depth: usize) {
     }
 }
 
-fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
+fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
             let ty = ctx
@@ -116,15 +117,15 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
                 .copied()
                 .unwrap_or(ScalarTy::U32);
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", msl_scalar(ty), name, emit_expr(init));
+            let _ = writeln!(s, "{} {} = {};", msl_scalar(ty), name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value));
+            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
+            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
@@ -132,13 +133,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
                 s,
                 "atomic_fetch_add_explicit(&{}[uint({})], {}, memory_order_relaxed);",
                 buf,
-                emit_expr(index),
-                emit_expr(value)
+                emit_expr(index)?,
+                emit_expr(value)?
             );
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index), emit_expr(value));
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index)?, emit_expr(value)?);
         }
         IrStmt::Barrier => {
             indent(s, depth);
@@ -146,16 +147,16 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond));
+            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
             for st in then {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             indent(s, depth);
             s.push('}');
             if let Some(else_block) = else_ {
                 s.push_str(" else {\n");
                 for st in else_block {
-                    emit_stmt(s, ctx, st, depth + 1);
+                    emit_stmt(s, ctx, st, depth + 1)?;
                 }
                 indent(s, depth);
                 s.push('}');
@@ -167,50 +168,59 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             let _ = writeln!(
                 s,
                 "for (uint {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo),
-                emit_expr(hi)
+                emit_expr(lo)?,
+                emit_expr(hi)?
             );
             for st in body {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             indent(s, depth);
             s.push_str("}\n");
         }
         IrStmt::Eval(expr) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(expr));
+            let _ = writeln!(s, "{};", emit_expr(expr)?);
         }
     }
+    Ok(())
 }
 
-fn emit_expr(expr: &IrExpr) -> String {
-    match expr {
+fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
+    Ok(match expr {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => msl_float(*v),
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
-        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)),
-        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(index)),
+        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)?),
+        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(index)?),
         IrExpr::GlobalId(c) => format!("gid.{}", component(*c)),
         IrExpr::LocalId(c) => format!("lid.{}", component(*c)),
         IrExpr::GroupId(c) => format!("group.{}", component(*c)),
         IrExpr::Builtin { func, args } => {
-            let a: Vec<String> = args.iter().map(emit_expr).collect();
+            let mut a = Vec::with_capacity(args.len());
+            for arg in args {
+                a.push(emit_expr(arg)?);
+            }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }
-        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)),
+        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)?),
         IrExpr::Binary { op, lhs, rhs } => {
-            format!("({} {} {})", emit_expr(lhs), binop(*op), emit_expr(rhs))
+            format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
         }
         IrExpr::Input(_)
         | IrExpr::FieldAccess { .. }
         | IrExpr::VecConstruct { .. }
         | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => "/* unsupported */".to_string(),
-    }
+        | IrExpr::Dot { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL compute backend: graphics-only IR node in a compute module",
+            ));
+        }
+    })
 }
 
 fn component(c: u32) -> &'static str {
@@ -221,8 +231,8 @@ fn component(c: u32) -> &'static str {
     }
 }
 
-fn binop(op: IrBinOp) -> &'static str {
-    match op {
+fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
+    Ok(match op {
         IrBinOp::Add => "+",
         IrBinOp::Sub => "-",
         IrBinOp::Mul => "*",
@@ -236,9 +246,13 @@ fn binop(op: IrBinOp) -> &'static str {
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            "/* UNSUPPORTED_BITWISE_OP_ON_MSL_BACKEND */"
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                "MSL backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
+                 this ZSL source is SPIR-V-only today",
+            ));
         }
-    }
+    })
 }
 
 fn msl_scalar(t: ScalarTy) -> &'static str {
@@ -250,12 +264,15 @@ fn msl_scalar(t: ScalarTy) -> &'static str {
     }
 }
 
-fn msl_buffer_elem(elem: BufElem) -> &'static str {
+fn msl_buffer_elem(elem: BufElem) -> Result<&'static str, Diagnostic> {
     match elem {
-        BufElem::F32 => "float",
-        BufElem::U32 => "uint",
-        BufElem::I32 => "int",
-        _ => unreachable!("unsupported compute buffer element"),
+        BufElem::F32 => Ok("float"),
+        BufElem::U32 => Ok("uint"),
+        BufElem::I32 => Ok("int"),
+        other => Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!("MSL backend: unsupported compute buffer element {other:?}"),
+        )),
     }
 }
 
@@ -272,7 +289,7 @@ mod tests {
     use crate::frontend::parser::parse_compute;
 
     fn msl(src: &str) -> MslShader {
-        lower_compute(&parse_compute(src).expect("parse"))
+        lower_compute(&parse_compute(src).expect("parse")).expect("lower")
     }
 
     /// Returns `false` when `xcrun metal` is unavailable.

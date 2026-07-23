@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
+use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
 use crate::ir::{GfxTy, GraphicsModule};
 
@@ -16,7 +17,7 @@ use crate::ir::{GfxTy, GraphicsModule};
 /// Metal HAL binds to this same index.
 pub const PUSH_BUFFER_INDEX: u32 = 16;
 
-pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
+pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let locals: HashMap<&str, GfxTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
     let ctx = Ctx { locals };
@@ -67,9 +68,9 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
-            emit_stmt(&mut s, &ctx, st, 1);
+            emit_stmt(&mut s, &ctx, st, 1)?;
         }
-        let _ = writeln!(s, "    return {};", emit_expr(&e.ret[0]));
+        let _ = writeln!(s, "    return {};", emit_expr(&e.ret[0])?);
         s.push_str("}\n");
     } else {
         s.push_str("struct VsOut {\n");
@@ -90,23 +91,23 @@ pub fn lower_graphics(module: &GraphicsModule) -> MslShader {
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
-            emit_stmt(&mut s, &ctx, st, 1);
+            emit_stmt(&mut s, &ctx, st, 1)?;
         }
         s.push_str("    VsOut out;\n");
-        let _ = writeln!(s, "    out.position = {};", emit_expr(&e.ret[0]));
+        let _ = writeln!(s, "    out.position = {};", emit_expr(&e.ret[0])?);
         for i in 0..e.varyings.len() {
-            let _ = writeln!(s, "    out.vary{i} = {};", emit_expr(&e.ret[i + 1]));
+            let _ = writeln!(s, "    out.vary{i} = {};", emit_expr(&e.ret[i + 1])?);
         }
         s.push_str("    return out;\n}\n");
     }
 
-    MslShader {
+    Ok(MslShader {
         source: s,
         entry: ENTRY,
         buffer_count: e.buf_params.len() as u32,
         has_push,
         local_size: [1, 1, 1],
-    }
+    })
 }
 
 struct Ctx<'a> {
@@ -119,33 +120,33 @@ fn indent(s: &mut String, depth: usize) {
     }
 }
 
-fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
+fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
             let ty = ctx.locals.get(name.as_str()).copied().unwrap_or(GfxTy::F32);
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", msl_ty(ty), name, emit_expr(init));
+            let _ = writeln!(s, "{} {} = {};", msl_ty(ty), name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value));
+            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
+            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond));
+            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
             for st in then {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             indent(s, depth);
             s.push('}');
             if let Some(else_block) = else_ {
                 s.push_str(" else {\n");
                 for st in else_block {
-                    emit_stmt(s, ctx, st, depth + 1);
+                    emit_stmt(s, ctx, st, depth + 1)?;
                 }
                 indent(s, depth);
                 s.push('}');
@@ -157,62 +158,75 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             let _ = writeln!(
                 s,
                 "for (uint {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo),
-                emit_expr(hi)
+                emit_expr(lo)?,
+                emit_expr(hi)?
             );
             for st in body {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             indent(s, depth);
             s.push_str("}\n");
         }
         IrStmt::AssignShared { .. } | IrStmt::Barrier => {
-            panic!("workgroup operations are unavailable in graphics shaders")
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL graphics backend: workgroup operations are unavailable in graphics shaders",
+            ));
         }
         IrStmt::AtomicAdd { .. } => {
-            panic!("atomic_add is unavailable in graphics shaders")
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL graphics backend: atomic_add is unavailable in graphics shaders",
+            ));
         }
         IrStmt::Eval(expr) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(expr));
+            let _ = writeln!(s, "{};", emit_expr(expr)?);
         }
     }
+    Ok(())
 }
 
-fn emit_expr(expr: &IrExpr) -> String {
-    match expr {
+fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
+    Ok(match expr {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => format!("{v:?}"),
         IrExpr::Local(n) => n.clone(),
         IrExpr::Input(n) => format!("in.{n}"),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
-        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)),
+        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)?),
         IrExpr::FieldAccess { base, component } => {
-            format!("({}).{}", emit_expr(base), component_char(*component))
+            format!("({}).{}", emit_expr(base)?, component_char(*component))
         }
         IrExpr::VecConstruct { dim, args } => {
-            let a: Vec<String> = args.iter().map(emit_expr).collect();
+            let mut a = Vec::with_capacity(args.len());
+            for arg in args {
+                a.push(emit_expr(arg)?);
+            }
             format!("float{dim}({})", a.join(", "))
         }
         IrExpr::Extend { base, scalar } => {
-            format!("float4({}, {})", emit_expr(base), emit_expr(scalar))
+            format!("float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
         }
-        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a), emit_expr(b)),
+        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a)?, emit_expr(b)?),
         IrExpr::Builtin { func, args } => {
-            let a: Vec<String> = args.iter().map(emit_expr).collect();
+            let mut a = Vec::with_capacity(args.len());
+            for arg in args {
+                a.push(emit_expr(arg)?);
+            }
             format!("{}({})", func.name(), a.join(", "))
         }
-        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)),
+        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)?),
         IrExpr::Binary { op, lhs, rhs } => {
-            format!("({} {} {})", emit_expr(lhs), binop(*op), emit_expr(rhs))
+            format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
         }
-        IrExpr::GlobalId(_)
-        | IrExpr::LocalId(_)
-        | IrExpr::GroupId(_)
-        | IrExpr::SharedLoad { .. } => {
-            "/* compute expression unavailable in graphics */".to_string()
+        IrExpr::GlobalId(_) | IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::SharedLoad { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL graphics backend: compute-only expression in a graphics module",
+            ));
         }
-    }
+    })
 }
 
 fn component_char(c: u32) -> char {
@@ -224,8 +238,8 @@ fn component_char(c: u32) -> char {
     }
 }
 
-fn binop(op: IrBinOp) -> &'static str {
-    match op {
+fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
+    Ok(match op {
         IrBinOp::Add => "+",
         IrBinOp::Sub => "-",
         IrBinOp::Mul => "*",
@@ -239,9 +253,13 @@ fn binop(op: IrBinOp) -> &'static str {
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            "/* UNSUPPORTED_BITWISE_OP_ON_MSL_BACKEND */"
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                "MSL backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
+                 this ZSL source is SPIR-V-only today",
+            ));
         }
-    }
+    })
 }
 
 fn msl_ty(t: GfxTy) -> &'static str {
@@ -262,7 +280,7 @@ mod tests {
 
     fn graphics(src: &str) -> MslShader {
         match parse_zsl(src).expect("parse") {
-            Shader::Graphics(m) => lower_graphics(&m),
+            Shader::Graphics(m) => lower_graphics(&m).expect("lower"),
             Shader::Compute(_) => panic!("expected graphics"),
         }
     }
