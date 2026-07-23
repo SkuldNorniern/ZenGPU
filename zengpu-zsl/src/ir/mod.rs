@@ -2,6 +2,7 @@
 //! graphics entries.
 
 pub mod node;
+pub mod validate;
 
 use node::{IrExpr, IrStmt};
 
