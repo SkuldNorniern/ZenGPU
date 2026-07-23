@@ -8,6 +8,7 @@
 //! varyings, vertex input/output structs) extends `EntryKind`/`Param` next.
 
 pub mod node;
+pub mod validate;
 
 use node::{IrExpr, IrStmt};
 
