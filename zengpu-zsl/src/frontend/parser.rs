@@ -109,7 +109,7 @@ struct Ctx {
     id_param: Option<String>,           // the `id: global_id` param name
     locals: HashMap<String, ScalarTy>,  // name → type (accumulated)
     locals_order: Vec<(String, ScalarTy)>,
-    shared: HashMap<String, SharedDecl>,
+    shared: HashMap<String, PendingShared>,
     shared_order: Vec<String>,
 }
 
@@ -117,6 +117,16 @@ struct Ctx {
 struct BufferSymbol {
     writable: bool,
     elem: BufElem,
+}
+
+/// A workgroup-shared array as accumulated during parsing, before its `elem`
+/// is interned into the module's `TypeArena`. Distinct from the public
+/// `ir::SharedDecl` (whose `elem` is a `TypeId`) so parsing itself needs no
+/// arena access — only the final construction in `parse_kernel_rest` does.
+struct PendingShared {
+    name: String,
+    elem: ScalarTy,
+    len: u32,
 }
 
 /// Resolved symbol tables for a graphics (vertex/fragment) body.
@@ -264,12 +274,14 @@ impl<'a> Parser<'a> {
         let params = self.parse_params(&mut ctx)?;
         let body = self.parse_block(&mut ctx)?;
 
+        let mut types = crate::ir::arena::TypeArena::new();
+
         let shared = ctx
             .shared_order
             .iter()
             .map(|name| SharedDecl {
                 name: name.clone(),
-                elem: ctx.shared[name].elem,
+                elem: types.intern_scalar(ctx.shared[name].elem),
                 len: ctx.shared[name].len,
             })
             .collect();
@@ -278,14 +290,21 @@ impl<'a> Parser<'a> {
             return self.err("unexpected trailing tokens after kernel");
         }
 
+        let locals = ctx
+            .locals_order
+            .into_iter()
+            .map(|(name, ty)| (name, types.intern_scalar(ty)))
+            .collect();
+
         Ok(Module {
             entry: Entry {
                 kind: EntryKind::Compute { local_size },
                 params,
                 shared,
-                locals: ctx.locals_order,
+                locals,
                 body,
             },
+            types,
         })
     }
 
@@ -558,7 +577,7 @@ impl<'a> Parser<'a> {
         }
         ctx.shared_order.push(name.clone());
         ctx.shared
-            .insert(name.clone(), SharedDecl { name, elem, len });
+            .insert(name.clone(), PendingShared { name, elem, len });
         Ok(())
     }
 
@@ -1872,8 +1891,8 @@ mod tests {
         "#;
         let m = parse_compute(src).expect("parse");
         let types: std::collections::HashMap<_, _> = m.entry.locals.iter().cloned().collect();
-        assert_eq!(types["i"], ScalarTy::U32);
-        assert_eq!(types["v"], ScalarTy::F32);
+        assert_eq!(m.types.scalar_ty_of(types["i"]), ScalarTy::U32);
+        assert_eq!(m.types.scalar_ty_of(types["v"]), ScalarTy::F32);
     }
 
     #[test]

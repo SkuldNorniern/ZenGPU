@@ -13,7 +13,9 @@ pub mod typeck;
 pub mod types;
 pub mod validate;
 
+use arena::TypeArena;
 use node::{IrExpr, IrStmt};
+use types::TypeId;
 
 /// Element type of a `buffer<T>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +82,11 @@ pub struct Entry {
     pub params: Vec<Param>,
     /// Workgroup-shared arrays declared in the kernel body.
     pub shared: Vec<SharedDecl>,
-    /// Locals in declaration order (the SPIR-V backend hoists these).
-    pub locals: Vec<(String, ScalarTy)>,
+    /// Locals in declaration order (the SPIR-V backend hoists these). Each
+    /// [`TypeId`] is interned in the owning [`Module`]'s `types` arena;
+    /// backends convert back to `ScalarTy` via `TypeArena::scalar_ty_of` at
+    /// their own boundary (see e.g. `backend::hip::compute::lower_compute`).
+    pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
 }
 
@@ -89,7 +94,10 @@ pub struct Entry {
 #[derive(Debug)]
 pub struct SharedDecl {
     pub name: String,
-    pub elem: ScalarTy,
+    /// Interned in the owning [`Module`]'s `types` arena. No backend reads
+    /// this field's value today (every backend hardcodes `f32`/`float` shared
+    /// memory regardless); it exists for future non-f32 shared arrays.
+    pub elem: TypeId,
     pub len: u32,
 }
 
@@ -97,6 +105,8 @@ pub struct SharedDecl {
 #[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
+    /// Interns every [`TypeId`] referenced by `entry.locals`/`entry.shared`.
+    pub types: TypeArena,
 }
 
 // ── Graphics IR ────────────────────────────────────────────────────────────────

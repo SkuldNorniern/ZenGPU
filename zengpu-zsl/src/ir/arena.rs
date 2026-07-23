@@ -61,6 +61,33 @@ impl TypeArena {
         self.intern(t)
     }
 
+    /// The reverse of [`TypeArena::intern_scalar`]: recover the `ScalarTy` a
+    /// previously-interned `TypeId` came from. Used at backend boundaries
+    /// that still work in terms of `ScalarTy` (e.g. every compute backend's
+    /// `emit_stmt`/`emit_expr`), so `Entry.locals`/`SharedDecl.elem` can hold
+    /// `TypeId` without requiring every backend to be rewritten in the same
+    /// commit. Panics if `id` does not resolve to a scalar type produced by
+    /// `intern_scalar` — every `TypeId` reachable from `Entry.locals` today
+    /// is guaranteed to be one, since only `intern_scalar` is used to build
+    /// `Entry.locals`/`SharedDecl.elem` in `frontend::parser`.
+    pub fn scalar_ty_of(&self, id: TypeId) -> ScalarTy {
+        match self.get(id) {
+            Type::Bool => ScalarTy::Bool,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => ScalarTy::U32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Signed,
+            } => ScalarTy::I32,
+            Type::Float {
+                format: FloatFormat::F32,
+            } => ScalarTy::F32,
+            other => panic!("TypeArena::scalar_ty_of: {other:?} is not a compute scalar type"),
+        }
+    }
+
     /// Lossless conversion from today's graphics-only [`GfxTy`]. Vector/matrix
     /// variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
@@ -238,6 +265,15 @@ mod tests {
                 assert_eq!(*columns, 3);
             }
             other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_ty_of_round_trips_every_scalar_ty() {
+        let mut arena = TypeArena::new();
+        for ty in [ScalarTy::Bool, ScalarTy::U32, ScalarTy::I32, ScalarTy::F32] {
+            let id = arena.intern_scalar(ty);
+            assert_eq!(arena.scalar_ty_of(id), ty);
         }
     }
 }

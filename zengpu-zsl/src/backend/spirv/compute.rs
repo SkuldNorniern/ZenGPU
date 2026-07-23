@@ -195,7 +195,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let mut ptr_func_bool = Id(0);
 
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
-    for (name, sty) in &entry.locals {
+    for (name, ty_id) in &entry.locals {
+        let sty = module.types.scalar_ty_of(*ty_id);
         let (ptr_ty_slot, spv_elem) = match sty {
             ScalarTy::U32 => (&mut ptr_func_u32, t_u32),
             ScalarTy::I32 => (&mut ptr_func_i32, t_i32),
@@ -210,7 +211,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             name.clone(),
             LocalVar {
                 ptr,
-                ty: *sty,
+                ty: sty,
                 ptr_ty: *ptr_ty_slot,
             },
         );
