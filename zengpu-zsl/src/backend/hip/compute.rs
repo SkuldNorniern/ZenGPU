@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::backend::hip::{ENTRY, HipShader};
+use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{BufElem, EntryKind, Module, Mutability, ParamKind, ScalarTy};
 
-pub fn lower_compute(module: &Module) -> HipShader {
+pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
@@ -43,11 +44,11 @@ pub fn lower_compute(module: &Module) -> HipShader {
         };
         match mutability {
             Mutability::Read => {
-                let ty = hip_buffer_elem(*elem);
+                let ty = hip_buffer_elem(*elem)?;
                 let _ = writeln!(s, "    const {ty}* __restrict__ {name}{comma}");
             }
             Mutability::ReadWrite => {
-                let ty = hip_buffer_elem(*elem);
+                let ty = hip_buffer_elem(*elem)?;
                 let _ = writeln!(s, "    {ty}* __restrict__ {name}{comma}");
             }
         }
@@ -82,18 +83,18 @@ pub fn lower_compute(module: &Module) -> HipShader {
 
     let ctx = Ctx { locals };
     for st in &e.body {
-        emit_stmt(&mut s, &ctx, st, 1);
+        emit_stmt(&mut s, &ctx, st, 1)?;
     }
 
     s.push_str("}\n");
 
-    HipShader {
+    Ok(HipShader {
         source: s,
         entry: ENTRY,
         buffer_count: buffers.len() as u32,
         has_scalars: !scalars.is_empty(),
         local_size,
-    }
+    })
 }
 
 struct Ctx<'a> {
@@ -115,16 +116,19 @@ fn hip_scalar(ty: ScalarTy) -> &'static str {
     }
 }
 
-fn hip_buffer_elem(elem: BufElem) -> &'static str {
+fn hip_buffer_elem(elem: BufElem) -> Result<&'static str, Diagnostic> {
     match elem {
-        BufElem::F32 => "float",
-        BufElem::U32 => "unsigned int",
-        BufElem::I32 => "int",
-        _ => unreachable!("unsupported compute buffer element"),
+        BufElem::F32 => Ok("float"),
+        BufElem::U32 => Ok("unsigned int"),
+        BufElem::I32 => Ok("int"),
+        other => Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!("HIP backend: unsupported compute buffer element {other:?}"),
+        )),
     }
 }
 
-fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
+fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
             let ty = ctx
@@ -133,15 +137,15 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
                 .copied()
                 .unwrap_or(ScalarTy::U32);
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", hip_scalar(ty), name, emit_expr(init));
+            let _ = writeln!(s, "{} {} = {};", hip_scalar(ty), name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value));
+            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index), emit_expr(value));
+            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
@@ -149,13 +153,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
                 s,
                 "atomicAdd(&{}[(unsigned int)({})], {});",
                 buf,
-                emit_expr(index),
-                emit_expr(value)
+                emit_expr(index)?,
+                emit_expr(value)?
             );
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index), emit_expr(value));
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index)?, emit_expr(value)?);
         }
         IrStmt::Barrier => {
             indent(s, depth);
@@ -163,15 +167,15 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond));
+            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
             for st in then {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             if let Some(els) = else_ {
                 indent(s, depth);
                 s.push_str("} else {\n");
                 for st in els {
-                    emit_stmt(s, ctx, st, depth + 1);
+                    emit_stmt(s, ctx, st, depth + 1)?;
                 }
             }
             indent(s, depth);
@@ -182,24 +186,25 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) {
             let _ = writeln!(
                 s,
                 "for (unsigned int {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo),
-                emit_expr(hi),
+                emit_expr(lo)?,
+                emit_expr(hi)?,
             );
             for st in body {
-                emit_stmt(s, ctx, st, depth + 1);
+                emit_stmt(s, ctx, st, depth + 1)?;
             }
             indent(s, depth);
             s.push_str("}\n");
         }
         IrStmt::Eval(e) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(e));
+            let _ = writeln!(s, "{};", emit_expr(e)?);
         }
     }
+    Ok(())
 }
 
-fn emit_expr(e: &IrExpr) -> String {
-    match e {
+fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
+    Ok(match e {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => {
             if v.fract() == 0.0 {
@@ -210,8 +215,8 @@ fn emit_expr(e: &IrExpr) -> String {
         }
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => n.clone(),
-        IrExpr::BufferLoad { buf, index } => format!("{}[{}]", buf, emit_expr(index)),
-        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(index)),
+        IrExpr::BufferLoad { buf, index } => format!("{}[{}]", buf, emit_expr(index)?),
+        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(index)?),
         IrExpr::GlobalId(0) => "gx".into(),
         IrExpr::GlobalId(1) => "gy".into(),
         IrExpr::GlobalId(2) => "gz".into(),
@@ -224,18 +229,24 @@ fn emit_expr(e: &IrExpr) -> String {
                 .get(*component as usize)
                 .copied()
                 .unwrap_or("x");
-            format!("{}.{}", emit_expr(base), field)
+            format!("{}.{}", emit_expr(base)?, field)
         }
         IrExpr::VecConstruct { dim, args } => {
-            let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+            let mut args_s = Vec::with_capacity(args.len());
+            for a in args {
+                args_s.push(emit_expr(a)?);
+            }
             format!("float{}({})", dim, args_s.join(", "))
         }
         IrExpr::Extend { base, scalar } => {
-            format!("float4({}, {})", emit_expr(base), emit_expr(scalar))
+            format!("float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
         }
-        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a), emit_expr(b)),
+        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a)?, emit_expr(b)?),
         IrExpr::Builtin { func, args } => {
-            let args_s: Vec<String> = args.iter().map(emit_expr).collect();
+            let mut args_s = Vec::with_capacity(args.len());
+            for a in args {
+                args_s.push(emit_expr(a)?);
+            }
             match func {
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
@@ -267,7 +278,7 @@ fn emit_expr(e: &IrExpr) -> String {
                 BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
             }
         }
-        IrExpr::Neg(inner) => format!("(-{})", emit_expr(inner)),
+        IrExpr::Neg(inner) => format!("(-{})", emit_expr(inner)?),
         IrExpr::Binary { op, lhs, rhs } => {
             let op_s = match op {
                 IrBinOp::Add => "+",
@@ -283,16 +294,22 @@ fn emit_expr(e: &IrExpr) -> String {
                 IrBinOp::And => "&&",
                 IrBinOp::Or => "||",
                 // Not yet supported on this backend; see the SPIR-V-only note
-                // on `IrBinOp`. Emits a deliberately invalid marker so any
-                // attempt to actually compile this source fails loudly
-                // instead of silently producing wrong HIP code.
+                // on `IrBinOp`. Previously emitted a deliberately invalid
+                // marker comment so a downstream C++ compile would fail
+                // loudly; now fails ZSL compilation itself instead.
                 IrBinOp::BitAnd
                 | IrBinOp::BitOr
                 | IrBinOp::BitXor
                 | IrBinOp::Shl
-                | IrBinOp::Shr => "/* UNSUPPORTED_BITWISE_OP_ON_HIP_BACKEND */",
+                | IrBinOp::Shr => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Unsupported,
+                        "HIP backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
+                         this ZSL source is SPIR-V-only today",
+                    ));
+                }
             };
-            format!("({} {} {})", emit_expr(lhs), op_s, emit_expr(rhs))
+            format!("({} {} {})", emit_expr(lhs)?, op_s, emit_expr(rhs)?)
         }
-    }
+    })
 }
