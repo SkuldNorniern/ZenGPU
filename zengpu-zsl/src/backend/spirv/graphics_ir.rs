@@ -139,7 +139,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut input_vars: HashMap<String, InputVar> = HashMap::new();
     let mut interface: Vec<Id> = Vec::new();
     for input in &sorted_inputs {
-        let (ptr_ty, elem_ty) = match input.ty {
+        let input_ty = module.types.gfx_ty_of(input.ty);
+        let (ptr_ty, elem_ty) = match input_ty {
             GfxTy::F32 | GfxTy::U32 => (t_ptr_in_f32, t_f32),
             GfxTy::Vec2 => (t_ptr_in_vec2, t_vec2),
             GfxTy::Vec3 => (t_ptr_in_vec3, t_vec3),
@@ -153,7 +154,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             input.name.clone(),
             InputVar {
                 var,
-                ty: input.ty,
+                ty: input_ty,
                 elem_ty,
             },
         );
@@ -171,7 +172,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
     // Varying outputs (vertex only).
     let mut varying_out_vars: Vec<(Id, GfxTy)> = Vec::new();
-    for (loc, vty) in e.varyings.iter().enumerate() {
+    for (loc, vty_id) in e.varyings.iter().enumerate() {
+        let vty = module.types.gfx_ty_of(*vty_id);
         let spv_elem = match vty {
             GfxTy::F32 => t_f32,
             GfxTy::U32 => t_u32,
@@ -184,7 +186,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         let var = spv.global_variable(t_ptr, sc::OUTPUT);
         spv.decorate(var, deco::LOCATION, &[loc as u32]);
         interface.push(var);
-        varying_out_vars.push((var, *vty));
+        varying_out_vars.push((var, vty));
     }
 
     // Bindless SSBO array.
@@ -208,7 +210,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     // Push-constant block: buf indices (u32) first, then scalars (u32/f32/mat4).
     let pc_var = if !e.buf_params.is_empty() || !e.scalar_params.is_empty() {
         let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
-        pc_members.extend(e.scalar_params.iter().map(|s| match s.ty {
+        pc_members.extend(e.scalar_params.iter().map(|s| match module.types.gfx_ty_of(s.ty) {
             GfxTy::U32 => t_u32,
             GfxTy::Mat4 => t_mat4,
             _ => t_f32,
@@ -222,7 +224,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         }
         for (i, s) in e.scalar_params.iter().enumerate() {
             let member = n_buf_params + i as u32;
-            match s.ty {
+            match module.types.gfx_ty_of(s.ty) {
                 GfxTy::Mat4 => {
                     offset = (offset + 15) & !15;
                     spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
@@ -259,7 +261,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let (ty, gty) = match s.ty {
+            let (ty, gty) = match module.types.gfx_ty_of(s.ty) {
                 GfxTy::U32 => (t_u32, GfxTy::U32),
                 GfxTy::Mat4 => (t_mat4, GfxTy::Mat4),
                 _ => (t_f32, GfxTy::F32),
@@ -291,7 +293,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
         }
         for s in &e.scalar_params {
-            match s.ty {
+            match module.types.gfx_ty_of(s.ty) {
                 GfxTy::U32 if t_ptr_pc_u32 == Id(0) => {
                     t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
                 }

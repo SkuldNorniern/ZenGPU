@@ -33,7 +33,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     if has_push {
         s.push_str("struct Push {\n");
         for sp in &e.scalar_params {
-            let _ = writeln!(s, "    {} {};", msl_ty(sp.ty), sp.name);
+            let _ = writeln!(s, "    {} {};", msl_ty(module.types.gfx_ty_of(sp.ty)), sp.name);
         }
         s.push_str("};\n\n");
     }
@@ -51,7 +51,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             let _ = writeln!(
                 s,
                 "    {} {} [[{}{})]];",
-                msl_ty(inp.ty),
+                msl_ty(module.types.gfx_ty_of(inp.ty)),
                 inp.name,
                 in_qualifier,
                 inp.location,
@@ -87,7 +87,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         s.push_str("struct VsOut {\n");
         s.push_str("    float4 position [[position]];\n");
         for (i, vty) in e.varyings.iter().enumerate() {
-            let _ = writeln!(s, "    {} vary{i} [[user(locn{i})]];", msl_ty(*vty));
+            let _ = writeln!(s, "    {} vary{i} [[user(locn{i})]];", msl_ty(module.types.gfx_ty_of(*vty)));
         }
         s.push_str("};\n\n");
 

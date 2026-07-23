@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use crate::frontend::lex::{Tok, Token, lex};
 use crate::ir::BufElem;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::types::TypeId;
 use crate::ir::{
     Entry, EntryKind, GfxInput, GfxScalar, GfxTy, GraphicsEntry, GraphicsModule, Module,
     Mutability, Param, ParamKind, ScalarTy, SharedDecl,
@@ -145,6 +146,22 @@ enum PendingParamKind {
         mutability: Mutability,
     },
     Scalar(ScalarTy),
+}
+
+/// A `@location` input as accumulated during parsing, before its type is
+/// interned into the module's `TypeArena`. Distinct from the public
+/// `ir::GfxInput` (whose `ty` is a `TypeId`).
+struct PendingGfxInput {
+    name: String,
+    location: u32,
+    ty: GfxTy,
+}
+
+/// A push-constant scalar/matrix param as accumulated during parsing, before
+/// its type is interned. Distinct from the public `ir::GfxScalar`.
+struct PendingGfxScalar {
+    name: String,
+    ty: GfxTy,
 }
 
 /// Resolved symbol tables for a graphics (vertex/fragment) body.
@@ -1099,6 +1116,29 @@ impl<'a> Parser<'a> {
         if self.pos != self.toks.len() {
             return self.err("unexpected trailing tokens after entry point");
         }
+
+        let mut types = crate::ir::arena::TypeArena::new();
+
+        let inputs: Vec<GfxInput> = inputs
+            .into_iter()
+            .map(|i| GfxInput {
+                name: i.name,
+                location: i.location,
+                ty: types.intern_gfx_ty(i.ty),
+            })
+            .collect();
+        let scalar_params: Vec<GfxScalar> = scalar_params
+            .into_iter()
+            .map(|s| GfxScalar {
+                name: s.name,
+                ty: types.intern_gfx_ty(s.ty),
+            })
+            .collect();
+        let varyings: Vec<TypeId> = varyings
+            .into_iter()
+            .map(|t| types.intern_gfx_ty(t))
+            .collect();
+
         Ok(GraphicsModule {
             entry: GraphicsEntry {
                 is_fragment,
@@ -1110,6 +1150,7 @@ impl<'a> Parser<'a> {
                 body,
                 ret,
             },
+            types,
         })
     }
 
@@ -1117,7 +1158,7 @@ impl<'a> Parser<'a> {
     fn parse_gfx_params(
         &mut self,
         ctx: &mut GfxCtx,
-    ) -> Result<(Vec<GfxInput>, Vec<GfxScalar>, Vec<String>), ParseError> {
+    ) -> Result<(Vec<PendingGfxInput>, Vec<PendingGfxScalar>, Vec<String>), ParseError> {
         self.expect(&Tok::LParen, "`(` after entry name")?;
         let mut inputs = Vec::new();
         let mut scalar_params = Vec::new();
@@ -1149,7 +1190,7 @@ impl<'a> Parser<'a> {
                     return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
                 }
                 ctx.inputs.insert(name.clone(), ty);
-                inputs.push(GfxInput {
+                inputs.push(PendingGfxInput {
                     name,
                     location: loc,
                     ty,
@@ -1188,7 +1229,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     ctx.scalars.insert(field.clone(), gty);
-                    scalar_params.push(GfxScalar {
+                    scalar_params.push(PendingGfxScalar {
                         name: field,
                         ty: gty,
                     });

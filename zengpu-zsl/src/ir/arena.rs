@@ -124,6 +124,32 @@ impl TypeArena {
         }
     }
 
+    /// The reverse of [`TypeArena::intern_gfx_ty`]: recover the `GfxTy` a
+    /// previously-interned `TypeId` came from. Used at backend boundaries
+    /// that still work in terms of `GfxTy` (every graphics backend's
+    /// input/push-constant/varying handling), so `GfxInput.ty`/`GfxScalar.
+    /// ty`/`GraphicsEntry.varyings` can hold `TypeId` without requiring every
+    /// backend to be rewritten in the same commit. Panics if `id` does not
+    /// resolve to a type `intern_gfx_ty` produces.
+    pub fn gfx_ty_of(&self, id: TypeId) -> GfxTy {
+        match self.get(id) {
+            Type::Float {
+                format: FloatFormat::F32,
+            } => GfxTy::F32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => GfxTy::U32,
+            Type::Vector { lanes, .. } => match lanes {
+                2 => GfxTy::Vec2,
+                3 => GfxTy::Vec3,
+                _ => GfxTy::Vec4,
+            },
+            Type::Matrix { .. } => GfxTy::Mat4,
+            other => panic!("TypeArena::gfx_ty_of: {other:?} is not a graphics value type"),
+        }
+    }
+
     /// Lossless conversion from today's graphics-only [`GfxTy`]. Vector/matrix
     /// variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
@@ -329,6 +355,22 @@ mod tests {
         ] {
             let id = arena.intern_buf_elem(elem);
             assert_eq!(arena.buf_elem_of(id), elem);
+        }
+    }
+
+    #[test]
+    fn gfx_ty_of_round_trips_every_gfx_ty() {
+        let mut arena = TypeArena::new();
+        for ty in [
+            GfxTy::F32,
+            GfxTy::U32,
+            GfxTy::Vec2,
+            GfxTy::Vec3,
+            GfxTy::Vec4,
+            GfxTy::Mat4,
+        ] {
+            let id = arena.intern_gfx_ty(ty);
+            assert_eq!(arena.gfx_ty_of(id), ty);
         }
     }
 }

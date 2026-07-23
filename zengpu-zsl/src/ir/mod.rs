@@ -136,14 +136,18 @@ pub enum GfxTy {
 pub struct GfxInput {
     pub name: String,
     pub location: u32,
-    pub ty: GfxTy,
+    /// Interned in the owning [`GraphicsModule`]'s `types` arena; backends
+    /// convert back via `TypeArena::gfx_ty_of`.
+    pub ty: TypeId,
 }
 
 /// A push-constant scalar/matrix param (`f32`/`u32`/`mat4x4`).
 #[derive(Debug)]
 pub struct GfxScalar {
     pub name: String,
-    pub ty: GfxTy,
+    /// Interned in the owning [`GraphicsModule`]'s `types` arena; backends
+    /// convert back via `TypeArena::gfx_ty_of`.
+    pub ty: TypeId,
 }
 
 /// A parsed, resolved vertex or fragment entry point.
@@ -157,8 +161,9 @@ pub struct GraphicsEntry {
     /// `buffer<f32>`/`mut buffer<f32>` param names, in declaration order
     /// (writability already enforced in the parser).
     pub buf_params: Vec<String>,
-    /// Vertex varying output types (empty for fragment / position-only vertex).
-    pub varyings: Vec<GfxTy>,
+    /// Vertex varying output types (empty for fragment / position-only
+    /// vertex). Interned in the owning [`GraphicsModule`]'s `types` arena.
+    pub varyings: Vec<TypeId>,
     /// Locals in declaration order, with inferred types.
     pub locals: Vec<(String, GfxTy)>,
     /// Leading statements (everything before the tail expression).
@@ -172,4 +177,7 @@ pub struct GraphicsEntry {
 #[derive(Debug)]
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
+    /// Interns every [`TypeId`] referenced by `entry.inputs`/`entry.
+    /// scalar_params`/`entry.varyings`.
+    pub types: TypeArena,
 }
