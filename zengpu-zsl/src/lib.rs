@@ -144,7 +144,9 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
 
     #[cfg(feature = "hip")]
     let hip_src = match &shader {
-        Shader::Compute(m) => backend::hip::lower_compute(m).source,
+        Shader::Compute(m) => backend::hip::lower_compute(m)
+            .map(|shader| shader.source)
+            .unwrap_or_default(),
         Shader::Graphics(_) => String::new(),
     };
     #[cfg(not(feature = "hip"))]
@@ -309,7 +311,7 @@ mod phase_z_tests {
     #[test]
     fn finite_number_builtins_lower_on_all_compute_backends() {
         let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
-        let hip_source = hip::lower_compute(&module).source;
+        let hip_source = hip::lower_compute(&module).expect("lower finite classification to HIP").source;
         let cuda_source = cuda::lower_compute(&module).source;
         let msl_source = msl::lower_compute(&module).source;
         for source in [&hip_source, &cuda_source, &msl_source] {
@@ -323,7 +325,7 @@ mod phase_z_tests {
     #[test]
     fn integer_storage_buffers_lower_on_all_compute_backends() {
         let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
-        let hip_source = hip::lower_compute(&module).source;
+        let hip_source = hip::lower_compute(&module).expect("lower typed buffers to HIP").source;
         let cuda_source = cuda::lower_compute(&module).source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("const unsigned int* __restrict__ src_u"));
@@ -344,7 +346,7 @@ mod phase_z_tests {
     #[test]
     fn trigonometry_lowers_on_all_compute_backends() {
         let module = parse_compute(TRIG).expect("parse trigonometry");
-        let hip_source = hip::lower_compute(&module).source;
+        let hip_source = hip::lower_compute(&module).expect("lower trigonometry to HIP").source;
         let cuda_source = cuda::lower_compute(&module).source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("sinf(x)"));
@@ -408,6 +410,7 @@ mod phase_z_tests {
         let module = parse_compute(source).expect("parse u32 cast");
         assert!(
             hip::lower_compute(&module)
+                .expect("lower u32 cast to HIP")
                 .source
                 .contains("(unsigned int)")
         );
@@ -423,7 +426,7 @@ mod phase_z_tests {
     #[test]
     fn scatter_add_lowers_on_all_backends_and_has_spirv_atomic_extension() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
-        let hip_source = hip::lower_compute(&module).source;
+        let hip_source = hip::lower_compute(&module).expect("lower scatter_add to HIP").source;
         let cuda_source = cuda::lower_compute(&module).source;
         let msl_source = msl::lower_compute(&module).source;
         assert!(hip_source.contains("atomicAdd(&out["));
@@ -475,7 +478,7 @@ mod phase_z_tests {
     #[test]
     fn scatter_add_hip_exact_match_when_gpu_present() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
-        let shader = hip::lower_compute(&module);
+        let shader = hip::lower_compute(&module).expect("lower scatter_add to HIP");
         assert!(shader.source.contains("atomicAdd(&out["));
 
         let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
@@ -603,7 +606,7 @@ int main() {{
     #[test]
     fn tiled_gemm_hip_compiles_and_matches_reference_when_gpu_present() {
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
-        let shader = hip::lower_compute(&module);
+        let shader = hip::lower_compute(&module).expect("lower tiled GEMM to HIP");
         assert!(shader.source.contains("__shared__ float as_tile[256]"));
         assert!(shader.source.contains("__syncthreads()"));
 
