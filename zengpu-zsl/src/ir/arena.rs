@@ -103,6 +103,27 @@ impl TypeArena {
         }
     }
 
+    /// Inverse of `intern_gfx_ty`; panics on other ids. Graphics backends still take `GfxTy` for
+    /// inputs, push constants and varyings.
+    pub fn gfx_ty_of(&self, id: TypeId) -> GfxTy {
+        match self.get(id) {
+            Type::Float {
+                format: FloatFormat::F32,
+            } => GfxTy::F32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => GfxTy::U32,
+            Type::Vector { lanes, .. } => match lanes {
+                2 => GfxTy::Vec2,
+                3 => GfxTy::Vec3,
+                _ => GfxTy::Vec4,
+            },
+            Type::Matrix { .. } => GfxTy::Mat4,
+            other => panic!("TypeArena::gfx_ty_of: {other:?} is not a graphics value type"),
+        }
+    }
+
     /// Lossless from [`GfxTy`]. Vector/matrix variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
         match ty {
@@ -304,6 +325,22 @@ mod tests {
         ] {
             let id = arena.intern_buf_elem(elem);
             assert_eq!(arena.buf_elem_of(id), elem);
+        }
+    }
+
+    #[test]
+    fn gfx_ty_of_round_trips_every_gfx_ty() {
+        let mut arena = TypeArena::new();
+        for ty in [
+            GfxTy::F32,
+            GfxTy::U32,
+            GfxTy::Vec2,
+            GfxTy::Vec3,
+            GfxTy::Vec4,
+            GfxTy::Mat4,
+        ] {
+            let id = arena.intern_gfx_ty(ty);
+            assert_eq!(arena.gfx_ty_of(id), ty);
         }
     }
 }

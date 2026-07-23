@@ -106,13 +106,15 @@ pub enum GfxTy {
 pub struct GfxInput {
     pub name: String,
     pub location: u32,
-    pub ty: GfxTy,
+    /// `TypeId` in the `types` arena. Backends convert back with `gfx_ty_of`.
+    pub ty: TypeId,
 }
 
 #[derive(Debug)]
 pub struct GfxScalar {
     pub name: String,
-    pub ty: GfxTy,
+    /// `TypeId` in the `types` arena. Backends convert back with `gfx_ty_of`.
+    pub ty: TypeId,
 }
 
 #[derive(Debug)]
@@ -123,8 +125,8 @@ pub struct GraphicsEntry {
     pub scalar_params: Vec<GfxScalar>,
     /// Names of the `buffer<f32>` params. The parser checks writability.
     pub buf_params: Vec<String>,
-    /// Vertex varying output types. Empty for fragment and position-only vertex stages.
-    pub varyings: Vec<GfxTy>,
+    /// Vertex varying outputs. Empty for fragment shaders and for position-only vertex shaders.
+    pub varyings: Vec<TypeId>,
     pub locals: Vec<(String, GfxTy)>,
     pub body: Vec<IrStmt>,
     /// Vertex: `[position, varyings…]`. Fragment: `[color]`.
@@ -134,4 +136,6 @@ pub struct GraphicsEntry {
 #[derive(Debug)]
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
+    /// Interns every `TypeId` used by `inputs`, `scalar_params` and `varyings`.
+    pub types: TypeArena,
 }
