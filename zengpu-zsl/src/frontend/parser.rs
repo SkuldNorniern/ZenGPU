@@ -2047,7 +2047,7 @@ mod tests {
         "#;
         let module = parse_compute(src).expect("parse");
         let err = crate::backend::spirv::lower_compute(&module).unwrap_err();
-        assert!(err.contains("u32 operands"), "got: {err}");
+        assert!(err.message.contains("u32 operands"), "got: {err}");
     }
 
     #[test]

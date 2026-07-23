@@ -29,6 +29,7 @@ mod glsl_op {
 use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
+use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{GfxTy, GraphicsModule};
 
@@ -95,7 +96,11 @@ impl Ctx<'_> {
     }
 }
 
-pub fn lower_graphics(module: &GraphicsModule) -> R<Vec<u32>> {
+pub fn lower_graphics(module: &GraphicsModule) -> Result<Vec<u32>, Diagnostic> {
+    lower_graphics_inner(module).map_err(Diagnostic::from)
+}
+
+fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let e = &module.entry;
     let is_fragment = e.is_fragment;
 

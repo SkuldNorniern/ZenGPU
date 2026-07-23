@@ -27,10 +27,15 @@ mod glsl_op {
 use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
+use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
 
-pub fn lower_compute(module: &Module) -> Result<Vec<u32>, String> {
+pub fn lower_compute(module: &Module) -> Result<Vec<u32>, Diagnostic> {
+    lower_compute_inner(module).map_err(Diagnostic::from)
+}
+
+fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let entry = &module.entry;
     let EntryKind::Compute { local_size } = entry.kind;
 
