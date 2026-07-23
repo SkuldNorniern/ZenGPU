@@ -157,18 +157,30 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
         Shader::Compute(m) => backend::spirv::lower_compute(m)?,
         Shader::Graphics(m) => backend::spirv::lower_graphics(m)?,
     };
+
+    #[cfg(feature = "hip")]
     let hip_src = match &shader {
         Shader::Compute(m) => backend::hip::lower_compute(m).source,
         Shader::Graphics(_) => String::new(),
     };
+    #[cfg(not(feature = "hip"))]
+    let hip_src = String::new();
+
+    #[cfg(feature = "metal")]
     let msl_src = match &shader {
         Shader::Compute(m) => backend::msl::lower_compute(m).source,
         Shader::Graphics(m) => backend::msl::lower_graphics(m).source,
     };
+    #[cfg(not(feature = "metal"))]
+    let msl_src = String::new();
+
+    #[cfg(feature = "cuda")]
     let cuda_src = match &shader {
         Shader::Compute(m) => backend::cuda::lower_compute(m).source,
         Shader::Graphics(_) => String::new(),
     };
+    #[cfg(not(feature = "cuda"))]
+    let cuda_src = String::new();
 
     let mut s = String::new();
     s.push_str("::zengpu_spirv::ZslShader { spv: ");
@@ -224,6 +236,7 @@ fn compile_error_tokens(msg: &str) -> TokenStream {
 
 #[cfg(test)]
 mod phase_z_tests {
+    #![cfg(feature = "test-all-backends")]
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 

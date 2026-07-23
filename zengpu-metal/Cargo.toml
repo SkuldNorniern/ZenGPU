@@ -24,4 +24,4 @@ metal = "0.29"
 
 # Native ZSL→MSL shaders for the compute tests.
 [dev-dependencies]
-zengpu-spirv.workspace = true
+zengpu-spirv = { workspace = true, features = ["metal"] }
