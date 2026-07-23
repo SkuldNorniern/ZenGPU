@@ -2,6 +2,12 @@
 //!
 //! Do not use this crate directly — import `zengpu_spirv` or `zengpu` and use
 //! the `zengpu_spirv!` macro.
+//!
+//! Native ZSL source syntax accepted today (e.g. `push P { ... }`, `device mut
+//! buffer<T>`, `shared name: array<T, N>`, `barrier()`) is accepted for this
+//! crate's present versioned release. A future release will emit deprecation
+//! diagnostics for the legacy forms, then remove them together in favor of
+//! the syntax changes tracked in the ZSL language design plan.
 
 extern crate proc_macro;
 

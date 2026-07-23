@@ -23,6 +23,13 @@
 //! backends (including a future DirectX target) instead of a fixed 4-field
 //! struct, and reports a missing backend as a typed [`BackendUnavailable`]
 //! error instead of silently substituting SPIR-V.
+//!
+//! `ZslShader`, [`ZslShader::for_backend`], and the current native ZSL source
+//! syntax are accepted for this crate's present versioned release. A future
+//! release will emit deprecation diagnostics for both, then remove them
+//! together in favor of [`CompiledModule`] and the syntax changes tracked in
+//! the ZSL language design plan. New code should prefer `CompiledModule` over
+//! `ZslShader` where practical.
 
 use std::slice;
 
