@@ -54,6 +54,26 @@ impl TypeArena {
         self.intern(t)
     }
 
+    /// Inverse of `intern_scalar`; panics on other ids. Backends still take `ScalarTy`, so
+    /// `Entry.locals` and `SharedDecl.elem` hold `TypeId` until they change.
+    pub fn scalar_ty_of(&self, id: TypeId) -> ScalarTy {
+        match self.get(id) {
+            Type::Bool => ScalarTy::Bool,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned,
+            } => ScalarTy::U32,
+            Type::Int {
+                width: IntWidth::W32,
+                signedness: Signedness::Signed,
+            } => ScalarTy::I32,
+            Type::Float {
+                format: FloatFormat::F32,
+            } => ScalarTy::F32,
+            other => panic!("TypeArena::scalar_ty_of: {other:?} is not a compute scalar type"),
+        }
+    }
+
     /// Lossless from [`GfxTy`]. Vector/matrix variants intern their `f32`/`u32` element first.
     pub fn intern_gfx_ty(&mut self, ty: GfxTy) -> TypeId {
         match ty {
@@ -227,6 +247,15 @@ mod tests {
                 assert_eq!(*columns, 3);
             }
             other => panic!("expected Matrix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scalar_ty_of_round_trips_every_scalar_ty() {
+        let mut arena = TypeArena::new();
+        for ty in [ScalarTy::Bool, ScalarTy::U32, ScalarTy::I32, ScalarTy::F32] {
+            let id = arena.intern_scalar(ty);
+            assert_eq!(arena.scalar_ty_of(id), ty);
         }
     }
 }

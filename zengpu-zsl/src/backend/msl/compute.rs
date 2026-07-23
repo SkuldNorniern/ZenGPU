@@ -11,7 +11,11 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
-    let locals: HashMap<&str, ScalarTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    let locals: HashMap<&str, ScalarTy> = e
+        .locals
+        .iter()
+        .map(|(n, t)| (n.as_str(), module.types.scalar_ty_of(*t)))
+        .collect();
     let buffers: Vec<(&str, BufElem)> = e
         .params
         .iter()

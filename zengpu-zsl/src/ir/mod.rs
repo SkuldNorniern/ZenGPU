@@ -7,7 +7,9 @@ pub mod typeck;
 pub mod types;
 pub mod validate;
 
+use arena::TypeArena;
 use node::{IrExpr, IrStmt};
+use types::TypeId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
@@ -68,21 +70,27 @@ pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
     pub shared: Vec<SharedDecl>,
-    /// Local variables in declaration order. The SPIR-V backend hoists them to the entry block.
-    pub locals: Vec<(String, ScalarTy)>,
+    /// Locals in declaration order (SPIR-V hoists them). Ids are in `types`; backends convert
+    /// with `scalar_ty_of`.
+    pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
 }
 
 #[derive(Debug)]
 pub struct SharedDecl {
     pub name: String,
-    pub elem: ScalarTy,
+    /// Interned in `Module::types`.
+    ///
+    /// Not yet read by any backend, which all hardcode f32 shared memory. Meant for future non-f32
+    /// shared arrays.
+    pub elem: TypeId,
     pub len: u32,
 }
 
 #[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
+    pub types: TypeArena,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
