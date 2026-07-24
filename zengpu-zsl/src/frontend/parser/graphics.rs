@@ -17,10 +17,10 @@ impl<'a> Parser<'a> {
 
         self.expect(&Tok::Arrow, "`->` return type")?;
         let ret_types = self.parse_ret_types()?;
-        if ret_types[0] != GfxTy::Vec4 {
+        if ret_types[0] != self.types.vec_id(4) {
             return self.err("first return type must be f32x4 (position/color)");
         }
-        let varyings: Vec<GfxTy> = if is_fragment {
+        let varyings: Vec<TypeId> = if is_fragment {
             Vec::new()
         } else {
             ret_types[1..].to_vec()
@@ -45,10 +45,6 @@ impl<'a> Parser<'a> {
                 name: s.name,
                 ty: s.ty,
             })
-            .collect();
-        let varyings: Vec<TypeId> = varyings
-            .into_iter()
-            .map(|t| self.types.intern_gfx_ty(t))
             .collect();
         let locals = ctx.locals_order;
 
@@ -108,10 +104,9 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Colon, "`:` after param name")?;
             if let Some(loc) = location {
                 let ty = self.parse_any_type()?;
-                if matches!(ty, GfxTy::Mat4) {
+                if ty == self.types.mat4_id() {
                     return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
                 }
-                let ty = self.types.intern_gfx_ty(ty);
                 ctx.inputs.insert(name.clone(), ty);
                 inputs.push(PendingGfxInput {
                     name,
@@ -126,7 +121,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::Lt, "`<`")?;
                 let elem = self.parse_any_type()?;
                 self.expect(&Tok::Gt, "`>`")?;
-                if elem != GfxTy::F32 {
+                if elem != self.types.f32_id() {
                     return self.err("only buffer<f32> is supported");
                 }
                 ctx.buffers.insert(name.clone(), writable);
@@ -145,13 +140,15 @@ impl<'a> Parser<'a> {
                     return self.err("only one push parameter is supported");
                 }
                 ctx.push_param = Some(name);
-                for (field, gty) in fields {
-                    if !matches!(gty, GfxTy::F32 | GfxTy::U32 | GfxTy::Mat4) {
+                let f32_id = self.types.f32_id();
+                let u32_id = self.types.u32_id();
+                let mat4_id = self.types.mat4_id();
+                for (field, ty) in fields {
+                    if ty != f32_id && ty != u32_id && ty != mat4_id {
                         return self.err(format!(
                             "graphics push field `{field}` must be f32/u32/mat4x4"
                         ));
                     }
-                    let ty = self.types.intern_gfx_ty(gty);
                     ctx.scalars.insert(field.clone(), ty);
                     scalar_params.push(PendingGfxScalar { name: field, ty });
                 }
@@ -169,7 +166,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_gfx_body(
         &mut self,
         ctx: &mut GfxCtx,
-        varyings: &[GfxTy],
+        varyings: &[TypeId],
     ) -> Result<(Vec<IrStmt>, Vec<IrExpr>), ParseError> {
         self.expect(&Tok::LBrace, "`{`")?;
         let mut body = Vec::new();
@@ -272,7 +269,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_g_expr(ctx)?;
         let ty = match annot {
-            Some(gty) => self.types.intern_gfx_ty(gty),
+            Some(ty) => ty,
             None => {
                 crate::ir::typeck::type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types)
             }

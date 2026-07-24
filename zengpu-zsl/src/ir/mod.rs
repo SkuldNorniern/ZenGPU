@@ -17,30 +17,6 @@ use arena::TypeArena;
 use node::{IrExpr, IrStmt};
 use types::TypeId;
 
-/// Element type of a `buffer<T>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum BufElem {
-    F32,
-    I32,
-    U32,
-    Vec2,
-    Vec3,
-    Vec4,
-    Mat2,
-    Mat3,
-    Mat4,
-}
-
-/// Scalar value / declaration type. Compute values are scalar today.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ScalarTy {
-    U32,
-    I32,
-    F32,
-    Bool,
-}
-
 /// Mutability of a resource parameter (`zen.md`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mutability {
@@ -59,17 +35,15 @@ pub struct Param {
 #[derive(Debug)]
 pub enum ParamKind {
     /// `device buffer<elem>` — a bindless storage buffer. `elem` is interned
-    /// in the owning [`Module`]'s `types` arena (via `TypeArena::
-    /// intern_buf_elem`); backends convert back via `TypeArena::buf_elem_of`
-    /// at their own boundary. `mutability` is carried for reflection and the
-    /// MSL backend; the SPIR-V backend only handles `f32` and enforces
-    /// writability in `ir::build`.
+    /// in the owning [`Module`]'s `types` arena. `mutability` is carried for
+    /// reflection and the MSL backend; the SPIR-V backend only handles `f32`
+    /// and enforces writability in `ir::build`.
     Buffer {
         elem: TypeId,
         mutability: Mutability,
     },
-    /// A push-constant scalar (`u32`/`f32`), interned via `TypeArena::
-    /// intern_scalar`; backends convert back via `TypeArena::scalar_ty_of`.
+    /// A push-constant scalar (`u32`/`f32`), interned in the owning
+    /// [`Module`]'s `types` arena.
     Scalar(TypeId),
 }
 
@@ -87,9 +61,7 @@ pub struct Entry {
     /// Workgroup-shared arrays declared in the kernel body.
     pub shared: Vec<SharedDecl>,
     /// Locals in declaration order (the SPIR-V backend hoists these). Each
-    /// [`TypeId`] is interned in the owning [`Module`]'s `types` arena;
-    /// backends convert back to `ScalarTy` via `TypeArena::scalar_ty_of` at
-    /// their own boundary (see e.g. `backend::hip::compute::lower_compute`).
+    /// [`TypeId`] is interned in the owning [`Module`]'s `types` arena.
     pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
 }
@@ -116,28 +88,15 @@ pub struct Module {
 // ── Graphics IR ────────────────────────────────────────────────────────────────
 //
 // Vertex/fragment shaders work over a richer value universe (vectors, matrices)
-// than compute's scalars, so they carry their own type enum and entry shape;
-// `IrExpr`/`IrStmt` nodes are shared. Unifying `ScalarTy` and `GfxTy` into one
-// `zen.md` `Type` is a later consolidation.
-
-/// Graphics value / declaration type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GfxTy {
-    F32,
-    U32,
-    Vec2,
-    Vec3,
-    Vec4,
-    Mat4,
-}
+// than compute's scalars, so they carry their own entry shape; `IrExpr`/
+// `IrStmt` nodes are shared. Values are `zen.md` `Type`s throughout.
 
 /// A `@location` vertex/fragment input.
 #[derive(Debug)]
 pub struct GfxInput {
     pub name: String,
     pub location: u32,
-    /// Interned in the owning [`GraphicsModule`]'s `types` arena; backends
-    /// convert back via `TypeArena::gfx_ty_of`.
+    /// Interned in the owning [`GraphicsModule`]'s `types` arena.
     pub ty: TypeId,
 }
 
@@ -145,8 +104,7 @@ pub struct GfxInput {
 #[derive(Debug)]
 pub struct GfxScalar {
     pub name: String,
-    /// Interned in the owning [`GraphicsModule`]'s `types` arena; backends
-    /// convert back via `TypeArena::gfx_ty_of`.
+    /// Interned in the owning [`GraphicsModule`]'s `types` arena.
     pub ty: TypeId,
 }
 

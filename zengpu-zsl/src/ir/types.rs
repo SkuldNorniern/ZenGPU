@@ -1,13 +1,9 @@
 //! The unified ZSL semantic type model (`zen.md`/design-decision §2.1).
 //!
-//! `ScalarTy`, `GfxTy`, and `BufElem` in `crate::ir` are three separate,
-//! overlapping type universes — one for compute scalars, one for graphics
-//! vectors/matrices, one for buffer element types. This module defines the
-//! single `Type` enum meant to eventually replace all three. Nothing outside
-//! this module and `crate::ir::arena` references `Type` yet: existing code,
-//! all four backends, and `lib.rs` are untouched by this commit. Later
-//! commits convert `Entry`/`GraphicsEntry`/backend signatures to use `TypeId`
-//! behind the adapters in `crate::ir::arena`, one field at a time.
+//! `Type` is the single value-type universe for both compute scalars and
+//! graphics vectors/matrices/buffer element types. The parser and every
+//! backend hold and compare [`TypeId`]s natively; [`crate::ir::arena::
+//! TypeArena`] is the only place `Type` values are constructed or inspected.
 
 /// An interned type. Obtained only from a [`crate::ir::arena::TypeArena`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

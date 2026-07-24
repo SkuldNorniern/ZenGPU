@@ -34,7 +34,7 @@ use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
-use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::{EntryKind, Module, ParamKind};
 
 // ── Public entry ─────────────────────────────────────────────────────────────
 
@@ -64,10 +64,10 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     // This arena is never written back to `module` — it exists only so this
     // lowering pass has stable `TypeId`s to compare against.
     let mut types = module.types.clone();
-    let u32_id = types.intern_scalar(ScalarTy::U32);
-    let i32_id = types.intern_scalar(ScalarTy::I32);
-    let f32_id = types.intern_scalar(ScalarTy::F32);
-    let bool_id = types.intern_scalar(ScalarTy::Bool);
+    let u32_id = types.u32_id();
+    let i32_id = types.i32_id();
+    let f32_id = types.f32_id();
+    let bool_id = types.bool_id();
 
     // ── Core scalar types ────────────────────────────────────────────────────
     let t_void = spv.type_void();
@@ -955,8 +955,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
 /// scalars (`f32`/`u32`/`i32`) and return it unchanged. Compute buffer
 /// elements are always scalar by construction (the parser only accepts
 /// `parse_scalar_type` for `device buffer<…>`), so this never actually
-/// observes anything else — the panic mirrors the original `BufElem`-keyed
-/// implementation's defensive `unreachable!()`.
+/// observes anything else.
 fn buffer_scalar(ctx: &LowerCtx<'_>, elem: TypeId) -> TypeId {
     if elem == ctx.f32_id || elem == ctx.u32_id || elem == ctx.i32_id {
         elem

@@ -204,7 +204,7 @@ impl<'a> Parser<'a> {
                             &ctx.type_ctx(),
                             &mut self.types,
                         );
-                        if idx_ty != self.types.intern_scalar(ScalarTy::U32) {
+                        if idx_ty != self.types.u32_id() {
                             return self.err("shared array index must be u32");
                         }
                         return Ok(IrExpr::SharedLoad {

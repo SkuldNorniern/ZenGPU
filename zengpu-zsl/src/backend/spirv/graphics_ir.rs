@@ -35,7 +35,7 @@ use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
-use crate::ir::{GfxTy, GraphicsModule};
+use crate::ir::GraphicsModule;
 
 type R<T> = Result<T, String>;
 
@@ -130,12 +130,12 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     // `module` — it exists only so this lowering pass has stable `TypeId`s to
     // compare against.
     let mut types = module.types.clone();
-    let f32_id = types.intern_gfx_ty(GfxTy::F32);
-    let u32_id = types.intern_gfx_ty(GfxTy::U32);
-    let vec2_id = types.intern_gfx_ty(GfxTy::Vec2);
-    let vec3_id = types.intern_gfx_ty(GfxTy::Vec3);
-    let vec4_id = types.intern_gfx_ty(GfxTy::Vec4);
-    let mat4_id = types.intern_gfx_ty(GfxTy::Mat4);
+    let f32_id = types.f32_id();
+    let u32_id = types.u32_id();
+    let vec2_id = types.vec_id(2);
+    let vec3_id = types.vec_id(3);
+    let vec4_id = types.vec_id(4);
+    let mat4_id = types.mat4_id();
 
     let mut spv = SpvBuilder::new();
     spv.capability_shader();

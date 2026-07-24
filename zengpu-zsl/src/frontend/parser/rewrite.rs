@@ -128,21 +128,14 @@ pub(super) fn resolve_construct_types_expr(
             base: Box::new(resolve_construct_types_expr(base, types)),
             component: *component,
         },
-        IrExpr::Construct { dim, args, .. } => {
-            let gty = match dim {
-                2 => GfxTy::Vec2,
-                3 => GfxTy::Vec3,
-                _ => GfxTy::Vec4,
-            };
-            IrExpr::Construct {
-                ty: Some(types.intern_gfx_ty(gty)),
-                dim: *dim,
-                args: args
-                    .iter()
-                    .map(|a| resolve_construct_types_expr(a, types))
-                    .collect(),
-            }
-        }
+        IrExpr::Construct { dim, args, .. } => IrExpr::Construct {
+            ty: Some(types.vec_id(*dim)),
+            dim: *dim,
+            args: args
+                .iter()
+                .map(|a| resolve_construct_types_expr(a, types))
+                .collect(),
+        },
         IrExpr::Builtin { func, args } => IrExpr::Builtin {
             func: *func,
             args: args
