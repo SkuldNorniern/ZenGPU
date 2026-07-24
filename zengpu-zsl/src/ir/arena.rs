@@ -15,7 +15,7 @@ use crate::ir::{BufElem, GfxTy, ScalarTy};
 
 /// An interning arena for [`Type`]. Structurally identical types (e.g. two
 /// separate requests to intern `f32`) receive the same [`TypeId`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     types: Vec<Type>,
     by_value: HashMap<Type, TypeId>,

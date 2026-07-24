@@ -33,7 +33,8 @@ use std::collections::HashMap;
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::types::TypeId;
+use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
 
 // ── Public entry ─────────────────────────────────────────────────────────────
 
@@ -56,6 +57,18 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
+    // ── Canonical scalar TypeIds ─────────────────────────────────────────────
+    // A local, mutable clone of the module's type arena: reuses every TypeId
+    // the parser already interned and adds the four canonical scalars if a
+    // module happens not to reference one (e.g. a kernel with no i32 use).
+    // This arena is never written back to `module` — it exists only so this
+    // lowering pass has stable `TypeId`s to compare against.
+    let mut types = module.types.clone();
+    let u32_id = types.intern_scalar(ScalarTy::U32);
+    let i32_id = types.intern_scalar(ScalarTy::I32);
+    let f32_id = types.intern_scalar(ScalarTy::F32);
+    let bool_id = types.intern_scalar(ScalarTy::Bool);
+
     // ── Core scalar types ────────────────────────────────────────────────────
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
@@ -67,19 +80,19 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     // ── Classify params (declaration order) ──────────────────────────────────
     // Buffer writability is already enforced in `ir::build`; the backend only
     // needs the names (for push-constant index assignment).
-    let buf_params: Vec<(&str, BufElem)> = entry
+    let buf_params: Vec<(&str, TypeId)> = entry
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), module.types.buf_elem_of(*elem))),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
             _ => None,
         })
         .collect();
-    let scalar_params: Vec<(&str, ScalarTy)> = entry
+    let scalar_params: Vec<(&str, TypeId)> = entry
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(ty) => Some((p.name.as_str(), module.types.scalar_ty_of(*ty))),
+            ParamKind::Scalar(ty) => Some((p.name.as_str(), *ty)),
             _ => None,
         })
         .collect();
@@ -104,11 +117,16 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let n_buf_params = buf_params.len() as u32;
     let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
         let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
-        pc_members.extend(scalar_params.iter().map(|(_, ty)| match ty {
-            ScalarTy::U32 => t_u32,
-            ScalarTy::I32 => t_i32,
-            ScalarTy::F32 => t_f32,
-            ScalarTy::Bool => t_u32,
+        pc_members.extend(scalar_params.iter().map(|(_, ty)| {
+            if *ty == u32_id {
+                t_u32
+            } else if *ty == i32_id {
+                t_i32
+            } else if *ty == f32_id {
+                t_f32
+            } else {
+                t_u32
+            }
         }));
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
@@ -169,17 +187,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         .iter()
         .enumerate()
         .map(|(i, (name, ty))| {
-            let ty_id = match ty {
-                ScalarTy::U32 => t_u32,
-                ScalarTy::I32 => t_i32,
-                ScalarTy::F32 => t_f32,
-                ScalarTy::Bool => t_bool,
-            };
             (
                 name.to_string(),
                 ScalarInfo {
                     pc_index: i as u32,
-                    ty: ty_id,
+                    ty: *ty,
                 },
             )
         })
@@ -196,12 +208,15 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
     for (name, ty_id) in &entry.locals {
-        let sty = module.types.scalar_ty_of(*ty_id);
-        let (ptr_ty_slot, spv_elem) = match sty {
-            ScalarTy::U32 => (&mut ptr_func_u32, t_u32),
-            ScalarTy::I32 => (&mut ptr_func_i32, t_i32),
-            ScalarTy::F32 => (&mut ptr_func_f32, t_f32),
-            ScalarTy::Bool => (&mut ptr_func_bool, t_bool),
+        let sty = *ty_id;
+        let (ptr_ty_slot, spv_elem) = if sty == u32_id {
+            (&mut ptr_func_u32, t_u32)
+        } else if sty == i32_id {
+            (&mut ptr_func_i32, t_i32)
+        } else if sty == f32_id {
+            (&mut ptr_func_f32, t_f32)
+        } else {
+            (&mut ptr_func_bool, t_bool)
         };
         if *ptr_ty_slot == Id(0) {
             *ptr_ty_slot = spv.type_pointer(sc::FUNCTION, spv_elem);
@@ -227,23 +242,22 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
         }
         for (_, ty) in &scalar_params {
-            match ty {
-                ScalarTy::U32 if t_ptr_pc_u32 == Id(0) => {
-                    t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
-                }
-                ScalarTy::I32 if t_ptr_pc_i32 == Id(0) => {
-                    t_ptr_pc_i32 = spv.type_pointer(sc::PUSH_CONSTANT, t_i32);
-                }
-                ScalarTy::F32 if t_ptr_pc_f32 == Id(0) => {
-                    t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
-                }
-                _ => {}
+            if *ty == u32_id && t_ptr_pc_u32 == Id(0) {
+                t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
+            } else if *ty == i32_id && t_ptr_pc_i32 == Id(0) {
+                t_ptr_pc_i32 = spv.type_pointer(sc::PUSH_CONSTANT, t_i32);
+            } else if *ty == f32_id && t_ptr_pc_f32 == Id(0) {
+                t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
             }
         }
     }
 
     let mut ctx = LowerCtx {
         spv: &mut spv,
+        u32_id,
+        i32_id,
+        f32_id,
+        bool_id,
         t_bool,
         t_u32,
         t_i32,
@@ -281,30 +295,37 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 #[derive(Clone, Copy)]
 struct BufInfo {
     pc_index: u32,
-    elem: BufElem,
+    elem: TypeId,
 }
 
 #[derive(Clone, Copy)]
 struct ScalarInfo {
     pc_index: u32,
-    ty: Id,
+    ty: TypeId,
 }
 
 #[derive(Clone, Copy)]
 struct Val {
     id: Id,
-    ty: ScalarTy,
+    ty: TypeId,
 }
 
 struct LocalVar {
     ptr: Id,
-    ty: ScalarTy,
+    ty: TypeId,
     #[allow(dead_code)]
     ptr_ty: Id,
 }
 
 struct LowerCtx<'a> {
     spv: &'a mut SpvBuilder,
+    /// Canonical `TypeId`s for the four compute scalars, cached once at the
+    /// top of lowering (see `lower_compute_inner`) so every comparison below
+    /// is a cheap `TypeId` equality check rather than an arena lookup.
+    u32_id: TypeId,
+    i32_id: TypeId,
+    f32_id: TypeId,
+    bool_id: TypeId,
     t_bool: Id,
     t_u32: Id,
     t_i32: Id,
@@ -332,12 +353,15 @@ struct LowerCtx<'a> {
 }
 
 impl LowerCtx<'_> {
-    fn spv_ty(&self, sty: ScalarTy) -> Id {
-        match sty {
-            ScalarTy::U32 => self.t_u32,
-            ScalarTy::I32 => self.t_i32,
-            ScalarTy::F32 => self.t_f32,
-            ScalarTy::Bool => self.t_bool,
+    fn spv_ty(&self, tid: TypeId) -> Id {
+        if tid == self.u32_id {
+            self.t_u32
+        } else if tid == self.i32_id {
+            self.t_i32
+        } else if tid == self.f32_id {
+            self.t_f32
+        } else {
+            self.t_bool
         }
     }
 }
@@ -365,7 +389,7 @@ fn has_atomic_add(stmts: &[IrStmt]) -> bool {
 fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     match stmt {
         IrStmt::Let { name, init } => {
-            let sty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ScalarTy::U32);
+            let sty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ctx.u32_id);
             let val = lower_expr(ctx, init)?;
             let ptr = ctx
                 .locals
@@ -403,7 +427,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
-            let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
+            let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
             let ptr_elem = ctx
@@ -430,14 +454,14 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .op_access_chain(ctx.t_ptr_pc_u32, pc_var, &[pc_field]);
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
-            let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
+            let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let ptr_elem = ctx.spv.op_access_chain(
                 ctx.t_ptr_ssbo_f32,
                 ctx.g_bufs_var,
                 &[buf_idx, ctx.const_0_u32, idx_id],
             );
             let rhs = lower_expr(ctx, value)?;
-            let rhs_id = coerce(ctx, rhs, ScalarTy::F32);
+            let rhs_id = coerce(ctx, rhs, ctx.f32_id);
             // ScopeDevice = 1; MemorySemanticsRelaxed = 0.
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
@@ -452,10 +476,10 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
-            let idx = coerce(ctx, idx, ScalarTy::U32);
+            let idx = coerce(ctx, idx, ctx.u32_id);
             let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
             let rhs = lower_expr(ctx, value)?;
-            let rhs = coerce(ctx, rhs, ScalarTy::F32);
+            let rhs = coerce(ctx, rhs, ctx.f32_id);
             ctx.spv.op_store(ptr, rhs);
             Ok(())
         }
@@ -470,7 +494,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
 
         IrStmt::If { cond, then, else_ } => {
             let cond = lower_expr(ctx, cond)?;
-            let cond_id = coerce(ctx, cond, ScalarTy::Bool);
+            let cond_id = coerce(ctx, cond, ctx.bool_id);
             let true_label = ctx.spv.fresh_id();
             let merge_label = ctx.spv.fresh_id();
 
@@ -503,9 +527,9 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
 
         IrStmt::For { var, lo, hi, body } => {
             let lo_val = lower_expr(ctx, lo)?;
-            let lo_id = coerce(ctx, lo_val, ScalarTy::U32);
+            let lo_id = coerce(ctx, lo_val, ctx.u32_id);
             let hi_val = lower_expr(ctx, hi)?;
-            let hi_id = coerce(ctx, hi_val, ScalarTy::U32);
+            let hi_id = coerce(ctx, hi_val, ctx.u32_id);
 
             let loop_ptr =
                 ctx.locals.get(var).map(|l| l.ptr).ok_or_else(|| {
@@ -561,18 +585,12 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     match expr {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
-            Ok(Val {
-                id,
-                ty: ScalarTy::U32,
-            })
+            Ok(Val { id, ty: ctx.u32_id })
         }
 
         IrExpr::LitF32(v) => {
             let id = ctx.spv.constant_f32(ctx.t_f32, *v);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
 
         IrExpr::Local(name) => {
@@ -594,12 +612,12 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
-            let (pc_ptr_ty, ty) = if info.ty == ctx.t_u32 {
-                (ctx.t_ptr_pc_u32, ScalarTy::U32)
-            } else if info.ty == ctx.t_i32 {
-                (ctx.t_ptr_pc_i32, ScalarTy::I32)
+            let (pc_ptr_ty, ty, spv_scalar_ty) = if info.ty == ctx.u32_id {
+                (ctx.t_ptr_pc_u32, ctx.u32_id, ctx.t_u32)
+            } else if info.ty == ctx.i32_id {
+                (ctx.t_ptr_pc_i32, ctx.i32_id, ctx.t_i32)
             } else {
-                (ctx.t_ptr_pc_f32, ScalarTy::F32)
+                (ctx.t_ptr_pc_f32, ctx.f32_id, ctx.t_f32)
             };
             if pc_ptr_ty == Id(0) {
                 return Err("ZSL: push-constant pointer type not allocated".to_string());
@@ -608,7 +626,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let actual_idx = ctx.n_buf_params + info.pc_index;
             let pc_idx = ctx.spv.constant_u32(ctx.t_u32, actual_idx);
             let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
-            let id = ctx.spv.op_load(info.ty, chain);
+            let id = ctx.spv.op_load(spv_scalar_ty, chain);
             Ok(Val { id, ty })
         }
 
@@ -628,7 +646,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             // g_bufs[buf_idx].data[elem_idx]
             let idx_val = lower_expr(ctx, index)?;
-            let idx_id = coerce(ctx, idx_val, ScalarTy::U32);
+            let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
             let ptr_elem = ctx
@@ -644,13 +662,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
-            let idx = coerce(ctx, idx, ScalarTy::U32);
+            let idx = coerce(ctx, idx, ctx.u32_id);
             let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
             let id = ctx.spv.op_load(ctx.t_f32, ptr);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
 
         IrExpr::GlobalId(component) => {
@@ -661,7 +676,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let val = ctx.spv.op_composite_extract(t_u32, gid, &[*component]);
             Ok(Val {
                 id: val,
-                ty: ScalarTy::U32,
+                ty: ctx.u32_id,
             })
         }
 
@@ -673,10 +688,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             };
             let id3 = ctx.spv.op_load(ctx.t_uvec3, var);
             let id = ctx.spv.op_composite_extract(ctx.t_u32, id3, &[*component]);
-            Ok(Val {
-                id,
-                ty: ScalarTy::U32,
-            })
+            Ok(Val { id, ty: ctx.u32_id })
         }
 
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
@@ -684,7 +696,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         IrExpr::Neg(inner) => {
             let val = lower_expr(ctx, inner)?;
             let ty_id = ctx.spv_ty(val.ty);
-            let id = if val.ty == ScalarTy::F32 {
+            let id = if val.ty == ctx.f32_id {
                 ctx.spv.op_fnegate(ty_id, val.id)
             } else {
                 ctx.spv.op_snegate(ty_id, val.id)
@@ -713,47 +725,57 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
         IrBinOp::Div => {
             let (lhs, rhs) = unify(ctx, lhs, rhs);
             let ty = ctx.spv_ty(lhs.ty);
-            let id = match lhs.ty {
-                ScalarTy::F32 => ctx.spv.op_fdiv(ty, lhs.id, rhs.id),
-                ScalarTy::I32 => ctx.spv.op_sdiv(ty, lhs.id, rhs.id),
-                ScalarTy::U32 => ctx.spv.op_udiv(ty, lhs.id, rhs.id),
-                ScalarTy::Bool => return Err("ZSL: division is not supported on bool".into()),
+            let id = if lhs.ty == ctx.f32_id {
+                ctx.spv.op_fdiv(ty, lhs.id, rhs.id)
+            } else if lhs.ty == ctx.i32_id {
+                ctx.spv.op_sdiv(ty, lhs.id, rhs.id)
+            } else if lhs.ty == ctx.u32_id {
+                ctx.spv.op_udiv(ty, lhs.id, rhs.id)
+            } else {
+                return Err("ZSL: division is not supported on bool".into());
             };
             Ok(Val { id, ty: lhs.ty })
         }
         IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne => {
             let (lhs, rhs) = unify(ctx, lhs, rhs);
             let bool_ty = ctx.t_bool;
-            let id = match (op, lhs.ty) {
-                (IrBinOp::Lt, ScalarTy::F32) => ctx.spv.op_ford_lt(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Le, ScalarTy::F32) => ctx.spv.op_ford_le(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Gt, ScalarTy::F32) => ctx.spv.op_ford_gt(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ge, ScalarTy::F32) => ctx.spv.op_ford_ge(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Eq, ScalarTy::F32) => ctx.spv.op_ford_eq(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ne, ScalarTy::F32) => ctx.spv.op_ford_ne(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Lt, ScalarTy::U32) => ctx.spv.op_ult(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Le, ScalarTy::U32) => ctx.spv.op_ule(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Gt, ScalarTy::U32) => ctx.spv.op_ugt(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ge, ScalarTy::U32) => ctx.spv.op_uge(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Eq, ScalarTy::U32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ne, ScalarTy::U32) => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Lt, ScalarTy::I32) => ctx.spv.op_slt(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Le, ScalarTy::I32) => ctx.spv.op_sle(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Gt, ScalarTy::I32) => ctx.spv.op_sgt(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ge, ScalarTy::I32) => ctx.spv.op_sge(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Eq, ScalarTy::I32) => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
-                (IrBinOp::Ne, ScalarTy::I32) => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
-                _ => {
-                    return Err("ZSL: comparisons not supported on bool".into());
+            let id = if lhs.ty == ctx.f32_id {
+                match op {
+                    IrBinOp::Lt => ctx.spv.op_ford_lt(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Le => ctx.spv.op_ford_le(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Gt => ctx.spv.op_ford_gt(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ge => ctx.spv.op_ford_ge(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Eq => ctx.spv.op_ford_eq(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ne => ctx.spv.op_ford_ne(bool_ty, lhs.id, rhs.id),
+                    _ => unreachable!(),
                 }
+            } else if lhs.ty == ctx.u32_id {
+                match op {
+                    IrBinOp::Lt => ctx.spv.op_ult(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Le => ctx.spv.op_ule(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Gt => ctx.spv.op_ugt(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ge => ctx.spv.op_uge(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Eq => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ne => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
+                    _ => unreachable!(),
+                }
+            } else if lhs.ty == ctx.i32_id {
+                match op {
+                    IrBinOp::Lt => ctx.spv.op_slt(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Le => ctx.spv.op_sle(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Gt => ctx.spv.op_sgt(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ge => ctx.spv.op_sge(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Eq => ctx.spv.op_iequal(bool_ty, lhs.id, rhs.id),
+                    IrBinOp::Ne => ctx.spv.op_inot_equal(bool_ty, lhs.id, rhs.id),
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err("ZSL: comparisons not supported on bool".into());
             };
-            Ok(Val {
-                id,
-                ty: ScalarTy::Bool,
-            })
+            Ok(Val { id, ty: ctx.bool_id })
         }
         IrBinOp::And | IrBinOp::Or => {
-            if lhs.ty != ScalarTy::Bool || rhs.ty != ScalarTy::Bool {
+            if lhs.ty != ctx.bool_id || rhs.ty != ctx.bool_id {
                 return Err("ZSL: `&&`/`||` require bool operands".into());
             }
             let bool_ty = ctx.t_bool;
@@ -762,16 +784,13 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 IrBinOp::Or => ctx.spv.op_logical_or(bool_ty, lhs.id, rhs.id),
                 _ => unreachable!(),
             };
-            Ok(Val {
-                id,
-                ty: ScalarTy::Bool,
-            })
+            Ok(Val { id, ty: ctx.bool_id })
         }
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            if lhs.ty != ScalarTy::U32 || rhs.ty != ScalarTy::U32 {
+            if lhs.ty != ctx.u32_id || rhs.ty != ctx.u32_id {
                 return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` currently require u32 operands".into());
             }
-            let ty = ctx.spv_ty(ScalarTy::U32);
+            let ty = ctx.spv_ty(ctx.u32_id);
             let id = match op {
                 IrBinOp::BitAnd => ctx.spv.op_bitwise_and(ty, lhs.id, rhs.id),
                 IrBinOp::BitOr => ctx.spv.op_bitwise_or(ty, lhs.id, rhs.id),
@@ -780,10 +799,7 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 IrBinOp::Shr => ctx.spv.op_shift_right_logical(ty, lhs.id, rhs.id),
                 _ => unreachable!(),
             };
-            Ok(Val {
-                id,
-                ty: ScalarTy::U32,
-            })
+            Ok(Val { id, ty: ctx.u32_id })
         }
     }
 }
@@ -796,11 +812,8 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err("ZSL: u32() takes 1 arg".into());
             }
             let v = lower_expr(ctx, &args[0])?;
-            let id = coerce(ctx, v, ScalarTy::U32);
-            Ok(Val {
-                id,
-                ty: ScalarTy::U32,
-            })
+            let id = coerce(ctx, v, ctx.u32_id);
+            Ok(Val { id, ty: ctx.u32_id })
         }
         BuiltinFn::Dot | BuiltinFn::Extend => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
@@ -810,7 +823,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err(format!("ZSL: {name}() takes 1 arg"));
             }
             let value = lower_expr(ctx, &args[0])?;
-            if value.ty != ScalarTy::F32 {
+            if value.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
             let id = match func {
@@ -826,10 +839,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 }
                 _ => unreachable!(),
             };
-            Ok(Val {
-                id,
-                ty: ScalarTy::Bool,
-            })
+            Ok(Val { id, ty: ctx.bool_id })
         }
         // Unary GLSL builtins: f32 → f32
         BuiltinFn::Abs
@@ -848,7 +858,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err(format!("ZSL: {name}() takes 1 arg"));
             }
             let v = lower_expr(ctx, &args[0])?;
-            if v.ty != ScalarTy::F32 {
+            if v.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
@@ -869,10 +879,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[v.id]);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
         // Binary GLSL builtins: (f32, f32) → f32
         BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
@@ -881,10 +888,10 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
-            if a.ty != ScalarTy::F32 {
+            if a.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
-            if b.ty != ScalarTy::F32 {
+            if b.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
@@ -896,10 +903,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[a.id, b.id]);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
         // clamp(x, lo, hi): (f32, f32, f32) → f32
         BuiltinFn::Clamp => {
@@ -909,7 +913,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let x = lower_expr(ctx, &args[0])?;
             let lo = lower_expr(ctx, &args[1])?;
             let hi = lower_expr(ctx, &args[2])?;
-            if x.ty != ScalarTy::F32 || lo.ty != ScalarTy::F32 || hi.ty != ScalarTy::F32 {
+            if x.ty != ctx.f32_id || lo.ty != ctx.f32_id || hi.ty != ctx.f32_id {
                 return Err("ZSL: clamp() requires f32 args".into());
             }
             let t_f32 = ctx.t_f32;
@@ -917,10 +921,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = ctx
                 .spv
                 .op_ext_inst(t_f32, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
         // mix(a, b, t): (f32, f32, f32) → f32
         BuiltinFn::Mix => {
@@ -930,7 +931,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
             let t = lower_expr(ctx, &args[2])?;
-            if a.ty != ScalarTy::F32 || b.ty != ScalarTy::F32 || t.ty != ScalarTy::F32 {
+            if a.ty != ctx.f32_id || b.ty != ctx.f32_id || t.ty != ctx.f32_id {
                 return Err("ZSL: mix() requires f32 args".into());
             }
             let t_f32 = ctx.t_f32;
@@ -938,10 +939,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = ctx
                 .spv
                 .op_ext_inst(t_f32, glsl, glsl_op::F_MIX, &[a.id, b.id, t.id]);
-            Ok(Val {
-                id,
-                ty: ScalarTy::F32,
-            })
+            Ok(Val { id, ty: ctx.f32_id })
         }
 
         // Vector-only builtins never appear in a compute module.
@@ -953,60 +951,64 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn buffer_scalar(elem: BufElem) -> ScalarTy {
-    match elem {
-        BufElem::F32 => ScalarTy::F32,
-        BufElem::U32 => ScalarTy::U32,
-        BufElem::I32 => ScalarTy::I32,
-        _ => unreachable!("unsupported compute buffer element"),
+/// Validate that a buffer's element `TypeId` is one of the compute-supported
+/// scalars (`f32`/`u32`/`i32`) and return it unchanged. Compute buffer
+/// elements are always scalar by construction (the parser only accepts
+/// `parse_scalar_type` for `device buffer<…>`), so this never actually
+/// observes anything else — the panic mirrors the original `BufElem`-keyed
+/// implementation's defensive `unreachable!()`.
+fn buffer_scalar(ctx: &LowerCtx<'_>, elem: TypeId) -> TypeId {
+    if elem == ctx.f32_id || elem == ctx.u32_id || elem == ctx.i32_id {
+        elem
+    } else {
+        unreachable!("unsupported compute buffer element")
     }
 }
 
-fn storage_to_value(ctx: &mut LowerCtx<'_>, raw_f32: Id, elem: BufElem) -> Val {
-    let ty = buffer_scalar(elem);
-    let id = match ty {
-        ScalarTy::F32 => raw_f32,
-        ScalarTy::U32 => ctx.spv.op_bitcast(ctx.t_u32, raw_f32),
-        ScalarTy::I32 => ctx.spv.op_bitcast(ctx.t_i32, raw_f32),
-        ScalarTy::Bool => unreachable!(),
+fn storage_to_value(ctx: &mut LowerCtx<'_>, raw_f32: Id, elem: TypeId) -> Val {
+    let ty = buffer_scalar(ctx, elem);
+    let id = if ty == ctx.f32_id {
+        raw_f32
+    } else if ty == ctx.u32_id {
+        ctx.spv.op_bitcast(ctx.t_u32, raw_f32)
+    } else {
+        ctx.spv.op_bitcast(ctx.t_i32, raw_f32)
     };
     Val { id, ty }
 }
 
-fn value_to_storage(ctx: &mut LowerCtx<'_>, value: Val, elem: BufElem) -> Id {
-    let ty = buffer_scalar(elem);
+fn value_to_storage(ctx: &mut LowerCtx<'_>, value: Val, elem: TypeId) -> Id {
+    let ty = buffer_scalar(ctx, elem);
     let value = coerce(ctx, value, ty);
-    match ty {
-        ScalarTy::F32 => value,
-        ScalarTy::U32 | ScalarTy::I32 => ctx.spv.op_bitcast(ctx.t_f32, value),
-        ScalarTy::Bool => unreachable!(),
+    if ty == ctx.f32_id {
+        value
+    } else {
+        ctx.spv.op_bitcast(ctx.t_f32, value)
     }
 }
 
-fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: ScalarTy) -> Id {
+fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {
     if val.ty == target {
         return val.id;
     }
-    match (val.ty, target) {
-        (ScalarTy::U32, ScalarTy::F32) => {
-            let f32_ty = ctx.t_f32;
-            ctx.spv.op_convert_u_to_f(f32_ty, val.id)
-        }
-        (ScalarTy::F32, ScalarTy::U32) => {
-            let u32_ty = ctx.t_u32;
-            ctx.spv.op_convert_f_to_u(u32_ty, val.id)
-        }
-        (ScalarTy::I32, ScalarTy::F32) => {
-            let f32_ty = ctx.t_f32;
-            ctx.spv.op_convert_s_to_f(f32_ty, val.id)
-        }
-        (ScalarTy::F32, ScalarTy::I32) => {
-            let i32_ty = ctx.t_i32;
-            ctx.spv.op_convert_f_to_s(i32_ty, val.id)
-        }
-        (ScalarTy::U32, ScalarTy::I32) => ctx.spv.op_bitcast(ctx.t_i32, val.id),
-        (ScalarTy::I32, ScalarTy::U32) => ctx.spv.op_bitcast(ctx.t_u32, val.id),
-        _ => val.id,
+    if val.ty == ctx.u32_id && target == ctx.f32_id {
+        let f32_ty = ctx.t_f32;
+        ctx.spv.op_convert_u_to_f(f32_ty, val.id)
+    } else if val.ty == ctx.f32_id && target == ctx.u32_id {
+        let u32_ty = ctx.t_u32;
+        ctx.spv.op_convert_f_to_u(u32_ty, val.id)
+    } else if val.ty == ctx.i32_id && target == ctx.f32_id {
+        let f32_ty = ctx.t_f32;
+        ctx.spv.op_convert_s_to_f(f32_ty, val.id)
+    } else if val.ty == ctx.f32_id && target == ctx.i32_id {
+        let i32_ty = ctx.t_i32;
+        ctx.spv.op_convert_f_to_s(i32_ty, val.id)
+    } else if val.ty == ctx.u32_id && target == ctx.i32_id {
+        ctx.spv.op_bitcast(ctx.t_i32, val.id)
+    } else if val.ty == ctx.i32_id && target == ctx.u32_id {
+        ctx.spv.op_bitcast(ctx.t_u32, val.id)
+    } else {
+        val.id
     }
 }
 
@@ -1014,12 +1016,12 @@ fn unify(ctx: &mut LowerCtx<'_>, lhs: Val, rhs: Val) -> (Val, Val) {
     if lhs.ty == rhs.ty {
         return (lhs, rhs);
     }
-    let target = if lhs.ty == ScalarTy::F32 || rhs.ty == ScalarTy::F32 {
-        ScalarTy::F32
-    } else if lhs.ty == ScalarTy::I32 || rhs.ty == ScalarTy::I32 {
-        ScalarTy::I32
+    let target = if lhs.ty == ctx.f32_id || rhs.ty == ctx.f32_id {
+        ctx.f32_id
+    } else if lhs.ty == ctx.i32_id || rhs.ty == ctx.i32_id {
+        ctx.i32_id
     } else {
-        ScalarTy::U32
+        ctx.u32_id
     };
     (
         Val {
@@ -1042,7 +1044,7 @@ fn binary_arith(
 ) -> Result<Val, String> {
     let (lhs, rhs) = unify(ctx, lhs, rhs);
     let ty = ctx.spv_ty(lhs.ty);
-    let id = if lhs.ty == ScalarTy::F32 {
+    let id = if lhs.ty == ctx.f32_id {
         float_op(ctx.spv, ty, lhs.id, rhs.id)
     } else {
         int_op(ctx.spv, ty, lhs.id, rhs.id)
