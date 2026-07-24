@@ -11,6 +11,7 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
 use crate::ir::{GfxTy, GraphicsModule};
 
 /// Push-constant buffer index for graphics shaders. High so it never overlaps vertex buffers; the
@@ -29,7 +30,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     if has_push {
         s.push_str("struct Push {\n");
         for sp in &e.scalar_params {
-            let _ = writeln!(s, "    {} {};", msl_ty(module.types.gfx_ty_of(sp.ty)), sp.name);
+            let _ = writeln!(s, "    {} {};", msl_ty_of(module.types.get(sp.ty))?, sp.name);
         }
         s.push_str("};\n\n");
     }
@@ -45,7 +46,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             let _ = writeln!(
                 s,
                 "    {} {} [[{}{})]];",
-                msl_ty(module.types.gfx_ty_of(inp.ty)),
+                msl_ty_of(module.types.get(inp.ty))?,
                 inp.name,
                 in_qualifier,
                 inp.location,
@@ -76,7 +77,11 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         s.push_str("struct VsOut {\n");
         s.push_str("    float4 position [[position]];\n");
         for (i, vty) in e.varyings.iter().enumerate() {
-            let _ = writeln!(s, "    {} vary{i} [[user(locn{i})]];", msl_ty(module.types.gfx_ty_of(*vty)));
+            let _ = writeln!(
+                s,
+                "    {} vary{i} [[user(locn{i})]];",
+                msl_ty_of(module.types.get(*vty))?
+            );
         }
         s.push_str("};\n\n");
 
@@ -262,6 +267,8 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
+/// MSL spelling of a [`GfxTy`], for `GraphicsEntry.locals` (still `GfxTy`) and the
+/// `IrStmt::Let` arm.
 fn msl_ty(t: GfxTy) -> &'static str {
     match t {
         GfxTy::F32 => "float",
@@ -270,6 +277,36 @@ fn msl_ty(t: GfxTy) -> &'static str {
         GfxTy::Vec3 => "float3",
         GfxTy::Vec4 => "float4",
         GfxTy::Mat4 => "float4x4",
+    }
+}
+
+/// MSL spelling of a [`Type`], for `GfxScalar.ty`, `GfxInput.ty` and `GraphicsEntry.varyings`. Kept
+/// apart from [`msl_ty`] so each function handles one type representation.
+fn msl_ty_of(t: &Type) -> Result<&'static str, Diagnostic> {
+    match t {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => Ok("float"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => Ok("uint"),
+        Type::Vector { lanes, .. } => match lanes {
+            2 => Ok("float2"),
+            3 => Ok("float3"),
+            4 => Ok("float4"),
+            other => Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                format!("MSL backend: unsupported vector width {other}"),
+            )),
+        },
+        Type::Matrix {
+            rows: 4, columns: 4, ..
+        } => Ok("float4x4"),
+        other => Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!("MSL backend: unsupported graphics value type {other:?}"),
+        )),
     }
 }
 
