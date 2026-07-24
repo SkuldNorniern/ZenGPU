@@ -659,12 +659,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             lower_binary(ctx, *op, lhs, rhs)
         }
 
-        IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
-        | IrExpr::VecConstruct { .. }
-        | IrExpr::Construct { .. }
-        | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => {
+        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
     }

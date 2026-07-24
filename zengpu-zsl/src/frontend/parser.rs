@@ -1605,22 +1605,10 @@ fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExpr {
             base: Box::new(rename_expr(base, map)),
             component: *component,
         },
-        IrExpr::VecConstruct { dim, args } => IrExpr::VecConstruct {
-            dim: *dim,
-            args: args.iter().map(|a| rename_expr(a, map)).collect(),
-        },
         IrExpr::Construct { ty, dim, args } => IrExpr::Construct {
             ty: *ty,
             dim: *dim,
             args: args.iter().map(|a| rename_expr(a, map)).collect(),
-        },
-        IrExpr::Extend { base, scalar } => IrExpr::Extend {
-            base: Box::new(rename_expr(base, map)),
-            scalar: Box::new(rename_expr(scalar, map)),
-        },
-        IrExpr::Dot { a, b } => IrExpr::Dot {
-            a: Box::new(rename_expr(a, map)),
-            b: Box::new(rename_expr(b, map)),
         },
         IrExpr::Builtin { func, args } => IrExpr::Builtin {
             func: *func,
@@ -1704,13 +1692,6 @@ fn resolve_construct_types_expr(expr: &IrExpr, types: &mut crate::ir::arena::Typ
             base: Box::new(resolve_construct_types_expr(base, types)),
             component: *component,
         },
-        IrExpr::VecConstruct { dim, args } => IrExpr::VecConstruct {
-            dim: *dim,
-            args: args
-                .iter()
-                .map(|a| resolve_construct_types_expr(a, types))
-                .collect(),
-        },
         IrExpr::Construct { dim, args, .. } => {
             let gty = match dim {
                 2 => GfxTy::Vec2,
@@ -1726,14 +1707,6 @@ fn resolve_construct_types_expr(expr: &IrExpr, types: &mut crate::ir::arena::Typ
                     .collect(),
             }
         }
-        IrExpr::Extend { base, scalar } => IrExpr::Extend {
-            base: Box::new(resolve_construct_types_expr(base, types)),
-            scalar: Box::new(resolve_construct_types_expr(scalar, types)),
-        },
-        IrExpr::Dot { a, b } => IrExpr::Dot {
-            a: Box::new(resolve_construct_types_expr(a, types)),
-            b: Box::new(resolve_construct_types_expr(b, types)),
-        },
         IrExpr::Builtin { func, args } => IrExpr::Builtin {
             func: *func,
             args: args
@@ -1930,21 +1903,11 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(GfxTy::F32),
         IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(GfxTy::F32),
         IrExpr::FieldAccess { .. } => GfxTy::F32,
-        IrExpr::VecConstruct { dim, .. } => match dim {
-            2 => GfxTy::Vec2,
-            3 => GfxTy::Vec3,
-            _ => GfxTy::Vec4,
-        },
         IrExpr::Construct { dim, .. } => match dim {
             2 => GfxTy::Vec2,
             3 => GfxTy::Vec3,
             _ => GfxTy::Vec4,
         },
-        IrExpr::Extend { base, .. } => match infer_gfx_ty(base, ctx) {
-            GfxTy::Vec2 => GfxTy::Vec3,
-            _ => GfxTy::Vec4,
-        },
-        IrExpr::Dot { .. } => GfxTy::F32,
         IrExpr::BufferLoad { .. } => GfxTy::F32,
         IrExpr::GlobalId(_) => GfxTy::U32,
         IrExpr::SharedLoad { .. } => GfxTy::F32,
@@ -2444,7 +2407,8 @@ mod tests {
         };
         ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
 
-        let vec4 = IrExpr::VecConstruct {
+        let vec4 = IrExpr::Construct {
+            ty: None,
             dim: 4,
             args: vec![
                 IrExpr::LitF32(0.0),
@@ -2463,7 +2427,8 @@ mod tests {
         let mut arena = crate::ir::arena::TypeArena::new();
         let mut new_ctx = crate::ir::typeck::GraphicsTypeCtx::default();
         new_ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
-        let new_vec4 = IrExpr::VecConstruct {
+        let new_vec4 = IrExpr::Construct {
+            ty: None,
             dim: 4,
             args: vec![
                 IrExpr::LitF32(0.0),

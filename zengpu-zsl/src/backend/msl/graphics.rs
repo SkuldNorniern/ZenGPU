@@ -198,13 +198,6 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::FieldAccess { base, component } => {
             format!("({}).{}", emit_expr(base)?, component_char(*component))
         }
-        IrExpr::VecConstruct { dim, args } => {
-            let mut a = Vec::with_capacity(args.len());
-            for arg in args {
-                a.push(emit_expr(arg)?);
-            }
-            format!("float{dim}({})", a.join(", "))
-        }
         IrExpr::Construct { dim, args, .. } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
@@ -212,10 +205,6 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("float{dim}({})", a.join(", "))
         }
-        IrExpr::Extend { base, scalar } => {
-            format!("float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
-        }
-        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a)?, emit_expr(b)?),
         IrExpr::Builtin { func, args } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {

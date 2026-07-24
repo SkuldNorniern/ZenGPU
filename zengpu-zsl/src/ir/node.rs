@@ -19,8 +19,6 @@ pub enum IrExpr {
     GroupId(u32),
     Input(String),
     FieldAccess { base: Box<IrExpr>, component: u32 },
-    /// Superseded by [`IrExpr::Construct`]. The parser does not build it.
-    VecConstruct { dim: u8, args: Vec<IrExpr> },
     /// `dim` is 2, 3 or 4. `ty` is `None` after parsing and is filled by
     /// `resolve_construct_types_expr` before any backend sees it.
     Construct {
@@ -28,13 +26,6 @@ pub enum IrExpr {
         dim: u8,
         args: Vec<IrExpr>,
     },
-    /// Superseded by `Builtin { func: BuiltinFn::Extend, .. }`. The parser does not build it.
-    Extend {
-        base: Box<IrExpr>,
-        scalar: Box<IrExpr>,
-    },
-    /// Superseded by `Builtin { func: BuiltinFn::Dot, .. }`. The parser does not build it.
-    Dot { a: Box<IrExpr>, b: Box<IrExpr> },
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     Neg(Box<IrExpr>),
     Binary {

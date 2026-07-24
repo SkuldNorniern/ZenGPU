@@ -237,13 +237,6 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                 .unwrap_or("x");
             format!("{}.{}", emit_expr(base)?, field)
         }
-        IrExpr::VecConstruct { dim, args } => {
-            let mut args_s = Vec::with_capacity(args.len());
-            for a in args {
-                args_s.push(emit_expr(a)?);
-            }
-            format!("make_float{}({})", dim, args_s.join(", "))
-        }
         IrExpr::Construct { dim, args, .. } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
@@ -251,10 +244,6 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("make_float{}({})", dim, args_s.join(", "))
         }
-        IrExpr::Extend { base, scalar } => {
-            format!("make_float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
-        }
-        IrExpr::Dot { a, b } => format!("dot({}, {})", emit_expr(a)?, emit_expr(b)?),
         IrExpr::Builtin { func, args } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {

@@ -220,12 +220,7 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
         }
-        IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
-        | IrExpr::VecConstruct { .. }
-        | IrExpr::Construct { .. }
-        | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => {
+        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL compute backend: graphics-only IR node in a compute module",
