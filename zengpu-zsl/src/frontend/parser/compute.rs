@@ -62,18 +62,15 @@ impl<'a> Parser<'a> {
         let params = self.parse_params(&mut ctx)?;
         let body = self.parse_block(&mut ctx)?;
 
-        let mut types = crate::ir::arena::TypeArena::new();
-
         let params = params
             .into_iter()
             .map(|p| Param {
                 name: p.name,
                 kind: match p.kind {
-                    PendingParamKind::Buffer { elem, mutability } => ParamKind::Buffer {
-                        elem: types.intern_buf_elem(elem),
-                        mutability,
-                    },
-                    PendingParamKind::Scalar(ty) => ParamKind::Scalar(types.intern_scalar(ty)),
+                    PendingParamKind::Buffer { elem, mutability } => {
+                        ParamKind::Buffer { elem, mutability }
+                    }
+                    PendingParamKind::Scalar(ty) => ParamKind::Scalar(ty),
                 },
             })
             .collect();
@@ -83,7 +80,7 @@ impl<'a> Parser<'a> {
             .iter()
             .map(|name| SharedDecl {
                 name: name.clone(),
-                elem: types.intern_scalar(ctx.shared[name].elem),
+                elem: ctx.shared[name].elem,
                 len: ctx.shared[name].len,
             })
             .collect();
@@ -92,15 +89,11 @@ impl<'a> Parser<'a> {
             return self.err("unexpected trailing tokens after kernel");
         }
 
-        let locals = ctx
-            .locals_order
-            .into_iter()
-            .map(|(name, ty)| (name, types.intern_scalar(ty)))
-            .collect();
+        let locals = ctx.locals_order;
 
         let body: Vec<IrStmt> = body
             .iter()
-            .map(|s| resolve_construct_types_stmt(s, &mut types))
+            .map(|s| resolve_construct_types_stmt(s, &mut self.types))
             .collect();
 
         Ok(Module {
@@ -111,7 +104,7 @@ impl<'a> Parser<'a> {
                 locals,
                 body,
             },
-            types,
+            types: std::mem::replace(&mut self.types, crate::ir::arena::TypeArena::new()),
         })
     }
 
@@ -182,7 +175,8 @@ impl<'a> Parser<'a> {
                 return self.err(format!("duplicate parameter `{pname}`"));
             }
             self.expect(&Tok::Colon, "`:` after fn parameter name")?;
-            let ty = self.parse_scalar_type()?;
+            let ty_scalar = self.parse_scalar_type()?;
+            let ty = self.types.intern_scalar(ty_scalar);
             ctx.locals.insert(pname.clone(), ty);
             params.push(FnParamDef {
                 name: pname,
@@ -248,6 +242,7 @@ impl<'a> Parser<'a> {
         if elem != ScalarTy::F32 {
             return self.err("only shared array<f32, N> is supported");
         }
+        let elem = self.types.intern_scalar(elem);
         self.expect(&Tok::Comma, "`,` in array<f32, N>")?;
         let len = match self.peek() {
             Some(Tok::Int(v)) if *v > 0 && *v <= u32::MAX as u64 => {
@@ -301,14 +296,19 @@ impl<'a> Parser<'a> {
                     "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
                 ));
             }
-            if buffer.elem != BufElem::F32 {
+            let f32_id = self.types.intern_scalar(ScalarTy::F32);
+            if buffer.elem != f32_id {
                 return self.err("atomic_add currently requires buffer<f32>");
             }
-            let index_ty = infer_ty(&index, ctx);
-            if index_ty != ScalarTy::U32 && index_ty != ScalarTy::F32 {
+            let index_ty =
+                crate::ir::typeck::type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
+            let u32_id = self.types.intern_scalar(ScalarTy::U32);
+            if index_ty != u32_id && index_ty != f32_id {
                 return self.err("atomic_add index must be a u32- or f32-typed expression");
             }
-            if infer_ty(&value, ctx) != ScalarTy::F32 {
+            if crate::ir::typeck::type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types)
+                != f32_id
+            {
                 return self.err("atomic_add value must be an f32-typed expression");
             }
             return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
@@ -338,10 +338,15 @@ impl<'a> Parser<'a> {
                             "`{buf}` is read-only; declare it `device mut buffer`"
                         ));
                     }
-                    if infer_ty(&rhs, ctx) != scalar_for_buffer(buffer.elem) {
+                    if crate::ir::typeck::type_of_compute_expr(
+                        &rhs,
+                        &ctx.type_ctx(),
+                        &mut self.types,
+                    ) != buffer.elem
+                    {
                         return self.err(format!(
                             "assignment to buffer<{}> has incompatible value type",
-                            buffer_elem_name(buffer.elem)
+                            buffer_elem_name(buffer.elem, &self.types)
                         ));
                     }
                     IrStmt::AssignBuffer {
@@ -407,7 +412,12 @@ impl<'a> Parser<'a> {
                 rename.insert(param.name.clone(), arg_name);
             } else {
                 let arg_expr = self.parse_expr(ctx)?;
-                if infer_ty(&arg_expr, ctx) != param.ty {
+                if crate::ir::typeck::type_of_compute_expr(
+                    &arg_expr,
+                    &ctx.type_ctx(),
+                    &mut self.types,
+                ) != param.ty
+                {
                     return self.err(format!(
                         "argument for parameter `{}` has the wrong type",
                         param.name
@@ -454,7 +464,12 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_expr(ctx)?;
-        let ty = annot.unwrap_or_else(|| infer_ty(&init, ctx));
+        let ty = match annot {
+            Some(sty) => self.types.intern_scalar(sty),
+            None => {
+                crate::ir::typeck::type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types)
+            }
+        };
         ctx.locals.insert(name.clone(), ty);
         ctx.locals_order.push((name.clone(), ty));
         Ok(IrStmt::Let { name, init })
@@ -483,8 +498,9 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::DotDot, "`..` in for-loop range")?;
         let hi = self.parse_expr(ctx)?;
         // The loop variable is a u32 local.
-        ctx.locals.insert(var.clone(), ScalarTy::U32);
-        ctx.locals_order.push((var.clone(), ScalarTy::U32));
+        let u32_id = self.types.intern_scalar(ScalarTy::U32);
+        ctx.locals.insert(var.clone(), u32_id);
+        ctx.locals_order.push((var.clone(), u32_id));
         let body = self.parse_block(ctx)?;
         Ok(IrStmt::For { var, lo, hi, body })
     }

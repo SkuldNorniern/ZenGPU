@@ -27,68 +27,20 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     })
 }
 
-/// Infer the scalar type of an expression (compute is scalar-only). Mirrors the
-/// SPIR-V backend's value-type inference so a `let`'s declared type matches.
-pub(super) fn infer_ty(expr: &IrExpr, ctx: &Ctx) -> ScalarTy {
-    match expr {
-        IrExpr::LitU32(_) => ScalarTy::U32,
-        IrExpr::LitF32(_) => ScalarTy::F32,
-        IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(ScalarTy::U32),
-        IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(ScalarTy::F32),
-        IrExpr::GlobalId(_) => ScalarTy::U32,
-        IrExpr::LocalId(_) | IrExpr::GroupId(_) => ScalarTy::U32,
-        IrExpr::BufferLoad { buf, .. } => ctx
-            .buffers
-            .get(buf)
-            .map(|buffer| scalar_for_buffer(buffer.elem))
-            .unwrap_or(ScalarTy::F32),
-        IrExpr::SharedLoad { .. } => ScalarTy::F32,
-        IrExpr::Builtin { func, .. } => match func {
-            BuiltinFn::U32 => ScalarTy::U32,
-            BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => ScalarTy::Bool,
-            _ => ScalarTy::F32,
-        },
-        IrExpr::Neg(e) => infer_ty(e, ctx),
-        IrExpr::Binary { op, lhs, rhs } => match op {
-            IrBinOp::Lt
-            | IrBinOp::Le
-            | IrBinOp::Gt
-            | IrBinOp::Ge
-            | IrBinOp::Eq
-            | IrBinOp::Ne
-            | IrBinOp::And
-            | IrBinOp::Or => ScalarTy::Bool,
-            _ => {
-                let l = infer_ty(lhs, ctx);
-                let r = infer_ty(rhs, ctx);
-                if l == ScalarTy::F32 || r == ScalarTy::F32 {
-                    ScalarTy::F32
-                } else if l == ScalarTy::I32 || r == ScalarTy::I32 {
-                    ScalarTy::I32
-                } else {
-                    ScalarTy::U32
-                }
-            }
-        },
-        // Graphics-only IR nodes are never produced by the compute parser.
-        _ => ScalarTy::U32,
-    }
-}
-
-pub(super) fn scalar_for_buffer(elem: BufElem) -> ScalarTy {
-    match elem {
-        BufElem::F32 => ScalarTy::F32,
-        BufElem::U32 => ScalarTy::U32,
-        BufElem::I32 => ScalarTy::I32,
-        _ => unreachable!("non-scalar buffer element reached compute parser"),
-    }
-}
-
-pub(super) fn buffer_elem_name(elem: BufElem) -> &'static str {
-    match elem {
-        BufElem::F32 => "f32",
-        BufElem::U32 => "u32",
-        BufElem::I32 => "i32",
+pub(super) fn buffer_elem_name(elem: TypeId, arena: &crate::ir::arena::TypeArena) -> &'static str {
+    use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
+    match arena.get(elem) {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => "f32",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => "u32",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => "i32",
         _ => "unsupported",
     }
 }

@@ -55,10 +55,8 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Lt, "`<` in buffer<…>")?;
             let elem = self.parse_scalar_type()?;
             self.expect(&Tok::Gt, "`>` in buffer<…>")?;
-            let elem = match elem {
-                ScalarTy::F32 => BufElem::F32,
-                ScalarTy::U32 => BufElem::U32,
-                ScalarTy::I32 => BufElem::I32,
+            let elem: TypeId = match elem {
+                ScalarTy::F32 | ScalarTy::U32 | ScalarTy::I32 => self.types.intern_scalar(elem),
                 ScalarTy::Bool => return self.err("buffer<bool> is not supported"),
             };
             ctx.buffers
@@ -99,9 +97,9 @@ impl<'a> Parser<'a> {
             }
             ctx.push_param = Some(name.to_string());
             for (field, gty) in fields {
-                let ty = match gty {
-                    GfxTy::U32 => ScalarTy::U32,
-                    GfxTy::F32 => ScalarTy::F32,
+                let ty: TypeId = match gty {
+                    GfxTy::U32 => self.types.intern_scalar(ScalarTy::U32),
+                    GfxTy::F32 => self.types.intern_scalar(ScalarTy::F32),
                     _ => {
                         return self
                             .err(format!("compute push field `{field}` must be u32 or f32"));
