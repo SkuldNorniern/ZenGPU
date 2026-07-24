@@ -1,6 +1,8 @@
 //! Backend-neutral, symbol-resolved nodes. Identifiers are classified (local, scalar param, buffer)
 //! and structure is checked in `build`. Type inference and conversions are per backend.
 
+use crate::ir::types::TypeId;
+
 #[derive(Debug)]
 pub enum IrExpr {
     /// Typed as `u32`.
@@ -17,16 +19,22 @@ pub enum IrExpr {
     GroupId(u32),
     Input(String),
     FieldAccess { base: Box<IrExpr>, component: u32 },
-    /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
+    /// Superseded by [`IrExpr::Construct`]. The parser does not build it.
     VecConstruct { dim: u8, args: Vec<IrExpr> },
-    /// `vec3.extend(scalar)` returns an `f32x4`.
+    /// `dim` is 2, 3 or 4. `ty` is `None` after parsing and is filled by
+    /// `resolve_construct_types_expr` before any backend sees it.
+    Construct {
+        ty: Option<TypeId>,
+        dim: u8,
+        args: Vec<IrExpr>,
+    },
+    /// Superseded by `Builtin { func: BuiltinFn::Extend, .. }`. The parser does not build it.
     Extend {
         base: Box<IrExpr>,
         scalar: Box<IrExpr>,
     },
-    /// `dot(a, b)` returns a scalar.
+    /// Superseded by `Builtin { func: BuiltinFn::Dot, .. }`. The parser does not build it.
     Dot { a: Box<IrExpr>, b: Box<IrExpr> },
-    /// A built-in math call, such as `abs`, `min` or `clamp`.
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     Neg(Box<IrExpr>),
     Binary {
@@ -99,6 +107,8 @@ pub enum BuiltinFn {
     Mix,
     Normalize,
     Length,
+    Dot,
+    Extend,
 }
 
 impl BuiltinFn {
@@ -127,6 +137,8 @@ impl BuiltinFn {
             BuiltinFn::Mix => "mix",
             BuiltinFn::Normalize => "normalize",
             BuiltinFn::Length => "length",
+            BuiltinFn::Dot => "dot",
+            BuiltinFn::Extend => "extend",
         }
     }
 }
