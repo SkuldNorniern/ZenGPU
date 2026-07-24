@@ -225,12 +225,7 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         // Graphics-only nodes never appear in a compute module built by this
         // crate's own parser; hitting this is a compiler defect, not a
         // target limitation.
-        IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
-        | IrExpr::VecConstruct { .. }
-        | IrExpr::Construct { .. }
-        | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => {
+        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL compute backend: graphics-only IR node in a compute module",

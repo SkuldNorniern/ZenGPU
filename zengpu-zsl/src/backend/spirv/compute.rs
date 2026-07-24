@@ -699,12 +699,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         }
 
         // Graphics-only expression forms never appear in a compute module.
-        IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
-        | IrExpr::VecConstruct { .. }
-        | IrExpr::Construct { .. }
-        | IrExpr::Extend { .. }
-        | IrExpr::Dot { .. } => {
+        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
     }

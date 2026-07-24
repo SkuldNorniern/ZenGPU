@@ -125,14 +125,6 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
         }
         IrExpr::Input(n) => arena.intern_gfx_ty(ctx.inputs.get(n).copied().unwrap_or(GfxTy::F32)),
         IrExpr::FieldAccess { .. } => arena.intern_gfx_ty(GfxTy::F32),
-        IrExpr::VecConstruct { dim, .. } => {
-            let ty = match dim {
-                2 => GfxTy::Vec2,
-                3 => GfxTy::Vec3,
-                _ => GfxTy::Vec4,
-            };
-            arena.intern_gfx_ty(ty)
-        }
         IrExpr::Construct { dim, .. } => {
             let ty = match dim {
                 2 => GfxTy::Vec2,
@@ -141,17 +133,6 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
             };
             arena.intern_gfx_ty(ty)
         }
-        IrExpr::Extend { base, .. } => {
-            let base_id = type_of_graphics_expr(base, ctx, arena);
-            let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
-            let ty = if base_id == vec2_id {
-                GfxTy::Vec3
-            } else {
-                GfxTy::Vec4
-            };
-            arena.intern_gfx_ty(ty)
-        }
-        IrExpr::Dot { .. } => arena.intern_gfx_ty(GfxTy::F32),
         IrExpr::BufferLoad { .. } => arena.intern_gfx_ty(GfxTy::F32),
         IrExpr::GlobalId(_) => arena.intern_gfx_ty(GfxTy::U32),
         IrExpr::SharedLoad { .. } => arena.intern_gfx_ty(GfxTy::F32),
@@ -259,7 +240,8 @@ mod tests {
     fn graphics_vec_construct_and_mat4_vec4_promotion() {
         let mut arena = TypeArena::new();
         let ctx = GraphicsTypeCtx::default();
-        let vec4 = IrExpr::VecConstruct {
+        let vec4 = IrExpr::Construct {
+            ty: None,
             dim: 4,
             args: vec![
                 IrExpr::LitF32(0.0),

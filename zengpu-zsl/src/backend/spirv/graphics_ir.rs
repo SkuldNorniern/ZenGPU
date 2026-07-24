@@ -604,23 +604,6 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
                 .op_composite_extract(t_f32, composite.id, &[*component]);
             Ok(GVal { id, ty: GfxTy::F32 })
         }
-        IrExpr::VecConstruct { dim, args } => {
-            let (gty, spv_ty) = match dim {
-                2 => (GfxTy::Vec2, ctx.t_vec2),
-                3 => (GfxTy::Vec3, ctx.t_vec3),
-                _ => (GfxTy::Vec4, ctx.t_vec4),
-            };
-            if args.len() != *dim as usize {
-                return Err(format!("f32x{dim} takes {dim} args, got {}", args.len()));
-            }
-            let mut comps = Vec::with_capacity(args.len());
-            for a in args {
-                let v = lower_expr(ctx, a)?;
-                comps.push(scalar_to_f32(ctx, v));
-            }
-            let id = ctx.spv.op_composite_construct(spv_ty, &comps);
-            Ok(GVal { id, ty: gty })
-        }
         IrExpr::Construct { dim, args, .. } => {
             let (gty, spv_ty) = match dim {
                 2 => (GfxTy::Vec2, ctx.t_vec2),
@@ -637,34 +620,6 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             }
             let id = ctx.spv.op_composite_construct(spv_ty, &comps);
             Ok(GVal { id, ty: gty })
-        }
-        IrExpr::Extend { base, scalar } => {
-            let b = lower_expr(ctx, base)?;
-            if b.ty != GfxTy::Vec3 {
-                return Err(".extend() requires a f32x3 receiver".into());
-            }
-            let ext = lower_expr(ctx, scalar)?;
-            let ext_id = scalar_to_f32(ctx, ext);
-            let t_f32 = ctx.t_f32;
-            let x = ctx.spv.op_composite_extract(t_f32, b.id, &[0]);
-            let y = ctx.spv.op_composite_extract(t_f32, b.id, &[1]);
-            let z = ctx.spv.op_composite_extract(t_f32, b.id, &[2]);
-            let t_vec4 = ctx.t_vec4;
-            let id = ctx.spv.op_composite_construct(t_vec4, &[x, y, z, ext_id]);
-            Ok(GVal {
-                id,
-                ty: GfxTy::Vec4,
-            })
-        }
-        IrExpr::Dot { a, b } => {
-            let a = lower_expr(ctx, a)?;
-            let b = lower_expr(ctx, b)?;
-            if !is_vec(a.ty) || a.ty != b.ty {
-                return Err("dot() requires two vectors of the same type".into());
-            }
-            let t_f32 = ctx.t_f32;
-            let id = ctx.spv.op_dot(t_f32, a.id, b.id);
-            Ok(GVal { id, ty: GfxTy::F32 })
         }
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
         IrExpr::Neg(inner) => {

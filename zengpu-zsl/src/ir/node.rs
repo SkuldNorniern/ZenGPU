@@ -32,9 +32,6 @@ pub enum IrExpr {
     Input(String),
     /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
     FieldAccess { base: Box<IrExpr>, component: u32 },
-    /// Superseded by [`IrExpr::Construct`]; the parser no longer constructs
-    /// this. Kept until a follow-up commit confirms no remaining consumers.
-    VecConstruct { dim: u8, args: Vec<IrExpr> },
     /// A vector constructor `f32xN(args…)`. `dim` is `2`/`3`/`4`; `ty` is
     /// `None` immediately after parsing (a `TypeArena` isn't available deep
     /// inside expression parsing) and is filled to `Some(..)` by
@@ -45,17 +42,6 @@ pub enum IrExpr {
         dim: u8,
         args: Vec<IrExpr>,
     },
-    /// Superseded by `Builtin { func: BuiltinFn::Extend, .. }`; the parser no
-    /// longer constructs this. Kept until a follow-up commit confirms no
-    /// remaining consumers.
-    Extend {
-        base: Box<IrExpr>,
-        scalar: Box<IrExpr>,
-    },
-    /// Superseded by `Builtin { func: BuiltinFn::Dot, .. }`; the parser no
-    /// longer constructs this. Kept until a follow-up commit confirms no
-    /// remaining consumers.
-    Dot { a: Box<IrExpr>, b: Box<IrExpr> },
     /// A built-in math call (`abs`, `min`, `clamp`, `dot`, `extend`, …).
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     /// Unary negation.
