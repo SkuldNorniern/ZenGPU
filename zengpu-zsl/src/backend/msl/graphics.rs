@@ -13,8 +13,8 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::GraphicsModule;
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
-use crate::ir::{GfxTy, GraphicsModule};
 
 /// Buffer index for the push-constant block in graphics shaders. Kept high so it
 /// never overlaps vertex geometry buffers bound for `[[stage_in]]`. The Metal
@@ -24,13 +24,10 @@ pub const PUSH_BUFFER_INDEX: u32 = 16;
 /// Lower a graphics [`GraphicsModule`] to MSL.
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
-    // `GraphicsEntry.locals` is `TypeId`; round-trip to `GfxTy` here since this
-    // backend's own `Ctx.locals` is still `GfxTy`-keyed (a separate cleanup).
-    let locals: HashMap<&str, GfxTy> = e
-        .locals
-        .iter()
-        .map(|(n, tid)| (n.as_str(), module.types.gfx_ty_of(*tid)))
-        .collect();
+    let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    for (n, tid) in &e.locals {
+        locals.insert(n.as_str(), msl_ty_of(module.types.get(*tid))?);
+    }
     let ctx = Ctx { locals };
 
     let mut s = String::new();
@@ -133,7 +130,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 }
 
 struct Ctx<'a> {
-    locals: HashMap<&'a str, GfxTy>,
+    locals: HashMap<&'a str, &'static str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -145,9 +142,9 @@ fn indent(s: &mut String, depth: usize) {
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
-            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or(GfxTy::F32);
+            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("float");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", msl_ty(ty), name, emit_expr(init)?);
+            let _ = writeln!(s, "{ty} {} = {};", name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
@@ -293,26 +290,8 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
-/// The MSL spelling of a [`GfxTy`]. Used only for `GraphicsEntry.locals`
-/// (still `GfxTy`, not yet `TypeId` — a separate, later conversion) and the
-/// `IrStmt::Let` arm above that reads it.
-fn msl_ty(t: GfxTy) -> &'static str {
-    match t {
-        GfxTy::F32 => "float",
-        GfxTy::U32 => "uint",
-        GfxTy::Vec2 => "float2",
-        GfxTy::Vec3 => "float3",
-        GfxTy::Vec4 => "float4",
-        GfxTy::Mat4 => "float4x4",
-    }
-}
-
 /// The MSL spelling of a unified [`Type`] — used for `GfxScalar.ty`/
-/// `GfxInput.ty`/`GraphicsEntry.varyings`, all already `TypeId`. Kept
-/// separate from [`msl_ty`] (which still serves `GraphicsEntry.locals`,
-/// not yet converted) so this file has one obviously-correct spelling per
-/// source representation rather than silently reconciling two type systems
-/// in one function.
+/// `GfxInput.ty`/`GraphicsEntry.varyings`/`GraphicsEntry.locals`, all `TypeId`.
 fn msl_ty_of(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
         Type::Float {
