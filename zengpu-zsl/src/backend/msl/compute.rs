@@ -209,6 +209,12 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::Dot | BuiltinFn::Extend => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Internal,
+                        "MSL compute backend: graphics-only IR node in a compute module",
+                    ));
+                }
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }
@@ -222,6 +228,7 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::Input(_)
         | IrExpr::FieldAccess { .. }
         | IrExpr::VecConstruct { .. }
+        | IrExpr::Construct { .. }
         | IrExpr::Extend { .. }
         | IrExpr::Dot { .. } => {
             return Err(Diagnostic::new(

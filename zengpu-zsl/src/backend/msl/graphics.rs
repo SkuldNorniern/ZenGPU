@@ -12,7 +12,7 @@ use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::{GfxTy, GraphicsModule};
 
 /// Buffer index for the push-constant block in graphics shaders. Kept high so it
@@ -219,6 +219,13 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("float{dim}({})", a.join(", "))
         }
+        IrExpr::Construct { dim, args, .. } => {
+            let mut a = Vec::with_capacity(args.len());
+            for arg in args {
+                a.push(emit_expr(arg)?);
+            }
+            format!("float{dim}({})", a.join(", "))
+        }
         IrExpr::Extend { base, scalar } => {
             format!("float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
         }
@@ -228,7 +235,11 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             for arg in args {
                 a.push(emit_expr(arg)?);
             }
-            format!("{}({})", func.name(), a.join(", "))
+            match func {
+                BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
+                BuiltinFn::Extend => format!("float4({}, {})", a[0], a[1]),
+                _ => format!("{}({})", func.name(), a.join(", ")),
+            }
         }
         IrExpr::Neg(e) => format!("(-{})", emit_expr(e)?),
         IrExpr::Binary { op, lhs, rhs } => {

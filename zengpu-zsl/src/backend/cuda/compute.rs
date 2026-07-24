@@ -244,6 +244,13 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("make_float{}({})", dim, args_s.join(", "))
         }
+        IrExpr::Construct { dim, args, .. } => {
+            let mut args_s = Vec::with_capacity(args.len());
+            for a in args {
+                args_s.push(emit_expr(a)?);
+            }
+            format!("make_float{}({})", dim, args_s.join(", "))
+        }
         IrExpr::Extend { base, scalar } => {
             format!("make_float4({}, {})", emit_expr(base)?, emit_expr(scalar)?)
         }
@@ -254,6 +261,8 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                 args_s.push(emit_expr(a)?);
             }
             match func {
+                BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::Extend => format!("make_float4({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),

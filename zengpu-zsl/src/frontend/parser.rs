@@ -345,6 +345,11 @@ impl<'a> Parser<'a> {
             .map(|(name, ty)| (name, types.intern_scalar(ty)))
             .collect();
 
+        let body: Vec<IrStmt> = body
+            .iter()
+            .map(|s| resolve_construct_types_stmt(s, &mut types))
+            .collect();
+
         Ok(Module {
             entry: Entry {
                 kind: EntryKind::Compute { local_size },
@@ -1139,6 +1144,15 @@ impl<'a> Parser<'a> {
             .map(|t| types.intern_gfx_ty(t))
             .collect();
 
+        let body: Vec<IrStmt> = body
+            .iter()
+            .map(|s| resolve_construct_types_stmt(s, &mut types))
+            .collect();
+        let ret: Vec<IrExpr> = ret
+            .iter()
+            .map(|e| resolve_construct_types_expr(e, &mut types))
+            .collect();
+
         Ok(GraphicsModule {
             entry: GraphicsEntry {
                 is_fragment,
@@ -1559,9 +1573,9 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::LParen, "`(`")?;
                 let arg = self.parse_g_expr(ctx)?;
                 self.expect(&Tok::RParen, "`)`")?;
-                base = IrExpr::Extend {
-                    base: Box::new(base),
-                    scalar: Box::new(arg),
+                base = IrExpr::Builtin {
+                    func: BuiltinFn::Extend,
+                    args: vec![base, arg],
                 };
             } else {
                 let component = match field.as_str() {
@@ -1595,10 +1609,9 @@ impl<'a> Parser<'a> {
                 if args.len() != 2 {
                     return self.err("dot(a, b) takes exactly 2 args");
                 }
-                let mut it = args.into_iter();
-                Ok(IrExpr::Dot {
-                    a: Box::new(it.next().unwrap()),
-                    b: Box::new(it.next().unwrap()),
+                Ok(IrExpr::Builtin {
+                    func: BuiltinFn::Dot,
+                    args,
                 })
             }
             "f32x2" | "f32x3" | "f32x4" => {
@@ -1607,7 +1620,7 @@ impl<'a> Parser<'a> {
                     "f32x3" => 3,
                     _ => 4,
                 };
-                Ok(IrExpr::VecConstruct { dim, args })
+                Ok(IrExpr::Construct { ty: None, dim, args })
             }
             _ => {
                 let func = gfx_builtin_from_name(name).ok_or_else(|| ParseError {
@@ -1657,6 +1670,11 @@ fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExpr {
             component: *component,
         },
         IrExpr::VecConstruct { dim, args } => IrExpr::VecConstruct {
+            dim: *dim,
+            args: args.iter().map(|a| rename_expr(a, map)).collect(),
+        },
+        IrExpr::Construct { ty, dim, args } => IrExpr::Construct {
+            ty: *ty,
             dim: *dim,
             args: args.iter().map(|a| rename_expr(a, map)).collect(),
         },
@@ -1722,6 +1740,134 @@ fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStmt {
             body: body.iter().map(|s| rename_stmt(s, map)).collect(),
         },
         IrStmt::Eval(e) => IrStmt::Eval(rename_expr(e, map)),
+    }
+}
+
+/// Fill in every [`IrExpr::Construct`]'s `ty` field (`None` immediately after
+/// parsing — a `TypeArena` isn't available deep inside expression parsing) by
+/// recursively rebuilding `expr`, exactly mirroring [`rename_expr`]'s shape.
+/// Every other variant is passed through structurally unchanged, recursing
+/// into children. Applied once, at the tail of `parse_kernel_rest`/
+/// `parse_graphics_rest`, using the same `TypeArena` already interning that
+/// module's locals/shared/params/inputs/scalar_params/varyings.
+fn resolve_construct_types_expr(expr: &IrExpr, types: &mut crate::ir::arena::TypeArena) -> IrExpr {
+    match expr {
+        IrExpr::LitU32(v) => IrExpr::LitU32(*v),
+        IrExpr::LitF32(v) => IrExpr::LitF32(*v),
+        IrExpr::Local(name) => IrExpr::Local(name.clone()),
+        IrExpr::ScalarParam(name) => IrExpr::ScalarParam(name.clone()),
+        IrExpr::BufferLoad { buf, index } => IrExpr::BufferLoad {
+            buf: buf.clone(),
+            index: Box::new(resolve_construct_types_expr(index, types)),
+        },
+        IrExpr::SharedLoad { name, index } => IrExpr::SharedLoad {
+            name: name.clone(),
+            index: Box::new(resolve_construct_types_expr(index, types)),
+        },
+        IrExpr::GlobalId(c) => IrExpr::GlobalId(*c),
+        IrExpr::LocalId(c) => IrExpr::LocalId(*c),
+        IrExpr::GroupId(c) => IrExpr::GroupId(*c),
+        IrExpr::Input(name) => IrExpr::Input(name.clone()),
+        IrExpr::FieldAccess { base, component } => IrExpr::FieldAccess {
+            base: Box::new(resolve_construct_types_expr(base, types)),
+            component: *component,
+        },
+        IrExpr::VecConstruct { dim, args } => IrExpr::VecConstruct {
+            dim: *dim,
+            args: args
+                .iter()
+                .map(|a| resolve_construct_types_expr(a, types))
+                .collect(),
+        },
+        IrExpr::Construct { dim, args, .. } => {
+            let gty = match dim {
+                2 => GfxTy::Vec2,
+                3 => GfxTy::Vec3,
+                _ => GfxTy::Vec4,
+            };
+            IrExpr::Construct {
+                ty: Some(types.intern_gfx_ty(gty)),
+                dim: *dim,
+                args: args
+                    .iter()
+                    .map(|a| resolve_construct_types_expr(a, types))
+                    .collect(),
+            }
+        }
+        IrExpr::Extend { base, scalar } => IrExpr::Extend {
+            base: Box::new(resolve_construct_types_expr(base, types)),
+            scalar: Box::new(resolve_construct_types_expr(scalar, types)),
+        },
+        IrExpr::Dot { a, b } => IrExpr::Dot {
+            a: Box::new(resolve_construct_types_expr(a, types)),
+            b: Box::new(resolve_construct_types_expr(b, types)),
+        },
+        IrExpr::Builtin { func, args } => IrExpr::Builtin {
+            func: *func,
+            args: args
+                .iter()
+                .map(|a| resolve_construct_types_expr(a, types))
+                .collect(),
+        },
+        IrExpr::Neg(inner) => IrExpr::Neg(Box::new(resolve_construct_types_expr(inner, types))),
+        IrExpr::Binary { op, lhs, rhs } => IrExpr::Binary {
+            op: *op,
+            lhs: Box::new(resolve_construct_types_expr(lhs, types)),
+            rhs: Box::new(resolve_construct_types_expr(rhs, types)),
+        },
+    }
+}
+
+/// Statement-level companion to [`resolve_construct_types_expr`], mirroring
+/// [`rename_stmt`]'s shape.
+fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut crate::ir::arena::TypeArena) -> IrStmt {
+    match stmt {
+        IrStmt::Let { name, init } => IrStmt::Let {
+            name: name.clone(),
+            init: resolve_construct_types_expr(init, types),
+        },
+        IrStmt::AssignLocal { name, value } => IrStmt::AssignLocal {
+            name: name.clone(),
+            value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::AssignBuffer { buf, index, value } => IrStmt::AssignBuffer {
+            buf: buf.clone(),
+            index: resolve_construct_types_expr(index, types),
+            value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::AtomicAdd { buf, index, value } => IrStmt::AtomicAdd {
+            buf: buf.clone(),
+            index: resolve_construct_types_expr(index, types),
+            value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::AssignShared { name, index, value } => IrStmt::AssignShared {
+            name: name.clone(),
+            index: resolve_construct_types_expr(index, types),
+            value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::Barrier => IrStmt::Barrier,
+        IrStmt::If { cond, then, else_ } => IrStmt::If {
+            cond: resolve_construct_types_expr(cond, types),
+            then: then
+                .iter()
+                .map(|s| resolve_construct_types_stmt(s, types))
+                .collect(),
+            else_: else_.as_ref().map(|blk| {
+                blk.iter()
+                    .map(|s| resolve_construct_types_stmt(s, types))
+                    .collect()
+            }),
+        },
+        IrStmt::For { var, lo, hi, body } => IrStmt::For {
+            var: var.clone(),
+            lo: resolve_construct_types_expr(lo, types),
+            hi: resolve_construct_types_expr(hi, types),
+            body: body
+                .iter()
+                .map(|s| resolve_construct_types_stmt(s, types))
+                .collect(),
+        },
+        IrStmt::Eval(e) => IrStmt::Eval(resolve_construct_types_expr(e, types)),
     }
 }
 
@@ -1862,6 +2008,11 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
             3 => GfxTy::Vec3,
             _ => GfxTy::Vec4,
         },
+        IrExpr::Construct { dim, .. } => match dim {
+            2 => GfxTy::Vec2,
+            3 => GfxTy::Vec3,
+            _ => GfxTy::Vec4,
+        },
         IrExpr::Extend { base, .. } => match infer_gfx_ty(base, ctx) {
             GfxTy::Vec2 => GfxTy::Vec3,
             _ => GfxTy::Vec4,
@@ -1874,6 +2025,11 @@ fn infer_gfx_ty(expr: &IrExpr, ctx: &GfxCtx) -> GfxTy {
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 => GfxTy::U32,
             BuiltinFn::Length => GfxTy::F32,
+            BuiltinFn::Dot => GfxTy::F32,
+            BuiltinFn::Extend => match args.first().map(|a| infer_gfx_ty(a, ctx)) {
+                Some(GfxTy::Vec2) => GfxTy::Vec3,
+                _ => GfxTy::Vec4,
+            },
             _ => args
                 .first()
                 .map(|a| infer_gfx_ty(a, ctx))

@@ -5,6 +5,8 @@
 //! known builtins) is checked during `build`. Value-type inference and the
 //! emission of conversions are left to each backend.
 
+use crate::ir::types::TypeId;
+
 /// A ZSL expression.
 #[derive(Debug)]
 pub enum IrExpr {
@@ -30,16 +32,31 @@ pub enum IrExpr {
     Input(String),
     /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
     FieldAccess { base: Box<IrExpr>, component: u32 },
-    /// A vector constructor `f32xN(args…)` (`dim` is `2`/`3`/`4`).
+    /// Superseded by [`IrExpr::Construct`]; the parser no longer constructs
+    /// this. Kept until a follow-up commit confirms no remaining consumers.
     VecConstruct { dim: u8, args: Vec<IrExpr> },
-    /// `vec3.extend(scalar)` → `f32x4`.
+    /// A vector constructor `f32xN(args…)`. `dim` is `2`/`3`/`4`; `ty` is
+    /// `None` immediately after parsing (a `TypeArena` isn't available deep
+    /// inside expression parsing) and is filled to `Some(..)` by
+    /// `frontend::parser`'s `resolve_construct_types_expr` pass before the
+    /// module is returned — always `Some` by the time any backend sees it.
+    Construct {
+        ty: Option<TypeId>,
+        dim: u8,
+        args: Vec<IrExpr>,
+    },
+    /// Superseded by `Builtin { func: BuiltinFn::Extend, .. }`; the parser no
+    /// longer constructs this. Kept until a follow-up commit confirms no
+    /// remaining consumers.
     Extend {
         base: Box<IrExpr>,
         scalar: Box<IrExpr>,
     },
-    /// `dot(a, b)` → scalar.
+    /// Superseded by `Builtin { func: BuiltinFn::Dot, .. }`; the parser no
+    /// longer constructs this. Kept until a follow-up commit confirms no
+    /// remaining consumers.
     Dot { a: Box<IrExpr>, b: Box<IrExpr> },
-    /// A built-in math call (`abs`, `min`, `clamp`, …).
+    /// A built-in math call (`abs`, `min`, `clamp`, `dot`, `extend`, …).
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     /// Unary negation.
     Neg(Box<IrExpr>),
@@ -121,6 +138,11 @@ pub enum BuiltinFn {
     Mix,
     Normalize,
     Length,
+    /// `dot(a, b)` → scalar. Formerly the dedicated `IrExpr::Dot` node.
+    Dot,
+    /// `vec3.extend(scalar)` → `f32x4`. Formerly the dedicated
+    /// `IrExpr::Extend` node.
+    Extend,
 }
 
 impl BuiltinFn {
@@ -150,6 +172,8 @@ impl BuiltinFn {
             BuiltinFn::Mix => "mix",
             BuiltinFn::Normalize => "normalize",
             BuiltinFn::Length => "length",
+            BuiltinFn::Dot => "dot",
+            BuiltinFn::Extend => "extend",
         }
     }
 }

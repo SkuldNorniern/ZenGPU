@@ -133,6 +133,14 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
             };
             arena.intern_gfx_ty(ty)
         }
+        IrExpr::Construct { dim, .. } => {
+            let ty = match dim {
+                2 => GfxTy::Vec2,
+                3 => GfxTy::Vec3,
+                _ => GfxTy::Vec4,
+            };
+            arena.intern_gfx_ty(ty)
+        }
         IrExpr::Extend { base, .. } => {
             let base_id = type_of_graphics_expr(base, ctx, arena);
             let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
@@ -151,6 +159,13 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 => arena.intern_gfx_ty(GfxTy::U32),
             BuiltinFn::Length => arena.intern_gfx_ty(GfxTy::F32),
+            BuiltinFn::Dot => arena.intern_gfx_ty(GfxTy::F32),
+            BuiltinFn::Extend => {
+                let base_ty = args.first().map(|a| type_of_graphics_expr(a, ctx, arena));
+                let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
+                let ty = if base_ty == Some(vec2_id) { GfxTy::Vec3 } else { GfxTy::Vec4 };
+                arena.intern_gfx_ty(ty)
+            }
             _ => match args.first() {
                 Some(a) => type_of_graphics_expr(a, ctx, arena),
                 None => arena.intern_gfx_ty(GfxTy::F32),

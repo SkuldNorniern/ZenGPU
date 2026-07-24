@@ -702,6 +702,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         IrExpr::Input(_)
         | IrExpr::FieldAccess { .. }
         | IrExpr::VecConstruct { .. }
+        | IrExpr::Construct { .. }
         | IrExpr::Extend { .. }
         | IrExpr::Dot { .. } => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
@@ -805,6 +806,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 id,
                 ty: ScalarTy::U32,
             })
+        }
+        BuiltinFn::Dot | BuiltinFn::Extend => {
+            Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
         BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => {
             if args.len() != 1 {
