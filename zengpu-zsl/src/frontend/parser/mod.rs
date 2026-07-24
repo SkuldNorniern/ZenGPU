@@ -46,7 +46,6 @@ use types::*;
 use std::collections::HashMap;
 
 use crate::frontend::lex::{Tok, Token, lex};
-use crate::ir::BufElem;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
 use crate::ir::{
@@ -95,6 +94,7 @@ struct Parser<'a> {
     functions: HashMap<String, FunctionDef>,
     /// Per-call-site counter that keeps inlined locals from colliding.
     call_counter: u32,
+    types: crate::ir::arena::TypeArena,
 }
 
 impl<'a> Parser<'a> {
@@ -105,6 +105,7 @@ impl<'a> Parser<'a> {
             pushes: HashMap::new(),
             functions: HashMap::new(),
             call_counter: 0,
+            types: crate::ir::arena::TypeArena::new(),
         }
     }
 
@@ -520,42 +521,20 @@ mod tests {
     }
 
     #[test]
-    fn standalone_checker_matches_infer_ty_for_local_and_literal() {
-        let mut ctx = Ctx {
-            buffers: HashMap::new(),
-            scalars: HashMap::new(),
-            push_param: None,
-            id_param: None,
-            locals: HashMap::new(),
-            locals_order: Vec::new(),
-            shared: HashMap::new(),
-            shared_order: Vec::new(),
-        };
-        ctx.locals.insert("x".to_string(), ScalarTy::F32);
-
-        let local_expr = IrExpr::Local("x".to_string());
-        let old_ty = infer_ty(&local_expr, &ctx);
-
+    fn typeck_infers_local_and_literal_types() {
         let mut arena = crate::ir::arena::TypeArena::new();
         let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
-        new_ctx.locals.insert("x".to_string(), ScalarTy::F32);
+        new_ctx
+            .locals
+            .insert("x".to_string(), arena.intern_scalar(ScalarTy::F32));
+        let local_expr = IrExpr::Local("x".to_string());
         let new_ty = crate::ir::typeck::type_of_compute_expr(&local_expr, &new_ctx, &mut arena);
 
-        assert_eq!(new_ty, arena.intern_scalar(old_ty));
+        assert_eq!(new_ty, arena.intern_scalar(ScalarTy::F32));
     }
 
     #[test]
-    fn standalone_checker_matches_infer_ty_for_comparison_and_arithmetic() {
-        let ctx = Ctx {
-            buffers: HashMap::new(),
-            scalars: HashMap::new(),
-            push_param: None,
-            id_param: None,
-            locals: HashMap::new(),
-            locals_order: Vec::new(),
-            shared: HashMap::new(),
-            shared_order: Vec::new(),
-        };
+    fn typeck_infers_comparison_and_arithmetic_types() {
         let cmp = IrExpr::Binary {
             op: IrBinOp::Lt,
             lhs: Box::new(IrExpr::LitU32(1)),
@@ -570,46 +549,28 @@ mod tests {
         let mut arena = crate::ir::arena::TypeArena::new();
         let new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
 
-        let old_cmp_ty = infer_ty(&cmp, &ctx);
         let new_cmp_ty = crate::ir::typeck::type_of_compute_expr(&cmp, &new_ctx, &mut arena);
-        assert_eq!(new_cmp_ty, arena.intern_scalar(old_cmp_ty));
+        assert_eq!(new_cmp_ty, arena.intern_scalar(ScalarTy::Bool));
 
-        let old_arith_ty = infer_ty(&arith, &ctx);
         let new_arith_ty = crate::ir::typeck::type_of_compute_expr(&arith, &new_ctx, &mut arena);
-        assert_eq!(new_arith_ty, arena.intern_scalar(old_arith_ty));
+        assert_eq!(new_arith_ty, arena.intern_scalar(ScalarTy::F32));
     }
 
     #[test]
-    fn standalone_checker_matches_infer_ty_for_buffer_load() {
-        let mut ctx = Ctx {
-            buffers: HashMap::new(),
-            scalars: HashMap::new(),
-            push_param: None,
-            id_param: None,
-            locals: HashMap::new(),
-            locals_order: Vec::new(),
-            shared: HashMap::new(),
-            shared_order: Vec::new(),
-        };
-        ctx.buffers.insert(
-            "buf".to_string(),
-            BufferSymbol {
-                writable: false,
-                elem: BufElem::I32,
-            },
-        );
+    fn typeck_infers_buffer_load_type() {
         let load = IrExpr::BufferLoad {
             buf: "buf".to_string(),
             index: Box::new(IrExpr::LitU32(0)),
         };
-        let old_ty = infer_ty(&load, &ctx);
 
         let mut arena = crate::ir::arena::TypeArena::new();
         let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
-        new_ctx.buffers.insert("buf".to_string(), BufElem::I32);
+        new_ctx
+            .buffers
+            .insert("buf".to_string(), arena.intern_scalar(ScalarTy::I32));
         let new_ty = crate::ir::typeck::type_of_compute_expr(&load, &new_ctx, &mut arena);
 
-        assert_eq!(new_ty, arena.intern_scalar(old_ty));
+        assert_eq!(new_ty, arena.intern_scalar(ScalarTy::I32));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use crate::ir::node::IrStmt;
-use crate::ir::{BufElem, GfxTy, Mutability, ScalarTy};
+use crate::ir::types::TypeId;
+use crate::ir::{GfxTy, Mutability};
 
 /// An `out` param. The call-site argument must be a plain, pre-declared local that receives
 /// the writes.
@@ -9,7 +10,7 @@ use crate::ir::{BufElem, GfxTy, Mutability, ScalarTy};
 pub(super) struct FnParamDef {
     pub(super) name: String,
     pub(super) is_out: bool,
-    pub(super) ty: ScalarTy,
+    pub(super) ty: TypeId,
 }
 
 /// Locals declared by the function itself (`let` and loop variables), not its params.
@@ -17,35 +18,47 @@ pub(super) struct FnParamDef {
 /// Renamed fresh per call.
 pub(super) struct FunctionDef {
     pub(super) params: Vec<FnParamDef>,
-    pub(super) locals: Vec<(String, ScalarTy)>,
+    pub(super) locals: Vec<(String, TypeId)>,
     pub(super) body: Vec<IrStmt>,
 }
 
 pub(super) struct Ctx {
     pub(super) buffers: HashMap<String, BufferSymbol>,
-    pub(super) scalars: HashMap<String, ScalarTy>,
+    pub(super) scalars: HashMap<String, TypeId>,
     pub(super) push_param: Option<String>,
     pub(super) id_param: Option<String>,
-    pub(super) locals: HashMap<String, ScalarTy>,
-    pub(super) locals_order: Vec<(String, ScalarTy)>,
+    pub(super) locals: HashMap<String, TypeId>,
+    pub(super) locals_order: Vec<(String, TypeId)>,
     pub(super) shared: HashMap<String, PendingShared>,
     pub(super) shared_order: Vec<String>,
+}
+
+impl Ctx {
+    pub(super) fn type_ctx(&self) -> crate::ir::typeck::ComputeTypeCtx {
+        crate::ir::typeck::ComputeTypeCtx {
+            locals: self.locals.clone(),
+            scalars: self.scalars.clone(),
+            buffers: self
+                .buffers
+                .iter()
+                .map(|(k, v)| (k.clone(), v.elem))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct BufferSymbol {
     pub(super) writable: bool,
-    pub(super) elem: BufElem,
+    pub(super) elem: TypeId,
 }
 
-/// Parser-side workgroup array, `elem` not yet interned. Public: `ir::SharedDecl`.
 pub(super) struct PendingShared {
     pub(super) name: String,
-    pub(super) elem: ScalarTy,
+    pub(super) elem: TypeId,
     pub(super) len: u32,
 }
 
-/// Parser-side compute param, type interned later in `parse_kernel_rest`. Public: `ir::Param`.
 pub(super) struct PendingParam {
     pub(super) name: String,
     pub(super) kind: PendingParamKind,
@@ -53,10 +66,10 @@ pub(super) struct PendingParam {
 
 pub(super) enum PendingParamKind {
     Buffer {
-        elem: BufElem,
+        elem: TypeId,
         mutability: Mutability,
     },
-    Scalar(ScalarTy),
+    Scalar(TypeId),
 }
 
 /// Parser-side `@location` input, type not yet interned. Public counterpart: `ir::GfxInput`.

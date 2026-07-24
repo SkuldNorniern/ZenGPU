@@ -1,55 +1,41 @@
-//! Standalone type checker over parsed compute/graphics IR, computing `TypeId` instead
-//! of `ScalarTy`/`GfxTy`.
+//! Type checking over parsed compute/graphics IR, producing [`crate::ir::types::TypeId`].
 //!
-//! It reimplements the parser's `infer_ty` and `infer_gfx_ty`, and the parser's tests compare the
-//! two. Only the tests call it.
+//! The graphics checker mirrors the parser's private `infer_gfx_ty`. Only tests call it.
 
 use std::collections::HashMap;
 
+use crate::ir::ScalarTy;
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr};
-use crate::ir::types::{Type, TypeId};
-use crate::ir::{BufElem, ScalarTy};
+use crate::ir::types::TypeId;
 
 /// Symbol tables for typing a compute expression. Standalone, not shared with the parser's `Ctx`.
 #[derive(Debug, Default)]
 pub struct ComputeTypeCtx {
-    pub locals: HashMap<String, ScalarTy>,
-    pub scalars: HashMap<String, ScalarTy>,
-    pub buffers: HashMap<String, BufElem>,
+    pub locals: HashMap<String, TypeId>,
+    pub scalars: HashMap<String, TypeId>,
+    pub buffers: HashMap<String, TypeId>,
 }
 
-/// Compute expression type, interned into `arena`. Mirrors the parser's `infer_ty`.
 pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut TypeArena) -> TypeId {
+    let u32_id = arena.intern_scalar(ScalarTy::U32);
+    let i32_id = arena.intern_scalar(ScalarTy::I32);
+    let f32_id = arena.intern_scalar(ScalarTy::F32);
+    let bool_id = arena.intern_scalar(ScalarTy::Bool);
     match expr {
-        IrExpr::LitU32(_) => arena.intern_scalar(ScalarTy::U32),
-        IrExpr::LitF32(_) => arena.intern_scalar(ScalarTy::F32),
-        IrExpr::Local(n) => {
-            let ty = ctx.locals.get(n).copied().unwrap_or(ScalarTy::U32);
-            arena.intern_scalar(ty)
-        }
-        IrExpr::ScalarParam(n) => {
-            let ty = ctx.scalars.get(n).copied().unwrap_or(ScalarTy::F32);
-            arena.intern_scalar(ty)
-        }
-        IrExpr::GlobalId(_) => arena.intern_scalar(ScalarTy::U32),
-        IrExpr::LocalId(_) | IrExpr::GroupId(_) => arena.intern_scalar(ScalarTy::U32),
-        IrExpr::BufferLoad { buf, .. } => {
-            let ty = match ctx.buffers.get(buf) {
-                Some(elem) => scalar_for_buffer(*elem),
-                None => ScalarTy::F32,
-            };
-            arena.intern_scalar(ty)
-        }
-        IrExpr::SharedLoad { .. } => arena.intern_scalar(ScalarTy::F32),
-        IrExpr::Builtin { func, .. } => {
-            let ty = match func {
-                BuiltinFn::U32 => ScalarTy::U32,
-                BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => ScalarTy::Bool,
-                _ => ScalarTy::F32,
-            };
-            arena.intern_scalar(ty)
-        }
+        IrExpr::LitU32(_) => u32_id,
+        IrExpr::LitF32(_) => f32_id,
+        IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(u32_id),
+        IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
+        IrExpr::GlobalId(_) => u32_id,
+        IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
+        IrExpr::BufferLoad { buf, .. } => ctx.buffers.get(buf).copied().unwrap_or(f32_id),
+        IrExpr::SharedLoad { .. } => f32_id,
+        IrExpr::Builtin { func, .. } => match func {
+            BuiltinFn::U32 => u32_id,
+            BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => bool_id,
+            _ => f32_id,
+        },
         IrExpr::Neg(e) => type_of_compute_expr(e, ctx, arena),
         IrExpr::Binary { op, lhs, rhs } => match op {
             IrBinOp::Lt
@@ -59,32 +45,20 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | IrBinOp::Eq
             | IrBinOp::Ne
             | IrBinOp::And
-            | IrBinOp::Or => arena.intern_scalar(ScalarTy::Bool),
+            | IrBinOp::Or => bool_id,
             _ => {
                 let l = type_of_compute_expr(lhs, ctx, arena);
                 let r = type_of_compute_expr(rhs, ctx, arena);
-                let f32_id = arena.intern_scalar(ScalarTy::F32);
-                let i32_id = arena.intern_scalar(ScalarTy::I32);
                 if l == f32_id || r == f32_id {
                     f32_id
                 } else if l == i32_id || r == i32_id {
                     i32_id
                 } else {
-                    arena.intern_scalar(ScalarTy::U32)
+                    u32_id
                 }
             }
         },
-        _ => arena.intern_scalar(ScalarTy::U32),
-    }
-}
-
-/// Mirrors the parser's `scalar_for_buffer`: compute buffers hold scalars only.
-fn scalar_for_buffer(elem: BufElem) -> ScalarTy {
-    match elem {
-        BufElem::F32 => ScalarTy::F32,
-        BufElem::U32 => ScalarTy::U32,
-        BufElem::I32 => ScalarTy::I32,
-        _ => unreachable!("non-scalar buffer element reached compute type checker"),
+        _ => u32_id,
     }
 }
 
@@ -180,15 +154,23 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
 mod tests {
     use super::*;
     use crate::ir::GfxTy;
+    use crate::ir::types::Type;
 
     #[test]
     fn compute_literal_and_local_types() {
         let mut arena = TypeArena::new();
         let mut ctx = ComputeTypeCtx::default();
-        ctx.locals.insert("x".into(), ScalarTy::F32);
+        ctx.locals
+            .insert("x".into(), arena.intern_scalar(ScalarTy::F32));
 
         let lit = type_of_compute_expr(&IrExpr::LitU32(1), &ctx, &mut arena);
-        assert_eq!(*arena.get(lit), Type::Int { width: crate::ir::types::IntWidth::W32, signedness: crate::ir::types::Signedness::Unsigned });
+        assert_eq!(
+            *arena.get(lit),
+            Type::Int {
+                width: crate::ir::types::IntWidth::W32,
+                signedness: crate::ir::types::Signedness::Unsigned
+            }
+        );
 
         let local = type_of_compute_expr(&IrExpr::Local("x".into()), &ctx, &mut arena);
         assert_eq!(local, arena.intern_scalar(ScalarTy::F32));

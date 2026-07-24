@@ -196,7 +196,12 @@ impl<'a> Parser<'a> {
                         });
                     }
                     if ctx.shared.contains_key(&name) {
-                        if infer_ty(&index, ctx) != ScalarTy::U32 {
+                        let idx_ty = crate::ir::typeck::type_of_compute_expr(
+                            &index,
+                            &ctx.type_ctx(),
+                            &mut self.types,
+                        );
+                        if idx_ty != self.types.intern_scalar(ScalarTy::U32) {
                             return self.err("shared array index must be u32");
                         }
                         return Ok(IrExpr::SharedLoad {
