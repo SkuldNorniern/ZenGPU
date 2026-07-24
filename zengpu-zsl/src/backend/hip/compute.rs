@@ -4,34 +4,35 @@ use std::fmt::Write;
 use crate::backend::hip::{ENTRY, HipShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{BufElem, EntryKind, Module, Mutability, ParamKind, ScalarTy};
+use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
+use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
 pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
-    let locals: HashMap<&str, ScalarTy> = e
-        .locals
-        .iter()
-        .map(|(n, t)| (n.as_str(), module.types.scalar_ty_of(*t)))
-        .collect();
+    // Locals carry their pre-resolved C-type spelling so `emit_stmt` needs no
+    // arena access. Every local is a scalar today; a non-scalar `TypeId` here
+    // surfaces as a clean `Diagnostic` rather than reaching codegen.
+    let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    for (n, t) in &e.locals {
+        locals.insert(n.as_str(), hip_scalar(module.types.get(*t))?);
+    }
 
-    let buffers: Vec<(&str, Mutability, BufElem)> = e
+    let buffers: Vec<(&str, Mutability, TypeId)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, mutability } => {
-                Some((p.name.as_str(), *mutability, module.types.buf_elem_of(*elem)))
-            }
+            ParamKind::Buffer { elem, mutability } => Some((p.name.as_str(), *mutability, *elem)),
             _ => None,
         })
         .collect();
 
-    let scalars: Vec<(&str, ScalarTy)> = e
+    let scalars: Vec<(&str, TypeId)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(t) => Some((p.name.as_str(), module.types.scalar_ty_of(*t))),
+            ParamKind::Scalar(t) => Some((p.name.as_str(), *t)),
             _ => None,
         })
         .collect();
@@ -50,11 +51,11 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         };
         match mutability {
             Mutability::Read => {
-                let ty = hip_buffer_elem(*elem)?;
+                let ty = hip_buffer_elem(module.types.get(*elem))?;
                 let _ = writeln!(s, "    const {ty}* __restrict__ {name}{comma}");
             }
             Mutability::ReadWrite => {
-                let ty = hip_buffer_elem(*elem)?;
+                let ty = hip_buffer_elem(module.types.get(*elem))?;
                 let _ = writeln!(s, "    {ty}* __restrict__ {name}{comma}");
             }
         }
@@ -62,7 +63,7 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 
     for (i, (name, ty)) in scalars.iter().enumerate() {
         let comma = if i + 1 < scalars.len() { "," } else { "" };
-        let cty = hip_scalar(*ty);
+        let cty = hip_scalar(module.types.get(*ty))?;
         let _ = writeln!(s, "    {cty} {name}{comma}");
     }
 
@@ -104,7 +105,8 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 }
 
 struct Ctx<'a> {
-    locals: HashMap<&'a str, ScalarTy>,
+    /// Local name → its resolved C-type spelling.
+    locals: HashMap<&'a str, &'static str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -113,20 +115,43 @@ fn indent(s: &mut String, depth: usize) {
     }
 }
 
-fn hip_scalar(ty: ScalarTy) -> &'static str {
+/// The HIP C++ spelling of a scalar [`Type`]. Non-scalar types are a compiler
+/// defect for a compute value and surface as an `Unsupported` diagnostic.
+fn hip_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
     match ty {
-        ScalarTy::U32 => "unsigned int",
-        ScalarTy::I32 => "int",
-        ScalarTy::F32 => "float",
-        ScalarTy::Bool => "bool",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => Ok("unsigned int"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => Ok("int"),
+        Type::Float {
+            format: FloatFormat::F32,
+        } => Ok("float"),
+        Type::Bool => Ok("bool"),
+        other => Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!("HIP backend: unsupported scalar type {other:?}"),
+        )),
     }
 }
 
-fn hip_buffer_elem(elem: BufElem) -> Result<&'static str, Diagnostic> {
-    match elem {
-        BufElem::F32 => Ok("float"),
-        BufElem::U32 => Ok("unsigned int"),
-        BufElem::I32 => Ok("int"),
+/// The HIP C++ spelling of a `device buffer<T>` element [`Type`].
+fn hip_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
+    match ty {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => Ok("float"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => Ok("unsigned int"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => Ok("int"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("HIP backend: unsupported compute buffer element {other:?}"),
@@ -141,9 +166,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .locals
                 .get(name.as_str())
                 .copied()
-                .unwrap_or(ScalarTy::U32);
+                .unwrap_or("unsigned int");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", hip_scalar(ty), name, emit_expr(init)?);
+            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
