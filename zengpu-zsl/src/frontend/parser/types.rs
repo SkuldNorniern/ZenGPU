@@ -1,27 +1,27 @@
 use super::*;
 
 impl<'a> Parser<'a> {
-    pub(super) fn parse_scalar_type(&mut self) -> Result<ScalarTy, ParseError> {
+    pub(super) fn parse_scalar_type(&mut self) -> Result<TypeId, ParseError> {
         let name = self.ident()?;
         match name.as_str() {
-            "u32" => Ok(ScalarTy::U32),
-            "i32" => Ok(ScalarTy::I32),
-            "f32" => Ok(ScalarTy::F32),
-            "bool" => Ok(ScalarTy::Bool),
+            "u32" => Ok(self.types.u32_id()),
+            "i32" => Ok(self.types.i32_id()),
+            "f32" => Ok(self.types.f32_id()),
+            "bool" => Ok(self.types.bool_id()),
             other => self.err(format!(
                 "unsupported scalar type `{other}`; use u32, i32, f32, or bool"
             )),
         }
     }
 
-    pub(super) fn parse_any_type(&mut self) -> Result<GfxTy, ParseError> {
+    pub(super) fn parse_any_type(&mut self) -> Result<TypeId, ParseError> {
         let name = self.ident()?;
         match name.as_str() {
-            "f32" => Ok(GfxTy::F32),
-            "u32" => Ok(GfxTy::U32),
-            "f32x2" => Ok(GfxTy::Vec2),
-            "f32x3" => Ok(GfxTy::Vec3),
-            "f32x4" => Ok(GfxTy::Vec4),
+            "f32" => Ok(self.types.f32_id()),
+            "u32" => Ok(self.types.u32_id()),
+            "f32x2" => Ok(self.types.vec_id(2)),
+            "f32x3" => Ok(self.types.vec_id(3)),
+            "f32x4" => Ok(self.types.vec_id(4)),
             "mat4x4" => {
                 self.expect(&Tok::Lt, "`<` in mat4x4<…>")?;
                 let elem = self.ident()?;
@@ -29,7 +29,7 @@ impl<'a> Parser<'a> {
                     return self.err("only mat4x4<f32> is supported");
                 }
                 self.expect(&Tok::Gt, "`>` in mat4x4<…>")?;
-                Ok(GfxTy::Mat4)
+                Ok(self.types.mat4_id())
             }
             other => self.err(format!(
                 "unsupported type `{other}`; use f32/u32/f32x2/f32x3/f32x4/mat4x4<f32>"
@@ -51,10 +51,9 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Lt, "`<` in buffer<…>")?;
             let elem = self.parse_scalar_type()?;
             self.expect(&Tok::Gt, "`>` in buffer<…>")?;
-            let elem: TypeId = match elem {
-                ScalarTy::F32 | ScalarTy::U32 | ScalarTy::I32 => self.types.intern_scalar(elem),
-                ScalarTy::Bool => return self.err("buffer<bool> is not supported"),
-            };
+            if elem == self.types.bool_id() {
+                return self.err("buffer<bool> is not supported");
+            }
             ctx.buffers
                 .insert(name.to_string(), BufferSymbol { writable, elem });
             params.push(PendingParam {
@@ -91,15 +90,12 @@ impl<'a> Parser<'a> {
                 return self.err("only one push parameter is supported");
             }
             ctx.push_param = Some(name.to_string());
-            for (field, gty) in fields {
-                let ty: TypeId = match gty {
-                    GfxTy::U32 => self.types.intern_scalar(ScalarTy::U32),
-                    GfxTy::F32 => self.types.intern_scalar(ScalarTy::F32),
-                    _ => {
-                        return self
-                            .err(format!("compute push field `{field}` must be u32 or f32"));
-                    }
-                };
+            let u32_id = self.types.u32_id();
+            let f32_id = self.types.f32_id();
+            for (field, ty) in fields {
+                if ty != u32_id && ty != f32_id {
+                    return self.err(format!("compute push field `{field}` must be u32 or f32"));
+                }
                 ctx.scalars.insert(field.clone(), ty);
                 params.push(PendingParam {
                     name: field,
@@ -110,7 +106,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn parse_ret_types(&mut self) -> Result<Vec<GfxTy>, ParseError> {
+    pub(super) fn parse_ret_types(&mut self) -> Result<Vec<TypeId>, ParseError> {
         if self.eat(&Tok::LParen) {
             let mut v = vec![self.parse_ret_one()?];
             while self.eat(&Tok::Comma) {
@@ -126,7 +122,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    pub(super) fn parse_ret_one(&mut self) -> Result<GfxTy, ParseError> {
+    pub(super) fn parse_ret_one(&mut self) -> Result<TypeId, ParseError> {
         if self.eat(&Tok::At) {
             let _attr = self.ident()?;
             self.expect(&Tok::LParen, "`(`")?;

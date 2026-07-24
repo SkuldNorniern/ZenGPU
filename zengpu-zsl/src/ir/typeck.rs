@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 
-use crate::ir::ScalarTy;
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr};
 use crate::ir::types::TypeId;
@@ -19,10 +18,10 @@ pub struct ComputeTypeCtx {
 }
 
 pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut TypeArena) -> TypeId {
-    let u32_id = arena.intern_scalar(ScalarTy::U32);
-    let i32_id = arena.intern_scalar(ScalarTy::I32);
-    let f32_id = arena.intern_scalar(ScalarTy::F32);
-    let bool_id = arena.intern_scalar(ScalarTy::Bool);
+    let u32_id = arena.u32_id();
+    let i32_id = arena.i32_id();
+    let f32_id = arena.f32_id();
+    let bool_id = arena.bool_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
         IrExpr::LitF32(_) => f32_id,
@@ -76,14 +75,12 @@ pub fn type_of_graphics_expr(
     ctx: &GraphicsTypeCtx,
     arena: &mut TypeArena,
 ) -> TypeId {
-    use crate::ir::GfxTy;
-
-    let u32_id = arena.intern_gfx_ty(GfxTy::U32);
-    let f32_id = arena.intern_gfx_ty(GfxTy::F32);
-    let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
-    let vec3_id = arena.intern_gfx_ty(GfxTy::Vec3);
-    let vec4_id = arena.intern_gfx_ty(GfxTy::Vec4);
-    let mat4_id = arena.intern_gfx_ty(GfxTy::Mat4);
+    let u32_id = arena.u32_id();
+    let f32_id = arena.f32_id();
+    let vec2_id = arena.vec_id(2);
+    let vec3_id = arena.vec_id(3);
+    let vec4_id = arena.vec_id(4);
+    let mat4_id = arena.mat4_id();
 
     match expr {
         IrExpr::LitU32(_) => u32_id,
@@ -154,15 +151,13 @@ pub fn type_of_graphics_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::GfxTy;
     use crate::ir::types::Type;
 
     #[test]
     fn compute_literal_and_local_types() {
         let mut arena = TypeArena::new();
         let mut ctx = ComputeTypeCtx::default();
-        ctx.locals
-            .insert("x".into(), arena.intern_scalar(ScalarTy::F32));
+        ctx.locals.insert("x".into(), arena.f32_id());
 
         let lit = type_of_compute_expr(&IrExpr::LitU32(1), &ctx, &mut arena);
         assert_eq!(
@@ -174,7 +169,7 @@ mod tests {
         );
 
         let local = type_of_compute_expr(&IrExpr::Local("x".into()), &ctx, &mut arena);
-        assert_eq!(local, arena.intern_scalar(ScalarTy::F32));
+        assert_eq!(local, arena.f32_id());
     }
 
     #[test]
@@ -187,7 +182,7 @@ mod tests {
             rhs: Box::new(IrExpr::LitU32(2)),
         };
         let ty = type_of_compute_expr(&expr, &ctx, &mut arena);
-        assert_eq!(ty, arena.intern_scalar(ScalarTy::Bool));
+        assert_eq!(ty, arena.bool_id());
     }
 
     #[test]
@@ -200,7 +195,7 @@ mod tests {
             rhs: Box::new(IrExpr::LitF32(2.0)),
         };
         let ty = type_of_compute_expr(&expr, &ctx, &mut arena);
-        assert_eq!(ty, arena.intern_scalar(ScalarTy::F32));
+        assert_eq!(ty, arena.f32_id());
     }
 
     #[test]
@@ -218,7 +213,7 @@ mod tests {
             ],
         };
         let vec4_ty = type_of_graphics_expr(&vec4, &ctx, &mut arena);
-        assert_eq!(vec4_ty, arena.intern_gfx_ty(GfxTy::Vec4));
+        assert_eq!(vec4_ty, arena.vec_id(4));
 
         let mat_mul = IrExpr::Binary {
             op: IrBinOp::Mul,
@@ -226,9 +221,8 @@ mod tests {
             rhs: Box::new(vec4),
         };
         let mut ctx2 = GraphicsTypeCtx::default();
-        ctx2.scalars
-            .insert("mvp".into(), arena.intern_gfx_ty(GfxTy::Mat4));
+        ctx2.scalars.insert("mvp".into(), arena.mat4_id());
         let promoted = type_of_graphics_expr(&mat_mul, &ctx2, &mut arena);
-        assert_eq!(promoted, arena.intern_gfx_ty(GfxTy::Vec4));
+        assert_eq!(promoted, arena.vec_id(4));
     }
 }

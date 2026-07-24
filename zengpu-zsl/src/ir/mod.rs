@@ -11,29 +11,6 @@ use arena::TypeArena;
 use node::{IrExpr, IrStmt};
 use types::TypeId;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum BufElem {
-    F32,
-    I32,
-    U32,
-    Vec2,
-    Vec3,
-    Vec4,
-    Mat2,
-    Mat3,
-    Mat4,
-}
-
-/// Scalar value / declaration type. Compute values are scalar only.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ScalarTy {
-    U32,
-    I32,
-    F32,
-    Bool,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mutability {
     Read,
@@ -48,14 +25,12 @@ pub struct Param {
 
 #[derive(Debug)]
 pub enum ParamKind {
-    /// `device buffer<elem>`: bindless storage buffer. `elem` is a `TypeId` in the module's `types`
-    /// arena. `mutability` is for reflection and MSL. SPIR-V only handles `f32` and checks
-    /// writability in `ir::build`.
+    /// `elem` is interned in `Module::types`. SPIR-V only handles `f32` elements. Writability is
+    /// checked in `ir::build`.
     Buffer {
         elem: TypeId,
         mutability: Mutability,
     },
-    /// Push-constant scalar (`u32`/`f32`). Backends convert with `scalar_ty_of`.
     Scalar(TypeId),
 }
 
@@ -69,8 +44,7 @@ pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
     pub shared: Vec<SharedDecl>,
-    /// Locals in declaration order (SPIR-V hoists them). Ids are in `types`; backends convert
-    /// with `scalar_ty_of`.
+    /// In declaration order. SPIR-V hoists these declarations. TypeIds live in `Module::types`.
     pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
 }
@@ -92,28 +66,16 @@ pub struct Module {
     pub types: TypeArena,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GfxTy {
-    F32,
-    U32,
-    Vec2,
-    Vec3,
-    Vec4,
-    Mat4,
-}
-
 #[derive(Debug)]
 pub struct GfxInput {
     pub name: String,
     pub location: u32,
-    /// `TypeId` in the `types` arena. Backends convert back with `gfx_ty_of`.
     pub ty: TypeId,
 }
 
 #[derive(Debug)]
 pub struct GfxScalar {
     pub name: String,
-    /// `TypeId` in the `types` arena. Backends convert back with `gfx_ty_of`.
     pub ty: TypeId,
 }
 

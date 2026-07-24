@@ -30,7 +30,7 @@ use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
-use crate::ir::{EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::{EntryKind, Module, ParamKind};
 
 pub fn lower_compute(module: &Module) -> Result<Vec<u32>, Diagnostic> {
     lower_compute_inner(module).map_err(Diagnostic::from)
@@ -51,10 +51,10 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     spv.memory_model_logical_glsl450();
 
     let mut types = module.types.clone();
-    let u32_id = types.intern_scalar(ScalarTy::U32);
-    let i32_id = types.intern_scalar(ScalarTy::I32);
-    let f32_id = types.intern_scalar(ScalarTy::F32);
-    let bool_id = types.intern_scalar(ScalarTy::Bool);
+    let u32_id = types.u32_id();
+    let i32_id = types.i32_id();
+    let f32_id = types.f32_id();
+    let bool_id = types.bool_id();
 
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
@@ -894,8 +894,8 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
     }
 }
 
-/// Element `TypeId` must be f32, u32 or i32. Buffer elements are scalar by construction; the panic
-/// is unreachable.
+/// Element `TypeId` must be f32, u32 or i32. Buffer elements are scalar by construction, so this
+/// never fails.
 fn buffer_scalar(ctx: &LowerCtx<'_>, elem: TypeId) -> TypeId {
     if elem == ctx.f32_id || elem == ctx.u32_id || elem == ctx.i32_id {
         elem

@@ -1,8 +1,5 @@
-//! Unified ZSL semantic type model: one `Type` enum meant to replace `ScalarTy`,
-//! `GfxTy` and `BufElem`.
-//!
-//! Only this module and `crate::ir::arena` use it. Backends and `lib.rs` are unchanged;
-//! `Entry`/`GraphicsEntry` move to `TypeId` field by field.
+//! Unified ZSL type model for compute and graphics. Parsers and backends compare `TypeId`s. Only
+//! `TypeArena` builds or inspects `Type`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeId(pub(crate) u32);
