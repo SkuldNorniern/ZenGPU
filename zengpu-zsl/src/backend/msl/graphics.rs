@@ -11,8 +11,8 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::GraphicsModule;
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
-use crate::ir::{GfxTy, GraphicsModule};
 
 /// Push-constant buffer index for graphics shaders. High so it never overlaps vertex buffers; the
 /// Metal HAL binds to this same index.
@@ -20,11 +20,10 @@ pub const PUSH_BUFFER_INDEX: u32 = 16;
 
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
-    let locals: HashMap<&str, GfxTy> = e
-        .locals
-        .iter()
-        .map(|(n, tid)| (n.as_str(), module.types.gfx_ty_of(*tid)))
-        .collect();
+    let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    for (n, tid) in &e.locals {
+        locals.insert(n.as_str(), msl_ty_of(module.types.get(*tid))?);
+    }
     let ctx = Ctx { locals };
 
     let mut s = String::new();
@@ -120,7 +119,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 }
 
 struct Ctx<'a> {
-    locals: HashMap<&'a str, GfxTy>,
+    locals: HashMap<&'a str, &'static str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -132,9 +131,9 @@ fn indent(s: &mut String, depth: usize) {
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
-            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or(GfxTy::F32);
+            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("float");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", msl_ty(ty), name, emit_expr(init)?);
+            let _ = writeln!(s, "{ty} {} = {};", name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
@@ -271,21 +270,7 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
-/// MSL spelling of a [`GfxTy`], for `GraphicsEntry.locals` (still `GfxTy`) and the
-/// `IrStmt::Let` arm.
-fn msl_ty(t: GfxTy) -> &'static str {
-    match t {
-        GfxTy::F32 => "float",
-        GfxTy::U32 => "uint",
-        GfxTy::Vec2 => "float2",
-        GfxTy::Vec3 => "float3",
-        GfxTy::Vec4 => "float4",
-        GfxTy::Mat4 => "float4x4",
-    }
-}
-
-/// MSL spelling of a [`Type`], for `GfxScalar.ty`, `GfxInput.ty` and `GraphicsEntry.varyings`. Kept
-/// apart from [`msl_ty`] so each function handles one type representation.
+/// MSL spelling of a [`Type`], for the graphics `TypeId` fields.
 fn msl_ty_of(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
         Type::Float {
