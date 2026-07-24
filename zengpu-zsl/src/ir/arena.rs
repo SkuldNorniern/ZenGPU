@@ -10,7 +10,7 @@ use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{BufElem, GfxTy, ScalarTy};
 
 /// structurally equal types share one [`TypeId`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct TypeArena {
     types: Vec<Type>,
     by_value: HashMap<Type, TypeId>,
