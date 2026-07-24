@@ -1,0 +1,312 @@
+use super::*;
+
+impl<'a> Parser<'a> {
+    pub(super) fn parse_graphics_rest(
+        &mut self,
+        is_fragment: bool,
+    ) -> Result<GraphicsModule, ParseError> {
+        let mut ctx = GfxCtx {
+            inputs: HashMap::new(),
+            scalars: HashMap::new(),
+            push_param: None,
+            buffers: HashMap::new(),
+            locals: HashMap::new(),
+            locals_order: Vec::new(),
+        };
+        let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx)?;
+
+        self.expect(&Tok::Arrow, "`->` return type")?;
+        let ret_types = self.parse_ret_types()?;
+        if ret_types[0] != GfxTy::Vec4 {
+            return self.err("first return type must be f32x4 (position/color)");
+        }
+        let varyings: Vec<GfxTy> = if is_fragment {
+            Vec::new()
+        } else {
+            ret_types[1..].to_vec()
+        };
+
+        let (body, ret) = self.parse_gfx_body(&mut ctx, &varyings)?;
+        if self.pos != self.toks.len() {
+            return self.err("unexpected trailing tokens after entry point");
+        }
+
+        let mut types = crate::ir::arena::TypeArena::new();
+
+        let inputs: Vec<GfxInput> = inputs
+            .into_iter()
+            .map(|i| GfxInput {
+                name: i.name,
+                location: i.location,
+                ty: types.intern_gfx_ty(i.ty),
+            })
+            .collect();
+        let scalar_params: Vec<GfxScalar> = scalar_params
+            .into_iter()
+            .map(|s| GfxScalar {
+                name: s.name,
+                ty: types.intern_gfx_ty(s.ty),
+            })
+            .collect();
+        let varyings: Vec<TypeId> = varyings
+            .into_iter()
+            .map(|t| types.intern_gfx_ty(t))
+            .collect();
+
+        let body: Vec<IrStmt> = body
+            .iter()
+            .map(|s| resolve_construct_types_stmt(s, &mut types))
+            .collect();
+        let ret: Vec<IrExpr> = ret
+            .iter()
+            .map(|e| resolve_construct_types_expr(e, &mut types))
+            .collect();
+
+        Ok(GraphicsModule {
+            entry: GraphicsEntry {
+                is_fragment,
+                inputs,
+                scalar_params,
+                buf_params,
+                varyings,
+                locals: ctx.locals_order,
+                body,
+                ret,
+            },
+            types,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn parse_gfx_params(
+        &mut self,
+        ctx: &mut GfxCtx,
+    ) -> Result<(Vec<PendingGfxInput>, Vec<PendingGfxScalar>, Vec<String>), ParseError> {
+        self.expect(&Tok::LParen, "`(` after entry name")?;
+        let mut inputs = Vec::new();
+        let mut scalar_params = Vec::new();
+        let mut buf_params = Vec::new();
+        while !self.eat(&Tok::RParen) {
+            let mut location = None;
+            if self.eat(&Tok::At) {
+                let a = self.ident()?;
+                if a != "location" {
+                    return self.err("only @location is supported on parameters");
+                }
+                self.expect(&Tok::LParen, "`(`")?;
+                location = Some(match self.peek() {
+                    Some(Tok::Int(v)) => {
+                        let v = *v as u32;
+                        self.pos += 1;
+                        v
+                    }
+                    _ => return self.err("expected location index"),
+                });
+                self.expect(&Tok::RParen, "`)`")?;
+            }
+            let name = self.ident()?;
+            self.expect(&Tok::Colon, "`:` after param name")?;
+            if let Some(loc) = location {
+                let ty = self.parse_any_type()?;
+                if matches!(ty, GfxTy::Mat4) {
+                    return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
+                }
+                ctx.inputs.insert(name.clone(), ty);
+                inputs.push(PendingGfxInput {
+                    name,
+                    location: loc,
+                    ty,
+                });
+            } else if self.eat_kw("device") {
+                let writable = self.eat_kw("mut");
+                if !self.eat_kw("buffer") {
+                    return self.err("expected `buffer`");
+                }
+                self.expect(&Tok::Lt, "`<`")?;
+                let elem = self.parse_any_type()?;
+                self.expect(&Tok::Gt, "`>`")?;
+                if elem != GfxTy::F32 {
+                    return self.err("only buffer<f32> is supported");
+                }
+                ctx.buffers.insert(name.clone(), writable);
+                buf_params.push(name);
+            } else {
+                let struct_name = self.ident()?;
+                let fields = self
+                    .pushes
+                    .get(&struct_name)
+                    .cloned()
+                    .ok_or_else(|| ParseError {
+                        msg: format!("unknown type `{struct_name}` (no matching push block)"),
+                        at: self.span(),
+                    })?;
+                if ctx.push_param.is_some() {
+                    return self.err("only one push parameter is supported");
+                }
+                ctx.push_param = Some(name);
+                for (field, gty) in fields {
+                    if !matches!(gty, GfxTy::F32 | GfxTy::U32 | GfxTy::Mat4) {
+                        return self.err(format!(
+                            "graphics push field `{field}` must be f32/u32/mat4x4"
+                        ));
+                    }
+                    ctx.scalars.insert(field.clone(), gty);
+                    scalar_params.push(PendingGfxScalar {
+                        name: field,
+                        ty: gty,
+                    });
+                }
+            }
+            self.eat(&Tok::Comma);
+            if self.peek().is_none() {
+                return self.err("unterminated parameter list");
+            }
+        }
+        Ok((inputs, scalar_params, buf_params))
+    }
+
+    /// Return type: `T` or `(T, T, …)`, each optionally with `@location` or `@builtin`.
+    pub(super) fn parse_gfx_body(
+        &mut self,
+        ctx: &mut GfxCtx,
+        varyings: &[GfxTy],
+    ) -> Result<(Vec<IrStmt>, Vec<IrExpr>), ParseError> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut body = Vec::new();
+        let expected = 1 + varyings.len();
+        loop {
+            match self.peek() {
+                None => return self.err("unterminated block"),
+                Some(Tok::RBrace) => {
+                    return self.err("vertex/fragment body needs a tail expression");
+                }
+                _ => {}
+            }
+            if self.eat_kw("let") {
+                body.push(self.parse_gfx_let(ctx)?);
+                continue;
+            }
+            if self.eat_kw("if") {
+                body.push(self.parse_gfx_if(ctx)?);
+                continue;
+            }
+            let tail = if self.peek() == Some(&Tok::LParen) {
+                self.parse_gfx_tail(ctx)?
+            } else {
+                let e = self.parse_g_expr(ctx)?;
+                if self.eat(&Tok::Eq) {
+                    let rhs = self.parse_g_expr(ctx)?;
+                    body.push(self.gfx_assign(ctx, e, rhs)?);
+                    continue;
+                }
+                vec![e]
+            };
+            self.expect(&Tok::RBrace, "`}` after tail expression")?;
+            if tail.len() != expected {
+                return self.err(format!(
+                    "return has {} value(s), expected {} (position + {} varyings)",
+                    tail.len(),
+                    expected,
+                    varyings.len()
+                ));
+            }
+            return Ok((body, tail));
+        }
+    }
+
+    pub(super) fn parse_gfx_tail(&mut self, ctx: &GfxCtx) -> Result<Vec<IrExpr>, ParseError> {
+        let save = self.pos;
+        self.pos += 1;
+        let first = self.parse_g_expr(ctx)?;
+        if self.peek() == Some(&Tok::Comma) {
+            let mut elems = vec![first];
+            while self.eat(&Tok::Comma) {
+                if self.peek() == Some(&Tok::RParen) {
+                    break;
+                }
+                elems.push(self.parse_g_expr(ctx)?);
+            }
+            self.expect(&Tok::RParen, "`)`")?;
+            Ok(elems)
+        } else {
+            self.pos = save;
+            Ok(vec![self.parse_g_expr(ctx)?])
+        }
+    }
+
+    pub(super) fn parse_gfx_stmts(&mut self, ctx: &mut GfxCtx) -> Result<Vec<IrStmt>, ParseError> {
+        self.expect(&Tok::LBrace, "`{`")?;
+        let mut stmts = Vec::new();
+        loop {
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            if self.peek().is_none() {
+                return self.err("unterminated block");
+            }
+            if self.eat_kw("let") {
+                stmts.push(self.parse_gfx_let(ctx)?);
+                continue;
+            }
+            if self.eat_kw("if") {
+                stmts.push(self.parse_gfx_if(ctx)?);
+                continue;
+            }
+            let e = self.parse_g_expr(ctx)?;
+            self.expect(&Tok::Eq, "`=` (block statements must be assignments)")?;
+            let rhs = self.parse_g_expr(ctx)?;
+            stmts.push(self.gfx_assign(ctx, e, rhs)?);
+        }
+        Ok(stmts)
+    }
+
+    pub(super) fn parse_gfx_let(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
+        let name = self.ident()?;
+        let annot = if self.eat(&Tok::Colon) {
+            Some(self.parse_any_type()?)
+        } else {
+            None
+        };
+        self.expect(&Tok::Eq, "`=` in let binding")?;
+        let init = self.parse_g_expr(ctx)?;
+        let ty = annot.unwrap_or_else(|| infer_gfx_ty(&init, ctx));
+        ctx.locals.insert(name.clone(), ty);
+        ctx.locals_order.push((name.clone(), ty));
+        Ok(IrStmt::Let { name, init })
+    }
+
+    pub(super) fn parse_gfx_if(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
+        let cond = self.parse_g_expr(ctx)?;
+        let then = self.parse_gfx_stmts(ctx)?;
+        let else_ = if self.eat_kw("else") {
+            Some(self.parse_gfx_stmts(ctx)?)
+        } else {
+            None
+        };
+        Ok(IrStmt::If { cond, then, else_ })
+    }
+
+    pub(super) fn gfx_assign(
+        &self,
+        ctx: &GfxCtx,
+        lhs: IrExpr,
+        rhs: IrExpr,
+    ) -> Result<IrStmt, ParseError> {
+        match lhs {
+            IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
+            IrExpr::BufferLoad { buf, index } => {
+                if !*ctx.buffers.get(&buf).unwrap_or(&false) {
+                    return self.err(format!(
+                        "`{buf}` is read-only; declare it `device mut buffer`"
+                    ));
+                }
+                Ok(IrStmt::AssignBuffer {
+                    buf,
+                    index: *index,
+                    value: rhs,
+                })
+            }
+            _ => self.err("invalid assignment target; use a local or buf[i]"),
+        }
+    }
+}
