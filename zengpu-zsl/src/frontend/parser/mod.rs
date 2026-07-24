@@ -574,17 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_checker_matches_infer_gfx_ty_for_mat4_vec4_promotion() {
-        let mut ctx = GfxCtx {
-            inputs: HashMap::new(),
-            scalars: HashMap::new(),
-            push_param: None,
-            buffers: HashMap::new(),
-            locals: HashMap::new(),
-            locals_order: Vec::new(),
-        };
-        ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
-
+    fn typeck_infers_mat4_vec4_promotion_type() {
         let vec4 = IrExpr::Construct {
             ty: None,
             dim: 4,
@@ -600,28 +590,13 @@ mod tests {
             lhs: Box::new(IrExpr::ScalarParam("mvp".to_string())),
             rhs: Box::new(vec4),
         };
-        let old_ty = infer_gfx_ty(&mat_mul, &ctx);
 
         let mut arena = crate::ir::arena::TypeArena::new();
-        let mut new_ctx = crate::ir::typeck::GraphicsTypeCtx::default();
-        new_ctx.scalars.insert("mvp".to_string(), GfxTy::Mat4);
-        let new_vec4 = IrExpr::Construct {
-            ty: None,
-            dim: 4,
-            args: vec![
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(1.0),
-            ],
-        };
-        let new_mat_mul = IrExpr::Binary {
-            op: IrBinOp::Mul,
-            lhs: Box::new(IrExpr::ScalarParam("mvp".to_string())),
-            rhs: Box::new(new_vec4),
-        };
-        let new_ty = crate::ir::typeck::type_of_graphics_expr(&new_mat_mul, &new_ctx, &mut arena);
+        let mut ctx = crate::ir::typeck::GraphicsTypeCtx::default();
+        ctx.scalars
+            .insert("mvp".to_string(), arena.intern_gfx_ty(GfxTy::Mat4));
+        let ty = crate::ir::typeck::type_of_graphics_expr(&mat_mul, &ctx, &mut arena);
 
-        assert_eq!(new_ty, arena.intern_gfx_ty(old_ty));
+        assert_eq!(ty, arena.intern_gfx_ty(GfxTy::Vec4));
     }
 }

@@ -20,7 +20,11 @@ pub const PUSH_BUFFER_INDEX: u32 = 16;
 
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
-    let locals: HashMap<&str, GfxTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    let locals: HashMap<&str, GfxTy> = e
+        .locals
+        .iter()
+        .map(|(n, tid)| (n.as_str(), module.types.gfx_ty_of(*tid)))
+        .collect();
     let ctx = Ctx { locals };
 
     let mut s = String::new();

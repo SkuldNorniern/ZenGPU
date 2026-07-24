@@ -127,7 +127,7 @@ pub struct GraphicsEntry {
     pub buf_params: Vec<String>,
     /// Vertex varying outputs. Empty for fragment shaders and for position-only vertex shaders.
     pub varyings: Vec<TypeId>,
-    pub locals: Vec<(String, GfxTy)>,
+    pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
     /// Vertex: `[position, varyings…]`. Fragment: `[color]`.
     pub ret: Vec<IrExpr>,
@@ -136,6 +136,5 @@ pub struct GraphicsEntry {
 #[derive(Debug)]
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
-    /// Interns every `TypeId` used by `inputs`, `scalar_params` and `varyings`.
     pub types: TypeArena,
 }

@@ -31,35 +31,34 @@ impl<'a> Parser<'a> {
             return self.err("unexpected trailing tokens after entry point");
         }
 
-        let mut types = crate::ir::arena::TypeArena::new();
-
         let inputs: Vec<GfxInput> = inputs
             .into_iter()
             .map(|i| GfxInput {
                 name: i.name,
                 location: i.location,
-                ty: types.intern_gfx_ty(i.ty),
+                ty: i.ty,
             })
             .collect();
         let scalar_params: Vec<GfxScalar> = scalar_params
             .into_iter()
             .map(|s| GfxScalar {
                 name: s.name,
-                ty: types.intern_gfx_ty(s.ty),
+                ty: s.ty,
             })
             .collect();
         let varyings: Vec<TypeId> = varyings
             .into_iter()
-            .map(|t| types.intern_gfx_ty(t))
+            .map(|t| self.types.intern_gfx_ty(t))
             .collect();
+        let locals = ctx.locals_order;
 
         let body: Vec<IrStmt> = body
             .iter()
-            .map(|s| resolve_construct_types_stmt(s, &mut types))
+            .map(|s| resolve_construct_types_stmt(s, &mut self.types))
             .collect();
         let ret: Vec<IrExpr> = ret
             .iter()
-            .map(|e| resolve_construct_types_expr(e, &mut types))
+            .map(|e| resolve_construct_types_expr(e, &mut self.types))
             .collect();
 
         Ok(GraphicsModule {
@@ -69,11 +68,11 @@ impl<'a> Parser<'a> {
                 scalar_params,
                 buf_params,
                 varyings,
-                locals: ctx.locals_order,
+                locals,
                 body,
                 ret,
             },
-            types,
+            types: std::mem::replace(&mut self.types, crate::ir::arena::TypeArena::new()),
         })
     }
 
@@ -111,6 +110,7 @@ impl<'a> Parser<'a> {
                 if matches!(ty, GfxTy::Mat4) {
                     return self.err("input type must be f32/u32/f32x2/f32x3/f32x4");
                 }
+                let ty = self.types.intern_gfx_ty(ty);
                 ctx.inputs.insert(name.clone(), ty);
                 inputs.push(PendingGfxInput {
                     name,
@@ -150,11 +150,9 @@ impl<'a> Parser<'a> {
                             "graphics push field `{field}` must be f32/u32/mat4x4"
                         ));
                     }
-                    ctx.scalars.insert(field.clone(), gty);
-                    scalar_params.push(PendingGfxScalar {
-                        name: field,
-                        ty: gty,
-                    });
+                    let ty = self.types.intern_gfx_ty(gty);
+                    ctx.scalars.insert(field.clone(), ty);
+                    scalar_params.push(PendingGfxScalar { name: field, ty });
                 }
             }
             self.eat(&Tok::Comma);
@@ -269,7 +267,12 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_g_expr(ctx)?;
-        let ty = annot.unwrap_or_else(|| infer_gfx_ty(&init, ctx));
+        let ty = match annot {
+            Some(gty) => self.types.intern_gfx_ty(gty),
+            None => {
+                crate::ir::typeck::type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types)
+            }
+        };
         ctx.locals.insert(name.clone(), ty);
         ctx.locals_order.push((name.clone(), ty));
         Ok(IrStmt::Let { name, init })

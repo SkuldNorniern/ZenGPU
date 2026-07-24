@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::ir::Mutability;
 use crate::ir::node::IrStmt;
 use crate::ir::types::TypeId;
-use crate::ir::{GfxTy, Mutability};
 
 /// An `out` param. The call-site argument must be a plain, pre-declared local that receives
 /// the writes.
@@ -72,24 +72,32 @@ pub(super) enum PendingParamKind {
     Scalar(TypeId),
 }
 
-/// Parser-side `@location` input, type not yet interned. Public counterpart: `ir::GfxInput`.
 pub(super) struct PendingGfxInput {
     pub(super) name: String,
     pub(super) location: u32,
-    pub(super) ty: GfxTy,
+    pub(super) ty: TypeId,
 }
 
-/// Parser-side push-constant scalar/matrix param, type not yet interned. Public: `ir::GfxScalar`.
 pub(super) struct PendingGfxScalar {
     pub(super) name: String,
-    pub(super) ty: GfxTy,
+    pub(super) ty: TypeId,
 }
 
 pub(super) struct GfxCtx {
-    pub(super) inputs: HashMap<String, GfxTy>,
-    pub(super) scalars: HashMap<String, GfxTy>,
+    pub(super) inputs: HashMap<String, TypeId>,
+    pub(super) scalars: HashMap<String, TypeId>,
     pub(super) push_param: Option<String>,
     pub(super) buffers: HashMap<String, bool>,
-    pub(super) locals: HashMap<String, GfxTy>,
-    pub(super) locals_order: Vec<(String, GfxTy)>,
+    pub(super) locals: HashMap<String, TypeId>,
+    pub(super) locals_order: Vec<(String, TypeId)>,
+}
+
+impl GfxCtx {
+    pub(super) fn type_ctx(&self) -> crate::ir::typeck::GraphicsTypeCtx {
+        crate::ir::typeck::GraphicsTypeCtx {
+            inputs: self.inputs.clone(),
+            scalars: self.scalars.clone(),
+            locals: self.locals.clone(),
+        }
+    }
 }
