@@ -319,7 +319,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut t_ptr_func_vec3 = Id(0);
     let mut t_ptr_func_vec4 = Id(0);
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
-    for (name, gty) in &e.locals {
+    for (name, tid) in &e.locals {
+        let gty = module.types.gfx_ty_of(*tid);
         let (elem_ty, slot) = match gty {
             GfxTy::F32 => (t_f32, &mut t_ptr_func_f32),
             GfxTy::U32 => (t_u32, &mut t_ptr_func_u32),
@@ -336,7 +337,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             name.clone(),
             LocalVar {
                 ptr,
-                ty: *gty,
+                ty: gty,
                 elem_ty,
             },
         );

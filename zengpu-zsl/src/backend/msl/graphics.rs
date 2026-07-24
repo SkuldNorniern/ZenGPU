@@ -24,9 +24,13 @@ pub const PUSH_BUFFER_INDEX: u32 = 16;
 /// Lower a graphics [`GraphicsModule`] to MSL.
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
-    // `GraphicsEntry.locals` is not yet `TypeId` (unlike inputs/scalar_params/
-    // varyings below) — a separate, parser-side conversion handles that.
-    let locals: HashMap<&str, GfxTy> = e.locals.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+    // `GraphicsEntry.locals` is `TypeId`; round-trip to `GfxTy` here since this
+    // backend's own `Ctx.locals` is still `GfxTy`-keyed (a separate cleanup).
+    let locals: HashMap<&str, GfxTy> = e
+        .locals
+        .iter()
+        .map(|(n, tid)| (n.as_str(), module.types.gfx_ty_of(*tid)))
+        .collect();
     let ctx = Ctx { locals };
 
     let mut s = String::new();

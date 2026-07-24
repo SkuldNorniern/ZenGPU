@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::ir::Mutability;
 use crate::ir::node::IrStmt;
 use crate::ir::types::TypeId;
-use crate::ir::{GfxTy, Mutability};
 
 /// One scalar `fn` parameter: `name: ty` (in, by value) or `out name: ty`
 /// (out — the call-site argument must be a plain pre-declared local; writes
@@ -76,28 +76,35 @@ pub(super) enum PendingParamKind {
     Scalar(TypeId),
 }
 
-/// A `@location` input as accumulated during parsing, before its type is
-/// interned into the module's `TypeArena`. Distinct from the public
-/// `ir::GfxInput` (whose `ty` is a `TypeId`).
+/// A `@location` input as accumulated during parsing.
 pub(super) struct PendingGfxInput {
     pub(super) name: String,
     pub(super) location: u32,
-    pub(super) ty: GfxTy,
+    pub(super) ty: TypeId,
 }
 
-/// A push-constant scalar/matrix param as accumulated during parsing, before
-/// its type is interned. Distinct from the public `ir::GfxScalar`.
+/// A push-constant scalar/matrix param as accumulated during parsing.
 pub(super) struct PendingGfxScalar {
     pub(super) name: String,
-    pub(super) ty: GfxTy,
+    pub(super) ty: TypeId,
 }
 
 /// Resolved symbol tables for a graphics (vertex/fragment) body.
 pub(super) struct GfxCtx {
-    pub(super) inputs: HashMap<String, GfxTy>, // @location input name → type
-    pub(super) scalars: HashMap<String, GfxTy>, // push-field name → type
-    pub(super) push_param: Option<String>,     // the push param name
-    pub(super) buffers: HashMap<String, bool>, // name → writable
-    pub(super) locals: HashMap<String, GfxTy>,
-    pub(super) locals_order: Vec<(String, GfxTy)>,
+    pub(super) inputs: HashMap<String, TypeId>, // @location input name → type
+    pub(super) scalars: HashMap<String, TypeId>, // push-field name → type
+    pub(super) push_param: Option<String>,      // the push param name
+    pub(super) buffers: HashMap<String, bool>,  // name → writable
+    pub(super) locals: HashMap<String, TypeId>,
+    pub(super) locals_order: Vec<(String, TypeId)>,
+}
+
+impl GfxCtx {
+    pub(super) fn type_ctx(&self) -> crate::ir::typeck::GraphicsTypeCtx {
+        crate::ir::typeck::GraphicsTypeCtx {
+            inputs: self.inputs.clone(),
+            scalars: self.scalars.clone(),
+            locals: self.locals.clone(),
+        }
+    }
 }

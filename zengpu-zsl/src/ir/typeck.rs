@@ -3,9 +3,9 @@
 //!
 //! The compute parser uses [`type_of_compute_expr`] to type expressions and
 //! store compute locals, parameters, and buffer elements natively as
-//! [`crate::ir::types::TypeId`]. The graphics checker remains a standalone
-//! equivalent of `crate::frontend::parser`'s private `infer_gfx_ty`; only its
-//! own tests and the parser comparison test call it today.
+//! [`crate::ir::types::TypeId`]. The graphics parser similarly uses
+//! [`type_of_graphics_expr`] to type expressions and store graphics inputs,
+//! scalar parameters, and locals natively as [`crate::ir::types::TypeId`].
 
 use std::collections::HashMap;
 
@@ -75,51 +75,58 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
 /// `crate::frontend::parser`'s private `GfxCtx`.
 #[derive(Debug, Default)]
 pub struct GraphicsTypeCtx {
-    pub inputs: HashMap<String, crate::ir::GfxTy>,
-    pub scalars: HashMap<String, crate::ir::GfxTy>,
-    pub locals: HashMap<String, crate::ir::GfxTy>,
+    pub inputs: HashMap<String, TypeId>,
+    pub scalars: HashMap<String, TypeId>,
+    pub locals: HashMap<String, TypeId>,
 }
 
-/// Type a graphics expression, interning the result into `arena`. Mirrors
-/// `crate::frontend::parser`'s private `infer_gfx_ty` exactly.
-pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut TypeArena) -> TypeId {
+/// Type a graphics expression, interning canonical graphics types into `arena`.
+pub fn type_of_graphics_expr(
+    expr: &IrExpr,
+    ctx: &GraphicsTypeCtx,
+    arena: &mut TypeArena,
+) -> TypeId {
     use crate::ir::GfxTy;
 
+    let u32_id = arena.intern_gfx_ty(GfxTy::U32);
+    let f32_id = arena.intern_gfx_ty(GfxTy::F32);
+    let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
+    let vec3_id = arena.intern_gfx_ty(GfxTy::Vec3);
+    let vec4_id = arena.intern_gfx_ty(GfxTy::Vec4);
+    let mat4_id = arena.intern_gfx_ty(GfxTy::Mat4);
+
     match expr {
-        IrExpr::LitU32(_) => arena.intern_gfx_ty(GfxTy::U32),
-        IrExpr::LitF32(_) => arena.intern_gfx_ty(GfxTy::F32),
-        IrExpr::Local(n) => arena.intern_gfx_ty(ctx.locals.get(n).copied().unwrap_or(GfxTy::F32)),
-        IrExpr::ScalarParam(n) => {
-            arena.intern_gfx_ty(ctx.scalars.get(n).copied().unwrap_or(GfxTy::F32))
-        }
-        IrExpr::Input(n) => arena.intern_gfx_ty(ctx.inputs.get(n).copied().unwrap_or(GfxTy::F32)),
-        IrExpr::FieldAccess { .. } => arena.intern_gfx_ty(GfxTy::F32),
-        IrExpr::Construct { dim, .. } => {
-            let ty = match dim {
-                2 => GfxTy::Vec2,
-                3 => GfxTy::Vec3,
-                _ => GfxTy::Vec4,
-            };
-            arena.intern_gfx_ty(ty)
-        }
-        IrExpr::BufferLoad { .. } => arena.intern_gfx_ty(GfxTy::F32),
-        IrExpr::GlobalId(_) => arena.intern_gfx_ty(GfxTy::U32),
-        IrExpr::SharedLoad { .. } => arena.intern_gfx_ty(GfxTy::F32),
-        IrExpr::LocalId(_) | IrExpr::GroupId(_) => arena.intern_gfx_ty(GfxTy::U32),
+        IrExpr::LitU32(_) => u32_id,
+        IrExpr::LitF32(_) => f32_id,
+        IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(f32_id),
+        IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
+        IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(f32_id),
+        IrExpr::FieldAccess { .. } => f32_id,
+        IrExpr::Construct { dim, .. } => match dim {
+            2 => vec2_id,
+            3 => vec3_id,
+            _ => vec4_id,
+        },
+        IrExpr::BufferLoad { .. } => f32_id,
+        IrExpr::GlobalId(_) => u32_id,
+        IrExpr::SharedLoad { .. } => f32_id,
+        IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
         IrExpr::Builtin { func, args } => match func {
-            BuiltinFn::U32 => arena.intern_gfx_ty(GfxTy::U32),
-            BuiltinFn::Length => arena.intern_gfx_ty(GfxTy::F32),
-            BuiltinFn::Dot => arena.intern_gfx_ty(GfxTy::F32),
+            BuiltinFn::U32 => u32_id,
+            BuiltinFn::Length => f32_id,
+            BuiltinFn::Dot => f32_id,
             BuiltinFn::Extend => {
                 let base_ty = args.first().map(|a| type_of_graphics_expr(a, ctx, arena));
-                let vec2_id = arena.intern_gfx_ty(GfxTy::Vec2);
-                let ty = if base_ty == Some(vec2_id) { GfxTy::Vec3 } else { GfxTy::Vec4 };
-                arena.intern_gfx_ty(ty)
+                if base_ty == Some(vec2_id) {
+                    vec3_id
+                } else {
+                    vec4_id
+                }
             }
-            _ => match args.first() {
-                Some(a) => type_of_graphics_expr(a, ctx, arena),
-                None => arena.intern_gfx_ty(GfxTy::F32),
-            },
+            _ => args
+                .first()
+                .map(|a| type_of_graphics_expr(a, ctx, arena))
+                .unwrap_or(f32_id),
         },
         IrExpr::Neg(e) => type_of_graphics_expr(e, ctx, arena),
         IrExpr::Binary { op, lhs, rhs } => match op {
@@ -130,18 +137,11 @@ pub fn type_of_graphics_expr(expr: &IrExpr, ctx: &GraphicsTypeCtx, arena: &mut T
             | IrBinOp::Eq
             | IrBinOp::Ne
             | IrBinOp::And
-            | IrBinOp::Or => arena.intern_gfx_ty(GfxTy::F32),
+            | IrBinOp::Or => f32_id,
             _ => {
                 let l = type_of_graphics_expr(lhs, ctx, arena);
                 let r = type_of_graphics_expr(rhs, ctx, arena);
-                let mat4_id = arena.intern_gfx_ty(GfxTy::Mat4);
-                let f32_id = arena.intern_gfx_ty(GfxTy::F32);
-                let u32_id = arena.intern_gfx_ty(GfxTy::U32);
-                let vec_ids = [
-                    arena.intern_gfx_ty(GfxTy::Vec2),
-                    arena.intern_gfx_ty(GfxTy::Vec3),
-                    arena.intern_gfx_ty(GfxTy::Vec4),
-                ];
+                let vec_ids = [vec2_id, vec3_id, vec4_id];
                 let is_vec = |id: TypeId| vec_ids.contains(&id);
                 if l == mat4_id && is_vec(r) {
                     r
@@ -237,7 +237,8 @@ mod tests {
         };
         // Force the lhs to read as Mat4 by seeding ctx.scalars.
         let mut ctx2 = GraphicsTypeCtx::default();
-        ctx2.scalars.insert("mvp".into(), GfxTy::Mat4);
+        ctx2.scalars
+            .insert("mvp".into(), arena.intern_gfx_ty(GfxTy::Mat4));
         let promoted = type_of_graphics_expr(&mat_mul, &ctx2, &mut arena);
         assert_eq!(promoted, arena.intern_gfx_ty(GfxTy::Vec4));
     }

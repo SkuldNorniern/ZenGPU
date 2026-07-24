@@ -165,7 +165,7 @@ pub struct GraphicsEntry {
     /// vertex). Interned in the owning [`GraphicsModule`]'s `types` arena.
     pub varyings: Vec<TypeId>,
     /// Locals in declaration order, with inferred types.
-    pub locals: Vec<(String, GfxTy)>,
+    pub locals: Vec<(String, TypeId)>,
     /// Leading statements (everything before the tail expression).
     pub body: Vec<IrStmt>,
     /// Tail outputs: `[position]` / `[position, varyings…]` for vertex,
@@ -178,6 +178,6 @@ pub struct GraphicsEntry {
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
     /// Interns every [`TypeId`] referenced by `entry.inputs`/`entry.
-    /// scalar_params`/`entry.varyings`.
+    /// scalar_params`/`entry.varyings`/`entry.locals`.
     pub types: TypeArena,
 }
