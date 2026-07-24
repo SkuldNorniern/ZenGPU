@@ -6,31 +6,34 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::{BufElem, EntryKind, Module, ParamKind, ScalarTy};
+use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
+use crate::ir::{EntryKind, Module, ParamKind};
 
 /// Lower a compute [`Module`] to MSL.
 pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 
-    let locals: HashMap<&str, ScalarTy> = e
-        .locals
-        .iter()
-        .map(|(n, t)| (n.as_str(), module.types.scalar_ty_of(*t)))
-        .collect();
-    let buffers: Vec<(&str, BufElem)> = e
+    // Locals carry their pre-resolved MSL-type spelling so `emit_stmt` needs
+    // no arena access. Every local is a scalar today; a non-scalar `TypeId`
+    // here surfaces as a clean `Diagnostic` rather than reaching codegen.
+    let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    for (n, t) in &e.locals {
+        locals.insert(n.as_str(), msl_scalar(module.types.get(*t))?);
+    }
+    let buffers: Vec<(&str, TypeId)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), module.types.buf_elem_of(*elem))),
+            ParamKind::Buffer { elem, .. } => Some((p.name.as_str(), *elem)),
             _ => None,
         })
         .collect();
-    let scalars: Vec<(&str, ScalarTy)> = e
+    let scalars: Vec<(&str, TypeId)> = e
         .params
         .iter()
         .filter_map(|p| match &p.kind {
-            ParamKind::Scalar(t) => Some((p.name.as_str(), module.types.scalar_ty_of(*t))),
+            ParamKind::Scalar(t) => Some((p.name.as_str(), *t)),
             _ => None,
         })
         .collect();
@@ -44,7 +47,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     if has_push {
         s.push_str("struct Push {\n");
         for (n, t) in &scalars {
-            let _ = writeln!(s, "    {} {};", msl_scalar(*t), n);
+            let _ = writeln!(s, "    {} {};", msl_scalar(module.types.get(*t))?, n);
         }
         s.push_str("};\n\n");
     }
@@ -55,7 +58,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         let elem = if atomic_buffers.contains(b) {
             "atomic_float"
         } else {
-            msl_buffer_elem(*buffer_elem)?
+            msl_buffer_elem(module.types.get(*buffer_elem))?
         };
         let _ = writeln!(s, "    device {elem}* {b} [[buffer({slot})]],");
         slot += 1;
@@ -87,7 +90,8 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
 }
 
 struct Ctx<'a> {
-    locals: HashMap<&'a str, ScalarTy>,
+    /// Local name → its resolved MSL-type spelling.
+    locals: HashMap<&'a str, &'static str>,
 }
 
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
@@ -121,9 +125,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .locals
                 .get(name.as_str())
                 .copied()
-                .unwrap_or(ScalarTy::U32);
+                .unwrap_or("uint");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", msl_scalar(ty), name, emit_expr(init)?);
+            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
@@ -269,20 +273,43 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
-fn msl_scalar(t: ScalarTy) -> &'static str {
+/// The MSL spelling of a scalar [`Type`]. Non-scalar types are a compiler
+/// defect for a compute value and surface as an `Unsupported` diagnostic.
+fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
-        ScalarTy::U32 => "uint",
-        ScalarTy::I32 => "int",
-        ScalarTy::F32 => "float",
-        ScalarTy::Bool => "bool",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => Ok("uint"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => Ok("int"),
+        Type::Float {
+            format: FloatFormat::F32,
+        } => Ok("float"),
+        Type::Bool => Ok("bool"),
+        other => Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!("MSL backend: unsupported scalar type {other:?}"),
+        )),
     }
 }
 
-fn msl_buffer_elem(elem: BufElem) -> Result<&'static str, Diagnostic> {
-    match elem {
-        BufElem::F32 => Ok("float"),
-        BufElem::U32 => Ok("uint"),
-        BufElem::I32 => Ok("int"),
+/// The MSL spelling of a `device buffer<T>` element [`Type`].
+fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
+    match t {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => Ok("float"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => Ok("uint"),
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => Ok("int"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("MSL backend: unsupported compute buffer element {other:?}"),
