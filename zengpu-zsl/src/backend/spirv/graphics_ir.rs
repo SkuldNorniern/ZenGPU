@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::types::TypeId;
 use crate::ir::{GfxTy, GraphicsModule};
 
 type R<T> = Result<T, String>;
@@ -41,12 +42,12 @@ type R<T> = Result<T, String>;
 #[derive(Clone, Copy)]
 struct GVal {
     id: Id,
-    ty: GfxTy,
+    ty: TypeId,
 }
 
 struct InputVar {
     var: Id,
-    ty: GfxTy,
+    ty: TypeId,
     elem_ty: Id,
 }
 
@@ -54,12 +55,12 @@ struct InputVar {
 struct ScalarInfo {
     pc_index: u32,
     ty: Id,
-    gty: GfxTy,
+    gty: TypeId,
 }
 
 struct LocalVar {
     ptr: Id,
-    ty: GfxTy,
+    ty: TypeId,
     elem_ty: Id,
 }
 
@@ -72,6 +73,15 @@ struct Ctx<'a> {
     t_vec3: Id,
     t_vec4: Id,
     t_mat4: Id,
+    /// Canonical `TypeId`s for the six graphics value types, cached once at
+    /// the top of lowering (see `lower_graphics_inner`) so every comparison
+    /// below is a cheap `TypeId` equality check rather than an arena lookup.
+    f32_id: TypeId,
+    u32_id: TypeId,
+    vec2_id: TypeId,
+    vec3_id: TypeId,
+    vec4_id: TypeId,
+    mat4_id: TypeId,
     glsl_ext: Id,
     inputs: HashMap<String, InputVar>,
     scalar_params: HashMap<String, ScalarInfo>,
@@ -87,14 +97,19 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
-    fn spv_elem_ty(&self, ty: GfxTy) -> Id {
-        match ty {
-            GfxTy::F32 => self.t_f32,
-            GfxTy::U32 => self.t_u32,
-            GfxTy::Vec2 => self.t_vec2,
-            GfxTy::Vec3 => self.t_vec3,
-            GfxTy::Vec4 => self.t_vec4,
-            GfxTy::Mat4 => self.t_mat4,
+    fn spv_elem_ty(&self, ty: TypeId) -> Id {
+        if ty == self.f32_id {
+            self.t_f32
+        } else if ty == self.u32_id {
+            self.t_u32
+        } else if ty == self.vec2_id {
+            self.t_vec2
+        } else if ty == self.vec3_id {
+            self.t_vec3
+        } else if ty == self.vec4_id {
+            self.t_vec4
+        } else {
+            self.t_mat4
         }
     }
 }
@@ -107,6 +122,20 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<Vec<u32>, Diagnostic> {
 fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let e = &module.entry;
     let is_fragment = e.is_fragment;
+
+    // ── Canonical graphics-value TypeIds ─────────────────────────────────────
+    // A local, mutable clone of the module's type arena: reuses every TypeId
+    // the parser already interned and adds the six canonical graphics types
+    // if a module happens not to reference one. Never written back to
+    // `module` — it exists only so this lowering pass has stable `TypeId`s to
+    // compare against.
+    let mut types = module.types.clone();
+    let f32_id = types.intern_gfx_ty(GfxTy::F32);
+    let u32_id = types.intern_gfx_ty(GfxTy::U32);
+    let vec2_id = types.intern_gfx_ty(GfxTy::Vec2);
+    let vec3_id = types.intern_gfx_ty(GfxTy::Vec3);
+    let vec4_id = types.intern_gfx_ty(GfxTy::Vec4);
+    let mat4_id = types.intern_gfx_ty(GfxTy::Mat4);
 
     let mut spv = SpvBuilder::new();
     spv.capability_shader();
@@ -139,13 +168,17 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut input_vars: HashMap<String, InputVar> = HashMap::new();
     let mut interface: Vec<Id> = Vec::new();
     for input in &sorted_inputs {
-        let input_ty = module.types.gfx_ty_of(input.ty);
-        let (ptr_ty, elem_ty) = match input_ty {
-            GfxTy::F32 | GfxTy::U32 => (t_ptr_in_f32, t_f32),
-            GfxTy::Vec2 => (t_ptr_in_vec2, t_vec2),
-            GfxTy::Vec3 => (t_ptr_in_vec3, t_vec3),
-            GfxTy::Vec4 => (t_ptr_in_vec4, t_vec4),
-            GfxTy::Mat4 => return Err("Mat4 inputs are not supported".into()),
+        let input_ty = input.ty;
+        let (ptr_ty, elem_ty) = if input_ty == f32_id || input_ty == u32_id {
+            (t_ptr_in_f32, t_f32)
+        } else if input_ty == vec2_id {
+            (t_ptr_in_vec2, t_vec2)
+        } else if input_ty == vec3_id {
+            (t_ptr_in_vec3, t_vec3)
+        } else if input_ty == vec4_id {
+            (t_ptr_in_vec4, t_vec4)
+        } else {
+            return Err("Mat4 inputs are not supported".into());
         };
         let var = spv.global_variable(ptr_ty, sc::INPUT);
         spv.decorate(var, deco::LOCATION, &[input.location]);
@@ -171,16 +204,21 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     interface.push(out_var);
 
     // Varying outputs (vertex only).
-    let mut varying_out_vars: Vec<(Id, GfxTy)> = Vec::new();
+    let mut varying_out_vars: Vec<(Id, TypeId)> = Vec::new();
     for (loc, vty_id) in e.varyings.iter().enumerate() {
-        let vty = module.types.gfx_ty_of(*vty_id);
-        let spv_elem = match vty {
-            GfxTy::F32 => t_f32,
-            GfxTy::U32 => t_u32,
-            GfxTy::Vec2 => t_vec2,
-            GfxTy::Vec3 => t_vec3,
-            GfxTy::Vec4 => t_vec4,
-            GfxTy::Mat4 => return Err("Mat4 varyings are not supported".into()),
+        let vty = *vty_id;
+        let spv_elem = if vty == f32_id {
+            t_f32
+        } else if vty == u32_id {
+            t_u32
+        } else if vty == vec2_id {
+            t_vec2
+        } else if vty == vec3_id {
+            t_vec3
+        } else if vty == vec4_id {
+            t_vec4
+        } else {
+            return Err("Mat4 varyings are not supported".into());
         };
         let t_ptr = spv.type_pointer(sc::OUTPUT, spv_elem);
         let var = spv.global_variable(t_ptr, sc::OUTPUT);
@@ -210,10 +248,14 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     // Push-constant block: buf indices (u32) first, then scalars (u32/f32/mat4).
     let pc_var = if !e.buf_params.is_empty() || !e.scalar_params.is_empty() {
         let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
-        pc_members.extend(e.scalar_params.iter().map(|s| match module.types.gfx_ty_of(s.ty) {
-            GfxTy::U32 => t_u32,
-            GfxTy::Mat4 => t_mat4,
-            _ => t_f32,
+        pc_members.extend(e.scalar_params.iter().map(|s| {
+            if s.ty == u32_id {
+                t_u32
+            } else if s.ty == mat4_id {
+                t_mat4
+            } else {
+                t_f32
+            }
         }));
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
@@ -224,18 +266,15 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         }
         for (i, s) in e.scalar_params.iter().enumerate() {
             let member = n_buf_params + i as u32;
-            match module.types.gfx_ty_of(s.ty) {
-                GfxTy::Mat4 => {
-                    offset = (offset + 15) & !15;
-                    spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
-                    spv.member_decorate(t_pc_struct, member, deco::COL_MAJOR, &[]);
-                    spv.member_decorate(t_pc_struct, member, deco::MATRIX_STRIDE, &[16]);
-                    offset += 64;
-                }
-                _ => {
-                    spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
-                    offset += 4;
-                }
+            if s.ty == mat4_id {
+                offset = (offset + 15) & !15;
+                spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
+                spv.member_decorate(t_pc_struct, member, deco::COL_MAJOR, &[]);
+                spv.member_decorate(t_pc_struct, member, deco::MATRIX_STRIDE, &[16]);
+                offset += 64;
+            } else {
+                spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
+                offset += 4;
             }
         }
         let t_ptr_pc = spv.type_pointer(sc::PUSH_CONSTANT, t_pc_struct);
@@ -261,10 +300,12 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         .iter()
         .enumerate()
         .map(|(i, s)| {
-            let (ty, gty) = match module.types.gfx_ty_of(s.ty) {
-                GfxTy::U32 => (t_u32, GfxTy::U32),
-                GfxTy::Mat4 => (t_mat4, GfxTy::Mat4),
-                _ => (t_f32, GfxTy::F32),
+            let (ty, gty) = if s.ty == u32_id {
+                (t_u32, u32_id)
+            } else if s.ty == mat4_id {
+                (t_mat4, mat4_id)
+            } else {
+                (t_f32, f32_id)
             };
             (
                 s.name.clone(),
@@ -293,18 +334,16 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
         }
         for s in &e.scalar_params {
-            match module.types.gfx_ty_of(s.ty) {
-                GfxTy::U32 if t_ptr_pc_u32 == Id(0) => {
+            if s.ty == u32_id {
+                if t_ptr_pc_u32 == Id(0) {
                     t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
                 }
-                GfxTy::Mat4 if t_ptr_pc_mat4 == Id(0) => {
+            } else if s.ty == mat4_id {
+                if t_ptr_pc_mat4 == Id(0) {
                     t_ptr_pc_mat4 = spv.type_pointer(sc::PUSH_CONSTANT, t_mat4);
                 }
-                GfxTy::U32 | GfxTy::Mat4 => {}
-                _ if t_ptr_pc_f32 == Id(0) => {
-                    t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
-                }
-                _ => {}
+            } else if t_ptr_pc_f32 == Id(0) {
+                t_ptr_pc_f32 = spv.type_pointer(sc::PUSH_CONSTANT, t_f32);
             }
         }
     }
@@ -320,14 +359,19 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut t_ptr_func_vec4 = Id(0);
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
     for (name, tid) in &e.locals {
-        let gty = module.types.gfx_ty_of(*tid);
-        let (elem_ty, slot) = match gty {
-            GfxTy::F32 => (t_f32, &mut t_ptr_func_f32),
-            GfxTy::U32 => (t_u32, &mut t_ptr_func_u32),
-            GfxTy::Vec2 => (t_vec2, &mut t_ptr_func_vec2),
-            GfxTy::Vec3 => (t_vec3, &mut t_ptr_func_vec3),
-            GfxTy::Vec4 => (t_vec4, &mut t_ptr_func_vec4),
-            GfxTy::Mat4 => return Err("Mat4 local variables are not supported".into()),
+        let gty = *tid;
+        let (elem_ty, slot) = if gty == f32_id {
+            (t_f32, &mut t_ptr_func_f32)
+        } else if gty == u32_id {
+            (t_u32, &mut t_ptr_func_u32)
+        } else if gty == vec2_id {
+            (t_vec2, &mut t_ptr_func_vec2)
+        } else if gty == vec3_id {
+            (t_vec3, &mut t_ptr_func_vec3)
+        } else if gty == vec4_id {
+            (t_vec4, &mut t_ptr_func_vec4)
+        } else {
+            return Err("Mat4 local variables are not supported".into());
         };
         if *slot == Id(0) {
             *slot = spv.type_pointer(sc::FUNCTION, elem_ty);
@@ -352,6 +396,12 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         t_vec3,
         t_vec4,
         t_mat4,
+        f32_id,
+        u32_id,
+        vec2_id,
+        vec3_id,
+        vec4_id,
+        mat4_id,
         glsl_ext,
         inputs: input_vars,
         scalar_params: scalar_param_map,
@@ -372,10 +422,10 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
     // Tail outputs: ret[0] → position/color, ret[1..] → varyings.
     let pos = lower_expr(&mut ctx, &e.ret[0])?;
-    if pos.ty != GfxTy::Vec4 {
+    if pos.ty != ctx.vec4_id {
         return Err(format!(
             "shader return (position/color) must be f32x4, got {:?}",
-            pos.ty
+            types.get(pos.ty)
         ));
     }
     ctx.spv.op_store(out_var, pos.id);
@@ -384,7 +434,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         if v.ty != *expected {
             return Err(format!(
                 "varying[{i}] type mismatch: expected {:?}, got {:?}",
-                expected, v.ty
+                types.get(*expected),
+                types.get(v.ty)
             ));
         }
         ctx.spv.op_store(*var_id, v.id);
@@ -400,7 +451,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
     match stmt {
         IrStmt::Let { name, init } => {
-            let gty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(GfxTy::F32);
+            let gty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ctx.f32_id);
             let val = lower_expr(ctx, init)?;
             let coerced = coerce(ctx, val, gty)?;
             let ptr = ctx
@@ -508,20 +559,28 @@ fn lower_condition(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<Id> {
             let rhs = lower_expr(ctx, rhs)?;
             let (lhs, rhs) = unify_scalars(ctx, lhs, rhs);
             let b = ctx.t_bool;
-            let id = match (op, lhs.ty) {
-                (IrBinOp::Lt, GfxTy::F32) => ctx.spv.op_ford_lt(b, lhs.id, rhs.id),
-                (IrBinOp::Le, GfxTy::F32) => ctx.spv.op_ford_le(b, lhs.id, rhs.id),
-                (IrBinOp::Gt, GfxTy::F32) => ctx.spv.op_ford_gt(b, lhs.id, rhs.id),
-                (IrBinOp::Ge, GfxTy::F32) => ctx.spv.op_ford_ge(b, lhs.id, rhs.id),
-                (IrBinOp::Eq, GfxTy::F32) => ctx.spv.op_ford_eq(b, lhs.id, rhs.id),
-                (IrBinOp::Ne, GfxTy::F32) => ctx.spv.op_ford_ne(b, lhs.id, rhs.id),
-                (IrBinOp::Lt, GfxTy::U32) => ctx.spv.op_ult(b, lhs.id, rhs.id),
-                (IrBinOp::Le, GfxTy::U32) => ctx.spv.op_ule(b, lhs.id, rhs.id),
-                (IrBinOp::Gt, GfxTy::U32) => ctx.spv.op_ugt(b, lhs.id, rhs.id),
-                (IrBinOp::Ge, GfxTy::U32) => ctx.spv.op_uge(b, lhs.id, rhs.id),
-                (IrBinOp::Eq, GfxTy::U32) => ctx.spv.op_iequal(b, lhs.id, rhs.id),
-                (IrBinOp::Ne, GfxTy::U32) => ctx.spv.op_inot_equal(b, lhs.id, rhs.id),
-                _ => return Err("comparisons require f32 or u32 operands".into()),
+            let id = if lhs.ty == ctx.f32_id {
+                match op {
+                    IrBinOp::Lt => ctx.spv.op_ford_lt(b, lhs.id, rhs.id),
+                    IrBinOp::Le => ctx.spv.op_ford_le(b, lhs.id, rhs.id),
+                    IrBinOp::Gt => ctx.spv.op_ford_gt(b, lhs.id, rhs.id),
+                    IrBinOp::Ge => ctx.spv.op_ford_ge(b, lhs.id, rhs.id),
+                    IrBinOp::Eq => ctx.spv.op_ford_eq(b, lhs.id, rhs.id),
+                    IrBinOp::Ne => ctx.spv.op_ford_ne(b, lhs.id, rhs.id),
+                    _ => unreachable!(),
+                }
+            } else if lhs.ty == ctx.u32_id {
+                match op {
+                    IrBinOp::Lt => ctx.spv.op_ult(b, lhs.id, rhs.id),
+                    IrBinOp::Le => ctx.spv.op_ule(b, lhs.id, rhs.id),
+                    IrBinOp::Gt => ctx.spv.op_ugt(b, lhs.id, rhs.id),
+                    IrBinOp::Ge => ctx.spv.op_uge(b, lhs.id, rhs.id),
+                    IrBinOp::Eq => ctx.spv.op_iequal(b, lhs.id, rhs.id),
+                    IrBinOp::Ne => ctx.spv.op_inot_equal(b, lhs.id, rhs.id),
+                    _ => unreachable!(),
+                }
+            } else {
+                return Err("comparisons require f32 or u32 operands".into());
             };
             return Ok(id);
         }
@@ -535,11 +594,11 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
     match expr {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
-            Ok(GVal { id, ty: GfxTy::U32 })
+            Ok(GVal { id, ty: ctx.u32_id })
         }
         IrExpr::LitF32(v) => {
             let id = ctx.spv.constant_f32(ctx.t_f32, *v);
-            Ok(GVal { id, ty: GfxTy::F32 })
+            Ok(GVal { id, ty: ctx.f32_id })
         }
         IrExpr::Local(name) => {
             let l = ctx
@@ -565,11 +624,14 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
                 .get(name)
                 .ok_or_else(|| format!("unknown push field `{name}`"))?;
             let pc_var = ctx.pc_var.ok_or("internal: no push-constant block")?;
-            let pc_ptr_ty = match info.gty {
-                GfxTy::U32 => ctx.t_ptr_pc_u32,
-                GfxTy::F32 => ctx.t_ptr_pc_f32,
-                GfxTy::Mat4 => ctx.t_ptr_pc_mat4,
-                _ => return Err("unsupported push-constant type".into()),
+            let pc_ptr_ty = if info.gty == ctx.u32_id {
+                ctx.t_ptr_pc_u32
+            } else if info.gty == ctx.f32_id {
+                ctx.t_ptr_pc_f32
+            } else if info.gty == ctx.mat4_id {
+                ctx.t_ptr_pc_mat4
+            } else {
+                return Err("unsupported push-constant type".into());
             };
             let pc_idx = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
             let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
@@ -595,7 +657,7 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
                 ctx.spv
                     .op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
             let id = ctx.spv.op_load(ctx.t_f32, ptr_elem);
-            Ok(GVal { id, ty: GfxTy::F32 })
+            Ok(GVal { id, ty: ctx.f32_id })
         }
         IrExpr::FieldAccess { base, component } => {
             let composite = lower_expr(ctx, base)?;
@@ -603,13 +665,13 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             let id = ctx
                 .spv
                 .op_composite_extract(t_f32, composite.id, &[*component]);
-            Ok(GVal { id, ty: GfxTy::F32 })
+            Ok(GVal { id, ty: ctx.f32_id })
         }
         IrExpr::Construct { dim, args, .. } => {
             let (gty, spv_ty) = match dim {
-                2 => (GfxTy::Vec2, ctx.t_vec2),
-                3 => (GfxTy::Vec3, ctx.t_vec3),
-                _ => (GfxTy::Vec4, ctx.t_vec4),
+                2 => (ctx.vec2_id, ctx.t_vec2),
+                3 => (ctx.vec3_id, ctx.t_vec3),
+                _ => (ctx.vec4_id, ctx.t_vec4),
             };
             if args.len() != *dim as usize {
                 return Err(format!("f32x{dim} takes {dim} args, got {}", args.len()));
@@ -625,14 +687,14 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
         IrExpr::Neg(inner) => {
             let v = lower_expr(ctx, inner)?;
-            match v.ty {
-                GfxTy::U32 => Err("cannot negate u32".into()),
-                GfxTy::Mat4 => Err("cannot negate mat4x4".into()),
-                _ => {
-                    let ty = ctx.spv_elem_ty(v.ty);
-                    let id = ctx.spv.op_fnegate(ty, v.id);
-                    Ok(GVal { id, ty: v.ty })
-                }
+            if v.ty == ctx.u32_id {
+                Err("cannot negate u32".into())
+            } else if v.ty == ctx.mat4_id {
+                Err("cannot negate mat4x4".into())
+            } else {
+                let ty = ctx.spv_elem_ty(v.ty);
+                let id = ctx.spv.op_fnegate(ty, v.id);
+                Ok(GVal { id, ty: v.ty })
             }
         }
         IrExpr::Binary { op, lhs, rhs } => {
@@ -674,9 +736,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let v = lower_expr(ctx, &args[0])?;
             let ok = if matches!(func, BuiltinFn::Normalize) {
-                is_vec(v.ty)
+                is_vec(ctx, v.ty)
             } else {
-                v.ty == GfxTy::F32 || is_vec(v.ty)
+                v.ty == ctx.f32_id || is_vec(ctx, v.ty)
             };
             if !ok {
                 return Err(format!("{name}() requires f32/f32x2/f32x3/f32x4"));
@@ -707,13 +769,13 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
                 return Err("length() takes 1 arg".into());
             }
             let v = lower_expr(ctx, &args[0])?;
-            if !is_vec(v.ty) {
+            if !is_vec(ctx, v.ty) {
                 return Err("length() requires f32x2/f32x3/f32x4".into());
             }
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx.spv.op_ext_inst(t_f32, glsl, glsl_op::LENGTH, &[v.id]);
-            Ok(GVal { id, ty: GfxTy::F32 })
+            Ok(GVal { id, ty: ctx.f32_id })
         }
         BuiltinFn::Dot => {
             if args.len() != 2 {
@@ -721,19 +783,19 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
-            if !is_vec(a.ty) || a.ty != b.ty {
+            if !is_vec(ctx, a.ty) || a.ty != b.ty {
                 return Err("dot() requires two vectors of the same type".into());
             }
             let t_f32 = ctx.t_f32;
             let id = ctx.spv.op_dot(t_f32, a.id, b.id);
-            Ok(GVal { id, ty: GfxTy::F32 })
+            Ok(GVal { id, ty: ctx.f32_id })
         }
         BuiltinFn::Extend => {
             if args.len() != 2 {
                 return Err(".extend() requires a f32x3 receiver".into());
             }
             let b = lower_expr(ctx, &args[0])?;
-            if b.ty != GfxTy::Vec3 {
+            if b.ty != ctx.vec3_id {
                 return Err(".extend() requires a f32x3 receiver".into());
             }
             let ext = lower_expr(ctx, &args[1])?;
@@ -746,7 +808,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let id = ctx.spv.op_composite_construct(t_vec4, &[x, y, z, ext_id]);
             Ok(GVal {
                 id,
-                ty: GfxTy::Vec4,
+                ty: ctx.vec4_id,
             })
         }
         BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
@@ -755,7 +817,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
-            if !(a.ty == GfxTy::F32 || is_vec(a.ty)) || a.ty != b.ty {
+            if !(a.ty == ctx.f32_id || is_vec(ctx, a.ty)) || a.ty != b.ty {
                 return Err(format!("{name}() requires matching f32/f32xN args"));
             }
             let opcode = match func {
@@ -775,7 +837,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let x = lower_expr(ctx, &args[0])?;
             let lo = lower_expr(ctx, &args[1])?;
             let hi = lower_expr(ctx, &args[2])?;
-            if !(x.ty == GfxTy::F32 || is_vec(x.ty)) || x.ty != lo.ty || x.ty != hi.ty {
+            if !(x.ty == ctx.f32_id || is_vec(ctx, x.ty)) || x.ty != lo.ty || x.ty != hi.ty {
                 return Err("clamp() requires matching f32/f32xN args".into());
             }
             let ty = ctx.spv_elem_ty(x.ty);
@@ -792,7 +854,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
             let t = lower_expr(ctx, &args[2])?;
-            if !(a.ty == GfxTy::F32 || is_vec(a.ty)) || a.ty != b.ty || a.ty != t.ty {
+            if !(a.ty == ctx.f32_id || is_vec(ctx, a.ty)) || a.ty != b.ty || a.ty != t.ty {
                 return Err("mix() requires matching f32/f32xN args".into());
             }
             let ty = ctx.spv_elem_ty(a.ty);
@@ -807,22 +869,22 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
 
 fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> {
     // Mat4 * Vec4.
-    if lhs.ty == GfxTy::Mat4 {
+    if lhs.ty == ctx.mat4_id {
         if !matches!(op, IrBinOp::Mul) {
             return Err("mat4x4 only supports `*`".into());
         }
-        if rhs.ty != GfxTy::Vec4 {
+        if rhs.ty != ctx.vec4_id {
             return Err("mat4x4 * requires f32x4 on the right".into());
         }
         let t_vec4 = ctx.t_vec4;
         let id = ctx.spv.op_matrix_times_vector(t_vec4, lhs.id, rhs.id);
         return Ok(GVal {
             id,
-            ty: GfxTy::Vec4,
+            ty: ctx.vec4_id,
         });
     }
     // Vector op vector (component-wise).
-    if is_vec(lhs.ty) && is_vec(rhs.ty) {
+    if is_vec(ctx, lhs.ty) && is_vec(ctx, rhs.ty) {
         if lhs.ty != rhs.ty {
             return Err(format!(
                 "vec op requires matching types; got {:?} and {:?}",
@@ -841,12 +903,12 @@ fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> 
     }
     // Vector * scalar / scalar * vector.
     if matches!(op, IrBinOp::Mul) {
-        let (vec_val, scalar_val) = match (is_vec(lhs.ty), is_vec(rhs.ty)) {
+        let (vec_val, scalar_val) = match (is_vec(ctx, lhs.ty), is_vec(ctx, rhs.ty)) {
             (true, false) => (lhs, rhs),
             (false, true) => (rhs, lhs),
             _ => (lhs, rhs),
         };
-        if is_vec(vec_val.ty) && !is_vec(scalar_val.ty) {
+        if is_vec(ctx, vec_val.ty) && !is_vec(ctx, scalar_val.ty) {
             let scalar_f32 = scalar_to_f32(ctx, scalar_val);
             let ty = ctx.spv_elem_ty(vec_val.ty);
             let id = ctx.spv.op_vector_times_scalar(ty, vec_val.id, scalar_f32);
@@ -854,33 +916,39 @@ fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> 
         }
     }
     // Scalar arithmetic.
-    if !matches!(lhs.ty, GfxTy::F32 | GfxTy::U32) {
+    if !(lhs.ty == ctx.f32_id || lhs.ty == ctx.u32_id) {
         return Err("binary arithmetic only on scalar or vector types".into());
     }
     let (lhs, rhs) = unify_scalars(ctx, lhs, rhs);
     let ty = ctx.spv_elem_ty(lhs.ty);
-    let id = match (op, lhs.ty) {
-        (IrBinOp::Add, GfxTy::F32) => ctx.spv.op_fadd(ty, lhs.id, rhs.id),
-        (IrBinOp::Sub, GfxTy::F32) => ctx.spv.op_fsub(ty, lhs.id, rhs.id),
-        (IrBinOp::Mul, GfxTy::F32) => ctx.spv.op_fmul(ty, lhs.id, rhs.id),
-        (IrBinOp::Div, GfxTy::F32) => ctx.spv.op_fdiv(ty, lhs.id, rhs.id),
-        (IrBinOp::Add, _) => ctx.spv.op_iadd(ty, lhs.id, rhs.id),
-        (IrBinOp::Sub, _) => ctx.spv.op_isub(ty, lhs.id, rhs.id),
-        (IrBinOp::Mul, _) => ctx.spv.op_imul(ty, lhs.id, rhs.id),
-        (IrBinOp::Div, _) => ctx.spv.op_udiv(ty, lhs.id, rhs.id),
-        _ => return Err("unsupported op; use +, -, *, /".into()),
+    let id = if lhs.ty == ctx.f32_id {
+        match op {
+            IrBinOp::Add => ctx.spv.op_fadd(ty, lhs.id, rhs.id),
+            IrBinOp::Sub => ctx.spv.op_fsub(ty, lhs.id, rhs.id),
+            IrBinOp::Mul => ctx.spv.op_fmul(ty, lhs.id, rhs.id),
+            IrBinOp::Div => ctx.spv.op_fdiv(ty, lhs.id, rhs.id),
+            _ => return Err("unsupported op; use +, -, *, /".into()),
+        }
+    } else {
+        match op {
+            IrBinOp::Add => ctx.spv.op_iadd(ty, lhs.id, rhs.id),
+            IrBinOp::Sub => ctx.spv.op_isub(ty, lhs.id, rhs.id),
+            IrBinOp::Mul => ctx.spv.op_imul(ty, lhs.id, rhs.id),
+            IrBinOp::Div => ctx.spv.op_udiv(ty, lhs.id, rhs.id),
+            _ => return Err("unsupported op; use +, -, *, /".into()),
+        }
     };
     Ok(GVal { id, ty: lhs.ty })
 }
 
 // ── Coercions ──────────────────────────────────────────────────────────────────
 
-fn is_vec(t: GfxTy) -> bool {
-    matches!(t, GfxTy::Vec2 | GfxTy::Vec3 | GfxTy::Vec4)
+fn is_vec(ctx: &Ctx<'_>, t: TypeId) -> bool {
+    t == ctx.vec2_id || t == ctx.vec3_id || t == ctx.vec4_id
 }
 
 fn scalar_to_f32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
-    if v.ty == GfxTy::F32 {
+    if v.ty == ctx.f32_id {
         return v.id;
     }
     let t = ctx.t_f32;
@@ -888,27 +956,28 @@ fn scalar_to_f32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
 }
 
 fn scalar_to_u32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
-    if v.ty == GfxTy::U32 {
+    if v.ty == ctx.u32_id {
         return v.id;
     }
     let t = ctx.t_u32;
     ctx.spv.op_convert_f_to_u(t, v.id)
 }
 
-fn coerce(ctx: &mut Ctx<'_>, v: GVal, target: GfxTy) -> R<Id> {
+fn coerce(ctx: &mut Ctx<'_>, v: GVal, target: TypeId) -> R<Id> {
     if v.ty == target {
         return Ok(v.id);
     }
-    match (v.ty, target) {
-        (GfxTy::U32, GfxTy::F32) => {
-            let t = ctx.t_f32;
-            Ok(ctx.spv.op_convert_u_to_f(t, v.id))
-        }
-        (GfxTy::F32, GfxTy::U32) => {
-            let t = ctx.t_u32;
-            Ok(ctx.spv.op_convert_f_to_u(t, v.id))
-        }
-        _ => Err(format!("cannot coerce {:?} to {:?}", v.ty, target)),
+    if v.ty == ctx.u32_id && target == ctx.f32_id {
+        let t = ctx.t_f32;
+        Ok(ctx.spv.op_convert_u_to_f(t, v.id))
+    } else if v.ty == ctx.f32_id && target == ctx.u32_id {
+        let t = ctx.t_u32;
+        Ok(ctx.spv.op_convert_f_to_u(t, v.id))
+    } else {
+        Err(format!(
+            "cannot coerce {:?} to {:?}",
+            v.ty, target
+        ))
     }
 }
 
@@ -921,11 +990,11 @@ fn unify_scalars(ctx: &mut Ctx<'_>, lhs: GVal, rhs: GVal) -> (GVal, GVal) {
     (
         GVal {
             id: l,
-            ty: GfxTy::F32,
+            ty: ctx.f32_id,
         },
         GVal {
             id: r,
-            ty: GfxTy::F32,
+            ty: ctx.f32_id,
         },
     )
 }
