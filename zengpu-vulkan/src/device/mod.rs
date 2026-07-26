@@ -38,11 +38,35 @@ use crate::offscreen::OffscreenTarget;
 use crate::surface::VulkanSurface;
 use crate::swapchain::{DeviceContext, map_vk_err};
 
-/// Maximum number of storage buffers in the bindless descriptor table.
+/// Maximum number of storage buffers in each bindless SSBO table (per element
+/// type — see [`SSBO_BINDING_F32`]/[`SSBO_BINDING_U32`]/[`SSBO_BINDING_I32`]).
 const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
 /// Maximum number of combined image samplers in the bindless texture table.
 const MAX_BINDLESS_TEXTURES: u32 = 1024;
+
+/// Bindless SSBO table for `buffer<f32>` element access. Every `STORAGE`
+/// buffer is registered here regardless of its ZSL-declared element type —
+/// buffers are untyped at the HAL level (see [`crate::device::hal_impl`]).
+const SSBO_BINDING_F32: u32 = 0;
+
+/// Bindless combined-image-sampler table (unrelated to buffers; numbered here
+/// only because it shares the same descriptor set layout).
+const SSBO_BINDING_TEXTURES: u32 = 1;
+
+/// Bindless SSBO table for `buffer<u32>` element access, same slot indices as
+/// [`SSBO_BINDING_F32`] — added alongside it so a kernel's typed SPIR-V can
+/// read/write `uint[]` directly instead of bitcasting through the f32 table.
+const SSBO_BINDING_U32: u32 = 2;
+
+/// Bindless SSBO table for `buffer<i32>` element access, same slot indices as
+/// [`SSBO_BINDING_F32`].
+const SSBO_BINDING_I32: u32 = 3;
+
+/// Number of distinct-element-type SSBO tables sharing the storage-buffer
+/// descriptor budget (`f32`/`u32`/`i32` today). Append-only: a future bf16/f16
+/// table adds a new binding number here without renumbering existing ones.
+const SSBO_TYPED_TABLE_COUNT: u32 = 3;
 
 /// Vulkan guarantees at least 128 bytes of push constants. Keeping compute's
 /// ABI at that portable floor avoids rejecting otherwise conforming devices.
@@ -813,12 +837,16 @@ impl VulkanDevice {
 
 fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
     let total = limits.max_update_after_bind_descriptors;
+    // `buffer_capacity` is a *per-table* slot count; there are
+    // `SSBO_TYPED_TABLE_COUNT` STORAGE_BUFFER tables sharing one descriptor
+    // pool, so the device's storage-buffer and total-descriptor budgets must
+    // be divided across all of them up front.
     let buffer_capacity = MAX_BINDLESS_BUFFERS
-        .min(limits.max_storage_buffers)
-        .min(total.saturating_sub(1));
+        .min(limits.max_storage_buffers / SSBO_TYPED_TABLE_COUNT)
+        .min(total.saturating_sub(1) / SSBO_TYPED_TABLE_COUNT);
     let texture_capacity = MAX_BINDLESS_TEXTURES
         .min(limits.max_sampled_textures)
-        .min(total.saturating_sub(buffer_capacity));
+        .min(total.saturating_sub(buffer_capacity * SSBO_TYPED_TABLE_COUNT));
     if buffer_capacity == 0 || texture_capacity == 0 {
         return Err(GpuError::Unsupported(format!(
             "bindless descriptor limits are too small: storage={}, textures={}, total={total}",
@@ -832,22 +860,36 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
     let (buffer_capacity, texture_capacity) = bindless_capacities(limits)?;
     let bindings = [
         vk::DescriptorSetLayoutBinding {
-            binding: 0,
+            binding: SSBO_BINDING_F32,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: buffer_capacity,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         },
         vk::DescriptorSetLayoutBinding {
-            binding: 1,
+            binding: SSBO_BINDING_TEXTURES,
             descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
             descriptor_count: texture_capacity,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         },
+        vk::DescriptorSetLayoutBinding {
+            binding: SSBO_BINDING_U32,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: buffer_capacity,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: SSBO_BINDING_I32,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: buffer_capacity,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        },
     ];
     let binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND
-        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; 2];
+        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; 4];
     let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
         binding_count: binding_flags.len() as u32,
         p_binding_flags: binding_flags.as_ptr(),
@@ -870,7 +912,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
     let pool_sizes = [
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: buffer_capacity,
+            descriptor_count: buffer_capacity * SSBO_TYPED_TABLE_COUNT,
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -1201,7 +1243,9 @@ mod tests {
             max_update_after_bind_descriptors: 12,
             ..Default::default()
         };
-        assert_eq!(bindless_capacities(limits).unwrap(), (11, 1));
+        // buffer_capacity = 4096.min(16/3=5).min((12-1)/3=3) = 3 (per-table);
+        // texture_capacity = 1024.min(8).min(12 - 3*3=3) = 3.
+        assert_eq!(bindless_capacities(limits).unwrap(), (3, 3));
         assert!(
             bindless_capacities(DeviceLimits {
                 max_storage_buffers: 1,
