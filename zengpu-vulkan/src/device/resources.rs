@@ -30,7 +30,7 @@ impl VulkanDevice {
         };
         let write = vk::WriteDescriptorSet {
             dst_set: self.bindless.set,
-            dst_binding: 1,
+            dst_binding: SSBO_BINDING_TEXTURES,
             dst_array_element: texture.index(),
             descriptor_count: 1,
             descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -44,7 +44,11 @@ impl VulkanDevice {
         Some(texture.index())
     }
 
-    /// Called by `create_buffer` for `STORAGE` buffers.
+    /// Register a `STORAGE` buffer in every SSBO table, at its slot index. Called
+    /// by `create_buffer`.
+    ///
+    /// Buffers are untyped at the HAL, so each kernel reads through the table matching its ZSL
+    /// element type: no bitcast.
     pub(super) fn bind_buffer_to_bindless(&self, slot: u32, buffer: vk::Buffer, size: u64) {
         debug_assert!(slot < self.bindless.buffer_capacity);
         let info = vk::DescriptorBufferInfo {
@@ -52,17 +56,22 @@ impl VulkanDevice {
             offset: 0,
             range: if size == 0 { vk::WHOLE_SIZE } else { size },
         };
-        let write = vk::WriteDescriptorSet {
+        let write_for = |dst_binding: u32| vk::WriteDescriptorSet {
             dst_set: self.bindless.set,
-            dst_binding: 0,
+            dst_binding,
             dst_array_element: slot,
             descriptor_count: 1,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             p_buffer_info: &info,
             ..Default::default()
         };
+        let writes = [
+            write_for(SSBO_BINDING_F32),
+            write_for(SSBO_BINDING_U32),
+            write_for(SSBO_BINDING_I32),
+        ];
         unsafe {
-            self.inner.device.update_descriptor_sets(&[write], &[]);
+            self.inner.device.update_descriptor_sets(&writes, &[]);
         }
     }
 
