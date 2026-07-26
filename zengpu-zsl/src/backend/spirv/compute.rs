@@ -80,18 +80,38 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         })
         .collect();
 
-    let t_ra_f32 = spv.type_runtime_array(t_f32);
-    spv.decorate(t_ra_f32, deco::ARRAY_STRIDE, &[4]);
-    let t_struct_buf_f32 = spv.type_struct(&[t_ra_f32]);
-    spv.decorate(t_struct_buf_f32, deco::BLOCK, &[]);
-    spv.member_decorate(t_struct_buf_f32, 0, deco::OFFSET, &[0]);
-    let t_ra_struct = spv.type_runtime_array(t_struct_buf_f32);
-    let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
-    let t_ptr_ssbo_f32 = spv.type_pointer(sc::STORAGE_BUFFER, t_f32);
+    let mut ssbo_tables: HashMap<TypeId, SsboTable> = HashMap::new();
+    for (_, elem) in &buf_params {
+        if ssbo_tables.contains_key(elem) {
+            continue;
+        }
+        let elem_ty = *elem;
+        let t_elem = if elem_ty == f32_id {
+            t_f32
+        } else if elem_ty == u32_id {
+            t_u32
+        } else if elem_ty == i32_id {
+            t_i32
+        } else {
+            unreachable!("unsupported compute buffer element")
+        };
+        let binding = ssbo_binding_for(elem_ty, f32_id, u32_id, i32_id);
 
-    let g_bufs_var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
-    spv.decorate(g_bufs_var, deco::DESCRIPTOR_SET, &[0]);
-    spv.decorate(g_bufs_var, deco::BINDING, &[0]);
+        let t_ra = spv.type_runtime_array(t_elem);
+        spv.decorate(t_ra, deco::ARRAY_STRIDE, &[4]);
+        let t_struct_buf = spv.type_struct(&[t_ra]);
+        spv.decorate(t_struct_buf, deco::BLOCK, &[]);
+        spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
+        let t_ra_struct = spv.type_runtime_array(t_struct_buf);
+        let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
+        let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_elem);
+
+        let var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
+        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+        spv.decorate(var, deco::BINDING, &[binding]);
+
+        ssbo_tables.insert(elem_ty, SsboTable { var, t_ptr_elem });
+    }
 
     let n_buf_params = buf_params.len() as u32;
     let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
@@ -234,9 +254,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         t_i32,
         t_f32,
         t_uvec3,
-        g_bufs_var,
+        ssbo_tables,
         n_buf_params,
-        t_ptr_ssbo_f32,
         glsl_ext,
         buf_params: buf_param_map,
         scalar_params: scalar_param_map,
@@ -265,6 +284,14 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 struct BufInfo {
     pc_index: u32,
     elem: TypeId,
+}
+
+/// Bindless SSBO array for one element type. The pointee is the element's real SPIR-V type:
+/// no bitcast.
+#[derive(Clone, Copy)]
+struct SsboTable {
+    var: Id,
+    t_ptr_elem: Id,
 }
 
 #[derive(Clone, Copy)]
@@ -298,8 +325,8 @@ struct LowerCtx<'a> {
     t_i32: Id,
     t_f32: Id,
     t_uvec3: Id,
-    t_ptr_ssbo_f32: Id,
-    g_bufs_var: Id,
+    /// One SSBO table per buffer element type, keyed by its canonical `TypeId`.
+    ssbo_tables: HashMap<TypeId, SsboTable>,
     glsl_ext: Id,
     buf_params: HashMap<String, BufInfo>,
     scalar_params: HashMap<String, ScalarInfo>,
@@ -382,7 +409,10 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .buf_params
                 .get(buf)
                 .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
-            let g_bufs = ctx.g_bufs_var;
+            let table = *ctx
+                .ssbo_tables
+                .get(&info.elem)
+                .expect("buffer element type has no SSBO table");
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
@@ -392,14 +422,13 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
-            let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
             let ptr_elem = ctx
                 .spv
-                .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+                .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
             let rhs = lower_expr(ctx, value)?;
-            let storage_value = value_to_storage(ctx, rhs, info.elem);
-            ctx.spv.op_store(ptr_elem, storage_value);
+            let rhs_id = coerce(ctx, rhs, info.elem);
+            ctx.spv.op_store(ptr_elem, rhs_id);
             Ok(())
         }
 
@@ -409,6 +438,10 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .get(buf)
                 .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
                 .pc_index;
+            let table = *ctx
+                .ssbo_tables
+                .get(&ctx.f32_id)
+                .expect("atomic_add requires an f32 SSBO table");
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
@@ -420,8 +453,8 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let ptr_elem = ctx.spv.op_access_chain(
-                ctx.t_ptr_ssbo_f32,
-                ctx.g_bufs_var,
+                table.t_ptr_elem,
+                table.var,
                 &[buf_idx, ctx.const_0_u32, idx_id],
             );
             let rhs = lower_expr(ctx, value)?;
@@ -590,7 +623,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 .buf_params
                 .get(buf)
                 .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
-            let g_bufs = ctx.g_bufs_var;
+            let table = *ctx
+                .ssbo_tables
+                .get(&info.elem)
+                .expect("buffer element type has no SSBO table");
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
@@ -600,13 +636,13 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
-            let ptr_ssbo_f32 = ctx.t_ptr_ssbo_f32;
             let c0 = ctx.const_0_u32;
             let ptr_elem = ctx
                 .spv
-                .op_access_chain(ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
-            let raw = ctx.spv.op_load(ctx.t_f32, ptr_elem);
-            Ok(storage_to_value(ctx, raw, info.elem))
+                .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
+            let elem_spv_ty = ctx.spv_ty(info.elem);
+            let id = ctx.spv.op_load(elem_spv_ty, ptr_elem);
+            Ok(Val { id, ty: info.elem })
         }
 
         IrExpr::SharedLoad { name, index } => {
@@ -894,35 +930,17 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
     }
 }
 
-/// Element `TypeId` must be f32, u32 or i32. Buffer elements are scalar by construction, so this
-/// never fails.
-fn buffer_scalar(ctx: &LowerCtx<'_>, elem: TypeId) -> TypeId {
-    if elem == ctx.f32_id || elem == ctx.u32_id || elem == ctx.i32_id {
-        elem
+/// Bindless SSBO binding for an element `TypeId`. Must match `zengpu-vulkan`'s set layout
+/// (`SSBO_BINDING_*` in `zengpu-vulkan/src/device/mod.rs`), kept in sync by hand.
+fn ssbo_binding_for(elem: TypeId, f32_id: TypeId, u32_id: TypeId, i32_id: TypeId) -> u32 {
+    if elem == f32_id {
+        0
+    } else if elem == u32_id {
+        2
+    } else if elem == i32_id {
+        3
     } else {
         unreachable!("unsupported compute buffer element")
-    }
-}
-
-fn storage_to_value(ctx: &mut LowerCtx<'_>, raw_f32: Id, elem: TypeId) -> Val {
-    let ty = buffer_scalar(ctx, elem);
-    let id = if ty == ctx.f32_id {
-        raw_f32
-    } else if ty == ctx.u32_id {
-        ctx.spv.op_bitcast(ctx.t_u32, raw_f32)
-    } else {
-        ctx.spv.op_bitcast(ctx.t_i32, raw_f32)
-    };
-    Val { id, ty }
-}
-
-fn value_to_storage(ctx: &mut LowerCtx<'_>, value: Val, elem: TypeId) -> Id {
-    let ty = buffer_scalar(ctx, elem);
-    let value = coerce(ctx, value, ty);
-    if ty == ctx.f32_id {
-        value
-    } else {
-        ctx.spv.op_bitcast(ctx.t_f32, value)
     }
 }
 
