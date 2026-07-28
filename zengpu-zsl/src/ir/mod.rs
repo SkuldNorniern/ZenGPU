@@ -5,6 +5,7 @@ pub mod arena;
 pub mod binding;
 pub mod layout;
 pub mod node;
+pub mod reflection;
 pub mod typeck;
 pub mod types;
 pub mod validate;
