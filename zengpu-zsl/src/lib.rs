@@ -415,6 +415,13 @@ mod phase_z_tests {
         }
     "#;
 
+    const COPY_BF16: &str = r#"
+        @workgroup_size(64)
+        kernel copy_bf16(src: device buffer<bf16>, out: device mut buffer<bf16>, id: global_id) {
+            out[id.x] = src[id.x]
+        }
+    "#;
+
     const FINITE_CLASSIFY: &str = r#"
         @workgroup_size(64)
         kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, id: global_id) {
@@ -464,6 +471,101 @@ mod phase_z_tests {
         assert!(msl_source.contains("device uint* out_u"));
         assert!(msl_source.contains("device int* out_i"));
         spirv::lower_compute(&module).expect("lower typed buffers to SPIR-V");
+    }
+
+    #[test]
+    fn bf16_buffer_lowers_to_hip_with_conversion_helpers() {
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let hip_source = hip::lower_compute(&module).expect("lower copy_bf16 to HIP").source;
+        assert!(hip_source.contains("const unsigned short* __restrict__ src"));
+        assert!(hip_source.contains("unsigned short* __restrict__ out"));
+        assert!(hip_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
+        assert!(hip_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
+        assert!(hip_source.contains("__device__ __forceinline__ float bf16_to_f32"));
+    }
+
+    #[test]
+    fn bf16_hip_round_trip_exact_match_when_gpu_present() {
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let shader = hip::lower_compute(&module).expect("lower copy_bf16 to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP bf16 proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_bf16_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_bf16_{}_{}", std::process::id(), tag));
+        // Host-side reference conversion mirrors laminax-runtime's raw HIP
+        // bf16 kernels bit-for-bit (round-to-nearest-even truncation), so a
+        // future parity swap to this ZSL-lowered path changes no bits.
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+{}
+static unsigned short f32_to_bf16_host(float x) {{
+    unsigned int bits;
+    std::memcpy(&bits, &x, sizeof(bits));
+    unsigned int bias = 0x7fffu + ((bits >> 16) & 1u);
+    return (unsigned short)((bits + bias) >> 16);
+}}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned N = 65536;
+    std::vector<unsigned short> src(N), out(N, 0);
+    for (unsigned i = 0; i < N; ++i) {{
+        float x = (float)i * 0.01f - 300.0f;
+        src[i] = f32_to_bf16_host(x);
+    }}
+    unsigned short *dsrc = nullptr, *dout = nullptr;
+    if (hipMalloc(&dsrc, src.size()*sizeof(unsigned short)) != hipSuccess ||
+        hipMalloc(&dout, out.size()*sizeof(unsigned short)) != hipSuccess) return 2;
+    hipMemcpy(dsrc, src.data(), src.size()*sizeof(unsigned short), hipMemcpyHostToDevice);
+    zsl_kernel<<<dim3((N+63)/64), dim3(64)>>>(dsrc, dout);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(out.data(), dout, out.size()*sizeof(unsigned short), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) mismatches += out[i] != src[i];
+    std::printf("BF16_EXACT mismatches=%u\n", mismatches);
+    hipFree(dsrc); hipFree(dout);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP bf16 proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP bf16 compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP copy_bf16");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "HIP copy_bf16 failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP copy_bf16: {}", stdout.trim());
     }
 
     #[test]

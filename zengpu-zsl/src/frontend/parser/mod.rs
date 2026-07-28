@@ -306,6 +306,39 @@ mod tests {
     }
 
     #[test]
+    fn bf16_buffer_round_trips_an_f32_value() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel copy_bf16(x: device buffer<bf16>, out: device mut buffer<bf16>, id: global_id) {
+                out[id.x] = x[id.x]
+            }
+        "#;
+        let module = parse_compute(src).expect("parse");
+        let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
+        for p in &module.entry.params {
+            if let crate::ir::ParamKind::Buffer { elem, .. } = p.kind {
+                assert_eq!(elem, bf16_id, "buffer<bf16> param `{}`", p.name);
+            }
+        }
+    }
+
+    #[test]
+    fn bf16_buffer_rejects_non_f32_assignment() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel bad(out: device mut buffer<bf16>) {
+                out[0] = 1u32
+            }
+        "#;
+        let e = parse_compute(src).unwrap_err();
+        assert!(
+            e.msg.contains("incompatible value type"),
+            "got: {}",
+            e.msg
+        );
+    }
+
+    #[test]
     fn unknown_identifier_is_rejected() {
         let src = r#"
             @workgroup_size(1)

@@ -14,6 +14,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse a `device buffer<…>` element type: scalars plus `bf16`. Distinct
+    /// from `parse_scalar_type` because `bf16` is storage-only — it is valid
+    /// as a buffer element but never as a local/param/push-field type (no
+    /// ZSL expression is ever bf16-typed at the value level).
+    pub(super) fn parse_buffer_elem_type(&mut self) -> Result<TypeId, ParseError> {
+        let name = self.ident()?;
+        match name.as_str() {
+            "u32" => Ok(self.types.u32_id()),
+            "i32" => Ok(self.types.i32_id()),
+            "f32" => Ok(self.types.f32_id()),
+            "bf16" => Ok(self.types.bf16_id()),
+            other => self.err(format!(
+                "unsupported buffer element type `{other}`; use u32, i32, f32, or bf16"
+            )),
+        }
+    }
+
     /// Parse any value type (scalar/vector/matrix), used for push fields and
     /// graphics declarations: `f32`, `u32`, `f32x2/3/4`, `mat4x4<f32>`.
     pub(super) fn parse_any_type(&mut self) -> Result<TypeId, ParseError> {
@@ -53,7 +70,7 @@ impl<'a> Parser<'a> {
                 return self.err("expected `buffer` in device buffer type");
             }
             self.expect(&Tok::Lt, "`<` in buffer<…>")?;
-            let elem = self.parse_scalar_type()?;
+            let elem = self.parse_buffer_elem_type()?;
             self.expect(&Tok::Gt, "`>` in buffer<…>")?;
             if elem == self.types.bool_id() {
                 return self.err("buffer<bool> is not supported");
