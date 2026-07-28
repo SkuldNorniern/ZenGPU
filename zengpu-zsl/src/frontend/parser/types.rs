@@ -14,6 +14,23 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parses a buffer element type: the scalars plus `bf16`.
+    ///
+    /// `bf16` is storage-only. It is valid as a buffer element, never as a local, param or
+    /// push field.
+    pub(super) fn parse_buffer_elem_type(&mut self) -> Result<TypeId, ParseError> {
+        let name = self.ident()?;
+        match name.as_str() {
+            "u32" => Ok(self.types.u32_id()),
+            "i32" => Ok(self.types.i32_id()),
+            "f32" => Ok(self.types.f32_id()),
+            "bf16" => Ok(self.types.bf16_id()),
+            other => self.err(format!(
+                "unsupported buffer element type `{other}`; use u32, i32, f32, or bf16"
+            )),
+        }
+    }
+
     pub(super) fn parse_any_type(&mut self) -> Result<TypeId, ParseError> {
         let name = self.ident()?;
         match name.as_str() {
@@ -49,7 +66,7 @@ impl<'a> Parser<'a> {
                 return self.err("expected `buffer` in device buffer type");
             }
             self.expect(&Tok::Lt, "`<` in buffer<…>")?;
-            let elem = self.parse_scalar_type()?;
+            let elem = self.parse_buffer_elem_type()?;
             self.expect(&Tok::Gt, "`>` in buffer<…>")?;
             if elem == self.types.bool_id() {
                 return self.err("buffer<bool> is not supported");

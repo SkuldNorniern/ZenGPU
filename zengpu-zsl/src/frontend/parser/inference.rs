@@ -41,6 +41,9 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &crate::ir::arena::TypeArena
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => "i32",
+        Type::Float {
+            format: FloatFormat::Bf16,
+        } => "bf16",
         _ => "unsupported",
     }
 }

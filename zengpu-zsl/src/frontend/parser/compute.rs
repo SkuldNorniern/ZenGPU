@@ -326,11 +326,18 @@ impl<'a> Parser<'a> {
                             "`{buf}` is read-only; declare it `device mut buffer`"
                         ));
                     }
+                    let bf16_id = self.types.bf16_id();
+                    let f32_id = self.types.f32_id();
+                    let expected = if buffer.elem == bf16_id {
+                        f32_id
+                    } else {
+                        buffer.elem
+                    };
                     if crate::ir::typeck::type_of_compute_expr(
                         &rhs,
                         &ctx.type_ctx(),
                         &mut self.types,
-                    ) != buffer.elem
+                    ) != expected
                     {
                         return self.err(format!(
                             "assignment to buffer<{}> has incompatible value type",

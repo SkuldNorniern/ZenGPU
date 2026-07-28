@@ -53,6 +53,13 @@ impl TypeArena {
         self.intern(Type::Bool)
     }
 
+    /// Storage-only: no expression has type bf16, and loads narrow to `f32`.
+    pub fn bf16_id(&mut self) -> TypeId {
+        self.intern(Type::Float {
+            format: FloatFormat::Bf16,
+        })
+    }
+
     pub fn vec_id(&mut self, lanes: u8) -> TypeId {
         let element = self.f32_id();
         self.intern(Type::Vector { element, lanes })
@@ -104,6 +111,22 @@ mod tests {
             Type::Int {
                 width: IntWidth::W32,
                 signedness: Signedness::Unsigned
+            }
+        );
+    }
+
+    #[test]
+    fn bf16_is_distinct_from_f32_and_idempotent() {
+        let mut arena = TypeArena::new();
+        let bf16_a = arena.bf16_id();
+        let bf16_b = arena.bf16_id();
+        let f32_id = arena.f32_id();
+        assert_eq!(bf16_a, bf16_b);
+        assert_ne!(bf16_a, f32_id);
+        assert_eq!(
+            *arena.get(bf16_a),
+            Type::Float {
+                format: FloatFormat::Bf16
             }
         );
     }
