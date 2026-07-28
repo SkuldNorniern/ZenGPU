@@ -2,6 +2,7 @@
 //! graphics entries.
 
 pub mod arena;
+pub mod layout;
 pub mod node;
 pub mod typeck;
 pub mod types;
