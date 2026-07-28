@@ -34,6 +34,37 @@ use zengpu_hal::{BackendPreference, ShaderDesc};
 #[cfg(test)]
 extern crate self as zengpu_spirv;
 
+/// Buffer element kind in `ZslShader` reflection. Own copy: `zengpu-zsl` is a proc-macro crate and
+/// exports no types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    F32,
+    U32,
+    I32,
+    /// A graphics push-constant `mat4x4<f32>`. Never a buffer element.
+    Mat4,
+}
+
+/// What one push-constant-block member actually holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// Buffer param: the push member is a `u32` slot in the table for `binding`, not `elem`.
+    /// `binding` is an `SSBO_BINDING_*` in zengpu-vulkan.
+    BufferIndex { elem: ScalarKind, binding: u32 },
+    /// A push-constant scalar, stored as its declared type.
+    Scalar { kind: ScalarKind },
+}
+
+/// Push-constant layout of one param in a `const ZslShader`.
+#[derive(Debug, Clone, Copy)]
+pub struct ParamLayout {
+    pub name: &'static str,
+    pub offset: u32,
+    /// Size in bytes (4 for a bindless index/scalar; 64 for `mat4x4<f32>`).
+    pub size: u32,
+    pub kind: ParamKind,
+}
+
 /// Compiled form of a ZSL shader, with one field per target.
 /// [`for_backend`](ZslShader::for_backend) picks one at runtime.
 pub struct ZslShader {
@@ -45,6 +76,9 @@ pub struct ZslShader {
     pub msl: &'static str,
     /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
     pub cuda: &'static str,
+    /// Push-constant layout and binding metadata. Buffer params come first, then scalars, as every
+    /// backend builds it.
+    pub reflection: &'static [ParamLayout],
 }
 
 impl ZslShader {
