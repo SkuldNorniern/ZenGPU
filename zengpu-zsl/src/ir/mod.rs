@@ -3,6 +3,7 @@
 
 pub mod arena;
 pub mod binding;
+pub mod capability;
 pub mod layout;
 pub mod node;
 pub mod reflection;
