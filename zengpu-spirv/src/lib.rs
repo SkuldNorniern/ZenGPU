@@ -40,6 +40,46 @@ use zengpu_hal::{BackendPreference, ShaderDesc};
 #[cfg(test)]
 extern crate self as zengpu_spirv;
 
+/// A buffer element's scalar kind, as carried by [`ZslShader`]'s reflection
+/// metadata. Independent of `zengpu-zsl`'s internal `TypeId` — `zengpu-zsl` is
+/// a `proc-macro = true` crate and cannot export ordinary types for another
+/// crate to name, so this is this crate's own small, `const`-friendly mirror
+/// of the same information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarKind {
+    F32,
+    U32,
+    I32,
+    /// A graphics push-constant `mat4x4<f32>` param (never a buffer element —
+    /// buffers are always scalar).
+    Mat4,
+}
+
+/// What one push-constant-block member actually holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamKind {
+    /// A `device buffer<elem>` param. The push-constant member itself always
+    /// holds a bindless-table `u32` slot index, not `elem` — `elem` and
+    /// `binding` describe what the *buffer* holds and which bindless table
+    /// (matching `zengpu-vulkan`'s `SSBO_BINDING_F32`=0/`SSBO_BINDING_U32`=2/
+    /// `SSBO_BINDING_I32`=3) it routes to.
+    BufferIndex { elem: ScalarKind, binding: u32 },
+    /// A push-constant scalar (or graphics `mat4x4<f32>`) param, stored as
+    /// its own declared type.
+    Scalar { kind: ScalarKind },
+}
+
+/// One param's push-constant layout, as embedded in a `const ZslShader`.
+#[derive(Debug, Clone, Copy)]
+pub struct ParamLayout {
+    pub name: &'static str,
+    /// Byte offset within the push-constant block.
+    pub offset: u32,
+    /// Size in bytes (4 for a bindless index/scalar; 64 for `mat4x4<f32>`).
+    pub size: u32,
+    pub kind: ParamKind,
+}
+
 /// All-backend compiled form of a ZSL shader.
 ///
 /// Produced by [`zsl!`] at build time. Each field holds the compiled output for
@@ -54,6 +94,11 @@ pub struct ZslShader {
     pub msl: &'static str,
     /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
     pub cuda: &'static str,
+    /// Push-constant layout + bindless-binding metadata for this entry
+    /// point's params, in declaration order (buffer params first, then
+    /// scalar params — matching every backend's own push-constant-block
+    /// construction).
+    pub reflection: &'static [ParamLayout],
 }
 
 impl ZslShader {

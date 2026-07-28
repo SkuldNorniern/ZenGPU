@@ -159,6 +159,15 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     use frontend::parser::{Shader, parse_zsl};
     let shader = parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))?;
 
+    let reflection: crate::ir::reflection::ModuleReflection = match &shader {
+        Shader::Compute(m) => crate::ir::reflection::reflect_compute(m),
+        Shader::Graphics(m) => crate::ir::reflection::reflect_graphics(m),
+    };
+    let types: &crate::ir::arena::TypeArena = match &shader {
+        Shader::Compute(m) => &m.types,
+        Shader::Graphics(m) => &m.types,
+    };
+
     let spv_words = match &shader {
         Shader::Compute(m) => backend::spirv::lower_compute(m)?,
         Shader::Graphics(m) => backend::spirv::lower_graphics(m)?,
@@ -217,6 +226,8 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     push_str_lit(&mut s, &msl_src);
     s.push_str(", cuda: ");
     push_str_lit(&mut s, &cuda_src);
+    s.push_str(", reflection: ");
+    s.push_str(&reflection_to_slice_str(&reflection, types));
     s.push_str(" }");
 
     s.parse()
@@ -232,6 +243,77 @@ fn words_to_slice_str(words: &[u32]) -> String {
         }
         s.push_str(&w.to_string());
         s.push_str("u32");
+    }
+    s.push(']');
+    s
+}
+
+/// The `zengpu_spirv::ScalarKind` variant name for `ty`, resolved against
+/// `types`. Used only to print a literal `zengpu_spirv::ScalarKind::…` token
+/// into generated source — see `reflection_to_slice_str`.
+fn scalar_kind_name(
+    ty: crate::ir::types::TypeId,
+    types: &crate::ir::arena::TypeArena,
+) -> &'static str {
+    use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
+    match types.get(ty) {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => "F32",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => "U32",
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => "I32",
+        Type::Matrix {
+            rows: 4,
+            columns: 4,
+            ..
+        } => "Mat4",
+        other => panic!("ZSL: reflection encountered an unsupported push-constant type {other:?}"),
+    }
+}
+
+/// Print `reflection` as a `&[zengpu_spirv::ParamLayout { ... }, ...]` Rust
+/// literal expression, resolving each param's `TypeId` against `types`.
+fn reflection_to_slice_str(
+    reflection: &crate::ir::reflection::ModuleReflection,
+    types: &crate::ir::arena::TypeArena,
+) -> String {
+    let mut s = String::from("&[");
+    for (i, p) in reflection.params.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str("::zengpu_spirv::ParamLayout { name: ");
+        push_str_lit(&mut s, &p.name);
+        s.push_str(", offset: ");
+        s.push_str(&p.layout.offset.to_string());
+        s.push_str(", size: ");
+        s.push_str(&p.layout.size.to_string());
+        s.push_str(", kind: ");
+        match (&p.layout.kind, p.binding) {
+            (crate::ir::layout::LayoutKind::BufferIndex { elem }, Some(binding)) => {
+                s.push_str(&format!(
+                    "::zengpu_spirv::ParamKind::BufferIndex {{ elem: ::zengpu_spirv::ScalarKind::{}, binding: {} }}",
+                    scalar_kind_name(*elem, types),
+                    binding.binding,
+                ));
+            }
+            (crate::ir::layout::LayoutKind::Scalar { ty }, None) => {
+                s.push_str(&format!(
+                    "::zengpu_spirv::ParamKind::Scalar {{ kind: ::zengpu_spirv::ScalarKind::{} }}",
+                    scalar_kind_name(*ty, types),
+                ));
+            }
+            _ => unreachable!(
+                "ZSL: reflection invariant broken — a BufferIndex layout must have a binding, a Scalar layout must not"
+            ),
+        }
+        s.push_str(" }");
     }
     s.push(']');
     s
