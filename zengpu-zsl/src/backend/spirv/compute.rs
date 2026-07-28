@@ -32,6 +32,7 @@ use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
+use crate::ir::binding::ssbo_binding_for;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -997,23 +998,6 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// The bindless SSBO binding index for a buffer element's `TypeId`, matching
-/// `zengpu-vulkan`'s bindless descriptor set layout (`SSBO_BINDING_F32`/
-/// `SSBO_BINDING_U32`/`SSBO_BINDING_I32` in `zengpu-vulkan/src/device/mod.rs`).
-/// Kept in sync by convention (not a shared crate constant — there are only
-/// three, and they rarely change).
-fn ssbo_binding_for(elem: TypeId, f32_id: TypeId, u32_id: TypeId, i32_id: TypeId) -> u32 {
-    if elem == f32_id {
-        0
-    } else if elem == u32_id {
-        2
-    } else if elem == i32_id {
-        3
-    } else {
-        unreachable!("unsupported compute buffer element")
-    }
-}
 
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {
     if val.ty == target {

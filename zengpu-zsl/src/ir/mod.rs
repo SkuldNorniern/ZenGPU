@@ -8,6 +8,7 @@
 //! varyings, vertex input/output structs) extends `EntryKind`/`Param` next.
 
 pub mod arena;
+pub mod binding;
 pub mod layout;
 pub mod node;
 pub mod typeck;
