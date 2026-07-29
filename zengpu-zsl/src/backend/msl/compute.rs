@@ -49,6 +49,17 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         .map(|(name, _)| *name)
         .collect();
 
+    // Buffers whose element is `f16`: storage is MSL's native `half` scalar
+    // type — conversion is just an explicit `float(x)`/`half(x)` cast, no
+    // conversion function needed (unlike bf16, which MSL has no native type
+    // for).
+    let f16_id = { let mut t = module.types.clone(); t.f16_id() };
+    let f16_buffers: HashSet<&str> = buffers
+        .iter()
+        .filter(|(_, elem)| *elem == f16_id)
+        .map(|(name, _)| *name)
+        .collect();
+
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
     if !bf16_buffers.is_empty() {
@@ -100,6 +111,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let ctx = Ctx {
         locals,
         bf16_buffers,
+        f16_buffers,
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -121,6 +133,9 @@ struct Ctx<'a> {
     /// Buffer names whose element is `bf16` — every load/store on these is
     /// wrapped in `bf16_to_f32`/`f32_to_bf16`.
     bf16_buffers: HashSet<&'a str>,
+    /// Buffer names whose element is `f16` — every load/store on these is
+    /// wrapped in `float(...)`/`half(...)`.
+    f16_buffers: HashSet<&'a str>,
 }
 
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
@@ -168,6 +183,8 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let val = emit_expr(ctx, value)?;
             let val = if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("f32_to_bf16({val})")
+            } else if ctx.f16_buffers.contains(buf.as_str()) {
+                format!("half({val})")
             } else {
                 val
             };
@@ -247,6 +264,8 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             let inner = format!("{buf}[{}]", emit_expr(ctx, index)?);
             if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("bf16_to_f32({inner})")
+            } else if ctx.f16_buffers.contains(buf.as_str()) {
+                format!("float({inner})")
             } else {
                 inner
             }
@@ -364,6 +383,9 @@ fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
         Type::Float {
             format: FloatFormat::Bf16,
         } => Ok("ushort"),
+        Type::Float {
+            format: FloatFormat::F16,
+        } => Ok("half"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,

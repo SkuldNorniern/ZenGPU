@@ -25,8 +25,9 @@ impl<'a> Parser<'a> {
             "i32" => Ok(self.types.i32_id()),
             "f32" => Ok(self.types.f32_id()),
             "bf16" => Ok(self.types.bf16_id()),
+            "f16" => Ok(self.types.f16_id()),
             other => self.err(format!(
-                "unsupported buffer element type `{other}`; use u32, i32, f32, or bf16"
+                "unsupported buffer element type `{other}`; use u32, i32, f32, bf16, or f16"
             )),
         }
     }

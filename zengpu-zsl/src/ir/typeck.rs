@@ -30,6 +30,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
     let f32_id = arena.f32_id();
     let bool_id = arena.bool_id();
     let bf16_id = arena.bf16_id();
+    let f16_id = arena.f16_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
         IrExpr::LitF32(_) => f32_id,
@@ -37,12 +38,16 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
         IrExpr::GlobalId(_) => u32_id,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
-        // `bf16` is storage-only: every value loaded from a bf16 buffer is
-        // f32 from the point of load onward (no ZSL expression is ever
-        // bf16-typed at the value level).
+        // `bf16`/`f16` are storage-only: every value loaded from one of
+        // these buffers is f32 from the point of load onward (no ZSL
+        // expression is ever bf16/f16-typed at the value level).
         IrExpr::BufferLoad { buf, .. } => {
             let elem = ctx.buffers.get(buf).copied().unwrap_or(f32_id);
-            if elem == bf16_id { f32_id } else { elem }
+            if elem == bf16_id || elem == f16_id {
+                f32_id
+            } else {
+                elem
+            }
         }
         IrExpr::SharedLoad { .. } => f32_id,
         IrExpr::Builtin { func, .. } => match func {
@@ -194,6 +199,20 @@ mod tests {
         let mut arena = TypeArena::new();
         let mut ctx = ComputeTypeCtx::default();
         ctx.buffers.insert("x".into(), arena.bf16_id());
+
+        let load = IrExpr::BufferLoad {
+            buf: "x".into(),
+            index: Box::new(IrExpr::LitU32(0)),
+        };
+        let ty = type_of_compute_expr(&load, &ctx, &mut arena);
+        assert_eq!(ty, arena.f32_id());
+    }
+
+    #[test]
+    fn compute_buffer_load_narrows_f16_to_f32() {
+        let mut arena = TypeArena::new();
+        let mut ctx = ComputeTypeCtx::default();
+        ctx.buffers.insert("x".into(), arena.f16_id());
 
         let load = IrExpr::BufferLoad {
             buf: "x".into(),

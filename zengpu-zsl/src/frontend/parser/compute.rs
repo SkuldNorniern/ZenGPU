@@ -336,12 +336,14 @@ impl<'a> Parser<'a> {
                             "`{buf}` is read-only; declare it `device mut buffer`"
                         ));
                     }
-                    // `bf16` is storage-only: a value assigned into a bf16
-                    // buffer is f32-typed (there is no bf16-typed ZSL
-                    // expression), so the expected type narrows to f32.
+                    // `bf16`/`f16` are storage-only: a value assigned into one
+                    // of these buffers is f32-typed (there is no bf16/f16-
+                    // typed ZSL expression), so the expected type narrows to
+                    // f32.
                     let bf16_id = self.types.bf16_id();
+                    let f16_id = self.types.f16_id();
                     let f32_id = self.types.f32_id();
-                    let expected = if buffer.elem == bf16_id {
+                    let expected = if buffer.elem == bf16_id || buffer.elem == f16_id {
                         f32_id
                     } else {
                         buffer.elem

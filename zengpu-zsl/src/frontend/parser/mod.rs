@@ -323,6 +323,23 @@ mod tests {
     }
 
     #[test]
+    fn f16_buffer_round_trips_an_f32_value() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel copy_f16(x: device buffer<f16>, out: device mut buffer<f16>, id: global_id) {
+                out[id.x] = x[id.x]
+            }
+        "#;
+        let module = parse_compute(src).expect("parse");
+        let f16_id = { let mut t = module.types.clone(); t.f16_id() };
+        for p in &module.entry.params {
+            if let crate::ir::ParamKind::Buffer { elem, .. } = p.kind {
+                assert_eq!(elem, f16_id, "buffer<f16> param `{}`", p.name);
+            }
+        }
+    }
+
+    #[test]
     fn bf16_buffer_rejects_non_f32_assignment() {
         let src = r#"
             @workgroup_size(1)

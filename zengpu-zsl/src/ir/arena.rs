@@ -70,6 +70,13 @@ impl TypeArena {
         })
     }
 
+    /// The canonical `f16` scalar type. Storage-only, same as `bf16_id`.
+    pub fn f16_id(&mut self) -> TypeId {
+        self.intern(Type::Float {
+            format: FloatFormat::F16,
+        })
+    }
+
     /// An `f32` vector of the given lane count (2/3/4).
     pub fn vec_id(&mut self, lanes: u8) -> TypeId {
         let element = self.f32_id();
@@ -138,6 +145,22 @@ mod tests {
             *arena.get(bf16_a),
             Type::Float {
                 format: FloatFormat::Bf16
+            }
+        );
+    }
+
+    #[test]
+    fn f16_is_distinct_from_bf16_and_f32() {
+        let mut arena = TypeArena::new();
+        let f16_id = arena.f16_id();
+        let bf16_id = arena.bf16_id();
+        let f32_id = arena.f32_id();
+        assert_ne!(f16_id, bf16_id);
+        assert_ne!(f16_id, f32_id);
+        assert_eq!(
+            *arena.get(f16_id),
+            Type::Float {
+                format: FloatFormat::F16
             }
         );
     }

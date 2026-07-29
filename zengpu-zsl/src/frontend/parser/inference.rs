@@ -45,6 +45,9 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &crate::ir::arena::TypeArena
         Type::Float {
             format: FloatFormat::Bf16,
         } => "bf16",
+        Type::Float {
+            format: FloatFormat::F16,
+        } => "f16",
         _ => "unsupported",
     }
 }
