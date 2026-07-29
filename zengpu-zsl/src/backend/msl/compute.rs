@@ -335,7 +335,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         s /= 2;
                     }
                     format!(
-                        "({{ __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        "({{ threadgroup_barrier(mem_flags::mem_threadgroup); __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
                         a[0]
                     )
                 }

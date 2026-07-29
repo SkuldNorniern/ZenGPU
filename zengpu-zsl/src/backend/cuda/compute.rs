@@ -506,7 +506,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         s /= 2;
                     }
                     format!(
-                        "({{ __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        "({{ __syncthreads(); __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
                         args_s[0]
                     )
                 }

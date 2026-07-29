@@ -1217,13 +1217,17 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let lid3 = ctx.spv.op_load(ctx.t_uvec3, ctx.lid_var);
             let lid_x = ctx.spv.op_composite_extract(ctx.t_u32, lid3, &[0]);
 
+            let barrier_scope = ctx.spv.constant_u32(ctx.t_u32, 2);
+            let barrier_semantics = ctx.spv.constant_u32(ctx.t_u32, 0x108);
+
+            ctx.spv
+                .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
+
             let ptr = ctx
                 .spv
                 .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
             ctx.spv.op_store(ptr, value.id);
 
-            let barrier_scope = ctx.spv.constant_u32(ctx.t_u32, 2);
-            let barrier_semantics = ctx.spv.constant_u32(ctx.t_u32, 0x108);
             ctx.spv
                 .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
 
