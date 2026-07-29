@@ -387,6 +387,13 @@ mod phase_z_tests {
         }
     "#;
 
+    const COPY_F16: &str = r#"
+        @workgroup_size(64)
+        kernel copy_f16(src: device buffer<f16>, out: device mut buffer<f16>, id: global_id) {
+            out[id.x] = src[id.x]
+        }
+    "#;
+
     const FINITE_CLASSIFY: &str = r#"
         @workgroup_size(64)
         kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, id: global_id) {
@@ -557,6 +564,106 @@ int main() {{
             String::from_utf8_lossy(&run.stderr)
         );
         eprintln!("HIP copy_bf16: {}", stdout.trim());
+    }
+
+    #[test]
+    fn f16_buffer_lowers_on_all_compute_backends() {
+        let module = parse_compute(COPY_F16).expect("parse copy_f16");
+        let hip_source = hip::lower_compute(&module).expect("lower copy_f16 to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower copy_f16 to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower copy_f16 to MSL").source;
+        assert!(hip_source.contains("#include <hip/hip_fp16.h>"));
+        assert!(hip_source.contains("const __half* __restrict__ src"));
+        assert!(hip_source.contains("__half* __restrict__ out"));
+        assert!(hip_source.contains("__float2half(__half2float(src[gx]))"));
+        assert!(cuda_source.contains("#include <cuda_fp16.h>"));
+        assert!(cuda_source.contains("const __half* __restrict__ src"));
+        assert!(cuda_source.contains("__float2half(__half2float(src[gx]))"));
+        assert!(msl_source.contains("device half* src"));
+        assert!(msl_source.contains("half(float(src[gid.x]))"));
+    }
+
+    #[test]
+    fn f16_buffer_rejects_cleanly_on_spirv_backend() {
+        let module = parse_compute(COPY_F16).expect("parse copy_f16");
+        let err = spirv::lower_compute(&module).expect_err("f16 must be rejected on SPIR-V");
+        assert!(err.message.contains("does not yet support"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn f16_hip_round_trip_exact_match_when_gpu_present() {
+        let module = parse_compute(COPY_F16).expect("parse copy_f16");
+        let shader = hip::lower_compute(&module).expect("lower copy_f16 to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP f16 proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_f16_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_f16_{}_{}", std::process::id(), tag));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned N = 65536;
+    std::vector<unsigned short> src(N), out(N, 0);
+    for (unsigned i = 0; i < N; ++i) {{
+        float x = (float)i * 0.01f - 300.0f;
+        __half h = __float2half(x);
+        std::memcpy(&src[i], &h, sizeof(unsigned short));
+    }}
+    unsigned short *dsrc = nullptr, *dout = nullptr;
+    if (hipMalloc(&dsrc, src.size()*sizeof(unsigned short)) != hipSuccess ||
+        hipMalloc(&dout, out.size()*sizeof(unsigned short)) != hipSuccess) return 2;
+    hipMemcpy(dsrc, src.data(), src.size()*sizeof(unsigned short), hipMemcpyHostToDevice);
+    zsl_kernel<<<dim3((N+63)/64), dim3(64)>>>((const __half*)dsrc, (__half*)dout);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(out.data(), dout, out.size()*sizeof(unsigned short), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) mismatches += out[i] != src[i];
+    std::printf("F16_EXACT mismatches=%u\n", mismatches);
+    hipFree(dsrc); hipFree(dout);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP f16 proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP f16 compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP copy_f16");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "HIP copy_f16 failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP copy_f16: {}", stdout.trim());
     }
 
     const MUL_ADD_F32: &str = r#"

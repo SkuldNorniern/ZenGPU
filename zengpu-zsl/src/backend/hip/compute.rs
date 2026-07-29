@@ -41,8 +41,18 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         .map(|(name, _, _)| *name)
         .collect();
 
+    let f16_id = { let mut t = module.types.clone(); t.f16_id() };
+    let f16_buffers: std::collections::HashSet<&str> = buffers
+        .iter()
+        .filter(|(_, _, elem)| *elem == f16_id)
+        .map(|(name, _, _)| *name)
+        .collect();
+
     let mut s = String::new();
 
+    if !f16_buffers.is_empty() {
+        s.push_str("#include <hip/hip_fp16.h>\n");
+    }
     if !bf16_buffers.is_empty() {
         s.push_str(
             "__device__ __forceinline__ unsigned short f32_to_bf16(float x) {\n\
@@ -108,6 +118,7 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let ctx = Ctx {
         locals,
         bf16_buffers,
+        f16_buffers,
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -127,6 +138,7 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
     bf16_buffers: std::collections::HashSet<&'a str>,
+    f16_buffers: std::collections::HashSet<&'a str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -167,6 +179,9 @@ fn hip_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
         Type::Float {
             format: FloatFormat::Bf16,
         } => Ok("unsigned short"),
+        Type::Float {
+            format: FloatFormat::F16,
+        } => Ok("__half"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
@@ -203,6 +218,8 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let val = emit_expr(ctx, value)?;
             let val = if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("f32_to_bf16({val})")
+            } else if ctx.f16_buffers.contains(buf.as_str()) {
+                format!("__float2half({val})")
             } else {
                 val
             };
@@ -286,6 +303,8 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             let inner = format!("{}[{}]", buf, emit_expr(ctx, index)?);
             if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("bf16_to_f32({inner})")
+            } else if ctx.f16_buffers.contains(buf.as_str()) {
+                format!("__half2float({inner})")
             } else {
                 inner
             }

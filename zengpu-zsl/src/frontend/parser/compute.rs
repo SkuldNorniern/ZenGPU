@@ -327,8 +327,9 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     let bf16_id = self.types.bf16_id();
+                    let f16_id = self.types.f16_id();
                     let f32_id = self.types.f32_id();
-                    let expected = if buffer.elem == bf16_id {
+                    let expected = if buffer.elem == bf16_id || buffer.elem == f16_id {
                         f32_id
                     } else {
                         buffer.elem
