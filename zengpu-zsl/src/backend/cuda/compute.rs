@@ -313,6 +313,9 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                     )
                 }
                 BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
+                BuiltinFn::MulAddF32 => {
+                    format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
             }
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(inner)?),

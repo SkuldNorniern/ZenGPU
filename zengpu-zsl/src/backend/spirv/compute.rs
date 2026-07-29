@@ -26,6 +26,7 @@ mod glsl_op {
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
     pub const F_MIX: u32 = 46;
+    pub const FMA: u32 = 50;
 }
 
 use std::collections::HashMap;
@@ -993,6 +994,25 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
         // Vector-only builtins never appear in a compute module.
         BuiltinFn::Normalize | BuiltinFn::Length => {
             Err(format!("ZSL: {name}() is not supported in compute shaders"))
+        }
+
+        // mul_add_f32(a, b, acc): (f32, f32, f32) → f32, single-rounding FMA.
+        BuiltinFn::MulAddF32 => {
+            if args.len() != 3 {
+                return Err("ZSL: mul_add_f32(a, b, acc) takes 3 args".into());
+            }
+            let a = lower_expr(ctx, &args[0])?;
+            let b = lower_expr(ctx, &args[1])?;
+            let acc = lower_expr(ctx, &args[2])?;
+            if a.ty != ctx.f32_id || b.ty != ctx.f32_id || acc.ty != ctx.f32_id {
+                return Err("ZSL: mul_add_f32() requires f32 args".into());
+            }
+            let t_f32 = ctx.t_f32;
+            let glsl = ctx.glsl_ext;
+            let id = ctx
+                .spv
+                .op_ext_inst(t_f32, glsl, glsl_op::FMA, &[a.id, b.id, acc.id]);
+            Ok(Val { id, ty: ctx.f32_id })
         }
     }
 }

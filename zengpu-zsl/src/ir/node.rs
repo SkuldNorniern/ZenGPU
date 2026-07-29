@@ -129,6 +129,10 @@ pub enum BuiltinFn {
     /// `vec3.extend(scalar)` → `f32x4`. Formerly the dedicated
     /// `IrExpr::Extend` node.
     Extend,
+    /// `mul_add_f32(a, b, acc) -> f32` — a single-rounding fused multiply-add
+    /// (`a * b + acc` computed with one rounding step, not two). Compute-only;
+    /// the design doc's F32-accumulate primitive for low-precision products.
+    MulAddF32,
 }
 
 impl BuiltinFn {
@@ -160,6 +164,7 @@ impl BuiltinFn {
             BuiltinFn::Length => "length",
             BuiltinFn::Dot => "dot",
             BuiltinFn::Extend => "extend",
+            BuiltinFn::MulAddF32 => "mul_add_f32",
         }
     }
 }

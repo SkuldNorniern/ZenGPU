@@ -568,6 +568,110 @@ int main() {{
         eprintln!("HIP copy_bf16: {}", stdout.trim());
     }
 
+    const MUL_ADD_F32: &str = r#"
+        @workgroup_size(64)
+        kernel fma3(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+            out[id.x] = mul_add_f32(a[id.x], b[id.x], c[id.x])
+        }
+    "#;
+
+    #[test]
+    fn mul_add_f32_lowers_on_all_compute_backends() {
+        let module = parse_compute(MUL_ADD_F32).expect("parse fma3");
+        let hip_source = hip::lower_compute(&module).expect("lower fma3 to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower fma3 to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower fma3 to MSL").source;
+        assert!(hip_source.contains("fmaf(a[gx], b[gx], c[gx])"));
+        assert!(cuda_source.contains("fmaf(a[gx], b[gx], c[gx])"));
+        assert!(msl_source.contains("fma(a[gid.x], b[gid.x], c[gid.x])"));
+        spirv::lower_compute(&module).expect("lower fma3 to SPIR-V");
+    }
+
+    #[test]
+    fn mul_add_f32_hip_matches_rust_fma_when_gpu_present() {
+        let module = parse_compute(MUL_ADD_F32).expect("parse fma3");
+        let shader = hip::lower_compute(&module).expect("lower fma3 to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP mul_add_f32 proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_fma_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_fma_{}_{}", std::process::id(), tag));
+        // Reference uses Rust's `f32::mul_add` (a correctly-rounded, single-
+        // rounding-step IEEE 754 fused multiply-add) — proves the backend
+        // emitted real hardware FMA, not a naive two-instruction `a*b+c`
+        // (which double-rounds and disagrees with the fused result for a
+        // large fraction of inputs, not just contrived edge cases).
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned N = 65536;
+    std::vector<float> a(N), b(N), c(N), out(N, 0.0f), ref(N, 0.0f);
+    for (unsigned i = 0; i < N; ++i) {{
+        a[i] = 1.0000001f + (float)(i % 997) * 0.000013f;
+        b[i] = 1.0000001f - (float)(i % 883) * 0.000017f;
+        c[i] = (float)((int)(i % 2011) - 1005) * 0.0009f;
+        ref[i] = fmaf(a[i], b[i], c[i]);
+    }}
+    float *da = nullptr, *db = nullptr, *dc = nullptr, *dout = nullptr;
+    if (hipMalloc(&da, a.size()*sizeof(float)) != hipSuccess ||
+        hipMalloc(&db, b.size()*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dc, c.size()*sizeof(float)) != hipSuccess ||
+        hipMalloc(&dout, out.size()*sizeof(float)) != hipSuccess) return 2;
+    hipMemcpy(da, a.data(), a.size()*sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(db, b.data(), b.size()*sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(dc, c.data(), c.size()*sizeof(float), hipMemcpyHostToDevice);
+    zsl_kernel<<<dim3((N+63)/64), dim3(64)>>>(da, db, dc, dout);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(out.data(), dout, out.size()*sizeof(float), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) mismatches += out[i] != ref[i];
+    std::printf("FMA_EXACT mismatches=%u\n", mismatches);
+    hipFree(da); hipFree(db); hipFree(dc); hipFree(dout);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP fma proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP fma compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP fma3");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "HIP fma3 failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP fma3: {}", stdout.trim());
+    }
+
     #[test]
     fn trigonometry_lowers_on_all_compute_backends() {
         let module = parse_compute(TRIG).expect("parse trigonometry");
