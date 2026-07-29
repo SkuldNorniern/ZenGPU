@@ -346,6 +346,16 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                     // 1, true of every kernel in this codebase today) — a
                     // multi-dimensional workgroup would need
                     // lid.x + lid.y*sizeX + lid.z*sizeX*sizeY.
+                    //
+                    // The leading `threadgroup_barrier` (before this call's
+                    // own write) is required, not defensive: the scratch
+                    // array is reused across every `workgroup_reduce_*` call
+                    // in a kernel, and without it a fast thread could start
+                    // overwriting the array for THIS call before a slower
+                    // thread has finished reading the PREVIOUS call's result
+                    // from it — confirmed as a real bug (not theoretical) via
+                    // a real-hardware laminax test that measured ~0.1 error
+                    // without this barrier, dropping to ~1e-7 with it.
                     let combine = match func {
                         BuiltinFn::WorkgroupReduceAdd => "v + o",
                         BuiltinFn::WorkgroupReduceMin => "min(v, o)",
@@ -361,7 +371,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         s /= 2;
                     }
                     format!(
-                        "({{ __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        "({{ threadgroup_barrier(mem_flags::mem_threadgroup); __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
                         a[0]
                     )
                 }

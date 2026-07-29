@@ -521,6 +521,16 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     // 1, true of every kernel in this codebase today) — a
                     // multi-dimensional workgroup would need
                     // threadIdx.x + threadIdx.y*sizeX + threadIdx.z*sizeX*sizeY.
+                    //
+                    // The leading `__syncthreads()` (before this call's own
+                    // write) is required, not defensive: the scratch array is
+                    // reused across every `workgroup_reduce_*` call in a
+                    // kernel, and without it a fast thread could start
+                    // overwriting the array for THIS call before a slower
+                    // thread has finished reading the PREVIOUS call's result
+                    // from it — confirmed as a real bug (not theoretical) via
+                    // a real-hardware laminax test that measured ~0.1 error
+                    // without this barrier, dropping to ~1e-7 with it.
                     let combine = match func {
                         BuiltinFn::WorkgroupReduceAdd => "v + o",
                         BuiltinFn::WorkgroupReduceMin => "fminf(v, o)",
@@ -536,7 +546,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         s /= 2;
                     }
                     format!(
-                        "({{ __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        "({{ __syncthreads(); __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
                         args_s[0]
                     )
                 }
