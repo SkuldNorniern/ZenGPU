@@ -30,6 +30,11 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "subgroup_any" => BuiltinFn::SubgroupAny,
         "subgroup_all" => BuiltinFn::SubgroupAll,
         "subgroup_ballot" => BuiltinFn::SubgroupBallot,
+        "subgroup_broadcast" => BuiltinFn::SubgroupBroadcast,
+        "subgroup_shuffle" => BuiltinFn::SubgroupShuffle,
+        "subgroup_shuffle_xor" => BuiltinFn::SubgroupShuffleXor,
+        "subgroup_shuffle_up" => BuiltinFn::SubgroupShuffleUp,
+        "subgroup_shuffle_down" => BuiltinFn::SubgroupShuffleDown,
         _ => return None,
     })
 }

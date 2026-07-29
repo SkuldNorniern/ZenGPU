@@ -57,9 +57,18 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         spv.enable_atomic_float32_add_ext();
     }
     let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&entry.body);
-    let (uses_subgroup_vote, uses_subgroup_ballot) =
-        crate::ir::node::stmts_use_subgroup_collectives(&entry.body);
-    if uses_subgroup_query || uses_subgroup_vote || uses_subgroup_ballot {
+    let (
+        uses_subgroup_vote,
+        uses_subgroup_ballot,
+        uses_subgroup_shuffle,
+        uses_subgroup_shuffle_relative,
+    ) = crate::ir::node::stmts_use_subgroup_collectives(&entry.body);
+    if uses_subgroup_query
+        || uses_subgroup_vote
+        || uses_subgroup_ballot
+        || uses_subgroup_shuffle
+        || uses_subgroup_shuffle_relative
+    {
         spv.capability_group_non_uniform();
     }
     if uses_subgroup_vote {
@@ -67,6 +76,12 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     }
     if uses_subgroup_ballot {
         spv.capability_group_non_uniform_ballot();
+    }
+    if uses_subgroup_shuffle {
+        spv.capability_group_non_uniform_shuffle();
+    }
+    if uses_subgroup_shuffle_relative {
+        spv.capability_group_non_uniform_shuffle_relative();
     }
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
@@ -1145,6 +1160,68 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 id,
                 ty: ctx.bitset128_id,
             })
+        }
+
+        // subgroup_broadcast/shuffle(value: f32, lane: u32) -> f32
+        BuiltinFn::SubgroupBroadcast | BuiltinFn::SubgroupShuffle => {
+            if args.len() != 2 {
+                return Err(format!("ZSL: {}(value, lane) takes 2 args", func.name()));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            let lane = lower_expr(ctx, &args[1])?;
+            if value.ty != ctx.f32_id {
+                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            }
+            let lane = coerce(ctx, lane, ctx.u32_id);
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let id = if matches!(func, BuiltinFn::SubgroupBroadcast) {
+                ctx.spv
+                    .op_group_non_uniform_broadcast(ctx.t_f32, scope, value.id, lane)
+            } else {
+                ctx.spv
+                    .op_group_non_uniform_shuffle(ctx.t_f32, scope, value.id, lane)
+            };
+            Ok(Val { id, ty: ctx.f32_id })
+        }
+
+        // subgroup_shuffle_xor(value: f32, mask: u32) -> f32
+        BuiltinFn::SubgroupShuffleXor => {
+            if args.len() != 2 {
+                return Err("ZSL: subgroup_shuffle_xor(value, mask) takes 2 args".to_string());
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            let mask = lower_expr(ctx, &args[1])?;
+            if value.ty != ctx.f32_id {
+                return Err("ZSL: subgroup_shuffle_xor() requires an f32 value".to_string());
+            }
+            let mask = coerce(ctx, mask, ctx.u32_id);
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let id =
+                ctx.spv
+                    .op_group_non_uniform_shuffle_xor(ctx.t_f32, scope, value.id, mask);
+            Ok(Val { id, ty: ctx.f32_id })
+        }
+
+        // subgroup_shuffle_up/down(value: f32, delta: u32) -> f32
+        BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown => {
+            if args.len() != 2 {
+                return Err(format!("ZSL: {}(value, delta) takes 2 args", func.name()));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            let delta = lower_expr(ctx, &args[1])?;
+            if value.ty != ctx.f32_id {
+                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            }
+            let delta = coerce(ctx, delta, ctx.u32_id);
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let id = if matches!(func, BuiltinFn::SubgroupShuffleUp) {
+                ctx.spv
+                    .op_group_non_uniform_shuffle_up(ctx.t_f32, scope, value.id, delta)
+            } else {
+                ctx.spv
+                    .op_group_non_uniform_shuffle_down(ctx.t_f32, scope, value.id, delta)
+            };
+            Ok(Val { id, ty: ctx.f32_id })
         }
     }
 }

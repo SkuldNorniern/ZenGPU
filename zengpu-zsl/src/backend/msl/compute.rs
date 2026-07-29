@@ -302,6 +302,13 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                          (needs a 128-bit-capable value representation)",
                     ));
                 }
+                BuiltinFn::SubgroupBroadcast => format!("simd_broadcast({}, {})", a[0], a[1]),
+                BuiltinFn::SubgroupShuffle => format!("simd_shuffle({}, {})", a[0], a[1]),
+                BuiltinFn::SubgroupShuffleXor => format!("simd_shuffle_xor({}, {})", a[0], a[1]),
+                BuiltinFn::SubgroupShuffleUp => format!("simd_shuffle_up({}, {})", a[0], a[1]),
+                BuiltinFn::SubgroupShuffleDown => {
+                    format!("simd_shuffle_down({}, {})", a[0], a[1])
+                }
                 BuiltinFn::SubgroupSize => "simd_size".to_string(),
                 BuiltinFn::SubgroupId => "simd_group".to_string(),
                 BuiltinFn::SubgroupLocalId => "simd_lane".to_string(),
