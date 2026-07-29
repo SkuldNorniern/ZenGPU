@@ -34,7 +34,27 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         })
         .collect();
 
+    let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
+    let bf16_buffers: std::collections::HashSet<&str> = buffers
+        .iter()
+        .filter(|(_, _, elem)| *elem == bf16_id)
+        .map(|(name, _, _)| *name)
+        .collect();
+
     let mut s = String::new();
+
+    if !bf16_buffers.is_empty() {
+        s.push_str(
+            "__device__ __forceinline__ unsigned short f32_to_bf16(float x) {\n\
+             \x20   unsigned int bits = __float_as_uint(x);\n\
+             \x20   unsigned int bias = 0x7fffu + ((bits >> 16) & 1u);\n\
+             \x20   return (unsigned short)((bits + bias) >> 16);\n\
+             }\n\
+             __device__ __forceinline__ float bf16_to_f32(unsigned short x) {\n\
+             \x20   return __uint_as_float(((unsigned int)x) << 16);\n\
+             }\n",
+        );
+    }
 
     let threads = local_size[0] * local_size[1] * local_size[2];
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
@@ -85,7 +105,10 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         );
     }
 
-    let ctx = Ctx { locals };
+    let ctx = Ctx {
+        locals,
+        bf16_buffers,
+    };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
     }
@@ -103,6 +126,7 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    bf16_buffers: std::collections::HashSet<&'a str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -133,11 +157,16 @@ fn cuda_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
     }
 }
 
+/// CUDA spelling of a buffer element [`Type`]. `bf16` is `unsigned short`, bit-exact with the HIP
+/// backend: round-to-nearest-even on store, zero-extend on load.
 fn cuda_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
     match ty {
         Type::Float {
             format: FloatFormat::F32,
         } => Ok("float"),
+        Type::Float {
+            format: FloatFormat::Bf16,
+        } => Ok("unsigned short"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
@@ -162,15 +191,22 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .copied()
                 .unwrap_or("unsigned int");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(init)?);
+            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
+            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
+            let idx = emit_expr(ctx, index)?;
+            let val = emit_expr(ctx, value)?;
+            let val = if ctx.bf16_buffers.contains(buf.as_str()) {
+                format!("f32_to_bf16({val})")
+            } else {
+                val
+            };
+            let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
@@ -178,13 +214,19 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 s,
                 "atomicAdd(&{}[(unsigned int)({})], {});",
                 buf,
-                emit_expr(index)?,
-                emit_expr(value)?
+                emit_expr(ctx, index)?,
+                emit_expr(ctx, value)?
             );
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index)?, emit_expr(value)?);
+            let _ = writeln!(
+                s,
+                "{}[{}] = {};",
+                name,
+                emit_expr(ctx, index)?,
+                emit_expr(ctx, value)?
+            );
         }
         IrStmt::Barrier => {
             indent(s, depth);
@@ -192,7 +234,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
+            let _ = writeln!(s, "if ({}) {{", emit_expr(ctx, cond)?);
             for st in then {
                 emit_stmt(s, ctx, st, depth + 1)?;
             }
@@ -211,8 +253,8 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let _ = writeln!(
                 s,
                 "for (unsigned int {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo)?,
-                emit_expr(hi)?,
+                emit_expr(ctx, lo)?,
+                emit_expr(ctx, hi)?,
             );
             for st in body {
                 emit_stmt(s, ctx, st, depth + 1)?;
@@ -222,13 +264,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::Eval(e) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(e)?);
+            let _ = writeln!(s, "{};", emit_expr(ctx, e)?);
         }
     }
     Ok(())
 }
 
-fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
+fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match e {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => {
@@ -240,8 +282,15 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
         }
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => n.clone(),
-        IrExpr::BufferLoad { buf, index } => format!("{}[{}]", buf, emit_expr(index)?),
-        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(index)?),
+        IrExpr::BufferLoad { buf, index } => {
+            let inner = format!("{}[{}]", buf, emit_expr(ctx, index)?);
+            if ctx.bf16_buffers.contains(buf.as_str()) {
+                format!("bf16_to_f32({inner})")
+            } else {
+                inner
+            }
+        }
+        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(ctx, index)?),
         IrExpr::GlobalId(0) => "gx".into(),
         IrExpr::GlobalId(1) => "gy".into(),
         IrExpr::GlobalId(2) => "gz".into(),
@@ -254,19 +303,19 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                 .get(*component as usize)
                 .copied()
                 .unwrap_or("x");
-            format!("{}.{}", emit_expr(base)?, field)
+            format!("{}.{}", emit_expr(ctx, base)?, field)
         }
         IrExpr::Construct { dim, args, .. } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
-                args_s.push(emit_expr(a)?);
+                args_s.push(emit_expr(ctx, a)?);
             }
             format!("make_float{}({})", dim, args_s.join(", "))
         }
         IrExpr::Builtin { func, args } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
-                args_s.push(emit_expr(a)?);
+                args_s.push(emit_expr(ctx, a)?);
             }
             match func {
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
@@ -309,7 +358,7 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                 }
             }
         }
-        IrExpr::Neg(inner) => format!("(-{})", emit_expr(inner)?),
+        IrExpr::Neg(inner) => format!("(-{})", emit_expr(ctx, inner)?),
         IrExpr::Binary { op, lhs, rhs } => {
             let op_s = match op {
                 IrBinOp::Add => "+",
@@ -336,7 +385,7 @@ fn emit_expr(e: &IrExpr) -> Result<String, Diagnostic> {
                     ));
                 }
             };
-            format!("({} {} {})", emit_expr(lhs)?, op_s, emit_expr(rhs)?)
+            format!("({} {} {})", emit_expr(ctx, lhs)?, op_s, emit_expr(ctx, rhs)?)
         }
     })
 }

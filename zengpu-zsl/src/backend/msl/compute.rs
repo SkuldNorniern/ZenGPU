@@ -33,8 +33,27 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         })
         .collect();
 
+    let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
+    let bf16_buffers: HashSet<&str> = buffers
+        .iter()
+        .filter(|(_, elem)| *elem == bf16_id)
+        .map(|(name, _)| *name)
+        .collect();
+
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    if !bf16_buffers.is_empty() {
+        s.push_str(
+            "inline ushort f32_to_bf16(float x) {\n\
+             \x20   uint bits = as_type<uint>(x);\n\
+             \x20   uint bias = 0x7fffu + ((bits >> 16) & 1u);\n\
+             \x20   return (ushort)((bits + bias) >> 16);\n\
+             }\n\
+             inline float bf16_to_f32(ushort x) {\n\
+             \x20   return as_type<float>(uint(x) << 16);\n\
+             }\n\n",
+        );
+    }
     let mut atomic_buffers = HashSet::new();
     collect_atomic_buffers(&e.body, &mut atomic_buffers);
 
@@ -69,7 +88,10 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         let _ = writeln!(s, "    threadgroup float {}[{}];", shared.name, shared.len);
     }
 
-    let ctx = Ctx { locals };
+    let ctx = Ctx {
+        locals,
+        bf16_buffers,
+    };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
     }
@@ -86,6 +108,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    bf16_buffers: HashSet<&'a str>,
 }
 
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
@@ -121,15 +144,22 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .copied()
                 .unwrap_or("uint");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(init)?);
+            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
+            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
+            let idx = emit_expr(ctx, index)?;
+            let val = emit_expr(ctx, value)?;
+            let val = if ctx.bf16_buffers.contains(buf.as_str()) {
+                format!("f32_to_bf16({val})")
+            } else {
+                val
+            };
+            let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
@@ -137,13 +167,19 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 s,
                 "atomic_fetch_add_explicit(&{}[uint({})], {}, memory_order_relaxed);",
                 buf,
-                emit_expr(index)?,
-                emit_expr(value)?
+                emit_expr(ctx, index)?,
+                emit_expr(ctx, value)?
             );
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(index)?, emit_expr(value)?);
+            let _ = writeln!(
+                s,
+                "{}[{}] = {};",
+                name,
+                emit_expr(ctx, index)?,
+                emit_expr(ctx, value)?
+            );
         }
         IrStmt::Barrier => {
             indent(s, depth);
@@ -151,7 +187,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
+            let _ = writeln!(s, "if ({}) {{", emit_expr(ctx, cond)?);
             for st in then {
                 emit_stmt(s, ctx, st, depth + 1)?;
             }
@@ -172,8 +208,8 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let _ = writeln!(
                 s,
                 "for (uint {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo)?,
-                emit_expr(hi)?
+                emit_expr(ctx, lo)?,
+                emit_expr(ctx, hi)?
             );
             for st in body {
                 emit_stmt(s, ctx, st, depth + 1)?;
@@ -183,27 +219,34 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::Eval(expr) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(expr)?);
+            let _ = writeln!(s, "{};", emit_expr(ctx, expr)?);
         }
     }
     Ok(())
 }
 
-fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
+fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => msl_float(*v),
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
-        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)?),
-        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(index)?),
+        IrExpr::BufferLoad { buf, index } => {
+            let inner = format!("{buf}[{}]", emit_expr(ctx, index)?);
+            if ctx.bf16_buffers.contains(buf.as_str()) {
+                format!("bf16_to_f32({inner})")
+            } else {
+                inner
+            }
+        }
+        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(ctx, index)?),
         IrExpr::GlobalId(c) => format!("gid.{}", component(*c)),
         IrExpr::LocalId(c) => format!("lid.{}", component(*c)),
         IrExpr::GroupId(c) => format!("group.{}", component(*c)),
         IrExpr::Builtin { func, args } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
-                a.push(emit_expr(arg)?);
+                a.push(emit_expr(ctx, arg)?);
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
@@ -217,9 +260,14 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }
-        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)?),
+        IrExpr::Neg(e) => format!("(-{})", emit_expr(ctx, e)?),
         IrExpr::Binary { op, lhs, rhs } => {
-            format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
+            format!(
+                "({} {} {})",
+                emit_expr(ctx, lhs)?,
+                binop(*op)?,
+                emit_expr(ctx, rhs)?
+            )
         }
         IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
             return Err(Diagnostic::new(
@@ -285,11 +333,16 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
     }
 }
 
+/// MSL spelling of a buffer element [`Type`]. `bf16` is `ushort`, bit-exact with the HIP/CUDA
+/// backends: round-to-nearest-even on store, zero-extend on load.
 fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
         Type::Float {
             format: FloatFormat::F32,
         } => Ok("float"),
+        Type::Float {
+            format: FloatFormat::Bf16,
+        } => Ok("ushort"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,

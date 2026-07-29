@@ -95,7 +95,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         } else if elem_ty == i32_id {
             t_i32
         } else {
-            unreachable!("unsupported compute buffer element")
+            return Err(format!(
+                "ZSL: SPIR-V backend does not yet support buffer<{:?}> \
+                 (only f32/u32/i32 typed storage exists today)",
+                types.get(elem_ty)
+            ));
         };
         let binding = ssbo_binding_for(elem_ty, f32_id, u32_id, i32_id);
 
