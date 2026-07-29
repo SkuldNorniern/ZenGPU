@@ -133,6 +133,7 @@ pub mod sc {
 #[allow(dead_code)]
 mod cap {
     pub const SHADER: u32 = 1;
+    pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
@@ -150,6 +151,9 @@ pub mod builtin {
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
     pub const LOCAL_INVOCATION_ID: u32 = 27;
     pub const WORKGROUP_ID: u32 = 26;
+    pub const SUBGROUP_SIZE: u32 = 36;
+    pub const SUBGROUP_ID: u32 = 40;
+    pub const SUBGROUP_LOCAL_INVOCATION_ID: u32 = 41;
 }
 
 /// Accumulates SPIR-V instructions, serializing to a word stream.
@@ -225,6 +229,18 @@ impl SpvBuilder {
         );
         let name = encode_string("SPV_EXT_shader_atomic_float");
         emit_raw(&mut self.extensions, op::EXTENSION, &name);
+    }
+
+    /// Enables the base subgroup-query builtins (`SubgroupSize`/`SubgroupId`/
+    /// `SubgroupLocalInvocationId`). Core since SPIR-V 1.3, no extension
+    /// string needed (unlike `RuntimeDescriptorArray`/atomic-float above,
+    /// both promoted only in later versions than this crate emits).
+    pub fn capability_group_non_uniform(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM],
+        );
     }
 
     /// Returns the ID of the GLSL.std.450 import.

@@ -133,6 +133,16 @@ pub enum BuiltinFn {
     /// (`a * b + acc` computed with one rounding step, not two). Compute-only;
     /// the design doc's F32-accumulate primitive for low-precision products.
     MulAddF32,
+    /// `subgroup_id() -> u32` — this thread's subgroup index within its
+    /// workgroup. Compute-only, legal in any control flow (a query, not a
+    /// collective — no uniformity requirement).
+    SubgroupId,
+    /// `subgroup_local_id() -> u32` — this thread's lane index within its
+    /// subgroup. Compute-only, legal in any control flow.
+    SubgroupLocalId,
+    /// `subgroup_size() -> u32` — the subgroup width for this dispatch.
+    /// Compute-only, legal in any control flow.
+    SubgroupSize,
 }
 
 impl BuiltinFn {
@@ -165,7 +175,72 @@ impl BuiltinFn {
             BuiltinFn::Dot => "dot",
             BuiltinFn::Extend => "extend",
             BuiltinFn::MulAddF32 => "mul_add_f32",
+            BuiltinFn::SubgroupId => "subgroup_id",
+            BuiltinFn::SubgroupLocalId => "subgroup_local_id",
+            BuiltinFn::SubgroupSize => "subgroup_size",
         }
+    }
+}
+
+/// Whether any statement (recursively, including nested expressions) calls
+/// `subgroup_id()`/`subgroup_local_id()`/`subgroup_size()` — shared by any
+/// backend that needs to conditionally declare subgroup-related
+/// capabilities/inputs only for kernels that actually use one (SPIR-V's
+/// `GroupNonUniform` capability + builtin input variables, MSL's
+/// simdgroup-attributed kernel parameters).
+pub fn stmts_use_subgroup_query(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(stmt_uses_subgroup_query)
+}
+
+fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
+            expr_uses_subgroup_query(init)
+        }
+        IrStmt::AssignBuffer { index, value, .. }
+        | IrStmt::AssignShared { index, value, .. }
+        | IrStmt::AtomicAdd { index, value, .. } => {
+            expr_uses_subgroup_query(index) || expr_uses_subgroup_query(value)
+        }
+        IrStmt::Barrier => false,
+        IrStmt::If { cond, then, else_ } => {
+            expr_uses_subgroup_query(cond)
+                || stmts_use_subgroup_query(then)
+                || else_.as_deref().is_some_and(stmts_use_subgroup_query)
+        }
+        IrStmt::For { lo, hi, body, .. } => {
+            expr_uses_subgroup_query(lo)
+                || expr_uses_subgroup_query(hi)
+                || stmts_use_subgroup_query(body)
+        }
+    }
+}
+
+fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Builtin { func, args } => {
+            matches!(
+                func,
+                BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize
+            ) || args.iter().any(expr_uses_subgroup_query)
+        }
+        IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
+            expr_uses_subgroup_query(index)
+        }
+        IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_query(base),
+        IrExpr::Construct { args, .. } => args.iter().any(expr_uses_subgroup_query),
+        IrExpr::Neg(inner) => expr_uses_subgroup_query(inner),
+        IrExpr::Binary { lhs, rhs, .. } => {
+            expr_uses_subgroup_query(lhs) || expr_uses_subgroup_query(rhs)
+        }
+        IrExpr::LitU32(_)
+        | IrExpr::LitF32(_)
+        | IrExpr::Local(_)
+        | IrExpr::ScalarParam(_)
+        | IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::Input(_) => false,
     }
 }
 

@@ -102,7 +102,18 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     }
     s.push_str("    uint3 gid [[thread_position_in_grid]],\n");
     s.push_str("    uint3 lid [[thread_position_in_threadgroup]],\n");
-    s.push_str("    uint3 group [[threadgroup_position_in_grid]]\n) {\n");
+    s.push_str("    uint3 group [[threadgroup_position_in_grid]]");
+    let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&e.body);
+    if uses_subgroup_query {
+        // Attribute names per the Metal Shading Language Specification; not
+        // verified against a real Metal toolchain on this Linux box (no
+        // `xcrun metal` here — MSL validation is deferred to the user's M1).
+        s.push_str(",\n    uint simd_size [[threads_per_simdgroup]],\n");
+        s.push_str("    uint simd_group [[simdgroup_index_in_threadgroup]],\n");
+        s.push_str("    uint simd_lane [[thread_index_in_simdgroup]]\n) {\n");
+    } else {
+        s.push_str("\n) {\n");
+    }
 
     for shared in &e.shared {
         let _ = writeln!(s, "    threadgroup float {}[{}];", shared.name, shared.len);
@@ -282,6 +293,9 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
                 BuiltinFn::MulAddF32 => format!("fma({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::SubgroupSize => "simd_size".to_string(),
+                BuiltinFn::SubgroupId => "simd_group".to_string(),
+                BuiltinFn::SubgroupLocalId => "simd_lane".to_string(),
                 BuiltinFn::Dot | BuiltinFn::Extend => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::Internal,

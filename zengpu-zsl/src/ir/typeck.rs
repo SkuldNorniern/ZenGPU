@@ -51,7 +51,10 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         }
         IrExpr::SharedLoad { .. } => f32_id,
         IrExpr::Builtin { func, .. } => match func {
-            BuiltinFn::U32 => u32_id,
+            BuiltinFn::U32
+            | BuiltinFn::SubgroupId
+            | BuiltinFn::SubgroupLocalId
+            | BuiltinFn::SubgroupSize => u32_id,
             BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => bool_id,
             _ => f32_id,
         },

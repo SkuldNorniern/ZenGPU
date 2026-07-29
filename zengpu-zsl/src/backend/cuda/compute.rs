@@ -398,6 +398,14 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
+                // No real NVIDIA hardware in this repo to verify an inline-PTX
+                // `%laneid` read against, so lane/subgroup index are derived
+                // arithmetically from `threadIdx.x` instead — correct for any
+                // 1D dispatch (true of every kernel in this codebase today;
+                // see the identical assumption in the HIP backend).
+                BuiltinFn::SubgroupLocalId => "(threadIdx.x % warpSize)".to_string(),
+                BuiltinFn::SubgroupId => "(threadIdx.x / warpSize)".to_string(),
             }
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(ctx, inner)?),

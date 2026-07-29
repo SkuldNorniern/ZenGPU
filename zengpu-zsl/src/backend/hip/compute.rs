@@ -391,6 +391,16 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
+                BuiltinFn::SubgroupLocalId => "__lane_id()".to_string(),
+                // HIP has no native "subgroup index within this dispatch"
+                // query; synthesized from the flattened local thread index.
+                // Assumes a 1D workgroup (local_size[1] == local_size[2] ==
+                // 1, true of every kernel in this codebase today) — a
+                // multi-dimensional workgroup would need
+                // threadIdx.x + threadIdx.y*sizeX + threadIdx.z*sizeX*sizeY
+                // before dividing by warpSize.
+                BuiltinFn::SubgroupId => "(threadIdx.x / warpSize)".to_string(),
             }
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(ctx, inner)?),
