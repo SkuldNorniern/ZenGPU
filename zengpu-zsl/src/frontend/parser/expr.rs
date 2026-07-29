@@ -240,6 +240,9 @@ impl<'a> Parser<'a> {
         if func == BuiltinFn::U32 && args.len() != 1 {
             return self.err("u32() takes 1 arg");
         }
+        if func == BuiltinFn::MulAddF32 && args.len() != 3 {
+            return self.err("mul_add_f32(a, b, acc) takes 3 args");
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 }

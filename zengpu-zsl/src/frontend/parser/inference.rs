@@ -23,6 +23,7 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "pow" => BuiltinFn::Pow,
         "clamp" => BuiltinFn::Clamp,
         "mix" => BuiltinFn::Mix,
+        "mul_add_f32" => BuiltinFn::MulAddF32,
         _ => return None,
     })
 }

@@ -100,6 +100,9 @@ pub enum BuiltinFn {
     Length,
     Dot,
     Extend,
+    /// Fused `a * b + acc` with a single rounding. This is the F32-accumulate primitive for
+    /// low-precision products. Compute only.
+    MulAddF32,
 }
 
 impl BuiltinFn {
@@ -130,6 +133,7 @@ impl BuiltinFn {
             BuiltinFn::Length => "length",
             BuiltinFn::Dot => "dot",
             BuiltinFn::Extend => "extend",
+            BuiltinFn::MulAddF32 => "mul_add_f32",
         }
     }
 }

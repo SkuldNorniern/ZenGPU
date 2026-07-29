@@ -207,6 +207,7 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::MulAddF32 => format!("fma({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::Dot | BuiltinFn::Extend => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::Internal,
