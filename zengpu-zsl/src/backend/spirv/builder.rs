@@ -7,7 +7,7 @@ use std::collections::HashMap;
 pub struct Id(pub u32);
 
 #[allow(dead_code)]
-mod op {
+pub(crate) mod op {
     pub const EXTENSION: u32 = 10;
     pub const CAPABILITY: u32 = 17;
     pub const EXT_INST_IMPORT: u32 = 11;
@@ -100,6 +100,16 @@ mod op {
     pub const GROUP_NON_UNIFORM_SHUFFLE_XOR: u32 = 346;
     pub const GROUP_NON_UNIFORM_SHUFFLE_UP: u32 = 347;
     pub const GROUP_NON_UNIFORM_SHUFFLE_DOWN: u32 = 348;
+    pub const GROUP_NON_UNIFORM_IADD: u32 = 349;
+    pub const GROUP_NON_UNIFORM_FADD: u32 = 350;
+    pub const GROUP_NON_UNIFORM_SMIN: u32 = 353;
+    pub const GROUP_NON_UNIFORM_UMIN: u32 = 354;
+    pub const GROUP_NON_UNIFORM_FMIN: u32 = 355;
+    pub const GROUP_NON_UNIFORM_SMAX: u32 = 356;
+    pub const GROUP_NON_UNIFORM_UMAX: u32 = 357;
+    pub const GROUP_NON_UNIFORM_FMAX: u32 = 358;
+    pub const GROUP_NON_UNIFORM_BITWISE_AND: u32 = 359;
+    pub const GROUP_NON_UNIFORM_BITWISE_OR: u32 = 360;
 }
 
 #[allow(dead_code)]
@@ -133,6 +143,7 @@ mod cap {
     pub const SHADER: u32 = 1;
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
+    pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
     pub const GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u32 = 66;
@@ -235,6 +246,14 @@ impl SpvBuilder {
             &mut self.capabilities,
             op::CAPABILITY,
             &[cap::GROUP_NON_UNIFORM_VOTE],
+        );
+    }
+
+    pub fn capability_group_non_uniform_arithmetic(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM_ARITHMETIC],
         );
     }
 
@@ -1102,6 +1121,24 @@ impl SpvBuilder {
             &mut self.functions,
             op::GROUP_NON_UNIFORM_SHUFFLE_DOWN,
             &[value_ty.0, id.0, scope.0, value.0, other.0],
+        );
+        id
+    }
+
+    /// All ten share the operand shape `[ResultType, ResultId, Scope, GroupOperation, Value]`.
+    pub fn op_group_non_uniform_arith(
+        &mut self,
+        opcode: u32,
+        value_ty: Id,
+        scope: Id,
+        group_operation: u32,
+        value: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            opcode,
+            &[value_ty.0, id.0, scope.0, group_operation, value.0],
         );
         id
     }

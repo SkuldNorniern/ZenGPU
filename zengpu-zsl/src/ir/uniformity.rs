@@ -42,6 +42,13 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     | BuiltinFn::SubgroupShuffleXor
                     | BuiltinFn::SubgroupShuffleUp
                     | BuiltinFn::SubgroupShuffleDown
+                    | BuiltinFn::SubgroupReduceAdd
+                    | BuiltinFn::SubgroupReduceMin
+                    | BuiltinFn::SubgroupReduceMax
+                    | BuiltinFn::SubgroupReduceAnd
+                    | BuiltinFn::SubgroupReduceOr
+                    | BuiltinFn::SubgroupScanInclusiveAdd
+                    | BuiltinFn::SubgroupScanExclusiveAdd
             ) || args.iter().any(expr_contains_subgroup_collective)
         }
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
@@ -233,6 +240,38 @@ mod tests {
             kernel k(out: device mut buffer<f32>, id: global_id) {
                 if local_id().x < 5u32 {
                     out[id.x] = subgroup_shuffle_xor(id.x * 1.0, 1u32)
+                }
+            }
+        "#,
+        )
+        .expect_err("local-id guard is divergent");
+        assert!(err.contains("uniform"));
+    }
+
+    #[test]
+    fn subgroup_reduce_add_inside_group_id_guard_is_uniform() {
+        check(
+            r#"
+            push P { n: u32 }
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<u32>, push: P, id: global_id) {
+                if group_id().x < push.n {
+                    out[id.x] = subgroup_reduce_add(id.x)
+                }
+            }
+        "#,
+        )
+        .expect("group-id guard is uniform");
+    }
+
+    #[test]
+    fn subgroup_reduce_add_inside_local_id_guard_is_rejected() {
+        let err = check(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<u32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    out[id.x] = subgroup_reduce_add(id.x)
                 }
             }
         "#,

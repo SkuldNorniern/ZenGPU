@@ -1,9 +1,12 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write;
 
 use crate::backend::hip::{ENTRY, HipShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::typeck::{type_of_compute_expr, ComputeTypeCtx};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
@@ -119,6 +122,18 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         locals,
         bf16_buffers,
         f16_buffers,
+        type_ctx: ComputeTypeCtx {
+            locals: e.locals.iter().cloned().collect(),
+            scalars: scalars
+                .iter()
+                .map(|(name, ty)| ((*name).to_string(), *ty))
+                .collect(),
+            buffers: buffers
+                .iter()
+                .map(|(name, _, ty)| ((*name).to_string(), *ty))
+                .collect(),
+        },
+        types: RefCell::new(module.types.clone()),
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -139,6 +154,14 @@ struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
     bf16_buffers: std::collections::HashSet<&'a str>,
     f16_buffers: std::collections::HashSet<&'a str>,
+    type_ctx: ComputeTypeCtx,
+    types: RefCell<TypeArena>,
+}
+
+fn expr_is_f32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
+    let mut types = ctx.types.borrow_mut();
+    let ty = type_of_compute_expr(expr, &ctx.type_ctx, &mut types);
+    ty == types.f32_id()
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -394,6 +417,41 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::SubgroupShuffleDown => {
                     format!("__shfl_down({}, (unsigned int)({}))", args_s[0], args_s[1])
+                }
+                BuiltinFn::SubgroupReduceAdd
+                | BuiltinFn::SubgroupReduceMin
+                | BuiltinFn::SubgroupReduceMax
+                | BuiltinFn::SubgroupReduceAnd
+                | BuiltinFn::SubgroupReduceOr => {
+                    let combine = match func {
+                        BuiltinFn::SubgroupReduceAdd => "v + o",
+                        BuiltinFn::SubgroupReduceMin if expr_is_f32(ctx, &args[0]) => "fminf(v, o)",
+                        BuiltinFn::SubgroupReduceMin => "(v < o ? v : o)",
+                        BuiltinFn::SubgroupReduceMax if expr_is_f32(ctx, &args[0]) => "fmaxf(v, o)",
+                        BuiltinFn::SubgroupReduceMax => "(v > o ? v : o)",
+                        BuiltinFn::SubgroupReduceAnd => "(v & o)",
+                        BuiltinFn::SubgroupReduceOr => "(v | o)",
+                        _ => unreachable!(),
+                    };
+                    format!(
+                        "({{ auto v = {}; for (unsigned int off = warpSize / 2; off > 0; off /= 2) {{ auto o = __shfl_xor(v, off); v = {combine}; }} v; }})",
+                        args_s[0]
+                    )
+                }
+                BuiltinFn::SubgroupScanInclusiveAdd => format!(
+                    "({{ auto v = {}; for (unsigned int off = 1; off < warpSize; off *= 2) {{ auto o = __shfl_up(v, off); if (__lane_id() >= off) v = v + o; }} v; }})",
+                    args_s[0]
+                ),
+                BuiltinFn::SubgroupScanExclusiveAdd => {
+                    let zero = if expr_is_f32(ctx, &args[0]) {
+                        "0.0f"
+                    } else {
+                        "0u"
+                    };
+                    format!(
+                        "({{ auto v = {}; for (unsigned int off = 1; off < warpSize; off *= 2) {{ auto o = __shfl_up(v, off); if (__lane_id() >= off) v = v + o; }} auto incl = v; auto excl = __shfl_up(incl, 1u); if (__lane_id() == 0) excl = {zero}; excl; }})",
+                        args_s[0]
+                    )
                 }
                 BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
                 BuiltinFn::SubgroupLocalId => "__lane_id()".to_string(),

@@ -288,6 +288,17 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::SubgroupShuffleDown => {
                     format!("simd_shuffle_down({}, {})", a[0], a[1])
                 }
+                BuiltinFn::SubgroupReduceAdd => format!("simd_sum({})", a[0]),
+                BuiltinFn::SubgroupReduceMin => format!("simd_min({})", a[0]),
+                BuiltinFn::SubgroupReduceMax => format!("simd_max({})", a[0]),
+                BuiltinFn::SubgroupReduceAnd => format!("simd_and({})", a[0]),
+                BuiltinFn::SubgroupReduceOr => format!("simd_or({})", a[0]),
+                BuiltinFn::SubgroupScanInclusiveAdd => {
+                    format!("simd_prefix_inclusive_sum({})", a[0])
+                }
+                BuiltinFn::SubgroupScanExclusiveAdd => {
+                    format!("simd_prefix_exclusive_sum({})", a[0])
+                }
                 BuiltinFn::SubgroupSize => "simd_size".to_string(),
                 BuiltinFn::SubgroupId => "simd_group".to_string(),
                 BuiltinFn::SubgroupLocalId => "simd_lane".to_string(),

@@ -35,6 +35,13 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "subgroup_shuffle_xor" => BuiltinFn::SubgroupShuffleXor,
         "subgroup_shuffle_up" => BuiltinFn::SubgroupShuffleUp,
         "subgroup_shuffle_down" => BuiltinFn::SubgroupShuffleDown,
+        "subgroup_reduce_add" => BuiltinFn::SubgroupReduceAdd,
+        "subgroup_reduce_min" => BuiltinFn::SubgroupReduceMin,
+        "subgroup_reduce_max" => BuiltinFn::SubgroupReduceMax,
+        "subgroup_reduce_and" => BuiltinFn::SubgroupReduceAnd,
+        "subgroup_reduce_or" => BuiltinFn::SubgroupReduceOr,
+        "subgroup_scan_inclusive_add" => BuiltinFn::SubgroupScanInclusiveAdd,
+        "subgroup_scan_exclusive_add" => BuiltinFn::SubgroupScanExclusiveAdd,
         _ => return None,
     })
 }
