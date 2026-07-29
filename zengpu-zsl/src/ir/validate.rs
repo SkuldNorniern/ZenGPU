@@ -3,8 +3,9 @@
 //! `ValidatedModule` wraps an already-parsed [`crate::frontend::parser::Shader`]
 //! behind private fields, so a backend can only ever receive a module that has
 //! gone through [`validate`] — never an arbitrary freshly-parsed one. For
-//! compute modules, [`validate`] checks binary-operator operand types before
-//! backend lowering. The parser (`crate::frontend::parser`) already rejects
+//! compute modules, [`validate`] checks binary-operator operand types and
+//! subgroup-collective control-flow uniformity before backend lowering. The
+//! parser (`crate::frontend::parser`) already rejects
 //! structurally invalid source (unknown identifiers, read-only buffer writes,
 //! type mismatches on bitwise operands, etc.) before a `Shader` ever exists.
 //! This module is the stable seam where a later, much larger validation pass
@@ -173,8 +174,9 @@ impl ValidatedModule {
 
 /// Validate a parsed [`Shader`], producing a [`ValidatedModule`].
 ///
-/// Compute modules are checked for invalid binary-operator operand types.
-/// Graphics validation is deferred and currently passes through unchanged.
+/// Compute modules are checked for invalid binary-operator operand types and
+/// subgroup collectives in divergent control flow. Graphics validation is
+/// deferred and currently passes through unchanged.
 pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
     if let Shader::Compute(module) = &shader {
         let ctx = compute_type_ctx(&module.entry);
@@ -184,6 +186,8 @@ pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
             check_stmt(stmt, &ctx, &mut types, bool_id)
                 .map_err(|msg| Diagnostic::new(DiagnosticCode::TypeMismatch, msg))?;
         }
+        crate::ir::uniformity::check_compute_uniformity(&module.entry)
+            .map_err(|msg| Diagnostic::new(DiagnosticCode::NonUniformControlFlow, msg))?;
     }
     Ok(ValidatedModule { shader })
 }
@@ -235,5 +239,27 @@ mod tests {
         };
         assert_eq!(err.code, DiagnosticCode::TypeMismatch);
         assert_eq!(err.message, "ZSL: `Add` does not support bool operands");
+    }
+
+    #[test]
+    fn validate_rejects_collective_in_divergent_control_flow() {
+        let module = parse_compute(
+            r#"
+            @workgroup_size(64)
+            kernel bad(out: device mut buffer<u32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    subgroup_any(id.x < 10u32)
+                }
+            }
+        "#,
+        )
+        .expect("parse");
+
+        let err = match validate(Shader::Compute(module)) {
+            Ok(_) => panic!("divergent subgroup collective must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, DiagnosticCode::NonUniformControlFlow);
+        assert!(err.message.contains("uniform"));
     }
 }

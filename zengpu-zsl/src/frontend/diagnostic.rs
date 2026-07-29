@@ -24,6 +24,9 @@ pub enum DiagnosticCode {
     /// A backend-internal invariant was violated; this indicates a compiler
     /// defect, not a user-source problem.
     Internal,
+    /// A subgroup collective (`subgroup_any`/`subgroup_all`/`subgroup_ballot`/
+    /// etc.) appears inside control flow that isn't subgroup-uniform.
+    NonUniformControlFlow,
 }
 
 /// A structured backend diagnostic: what went wrong, why, and where.

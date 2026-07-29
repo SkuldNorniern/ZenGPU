@@ -398,6 +398,19 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::SubgroupAny => {
+                    format!("((bool)__any_sync(0xffffffffu, (int)({})))", args_s[0])
+                }
+                BuiltinFn::SubgroupAll => {
+                    format!("((bool)__all_sync(0xffffffffu, (int)({})))", args_s[0])
+                }
+                BuiltinFn::SubgroupBallot => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Unsupported,
+                        "CUDA backend: subgroup_ballot() is not yet supported \
+                         (needs a 128-bit-capable value representation)",
+                    ));
+                }
                 BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
                 // No real NVIDIA hardware in this repo to verify an inline-PTX
                 // `%laneid` read against, so lane/subgroup index are derived

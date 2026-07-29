@@ -143,6 +143,17 @@ pub enum BuiltinFn {
     /// `subgroup_size() -> u32` — the subgroup width for this dispatch.
     /// Compute-only, legal in any control flow.
     SubgroupSize,
+    /// `subgroup_any(predicate: bool) -> bool` — true if `predicate` is true
+    /// for any active lane. Compute-only; a collective — must occur in
+    /// subgroup-uniform control flow (`ir::uniformity`).
+    SubgroupAny,
+    /// `subgroup_all(predicate: bool) -> bool` — true if `predicate` is true
+    /// for every active lane. Compute-only; a collective.
+    SubgroupAll,
+    /// `subgroup_ballot(predicate: bool) -> bitset<128>` — bit `i` is
+    /// `predicate` evaluated on lane `i`; bits at or above `subgroup_size()`
+    /// are zero. Compute-only; a collective.
+    SubgroupBallot,
 }
 
 impl BuiltinFn {
@@ -178,6 +189,9 @@ impl BuiltinFn {
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",
+            BuiltinFn::SubgroupAny => "subgroup_any",
+            BuiltinFn::SubgroupAll => "subgroup_all",
+            BuiltinFn::SubgroupBallot => "subgroup_ballot",
         }
     }
 }
@@ -241,6 +255,89 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
         | IrExpr::Input(_) => false,
+    }
+}
+
+/// Whether the statement tree uses subgroup vote and/or ballot collectives.
+///
+/// The returned tuple is `(uses_vote, uses_ballot)`, allowing SPIR-V lowering
+/// to declare the two independently-required capabilities in one walk.
+pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool) {
+    stmts.iter().fold((false, false), |acc, stmt| {
+        merge_subgroup_collective_uses(acc, stmt_uses_subgroup_collectives(stmt))
+    })
+}
+
+fn merge_subgroup_collective_uses(a: (bool, bool), b: (bool, bool)) -> (bool, bool) {
+    (a.0 || b.0, a.1 || b.1)
+}
+
+fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool) {
+    match stmt {
+        IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
+            expr_uses_subgroup_collectives(init)
+        }
+        IrStmt::AssignBuffer { index, value, .. }
+        | IrStmt::AssignShared { index, value, .. }
+        | IrStmt::AtomicAdd { index, value, .. } => merge_subgroup_collective_uses(
+            expr_uses_subgroup_collectives(index),
+            expr_uses_subgroup_collectives(value),
+        ),
+        IrStmt::Barrier => (false, false),
+        IrStmt::If { cond, then, else_ } => {
+            let mut uses = merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(cond),
+                stmts_use_subgroup_collectives(then),
+            );
+            if let Some(else_block) = else_ {
+                uses = merge_subgroup_collective_uses(
+                    uses,
+                    stmts_use_subgroup_collectives(else_block),
+                );
+            }
+            uses
+        }
+        IrStmt::For { lo, hi, body, .. } => merge_subgroup_collective_uses(
+            merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(lo),
+                expr_uses_subgroup_collectives(hi),
+            ),
+            stmts_use_subgroup_collectives(body),
+        ),
+    }
+}
+
+fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool) {
+    match expr {
+        IrExpr::Builtin { func, args } => {
+            let own = (
+                matches!(func, BuiltinFn::SubgroupAny | BuiltinFn::SubgroupAll),
+                matches!(func, BuiltinFn::SubgroupBallot),
+            );
+            args.iter().fold(own, |acc, arg| {
+                merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
+            })
+        }
+        IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
+            expr_uses_subgroup_collectives(index)
+        }
+        IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_collectives(base),
+        IrExpr::Construct { args, .. } => args.iter().fold((false, false), |acc, arg| {
+            merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
+        }),
+        IrExpr::Neg(inner) => expr_uses_subgroup_collectives(inner),
+        IrExpr::Binary { lhs, rhs, .. } => merge_subgroup_collective_uses(
+            expr_uses_subgroup_collectives(lhs),
+            expr_uses_subgroup_collectives(rhs),
+        ),
+        IrExpr::LitU32(_)
+        | IrExpr::LitF32(_)
+        | IrExpr::Local(_)
+        | IrExpr::ScalarParam(_)
+        | IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::Input(_) => (false, false),
     }
 }
 

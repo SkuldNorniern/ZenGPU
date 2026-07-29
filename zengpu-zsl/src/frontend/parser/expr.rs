@@ -254,6 +254,13 @@ impl<'a> Parser<'a> {
         {
             return self.err(format!("{}() takes no args", func.name()));
         }
+        if matches!(
+            func,
+            BuiltinFn::SubgroupAny | BuiltinFn::SubgroupAll | BuiltinFn::SubgroupBallot
+        ) && args.len() != 1
+        {
+            return self.err(format!("{}(predicate) takes 1 arg", func.name()));
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 
