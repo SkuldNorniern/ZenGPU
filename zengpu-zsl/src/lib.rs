@@ -485,6 +485,38 @@ mod phase_z_tests {
     }
 
     #[test]
+    fn bf16_buffer_lowers_to_cuda_with_conversion_helpers() {
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let cuda_source = cuda::lower_compute(&module).expect("lower copy_bf16 to CUDA").source;
+        assert!(cuda_source.contains("const unsigned short* __restrict__ src"));
+        assert!(cuda_source.contains("unsigned short* __restrict__ out"));
+        assert!(cuda_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
+        assert!(cuda_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
+        assert!(cuda_source.contains("__device__ __forceinline__ float bf16_to_f32"));
+    }
+
+    #[test]
+    fn bf16_buffer_lowers_to_msl_with_conversion_helpers() {
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let msl_source = msl::lower_compute(&module).expect("lower copy_bf16 to MSL").source;
+        assert!(msl_source.contains("device ushort* src"));
+        assert!(msl_source.contains("device ushort* out"));
+        assert!(msl_source.contains("f32_to_bf16(bf16_to_f32(src[gid.x]))"));
+        assert!(msl_source.contains("inline ushort f32_to_bf16"));
+        assert!(msl_source.contains("inline float bf16_to_f32"));
+    }
+
+    #[test]
+    fn bf16_buffer_rejects_cleanly_on_spirv_backend() {
+        // SPIR-V bf16 storage isn't implemented yet (needs a device-
+        // capability-gated 16-bit bindless table); this must be a clean
+        // `Diagnostic`, never a panic.
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let err = spirv::lower_compute(&module).expect_err("bf16 must be rejected on SPIR-V");
+        assert!(err.message.contains("does not yet support"), "got: {}", err.message);
+    }
+
+    #[test]
     fn bf16_hip_round_trip_exact_match_when_gpu_present() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let shader = hip::lower_compute(&module).expect("lower copy_bf16 to HIP");

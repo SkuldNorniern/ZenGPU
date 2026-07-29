@@ -122,7 +122,18 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         } else if elem_ty == i32_id {
             t_i32
         } else {
-            unreachable!("unsupported compute buffer element")
+            // bf16/f16 typed storage is not yet implemented for SPIR-V: real
+            // 16-bit storage needs a device-capability-gated 4th bindless
+            // table (Int16 capability + StorageBuffer16BitAccess extension),
+            // which depends on device-profile integration `ir::capability`
+            // deliberately deferred (see its module doc comment) — not a
+            // language-level restriction, so this is a clean diagnostic, not
+            // a compiler defect.
+            return Err(format!(
+                "ZSL: SPIR-V backend does not yet support buffer<{:?}> \
+                 (only f32/u32/i32 typed storage exists today)",
+                types.get(elem_ty)
+            ));
         };
         let binding = ssbo_binding_for(elem_ty, f32_id, u32_id, i32_id);
 
