@@ -14,6 +14,8 @@ pub enum DiagnosticCode {
     InvalidAccess,
     /// Backend invariant violated: a compiler defect, not a user error.
     Internal,
+    /// Subgroup collective inside non-subgroup-uniform control flow.
+    NonUniformControlFlow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -1,10 +1,10 @@
-//! Seam between parsed IR and backend input.
+//! Seam between parsed IR and backends.
 //!
-//! `ValidatedModule` has private fields, so backends only get a module that passed [`validate`].
-//! The parser already rejects structurally invalid source. Later checks (types, layout,
-//! capabilities, uniformity) go here without changing `validate`'s signature.
+//! `ValidatedModule` has private fields, so backends only receive the output of [`validate`].
+//! Compute checks binary operand types and subgroup collective uniformity. The parser already
+//! rejects structural errors.
 //!
-//! No backend takes `&ValidatedModule` yet.
+//! Not yet: graphics checks, and a backend that takes `&ValidatedModule`.
 
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::frontend::parser::Shader;
@@ -149,7 +149,7 @@ impl ValidatedModule {
     }
 }
 
-/// Validate a parsed [`Shader`]. Compute: binary-operator operand types. Graphics: passes
+/// Compute checks binary operand types and subgroup collectives in divergent flow. Graphics passes
 /// through unchanged.
 pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
     if let Shader::Compute(module) = &shader {
@@ -160,6 +160,8 @@ pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
             check_stmt(stmt, &ctx, &mut types, bool_id)
                 .map_err(|msg| Diagnostic::new(DiagnosticCode::TypeMismatch, msg))?;
         }
+        crate::ir::uniformity::check_compute_uniformity(&module.entry)
+            .map_err(|msg| Diagnostic::new(DiagnosticCode::NonUniformControlFlow, msg))?;
     }
     Ok(ValidatedModule { shader })
 }
@@ -211,5 +213,27 @@ mod tests {
         };
         assert_eq!(err.code, DiagnosticCode::TypeMismatch);
         assert_eq!(err.message, "ZSL: `Add` does not support bool operands");
+    }
+
+    #[test]
+    fn validate_rejects_collective_in_divergent_control_flow() {
+        let module = parse_compute(
+            r#"
+            @workgroup_size(64)
+            kernel bad(out: device mut buffer<u32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    subgroup_any(id.x < 10u32)
+                }
+            }
+        "#,
+        )
+        .expect("parse");
+
+        let err = match validate(Shader::Compute(module)) {
+            Ok(_) => panic!("divergent subgroup collective must be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, DiagnosticCode::NonUniformControlFlow);
+        assert!(err.message.contains("uniform"));
     }
 }

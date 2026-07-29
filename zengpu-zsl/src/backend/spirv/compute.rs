@@ -50,8 +50,16 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         spv.enable_atomic_float32_add_ext();
     }
     let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&entry.body);
-    if uses_subgroup_query {
+    let (uses_subgroup_vote, uses_subgroup_ballot) =
+        crate::ir::node::stmts_use_subgroup_collectives(&entry.body);
+    if uses_subgroup_query || uses_subgroup_vote || uses_subgroup_ballot {
         spv.capability_group_non_uniform();
+    }
+    if uses_subgroup_vote {
+        spv.capability_group_non_uniform_vote();
+    }
+    if uses_subgroup_ballot {
+        spv.capability_group_non_uniform_ballot();
     }
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
@@ -61,6 +69,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let i32_id = types.i32_id();
     let f32_id = types.f32_id();
     let bool_id = types.bool_id();
+    let bitset128_id = types.bitset128_id();
 
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
@@ -68,6 +77,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let t_i32 = spv.type_int(32, true);
     let t_f32 = spv.type_float(32);
     let t_uvec3 = spv.type_vector(t_u32, 3);
+    let t_uvec4 = spv.type_vector(t_u32, 4);
 
     let buf_params: Vec<(&str, TypeId)> = entry
         .params
@@ -233,6 +243,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let mut ptr_func_i32 = Id(0);
     let mut ptr_func_f32 = Id(0);
     let mut ptr_func_bool = Id(0);
+    let mut ptr_func_uvec4 = Id(0);
 
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
     for (name, ty_id) in &entry.locals {
@@ -243,6 +254,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             (&mut ptr_func_i32, t_i32)
         } else if sty == f32_id {
             (&mut ptr_func_f32, t_f32)
+        } else if sty == bitset128_id {
+            (&mut ptr_func_uvec4, t_uvec4)
         } else {
             (&mut ptr_func_bool, t_bool)
         };
@@ -284,11 +297,13 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         i32_id,
         f32_id,
         bool_id,
+        bitset128_id,
         t_bool,
         t_u32,
         t_i32,
         t_f32,
         t_uvec3,
+        t_uvec4,
         ssbo_tables,
         n_buf_params,
         glsl_ext,
@@ -359,16 +374,18 @@ struct LocalVar {
 
 struct LowerCtx<'a> {
     spv: &'a mut SpvBuilder,
-    /// Canonical `TypeId`s of the four compute scalars: equality checks, not arena lookups.
+    /// Canonical `TypeId`s, cached in `lower_compute_inner` so comparisons are plain id equality.
     u32_id: TypeId,
     i32_id: TypeId,
     f32_id: TypeId,
     bool_id: TypeId,
+    bitset128_id: TypeId,
     t_bool: Id,
     t_u32: Id,
     t_i32: Id,
     t_f32: Id,
     t_uvec3: Id,
+    t_uvec4: Id,
     /// One SSBO table per buffer element type, keyed by its canonical `TypeId`.
     ssbo_tables: HashMap<TypeId, SsboTable>,
     glsl_ext: Id,
@@ -398,6 +415,8 @@ impl LowerCtx<'_> {
             self.t_i32
         } else if tid == self.f32_id {
             self.t_f32
+        } else if tid == self.bitset128_id {
+            self.t_uvec4
         } else {
             self.t_bool
         }
@@ -1003,6 +1022,46 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             };
             let id = ctx.spv.op_load(ctx.t_u32, var);
             Ok(Val { id, ty: ctx.u32_id })
+        }
+
+        BuiltinFn::SubgroupAny | BuiltinFn::SubgroupAll => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {}(predicate) takes 1 arg", func.name()));
+            }
+            let pred = lower_expr(ctx, &args[0])?;
+            if pred.ty != ctx.bool_id {
+                return Err(format!("ZSL: {}() requires a bool predicate", func.name()));
+            }
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let id = if matches!(func, BuiltinFn::SubgroupAny) {
+                ctx.spv
+                    .op_group_non_uniform_any(ctx.t_bool, scope, pred.id)
+            } else {
+                ctx.spv
+                    .op_group_non_uniform_all(ctx.t_bool, scope, pred.id)
+            };
+            Ok(Val {
+                id,
+                ty: ctx.bool_id,
+            })
+        }
+
+        BuiltinFn::SubgroupBallot => {
+            if args.len() != 1 {
+                return Err("ZSL: subgroup_ballot(predicate) takes 1 arg".to_string());
+            }
+            let pred = lower_expr(ctx, &args[0])?;
+            if pred.ty != ctx.bool_id {
+                return Err("ZSL: subgroup_ballot() requires a bool predicate".to_string());
+            }
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let id = ctx
+                .spv
+                .op_group_non_uniform_ballot(ctx.t_uvec4, scope, pred.id);
+            Ok(Val {
+                id,
+                ty: ctx.bitset128_id,
+            })
         }
     }
 }

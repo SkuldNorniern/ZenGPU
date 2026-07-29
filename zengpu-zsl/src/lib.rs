@@ -687,6 +687,29 @@ int main() {{
         }
     "#;
 
+    const SUBGROUP_VOTE: &str = r#"
+        push P { n: u32 }
+        @workgroup_size(256)
+        kernel vote(
+            out_any: device mut buffer<u32>,
+            out_all: device mut buffer<u32>,
+            p: P,
+            id: global_id,
+        ) {
+            if group_id().x < p.n {
+                out_any[id.x] = u32(subgroup_any(subgroup_local_id() < 1u32))
+                out_all[id.x] = u32(subgroup_all(subgroup_local_id() < 1u32))
+            }
+        }
+    "#;
+
+    const SUBGROUP_BALLOT: &str = r#"
+        @workgroup_size(256)
+        kernel ballot(out: device mut buffer<u32>, id: global_id) {
+            subgroup_ballot(id.x < 10u32)
+        }
+    "#;
+
     #[test]
     fn subgroup_queries_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
@@ -706,6 +729,33 @@ int main() {{
         assert!(msl_source.contains("out_id[gid.x] = simd_group"));
         assert!(msl_source.contains("out_lane[gid.x] = simd_lane"));
         spirv::lower_compute(&module).expect("lower query to SPIR-V");
+    }
+
+    #[test]
+    fn subgroup_any_and_all_lower_on_all_compute_backends() {
+        let module = parse_compute(SUBGROUP_VOTE).expect("parse vote");
+        let hip_source = hip::lower_compute(&module).expect("lower vote to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower vote to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower vote to MSL").source;
+        assert!(hip_source.contains("__any("));
+        assert!(hip_source.contains("__all("));
+        assert!(cuda_source.contains("__any_sync("));
+        assert!(cuda_source.contains("__all_sync("));
+        assert!(msl_source.contains("simd_any("));
+        assert!(msl_source.contains("simd_all("));
+        spirv::lower_compute(&module).expect("lower vote to SPIR-V");
+    }
+
+    #[test]
+    fn subgroup_ballot_is_spirv_only_for_now() {
+        let module = parse_compute(SUBGROUP_BALLOT).expect("parse ballot");
+        assert!(hip::lower_compute(&module).is_err(), "HIP ballot must reject");
+        assert!(
+            cuda::lower_compute(&module).is_err(),
+            "CUDA ballot must reject"
+        );
+        assert!(msl::lower_compute(&module).is_err(), "MSL ballot must reject");
+        spirv::lower_compute(&module).expect("lower ballot to SPIR-V");
     }
 
     #[test]
@@ -789,6 +839,83 @@ int main() {{
             String::from_utf8_lossy(&run.stderr)
         );
         eprintln!("HIP query: {}", stdout.trim());
+    }
+
+    #[test]
+    fn subgroup_any_and_all_hip_match_real_wave_votes_when_gpu_present() {
+        let module = parse_compute(SUBGROUP_VOTE).expect("parse vote");
+        let shader = hip::lower_compute(&module).expect("lower vote to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP subgroup vote proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_vote_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_vote_{}_{}", std::process::id(), tag));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned WG = 256, GROUPS = 256, N = WG * GROUPS;
+    std::vector<unsigned> any(N, 0), all(N, 1);
+    unsigned *dany = nullptr, *dall = nullptr;
+    if (hipMalloc(&dany, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&dall, N*sizeof(unsigned)) != hipSuccess) return 2;
+    zsl_kernel<<<dim3(GROUPS), dim3(WG)>>>(dany, dall, GROUPS);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(any.data(), dany, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(all.data(), dall, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) {{
+        mismatches += any[i] != 1u;
+        mismatches += all[i] != 0u;
+    }}
+    std::printf("SUBGROUP_VOTE_EXACT mismatches=%u\n", mismatches);
+    hipFree(dany); hipFree(dall);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP subgroup vote proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP subgroup vote compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP vote");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            !stdout.contains("SKIP_NO_HIP_GPU"),
+            "HIP subgroup vote proof unexpectedly skipped"
+        );
+        assert!(
+            run.status.success(),
+            "HIP vote failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP subgroup vote: {}", stdout.trim());
     }
 
     #[test]

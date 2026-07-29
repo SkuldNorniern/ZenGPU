@@ -67,6 +67,12 @@ impl TypeArena {
         })
     }
 
+    /// Result of `subgroup_ballot()`. 128 bits cover every subgroup width, and bits past
+    /// `subgroup_size()` are zero.
+    pub fn bitset128_id(&mut self) -> TypeId {
+        self.intern(Type::Bitset { bits: 128 })
+    }
+
     pub fn vec_id(&mut self, lanes: u8) -> TypeId {
         let element = self.f32_id();
         self.intern(Type::Vector { element, lanes })
@@ -152,6 +158,17 @@ mod tests {
                 format: FloatFormat::F16
             }
         );
+    }
+
+    #[test]
+    fn bitset128_is_idempotent_and_distinct_from_u32() {
+        let mut arena = TypeArena::new();
+        let a = arena.bitset128_id();
+        let b = arena.bitset128_id();
+        let u32_id = arena.u32_id();
+        assert_eq!(a, b);
+        assert_ne!(a, u32_id);
+        assert_eq!(*arena.get(a), Type::Bitset { bits: 128 });
     }
 
     #[test]

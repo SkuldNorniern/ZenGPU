@@ -92,6 +92,9 @@ mod op {
     pub const BITWISE_XOR: u32 = 198;
     pub const BITWISE_AND: u32 = 199;
     pub const EXT_INST: u32 = 12;
+    pub const GROUP_NON_UNIFORM_ALL: u32 = 334;
+    pub const GROUP_NON_UNIFORM_ANY: u32 = 335;
+    pub const GROUP_NON_UNIFORM_BALLOT: u32 = 339;
 }
 
 #[allow(dead_code)]
@@ -124,6 +127,8 @@ pub mod sc {
 mod cap {
     pub const SHADER: u32 = 1;
     pub const GROUP_NON_UNIFORM: u32 = 61;
+    pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
+    pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
@@ -215,6 +220,22 @@ impl SpvBuilder {
             &mut self.capabilities,
             op::CAPABILITY,
             &[cap::GROUP_NON_UNIFORM],
+        );
+    }
+
+    pub fn capability_group_non_uniform_vote(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM_VOTE],
+        );
+    }
+
+    pub fn capability_group_non_uniform_ballot(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM_BALLOT],
         );
     }
 
@@ -944,6 +965,41 @@ impl SpvBuilder {
             words.push(o.0);
         }
         emit_raw(&mut self.functions, op::EXT_INST, &words);
+        id
+    }
+
+    pub fn op_group_non_uniform_any(&mut self, bool_ty: Id, scope: Id, predicate: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_ANY,
+            &[bool_ty.0, id.0, scope.0, predicate.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_all(&mut self, bool_ty: Id, scope: Id, predicate: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_ALL,
+            &[bool_ty.0, id.0, scope.0, predicate.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_ballot(
+        &mut self,
+        uvec4_ty: Id,
+        scope: Id,
+        predicate: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_BALLOT,
+            &[uvec4_ty.0, id.0, scope.0, predicate.0],
+        );
         id
     }
 

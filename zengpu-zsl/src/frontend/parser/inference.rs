@@ -27,6 +27,9 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "subgroup_id" => BuiltinFn::SubgroupId,
         "subgroup_local_id" => BuiltinFn::SubgroupLocalId,
         "subgroup_size" => BuiltinFn::SubgroupSize,
+        "subgroup_any" => BuiltinFn::SubgroupAny,
+        "subgroup_all" => BuiltinFn::SubgroupAll,
+        "subgroup_ballot" => BuiltinFn::SubgroupBallot,
         _ => return None,
     })
 }

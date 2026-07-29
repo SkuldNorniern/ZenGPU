@@ -9,6 +9,7 @@ pub mod node;
 pub mod reflection;
 pub mod typeck;
 pub mod types;
+pub mod uniformity;
 pub mod validate;
 
 use arena::TypeArena;

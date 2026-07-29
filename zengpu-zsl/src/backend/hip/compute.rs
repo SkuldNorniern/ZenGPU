@@ -370,6 +370,19 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::SubgroupAny => {
+                    format!("((bool)__any((int)({})))", args_s[0])
+                }
+                BuiltinFn::SubgroupAll => {
+                    format!("((bool)__all((int)({})))", args_s[0])
+                }
+                BuiltinFn::SubgroupBallot => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Unsupported,
+                        "HIP backend: subgroup_ballot() is not yet supported \
+                         (needs a 128-bit-capable value representation)",
+                    ));
+                }
                 BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
                 BuiltinFn::SubgroupLocalId => "__lane_id()".to_string(),
                 BuiltinFn::SubgroupId => "(threadIdx.x / warpSize)".to_string(),

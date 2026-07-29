@@ -272,6 +272,15 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
                 BuiltinFn::MulAddF32 => format!("fma({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
+                BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
+                BuiltinFn::SubgroupBallot => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Unsupported,
+                        "MSL backend: subgroup_ballot() is not yet supported \
+                         (needs a 128-bit-capable value representation)",
+                    ));
+                }
                 BuiltinFn::SubgroupSize => "simd_size".to_string(),
                 BuiltinFn::SubgroupId => "simd_group".to_string(),
                 BuiltinFn::SubgroupLocalId => "simd_lane".to_string(),

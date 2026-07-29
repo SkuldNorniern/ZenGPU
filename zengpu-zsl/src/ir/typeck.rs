@@ -24,6 +24,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
     let bool_id = arena.bool_id();
     let bf16_id = arena.bf16_id();
     let f16_id = arena.f16_id();
+    let bitset128_id = arena.bitset128_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
         IrExpr::LitF32(_) => f32_id,
@@ -45,7 +46,12 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::SubgroupId
             | BuiltinFn::SubgroupLocalId
             | BuiltinFn::SubgroupSize => u32_id,
-            BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => bool_id,
+            BuiltinFn::IsNan
+            | BuiltinFn::IsInf
+            | BuiltinFn::IsFinite
+            | BuiltinFn::SubgroupAny
+            | BuiltinFn::SubgroupAll => bool_id,
+            BuiltinFn::SubgroupBallot => bitset128_id,
             _ => f32_id,
         },
         IrExpr::Neg(e) => type_of_compute_expr(e, ctx, arena),

@@ -695,7 +695,10 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::MulAddF32
         | BuiltinFn::SubgroupId
         | BuiltinFn::SubgroupLocalId
-        | BuiltinFn::SubgroupSize => Err(format!(
+        | BuiltinFn::SubgroupSize
+        | BuiltinFn::SubgroupAny
+        | BuiltinFn::SubgroupAll
+        | BuiltinFn::SubgroupBallot => Err(format!(
             "{}() is only available in compute shaders",
             func.name()
         )),
