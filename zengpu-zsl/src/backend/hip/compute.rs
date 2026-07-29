@@ -370,6 +370,9 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
+                BuiltinFn::SubgroupLocalId => "__lane_id()".to_string(),
+                BuiltinFn::SubgroupId => "(threadIdx.x / warpSize)".to_string(),
             }
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(ctx, inner)?),

@@ -243,6 +243,13 @@ impl<'a> Parser<'a> {
         if func == BuiltinFn::MulAddF32 && args.len() != 3 {
             return self.err("mul_add_f32(a, b, acc) takes 3 args");
         }
+        if matches!(
+            func,
+            BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize
+        ) && !args.is_empty()
+        {
+            return self.err(format!("{}() takes no args", func.name()));
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 }

@@ -673,6 +673,124 @@ int main() {{
         }
     "#;
 
+    const SUBGROUP_QUERY: &str = r#"
+        @workgroup_size(256)
+        kernel query(
+            out_size: device mut buffer<u32>,
+            out_id: device mut buffer<u32>,
+            out_lane: device mut buffer<u32>,
+            id: global_id,
+        ) {
+            out_size[id.x] = subgroup_size()
+            out_id[id.x] = subgroup_id()
+            out_lane[id.x] = subgroup_local_id()
+        }
+    "#;
+
+    #[test]
+    fn subgroup_queries_lower_on_all_compute_backends() {
+        let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
+        let hip_source = hip::lower_compute(&module).expect("lower query to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower query to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower query to MSL").source;
+        assert!(hip_source.contains("((unsigned int)warpSize)"));
+        assert!(hip_source.contains("(threadIdx.x / warpSize)"));
+        assert!(hip_source.contains("__lane_id()"));
+        assert!(cuda_source.contains("((unsigned int)warpSize)"));
+        assert!(cuda_source.contains("(threadIdx.x / warpSize)"));
+        assert!(cuda_source.contains("(threadIdx.x % warpSize)"));
+        assert!(msl_source.contains("uint simd_size [[threads_per_simdgroup]]"));
+        assert!(msl_source.contains("uint simd_group [[simdgroup_index_in_threadgroup]]"));
+        assert!(msl_source.contains("uint simd_lane [[thread_index_in_simdgroup]]"));
+        assert!(msl_source.contains("out_size[gid.x] = simd_size"));
+        assert!(msl_source.contains("out_id[gid.x] = simd_group"));
+        assert!(msl_source.contains("out_lane[gid.x] = simd_lane"));
+        spirv::lower_compute(&module).expect("lower query to SPIR-V");
+    }
+
+    #[test]
+    fn subgroup_query_kernel_without_use_has_no_msl_simd_params() {
+        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
+        let msl_source = msl::lower_compute(&module).expect("lower copy_bf16 to MSL").source;
+        assert!(!msl_source.contains("simdgroup_index_in_threadgroup"));
+    }
+
+    #[test]
+    fn subgroup_query_hip_matches_real_wave_layout_when_gpu_present() {
+        let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
+        let shader = hip::lower_compute(&module).expect("lower query to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!("skipping HIP subgroup query proof: {} not found", hipcc.display());
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_{}_{}.hip", std::process::id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_{}_{}", std::process::id(), tag));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned WG = 256, N = WG * 256;
+    std::vector<unsigned> size(N, 0), id(N, 0), lane(N, 0);
+    unsigned *dsize = nullptr, *did = nullptr, *dlane = nullptr;
+    if (hipMalloc(&dsize, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&did, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&dlane, N*sizeof(unsigned)) != hipSuccess) return 2;
+    zsl_kernel<<<dim3(N/WG), dim3(WG)>>>(dsize, did, dlane);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(size.data(), dsize, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(id.data(), did, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(lane.data(), dlane, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) {{
+        unsigned local = i % WG;
+        bool ok = size[i] == 32 && lane[i] < size[i] && (id[i] * size[i] + lane[i]) == local;
+        mismatches += !ok;
+    }}
+    std::printf("SUBGROUP_QUERY_EXACT mismatches=%u\n", mismatches);
+    hipFree(dsize); hipFree(did); hipFree(dlane);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP subgroup query proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP subgroup query compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path).output().expect("run HIP query");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            run.status.success(),
+            "HIP query failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP query: {}", stdout.trim());
+    }
+
     #[test]
     fn mul_add_f32_lowers_on_all_compute_backends() {
         let module = parse_compute(MUL_ADD_F32).expect("parse fma3");

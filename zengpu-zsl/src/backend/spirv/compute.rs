@@ -49,6 +49,10 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     if has_atomic_add(&entry.body) {
         spv.enable_atomic_float32_add_ext();
     }
+    let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&entry.body);
+    if uses_subgroup_query {
+        spv.capability_group_non_uniform();
+    }
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
 
@@ -152,6 +156,27 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let group_var = spv.global_variable(t_ptr_in_uvec3, sc::INPUT);
     spv.decorate(group_var, deco::BUILT_IN, &[builtin::WORKGROUP_ID]);
 
+    let subgroup_vars = if uses_subgroup_query {
+        let t_ptr_in_u32 = spv.type_pointer(sc::INPUT, t_u32);
+        let size_var = spv.global_variable(t_ptr_in_u32, sc::INPUT);
+        spv.decorate(size_var, deco::BUILT_IN, &[builtin::SUBGROUP_SIZE]);
+        let id_var = spv.global_variable(t_ptr_in_u32, sc::INPUT);
+        spv.decorate(id_var, deco::BUILT_IN, &[builtin::SUBGROUP_ID]);
+        let local_id_var = spv.global_variable(t_ptr_in_u32, sc::INPUT);
+        spv.decorate(
+            local_id_var,
+            deco::BUILT_IN,
+            &[builtin::SUBGROUP_LOCAL_INVOCATION_ID],
+        );
+        Some(SubgroupVars {
+            size: size_var,
+            id: id_var,
+            local_id: local_id_var,
+        })
+    } else {
+        None
+    };
+
     let t_ptr_wg_f32 = spv.type_pointer(sc::WORKGROUP, t_f32);
     let mut shared = HashMap::new();
     for decl in &entry.shared {
@@ -164,7 +189,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 
     let t_fn = spv.type_function(t_void, &[]);
     let fn_id = spv.fresh_id();
-    spv.entry_point_glcompute(fn_id, "main", &[gid_var, lid_var, group_var]);
+    let mut interface_vars = vec![gid_var, lid_var, group_var];
+    if let Some(sg) = &subgroup_vars {
+        interface_vars.extend([sg.size, sg.id, sg.local_id]);
+    }
+    spv.entry_point_glcompute(fn_id, "main", &interface_vars);
     spv.execution_mode_local_size(fn_id, local_size[0], local_size[1], local_size[2]);
 
     let const_0_u32 = spv.constant_u32(t_u32, 0);
@@ -269,6 +298,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         gid_var,
         lid_var,
         group_var,
+        subgroup_vars,
         shared,
         t_ptr_wg_f32,
         const_0_u32,
@@ -304,6 +334,14 @@ struct SsboTable {
 struct ScalarInfo {
     pc_index: u32,
     ty: TypeId,
+}
+
+/// Subgroup-query inputs, declared only when a kernel calls one.
+#[derive(Clone, Copy)]
+struct SubgroupVars {
+    size: Id,
+    id: Id,
+    local_id: Id,
 }
 
 #[derive(Clone, Copy)]
@@ -342,6 +380,7 @@ struct LowerCtx<'a> {
     gid_var: Id,
     lid_var: Id,
     group_var: Id,
+    subgroup_vars: Option<SubgroupVars>,
     shared: HashMap<String, Id>,
     t_ptr_wg_f32: Id,
     const_0_u32: Id,
@@ -950,6 +989,20 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 .spv
                 .op_ext_inst(t_f32, glsl, glsl_op::FMA, &[a.id, b.id, acc.id]);
             Ok(Val { id, ty: ctx.f32_id })
+        }
+
+        BuiltinFn::SubgroupSize | BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId => {
+            let sg = ctx
+                .subgroup_vars
+                .expect("stmts_use_subgroup_query should have detected this call");
+            let var = match func {
+                BuiltinFn::SubgroupSize => sg.size,
+                BuiltinFn::SubgroupId => sg.id,
+                BuiltinFn::SubgroupLocalId => sg.local_id,
+                _ => unreachable!(),
+            };
+            let id = ctx.spv.op_load(ctx.t_u32, var);
+            Ok(Val { id, ty: ctx.u32_id })
         }
     }
 }
