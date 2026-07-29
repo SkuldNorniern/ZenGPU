@@ -282,6 +282,9 @@ impl<'a> Parser<'a> {
                 | BuiltinFn::SubgroupReduceOr
                 | BuiltinFn::SubgroupScanInclusiveAdd
                 | BuiltinFn::SubgroupScanExclusiveAdd
+                | BuiltinFn::WorkgroupReduceAdd
+                | BuiltinFn::WorkgroupReduceMin
+                | BuiltinFn::WorkgroupReduceMax
         ) && args.len()
             != 1
         {

@@ -736,7 +736,10 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::SubgroupReduceAnd
         | BuiltinFn::SubgroupReduceOr
         | BuiltinFn::SubgroupScanInclusiveAdd
-        | BuiltinFn::SubgroupScanExclusiveAdd => Err(format!(
+        | BuiltinFn::SubgroupScanExclusiveAdd
+        | BuiltinFn::WorkgroupReduceAdd
+        | BuiltinFn::WorkgroupReduceMin
+        | BuiltinFn::WorkgroupReduceMax => Err(format!(
             "{}() is only available in compute shaders",
             func.name()
         )),

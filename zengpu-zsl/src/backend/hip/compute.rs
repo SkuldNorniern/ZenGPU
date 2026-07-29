@@ -62,6 +62,16 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         .filter(|(_, _, elem)| *elem == f16_id)
         .map(|(name, _, _)| *name)
         .collect();
+    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&e.body);
+    let block_size = local_size[0] * local_size[1] * local_size[2];
+    if uses_workgroup_reduce && !block_size.is_power_of_two() {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!(
+                "ZSL: workgroup_reduce_* requires a power-of-two workgroup thread count, got {block_size}"
+            ),
+        ));
+    }
 
     let mut s = String::new();
 
@@ -114,6 +124,12 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     for shared in &e.shared {
         let _ = writeln!(s, "    __shared__ float {}[{}];", shared.name, shared.len);
     }
+    if uses_workgroup_reduce {
+        let _ = writeln!(
+            s,
+            "    __shared__ float __zsl_wg_reduce_f32[{block_size}];"
+        );
+    }
 
     let _ = writeln!(
         s,
@@ -146,6 +162,7 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
                 .collect(),
         },
         types: RefCell::new(module.types.clone()),
+        block_size,
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -175,6 +192,8 @@ struct Ctx<'a> {
     /// reduction spellings and the exclusive-scan identity literal.
     type_ctx: ComputeTypeCtx,
     types: RefCell<TypeArena>,
+    /// Total workgroup thread count used to unroll workgroup reductions.
+    block_size: u32,
 }
 
 fn expr_is_f32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
@@ -473,6 +492,32 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     };
                     format!(
                         "({{ auto v = {}; for (unsigned int off = 1; off < warpSize; off *= 2) {{ auto o = __shfl_up(v, off); if (__lane_id() >= off) v = v + o; }} auto incl = v; auto excl = __shfl_up(incl, 1u); if (__lane_id() == 0) excl = {zero}; excl; }})",
+                        args_s[0]
+                    )
+                }
+                BuiltinFn::WorkgroupReduceAdd
+                | BuiltinFn::WorkgroupReduceMin
+                | BuiltinFn::WorkgroupReduceMax => {
+                    // Assumes a 1D workgroup (local_size[1] == local_size[2] ==
+                    // 1, true of every kernel in this codebase today) — a
+                    // multi-dimensional workgroup would need
+                    // threadIdx.x + threadIdx.y*sizeX + threadIdx.z*sizeX*sizeY.
+                    let combine = match func {
+                        BuiltinFn::WorkgroupReduceAdd => "v + o",
+                        BuiltinFn::WorkgroupReduceMin => "fminf(v, o)",
+                        BuiltinFn::WorkgroupReduceMax => "fmaxf(v, o)",
+                        _ => unreachable!(),
+                    };
+                    let mut steps = String::new();
+                    let mut s = ctx.block_size / 2;
+                    while s > 0 {
+                        steps.push_str(&format!(
+                            "if (threadIdx.x < {s}u) {{ auto o = __zsl_wg_reduce_f32[threadIdx.x + {s}u]; auto v = __zsl_wg_reduce_f32[threadIdx.x]; __zsl_wg_reduce_f32[threadIdx.x] = {combine}; }} __syncthreads(); "
+                        ));
+                        s /= 2;
+                    }
+                    format!(
+                        "({{ __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
                         args_s[0]
                     )
                 }

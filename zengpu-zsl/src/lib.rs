@@ -836,6 +836,41 @@ int main() {{
         }
     "#;
 
+    const WORKGROUP_REDUCE: &str = r#"
+        push P { n: u32 }
+        @workgroup_size(256)
+        kernel workgroup_reduce(
+            src: device buffer<f32>,
+            out_add: device mut buffer<f32>,
+            out_min: device mut buffer<f32>,
+            out_max: device mut buffer<f32>,
+            p: P,
+            id: global_id,
+        ) {
+            if group_id().x < p.n {
+                let value = src[id.x]
+                out_add[id.x] = workgroup_reduce_add(value)
+                out_min[id.x] = workgroup_reduce_min(value)
+                out_max[id.x] = workgroup_reduce_max(value)
+            }
+        }
+    "#;
+
+    const WORKGROUP_REDUCE_PROOF: &str = r#"
+        @workgroup_size(256)
+        kernel workgroup_reduce_proof(
+            out_add: device mut buffer<f32>,
+            out_min: device mut buffer<f32>,
+            out_max: device mut buffer<f32>,
+            id: global_id,
+        ) {
+            out_add[id.x] = workgroup_reduce_add(1.0)
+            let lane = local_id().x * 1.0
+            out_min[id.x] = workgroup_reduce_min(lane)
+            out_max[id.x] = workgroup_reduce_max(lane)
+        }
+    "#;
+
     #[test]
     fn subgroup_queries_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
@@ -933,6 +968,71 @@ int main() {{
         assert!(msl_source.contains("simd_prefix_inclusive_sum("));
         assert!(msl_source.contains("simd_prefix_exclusive_sum("));
         spirv::lower_compute(&module).expect("lower subgroup arithmetic to SPIR-V");
+    }
+
+    #[test]
+    fn workgroup_reduce_lowers_on_all_compute_backends() {
+        let module = parse_compute(WORKGROUP_REDUCE).expect("parse workgroup reduce");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower workgroup reduce to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower workgroup reduce to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower workgroup reduce to MSL")
+            .source;
+        assert!(hip_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
+        assert!(hip_source.contains("fminf(v, o)"));
+        assert!(hip_source.contains("fmaxf(v, o)"));
+        assert!(hip_source.contains("__zsl_wg_reduce_f32[0]"));
+        assert!(cuda_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
+        assert!(cuda_source.contains("__syncthreads()"));
+        assert!(msl_source.contains("threadgroup float __zsl_wg_reduce_f32[256]"));
+        assert!(msl_source.contains("min(v, o)"));
+        assert!(msl_source.contains("max(v, o)"));
+        assert!(msl_source.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
+        spirv::lower_compute(&module).expect("lower workgroup reduce to SPIR-V");
+    }
+
+    #[test]
+    fn workgroup_reduce_rejects_non_power_of_two_workgroups() {
+        let source = r#"
+            @workgroup_size(48)
+            kernel bad(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = workgroup_reduce_add(1.0)
+            }
+        "#;
+        let module = parse_compute(source).expect("parse non-power-of-two workgroup reduce");
+        let expected =
+            "workgroup_reduce_* requires a power-of-two workgroup thread count, got 48";
+        assert!(
+            hip::lower_compute(&module)
+                .err()
+                .expect("HIP must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            cuda::lower_compute(&module)
+                .err()
+                .expect("CUDA must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            msl::lower_compute(&module)
+                .err()
+                .expect("MSL must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            spirv::lower_compute(&module)
+                .expect_err("SPIR-V must reject")
+                .message
+                .contains(expected)
+        );
     }
 
     #[test]
@@ -1308,6 +1408,107 @@ int main() {{
             src_path.display()
         );
         eprintln!("HIP subgroup arithmetic: {}", stdout.trim());
+    }
+
+    #[test]
+    fn workgroup_reduce_hip_exact_invariants_when_gpu_present() {
+        let module = parse_compute(WORKGROUP_REDUCE_PROOF).expect("parse workgroup reduce proof");
+        let shader = hip::lower_compute(&module).expect("lower workgroup reduce proof to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!(
+                "skipping HIP workgroup reduce proof: {} not found",
+                hipcc.display()
+            );
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!(
+            "zsl_workgroup_reduce_{}_{}.hip",
+            std::process::id(),
+            tag
+        ));
+        let exe_path = dir.join(format!(
+            "zsl_workgroup_reduce_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned WG = 256, GROUPS = 256, N = WG * GROUPS;
+    std::vector<float> add(N), min(N), max(N);
+    float *d_add = nullptr, *d_min = nullptr, *d_max = nullptr;
+    if (hipMalloc(&d_add, N*sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_min, N*sizeof(float)) != hipSuccess ||
+        hipMalloc(&d_max, N*sizeof(float)) != hipSuccess) return 2;
+    zsl_kernel<<<dim3(GROUPS), dim3(WG)>>>(d_add, d_min, d_max);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(add.data(), d_add, N*sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(min.data(), d_min, N*sizeof(float), hipMemcpyDeviceToHost);
+    hipMemcpy(max.data(), d_max, N*sizeof(float), hipMemcpyDeviceToHost);
+    unsigned add_mismatches = 0, min_mismatches = 0, max_mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) {{
+        add_mismatches += add[i] != 256.0f;
+        min_mismatches += min[i] != 0.0f;
+        max_mismatches += max[i] != 255.0f;
+    }}
+    std::printf(
+        "WORKGROUP_REDUCE_EXACT add=%u min=%u max=%u\n",
+        add_mismatches, min_mismatches, max_mismatches);
+    hipFree(d_add);
+    hipFree(d_min);
+    hipFree(d_max);
+    return add_mismatches + min_mismatches + max_mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP workgroup reduce proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP workgroup reduce compilation failed:\n{}\nsource: {}",
+                String::from_utf8_lossy(&compile.stderr),
+                src_path.display()
+            );
+        }
+        let run = Command::new(&exe_path)
+            .output()
+            .expect("run HIP workgroup reduce");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        if run.status.success() {
+            let _ = std::fs::remove_file(&src_path);
+            let _ = std::fs::remove_file(&exe_path);
+        }
+        assert!(
+            !stdout.contains("SKIP_NO_HIP_GPU"),
+            "HIP workgroup reduce proof unexpectedly skipped"
+        );
+        assert!(
+            run.status.success(),
+            "HIP workgroup reduce failed: {stdout}\n{}\nsource: {}",
+            String::from_utf8_lossy(&run.stderr),
+            src_path.display()
+        );
+        eprintln!("HIP workgroup reduce: {}", stdout.trim());
     }
 
     #[test]

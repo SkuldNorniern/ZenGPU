@@ -59,6 +59,16 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         .filter(|(_, elem)| *elem == f16_id)
         .map(|(name, _)| *name)
         .collect();
+    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&e.body);
+    let block_size = local_size[0] * local_size[1] * local_size[2];
+    if uses_workgroup_reduce && !block_size.is_power_of_two() {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!(
+                "ZSL: workgroup_reduce_* requires a power-of-two workgroup thread count, got {block_size}"
+            ),
+        ));
+    }
 
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
@@ -118,11 +128,18 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     for shared in &e.shared {
         let _ = writeln!(s, "    threadgroup float {}[{}];", shared.name, shared.len);
     }
+    if uses_workgroup_reduce {
+        let _ = writeln!(
+            s,
+            "    threadgroup float __zsl_wg_reduce_f32[{block_size}];"
+        );
+    }
 
     let ctx = Ctx {
         locals,
         bf16_buffers,
         f16_buffers,
+        block_size,
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -147,6 +164,8 @@ struct Ctx<'a> {
     /// Buffer names whose element is `f16` — every load/store on these is
     /// wrapped in `float(...)`/`half(...)`.
     f16_buffers: HashSet<&'a str>,
+    /// Total workgroup thread count used to unroll workgroup reductions.
+    block_size: u32,
 }
 
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
@@ -319,6 +338,32 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::SubgroupScanExclusiveAdd => {
                     format!("simd_prefix_exclusive_sum({})", a[0])
+                }
+                BuiltinFn::WorkgroupReduceAdd
+                | BuiltinFn::WorkgroupReduceMin
+                | BuiltinFn::WorkgroupReduceMax => {
+                    // Assumes a 1D workgroup (local_size[1] == local_size[2] ==
+                    // 1, true of every kernel in this codebase today) — a
+                    // multi-dimensional workgroup would need
+                    // lid.x + lid.y*sizeX + lid.z*sizeX*sizeY.
+                    let combine = match func {
+                        BuiltinFn::WorkgroupReduceAdd => "v + o",
+                        BuiltinFn::WorkgroupReduceMin => "min(v, o)",
+                        BuiltinFn::WorkgroupReduceMax => "max(v, o)",
+                        _ => unreachable!(),
+                    };
+                    let mut steps = String::new();
+                    let mut s = ctx.block_size / 2;
+                    while s > 0 {
+                        steps.push_str(&format!(
+                            "if (lid.x < {s}u) {{ auto o = __zsl_wg_reduce_f32[lid.x + {s}u]; auto v = __zsl_wg_reduce_f32[lid.x]; __zsl_wg_reduce_f32[lid.x] = {combine}; }} threadgroup_barrier(mem_flags::mem_threadgroup); "
+                        ));
+                        s /= 2;
+                    }
+                    format!(
+                        "({{ __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        a[0]
+                    )
                 }
                 BuiltinFn::SubgroupSize => "simd_size".to_string(),
                 BuiltinFn::SubgroupId => "simd_group".to_string(),
