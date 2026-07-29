@@ -42,6 +42,9 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "subgroup_reduce_or" => BuiltinFn::SubgroupReduceOr,
         "subgroup_scan_inclusive_add" => BuiltinFn::SubgroupScanInclusiveAdd,
         "subgroup_scan_exclusive_add" => BuiltinFn::SubgroupScanExclusiveAdd,
+        "workgroup_reduce_add" => BuiltinFn::WorkgroupReduceAdd,
+        "workgroup_reduce_min" => BuiltinFn::WorkgroupReduceMin,
+        "workgroup_reduce_max" => BuiltinFn::WorkgroupReduceMax,
         _ => return None,
     })
 }

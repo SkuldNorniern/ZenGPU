@@ -142,6 +142,13 @@ pub enum BuiltinFn {
     SubgroupScanInclusiveAdd,
     /// Exclusive prefix sum over f32, u32 and i32. A collective. Compute only.
     SubgroupScanExclusiveAdd,
+    /// Workgroup-wide reduction over all threads, via shared memory and barriers. Needs no
+    /// subgroup capability.
+    ///
+    /// Requires a power-of-two thread count.
+    WorkgroupReduceAdd,
+    WorkgroupReduceMin,
+    WorkgroupReduceMax,
 }
 
 impl BuiltinFn {
@@ -191,6 +198,9 @@ impl BuiltinFn {
             BuiltinFn::SubgroupReduceOr => "subgroup_reduce_or",
             BuiltinFn::SubgroupScanInclusiveAdd => "subgroup_scan_inclusive_add",
             BuiltinFn::SubgroupScanExclusiveAdd => "subgroup_scan_exclusive_add",
+            BuiltinFn::WorkgroupReduceAdd => "workgroup_reduce_add",
+            BuiltinFn::WorkgroupReduceMin => "workgroup_reduce_min",
+            BuiltinFn::WorkgroupReduceMax => "workgroup_reduce_max",
         }
     }
 }
@@ -244,6 +254,67 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         IrExpr::Neg(inner) => expr_uses_subgroup_query(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_uses_subgroup_query(lhs) || expr_uses_subgroup_query(rhs)
+        }
+        IrExpr::LitU32(_)
+        | IrExpr::LitF32(_)
+        | IrExpr::Local(_)
+        | IrExpr::ScalarParam(_)
+        | IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::Input(_) => false,
+    }
+}
+
+/// True if any `workgroup_reduce_add/min/max` is called.
+///
+/// This decides whether the kernel gets the f32 shared scratch array.
+pub fn stmts_use_workgroup_reduce(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(stmt_uses_workgroup_reduce)
+}
+
+fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
+    match stmt {
+        IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
+            expr_uses_workgroup_reduce(init)
+        }
+        IrStmt::AssignBuffer { index, value, .. }
+        | IrStmt::AssignShared { index, value, .. }
+        | IrStmt::AtomicAdd { index, value, .. } => {
+            expr_uses_workgroup_reduce(index) || expr_uses_workgroup_reduce(value)
+        }
+        IrStmt::Barrier => false,
+        IrStmt::If { cond, then, else_ } => {
+            expr_uses_workgroup_reduce(cond)
+                || stmts_use_workgroup_reduce(then)
+                || else_.as_deref().is_some_and(stmts_use_workgroup_reduce)
+        }
+        IrStmt::For { lo, hi, body, .. } => {
+            expr_uses_workgroup_reduce(lo)
+                || expr_uses_workgroup_reduce(hi)
+                || stmts_use_workgroup_reduce(body)
+        }
+    }
+}
+
+fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
+    match expr {
+        IrExpr::Builtin { func, args } => {
+            matches!(
+                func,
+                BuiltinFn::WorkgroupReduceAdd
+                    | BuiltinFn::WorkgroupReduceMin
+                    | BuiltinFn::WorkgroupReduceMax
+            ) || args.iter().any(expr_uses_workgroup_reduce)
+        }
+        IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
+            expr_uses_workgroup_reduce(index)
+        }
+        IrExpr::FieldAccess { base, .. } => expr_uses_workgroup_reduce(base),
+        IrExpr::Construct { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
+        IrExpr::Neg(inner) => expr_uses_workgroup_reduce(inner),
+        IrExpr::Binary { lhs, rhs, .. } => {
+            expr_uses_workgroup_reduce(lhs) || expr_uses_workgroup_reduce(rhs)
         }
         IrExpr::LitU32(_)
         | IrExpr::LitF32(_)

@@ -216,6 +216,21 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
         shared.insert(decl.name.clone(), var);
     }
+    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&entry.body);
+    let workgroup_reduce_len = local_size[0] * local_size[1] * local_size[2];
+    let workgroup_reduce_var = if uses_workgroup_reduce {
+        if !workgroup_reduce_len.is_power_of_two() {
+            return Err(format!(
+                "ZSL: workgroup_reduce_* requires a power-of-two workgroup thread count, got {workgroup_reduce_len}"
+            ));
+        }
+        let len_const = spv.constant_u32(t_u32, workgroup_reduce_len);
+        let array_ty = spv.type_array(t_f32, len_const);
+        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+        Some(spv.global_variable(ptr_ty, sc::WORKGROUP))
+    } else {
+        None
+    };
 
     let t_fn = spv.type_function(t_void, &[]);
     let fn_id = spv.fresh_id();
@@ -335,6 +350,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         group_var,
         subgroup_vars,
         shared,
+        workgroup_reduce_var,
+        workgroup_reduce_len,
         t_ptr_wg_f32,
         const_0_u32,
         locals,
@@ -419,6 +436,8 @@ struct LowerCtx<'a> {
     group_var: Id,
     subgroup_vars: Option<SubgroupVars>,
     shared: HashMap<String, Id>,
+    workgroup_reduce_var: Option<Id>,
+    workgroup_reduce_len: u32,
     t_ptr_wg_f32: Id,
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
@@ -1178,6 +1197,91 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 ctx.spv
                     .op_group_non_uniform_arith(opcode, ty, scope, group_op, value.id);
             Ok(Val { id, ty: value.ty })
+        }
+
+        BuiltinFn::WorkgroupReduceAdd
+        | BuiltinFn::WorkgroupReduceMin
+        | BuiltinFn::WorkgroupReduceMax => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {}(value) takes 1 arg", func.name()));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            if value.ty != ctx.f32_id {
+                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            }
+            let var = ctx
+                .workgroup_reduce_var
+                .expect("stmts_use_workgroup_reduce should have detected this call");
+            let n = ctx.workgroup_reduce_len;
+
+            let lid3 = ctx.spv.op_load(ctx.t_uvec3, ctx.lid_var);
+            let lid_x = ctx.spv.op_composite_extract(ctx.t_u32, lid3, &[0]);
+
+            let ptr = ctx
+                .spv
+                .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+            ctx.spv.op_store(ptr, value.id);
+
+            let barrier_scope = ctx.spv.constant_u32(ctx.t_u32, 2);
+            let barrier_semantics = ctx.spv.constant_u32(ctx.t_u32, 0x108);
+            ctx.spv
+                .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
+
+            let mut s = n / 2;
+            while s > 0 {
+                let s_const = ctx.spv.constant_u32(ctx.t_u32, s);
+                let cond = ctx.spv.op_ult(ctx.t_bool, lid_x, s_const);
+                let true_label = ctx.spv.fresh_id();
+                let merge_label = ctx.spv.fresh_id();
+                ctx.spv.op_selection_merge(merge_label);
+                ctx.spv
+                    .op_branch_conditional(cond, true_label, merge_label);
+
+                ctx.spv.label_with_id(true_label);
+                let lid_plus_s = ctx.spv.op_iadd(ctx.t_u32, lid_x, s_const);
+                let ptr_lo =
+                    ctx.spv
+                        .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+                let ptr_hi =
+                    ctx.spv
+                        .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_plus_s]);
+                let v_lo = ctx.spv.op_load(ctx.t_f32, ptr_lo);
+                let v_hi = ctx.spv.op_load(ctx.t_f32, ptr_hi);
+                let combined = match func {
+                    BuiltinFn::WorkgroupReduceAdd => {
+                        ctx.spv.op_fadd(ctx.t_f32, v_lo, v_hi)
+                    }
+                    BuiltinFn::WorkgroupReduceMin => {
+                        let glsl = ctx.glsl_ext;
+                        ctx.spv
+                            .op_ext_inst(ctx.t_f32, glsl, glsl_op::F_MIN, &[v_lo, v_hi])
+                    }
+                    BuiltinFn::WorkgroupReduceMax => {
+                        let glsl = ctx.glsl_ext;
+                        ctx.spv
+                            .op_ext_inst(ctx.t_f32, glsl, glsl_op::F_MAX, &[v_lo, v_hi])
+                    }
+                    _ => unreachable!(),
+                };
+                ctx.spv.op_store(ptr_lo, combined);
+                ctx.spv.op_branch(merge_label);
+
+                ctx.spv.label_with_id(merge_label);
+                ctx.spv
+                    .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
+
+                s /= 2;
+            }
+
+            let zero_const = ctx.spv.constant_u32(ctx.t_u32, 0);
+            let ptr_zero =
+                ctx.spv
+                    .op_access_chain(ctx.t_ptr_wg_f32, var, &[zero_const]);
+            let result = ctx.spv.op_load(ctx.t_f32, ptr_zero);
+            Ok(Val {
+                id: result,
+                ty: ctx.f32_id,
+            })
         }
     }
 }

@@ -29,6 +29,7 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
     }
 }
 
+/// workgroup reductions need the same uniform flow, so this predicate matches them too.
 fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
     match expr {
         IrExpr::Builtin { func, args } => {
@@ -49,6 +50,9 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     | BuiltinFn::SubgroupReduceOr
                     | BuiltinFn::SubgroupScanInclusiveAdd
                     | BuiltinFn::SubgroupScanExclusiveAdd
+                    | BuiltinFn::WorkgroupReduceAdd
+                    | BuiltinFn::WorkgroupReduceMin
+                    | BuiltinFn::WorkgroupReduceMax
             ) || args.iter().any(expr_contains_subgroup_collective)
         }
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
@@ -272,6 +276,38 @@ mod tests {
             kernel k(out: device mut buffer<u32>, id: global_id) {
                 if local_id().x < 5u32 {
                     out[id.x] = subgroup_reduce_add(id.x)
+                }
+            }
+        "#,
+        )
+        .expect_err("local-id guard is divergent");
+        assert!(err.contains("uniform"));
+    }
+
+    #[test]
+    fn workgroup_reduce_add_inside_group_id_guard_is_uniform() {
+        check(
+            r#"
+            push P { n: u32 }
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
+                if group_id().x < push.n {
+                    out[id.x] = workgroup_reduce_add(id.x * 1.0)
+                }
+            }
+        "#,
+        )
+        .expect("group-id guard is uniform");
+    }
+
+    #[test]
+    fn workgroup_reduce_add_inside_local_id_guard_is_rejected() {
+        let err = check(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    out[id.x] = workgroup_reduce_add(id.x * 1.0)
                 }
             }
         "#,
