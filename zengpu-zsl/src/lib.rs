@@ -788,6 +788,54 @@ int main() {{
         }
     "#;
 
+    const SUBGROUP_ARITHMETIC: &str = r#"
+        push P { n: u32 }
+        @workgroup_size(256)
+        kernel subgroup_arithmetic(
+            src_f: device buffer<f32>,
+            src_u: device buffer<u32>,
+            out_f: device mut buffer<f32>,
+            out_u: device mut buffer<u32>,
+            p: P,
+            id: global_id,
+        ) {
+            if group_id().x < p.n {
+                let f = src_f[id.x]
+                let u = src_u[id.x]
+                out_f[id.x] = subgroup_reduce_add(f)
+                out_f[id.x] = subgroup_reduce_min(f)
+                out_f[id.x] = subgroup_reduce_max(f)
+                out_f[id.x] = subgroup_scan_inclusive_add(f)
+                out_f[id.x] = subgroup_scan_exclusive_add(f)
+                out_u[id.x] = subgroup_reduce_add(u)
+                out_u[id.x] = subgroup_reduce_min(u)
+                out_u[id.x] = subgroup_reduce_max(u)
+                out_u[id.x] = subgroup_reduce_and(u)
+                out_u[id.x] = subgroup_reduce_or(u)
+                out_u[id.x] = subgroup_scan_inclusive_add(u)
+                out_u[id.x] = subgroup_scan_exclusive_add(u)
+            }
+        }
+    "#;
+
+    const SUBGROUP_ARITHMETIC_PROOF: &str = r#"
+        @workgroup_size(256)
+        kernel subgroup_arithmetic_proof(
+            out_reduce_add: device mut buffer<u32>,
+            out_scan_inclusive: device mut buffer<u32>,
+            out_scan_exclusive: device mut buffer<u32>,
+            out_reduce_min: device mut buffer<u32>,
+            out_reduce_max: device mut buffer<u32>,
+            id: global_id,
+        ) {
+            out_reduce_add[id.x] = subgroup_reduce_add(1u32)
+            out_scan_inclusive[id.x] = subgroup_scan_inclusive_add(1u32)
+            out_scan_exclusive[id.x] = subgroup_scan_exclusive_add(1u32)
+            out_reduce_min[id.x] = subgroup_reduce_min(subgroup_local_id())
+            out_reduce_max[id.x] = subgroup_reduce_max(subgroup_local_id())
+        }
+    "#;
+
     #[test]
     fn subgroup_queries_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
@@ -857,6 +905,34 @@ int main() {{
         assert!(msl_source.contains("simd_shuffle_up("));
         assert!(msl_source.contains("simd_shuffle_down("));
         spirv::lower_compute(&module).expect("lower subgroup exchange to SPIR-V");
+    }
+
+    #[test]
+    fn subgroup_arithmetic_lowers_on_all_compute_backends() {
+        let module = parse_compute(SUBGROUP_ARITHMETIC).expect("parse subgroup arithmetic");
+        let hip_source =
+            hip::lower_compute(&module).expect("lower subgroup arithmetic to HIP").source;
+        let cuda_source =
+            cuda::lower_compute(&module).expect("lower subgroup arithmetic to CUDA").source;
+        let msl_source =
+            msl::lower_compute(&module).expect("lower subgroup arithmetic to MSL").source;
+        assert!(hip_source.contains("auto o = __shfl_xor(v, off)"));
+        assert!(hip_source.contains("auto o = __shfl_up(v, off)"));
+        assert!(hip_source.contains("fminf(v, o)"));
+        assert!(hip_source.contains("(v & o)"));
+        assert!(hip_source.contains("excl = 0.0f"));
+        assert!(hip_source.contains("excl = 0u"));
+        assert!(cuda_source.contains("__shfl_xor_sync(0xffffffffu, v, off)"));
+        assert!(cuda_source.contains("__shfl_up_sync(0xffffffffu, v, off)"));
+        assert!(cuda_source.contains("(threadIdx.x % warpSize) >= off"));
+        assert!(msl_source.contains("simd_sum("));
+        assert!(msl_source.contains("simd_min("));
+        assert!(msl_source.contains("simd_max("));
+        assert!(msl_source.contains("simd_and("));
+        assert!(msl_source.contains("simd_or("));
+        assert!(msl_source.contains("simd_prefix_inclusive_sum("));
+        assert!(msl_source.contains("simd_prefix_exclusive_sum("));
+        spirv::lower_compute(&module).expect("lower subgroup arithmetic to SPIR-V");
     }
 
     #[test]
@@ -1116,6 +1192,122 @@ int main() {{
             String::from_utf8_lossy(&run.stderr)
         );
         eprintln!("HIP subgroup shuffle xor: {}", stdout.trim());
+    }
+
+    #[test]
+    fn subgroup_arithmetic_hip_exact_invariants_when_gpu_present() {
+        let module =
+            parse_compute(SUBGROUP_ARITHMETIC_PROOF).expect("parse subgroup arithmetic proof");
+        let shader =
+            hip::lower_compute(&module).expect("lower subgroup arithmetic proof to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!(
+                "skipping HIP subgroup arithmetic proof: {} not found",
+                hipcc.display()
+            );
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!(
+            "zsl_subgroup_arithmetic_{}_{}.hip",
+            std::process::id(),
+            tag
+        ));
+        let exe_path = dir.join(format!(
+            "zsl_subgroup_arithmetic_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned WG = 256, GROUPS = 256, N = WG * GROUPS;
+    std::vector<unsigned> reduce_add(N), scan_inclusive(N), scan_exclusive(N), reduce_min(N), reduce_max(N);
+    unsigned *d_reduce_add = nullptr, *d_scan_inclusive = nullptr, *d_scan_exclusive = nullptr;
+    unsigned *d_reduce_min = nullptr, *d_reduce_max = nullptr;
+    if (hipMalloc(&d_reduce_add, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&d_scan_inclusive, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&d_scan_exclusive, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&d_reduce_min, N*sizeof(unsigned)) != hipSuccess ||
+        hipMalloc(&d_reduce_max, N*sizeof(unsigned)) != hipSuccess) return 2;
+    zsl_kernel<<<dim3(GROUPS), dim3(WG)>>>(
+        d_reduce_add, d_scan_inclusive, d_scan_exclusive, d_reduce_min, d_reduce_max);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(reduce_add.data(), d_reduce_add, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(scan_inclusive.data(), d_scan_inclusive, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(scan_exclusive.data(), d_scan_exclusive, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(reduce_min.data(), d_reduce_min, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    hipMemcpy(reduce_max.data(), d_reduce_max, N*sizeof(unsigned), hipMemcpyDeviceToHost);
+    unsigned add_mismatches = 0, inclusive_mismatches = 0, exclusive_mismatches = 0;
+    unsigned min_mismatches = 0, max_mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) {{
+        const unsigned lane = i % 32u;
+        add_mismatches += reduce_add[i] != 32u;
+        inclusive_mismatches += scan_inclusive[i] != lane + 1u;
+        exclusive_mismatches += scan_exclusive[i] != lane;
+        min_mismatches += reduce_min[i] != 0u;
+        max_mismatches += reduce_max[i] != 31u;
+    }}
+    std::printf(
+        "SUBGROUP_ARITHMETIC_EXACT reduce_add=%u scan_inclusive=%u scan_exclusive=%u reduce_min=%u reduce_max=%u\n",
+        add_mismatches, inclusive_mismatches, exclusive_mismatches, min_mismatches, max_mismatches);
+    hipFree(d_reduce_add);
+    hipFree(d_scan_inclusive);
+    hipFree(d_scan_exclusive);
+    hipFree(d_reduce_min);
+    hipFree(d_reduce_max);
+    return add_mismatches + inclusive_mismatches + exclusive_mismatches +
+        min_mismatches + max_mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP subgroup arithmetic proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP subgroup arithmetic compilation failed:\n{}\nsource: {}",
+                String::from_utf8_lossy(&compile.stderr),
+                src_path.display()
+            );
+        }
+        let run = Command::new(&exe_path)
+            .output()
+            .expect("run HIP subgroup arithmetic");
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        if run.status.success() {
+            let _ = std::fs::remove_file(&src_path);
+            let _ = std::fs::remove_file(&exe_path);
+        }
+        assert!(
+            !stdout.contains("SKIP_NO_HIP_GPU"),
+            "HIP subgroup arithmetic proof unexpectedly skipped"
+        );
+        assert!(
+            run.status.success(),
+            "HIP subgroup arithmetic failed: {stdout}\n{}\nsource: {}",
+            String::from_utf8_lossy(&run.stderr),
+            src_path.display()
+        );
+        eprintln!("HIP subgroup arithmetic: {}", stdout.trim());
     }
 
     #[test]

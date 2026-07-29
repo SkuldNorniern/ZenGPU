@@ -51,7 +51,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             }
         }
         IrExpr::SharedLoad { .. } => f32_id,
-        IrExpr::Builtin { func, .. } => match func {
+        IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32
             | BuiltinFn::SubgroupId
             | BuiltinFn::SubgroupLocalId
@@ -62,6 +62,16 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::SubgroupAny
             | BuiltinFn::SubgroupAll => bool_id,
             BuiltinFn::SubgroupBallot => bitset128_id,
+            BuiltinFn::SubgroupReduceAdd
+            | BuiltinFn::SubgroupReduceMin
+            | BuiltinFn::SubgroupReduceMax
+            | BuiltinFn::SubgroupReduceAnd
+            | BuiltinFn::SubgroupReduceOr
+            | BuiltinFn::SubgroupScanInclusiveAdd
+            | BuiltinFn::SubgroupScanExclusiveAdd => args
+                .first()
+                .map(|a| type_of_compute_expr(a, ctx, arena))
+                .unwrap_or(f32_id),
             _ => f32_id,
         },
         IrExpr::Neg(e) => type_of_compute_expr(e, ctx, arena),

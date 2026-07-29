@@ -171,6 +171,27 @@ pub enum BuiltinFn {
     /// `subgroup_shuffle_down(value: f32, delta: u32) -> f32` — returns
     /// `value` from a higher-numbered lane. Compute-only; a collective.
     SubgroupShuffleDown,
+    /// `subgroup_reduce_add(value) -> typeof(value)` — all-reduces an f32,
+    /// u32, or i32 value with addition. Compute-only; a collective.
+    SubgroupReduceAdd,
+    /// `subgroup_reduce_min(value) -> typeof(value)` — all-reduces an f32,
+    /// u32, or i32 value with minimum. Compute-only; a collective.
+    SubgroupReduceMin,
+    /// `subgroup_reduce_max(value) -> typeof(value)` — all-reduces an f32,
+    /// u32, or i32 value with maximum. Compute-only; a collective.
+    SubgroupReduceMax,
+    /// `subgroup_reduce_and(value: u32) -> u32` — all-reduces with bitwise
+    /// AND. Compute-only; a collective.
+    SubgroupReduceAnd,
+    /// `subgroup_reduce_or(value: u32) -> u32` — all-reduces with bitwise OR.
+    /// Compute-only; a collective.
+    SubgroupReduceOr,
+    /// `subgroup_scan_inclusive_add(value) -> typeof(value)` — inclusive
+    /// prefix sum of an f32, u32, or i32 value. Compute-only; a collective.
+    SubgroupScanInclusiveAdd,
+    /// `subgroup_scan_exclusive_add(value) -> typeof(value)` — exclusive
+    /// prefix sum of an f32, u32, or i32 value. Compute-only; a collective.
+    SubgroupScanExclusiveAdd,
 }
 
 impl BuiltinFn {
@@ -214,6 +235,13 @@ impl BuiltinFn {
             BuiltinFn::SubgroupShuffleXor => "subgroup_shuffle_xor",
             BuiltinFn::SubgroupShuffleUp => "subgroup_shuffle_up",
             BuiltinFn::SubgroupShuffleDown => "subgroup_shuffle_down",
+            BuiltinFn::SubgroupReduceAdd => "subgroup_reduce_add",
+            BuiltinFn::SubgroupReduceMin => "subgroup_reduce_min",
+            BuiltinFn::SubgroupReduceMax => "subgroup_reduce_max",
+            BuiltinFn::SubgroupReduceAnd => "subgroup_reduce_and",
+            BuiltinFn::SubgroupReduceOr => "subgroup_reduce_or",
+            BuiltinFn::SubgroupScanInclusiveAdd => "subgroup_scan_inclusive_add",
+            BuiltinFn::SubgroupScanExclusiveAdd => "subgroup_scan_exclusive_add",
         }
     }
 }
@@ -280,26 +308,32 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
     }
 }
 
-/// Whether the statement tree uses subgroup vote, ballot, shuffle, and/or
-/// relative-shuffle collectives.
+/// Whether the statement tree uses subgroup vote, ballot, shuffle,
+/// relative-shuffle, and/or arithmetic collectives.
 ///
 /// The returned tuple is `(uses_vote, uses_ballot, uses_shuffle,
-/// uses_shuffle_relative)`, allowing SPIR-V lowering to declare the four
+/// uses_shuffle_relative, uses_arithmetic)`, allowing SPIR-V lowering to declare the five
 /// independently-required capabilities in one walk.
-pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool, bool, bool) {
-    stmts.iter().fold((false, false, false, false), |acc, stmt| {
+pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool, bool, bool, bool) {
+    stmts.iter().fold((false, false, false, false, false), |acc, stmt| {
         merge_subgroup_collective_uses(acc, stmt_uses_subgroup_collectives(stmt))
     })
 }
 
 fn merge_subgroup_collective_uses(
-    a: (bool, bool, bool, bool),
-    b: (bool, bool, bool, bool),
-) -> (bool, bool, bool, bool) {
-    (a.0 || b.0, a.1 || b.1, a.2 || b.2, a.3 || b.3)
+    a: (bool, bool, bool, bool, bool),
+    b: (bool, bool, bool, bool, bool),
+) -> (bool, bool, bool, bool, bool) {
+    (
+        a.0 || b.0,
+        a.1 || b.1,
+        a.2 || b.2,
+        a.3 || b.3,
+        a.4 || b.4,
+    )
 }
 
-fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool) {
+fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, bool) {
     match stmt {
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             expr_uses_subgroup_collectives(init)
@@ -310,7 +344,7 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool) {
             expr_uses_subgroup_collectives(index),
             expr_uses_subgroup_collectives(value),
         ),
-        IrStmt::Barrier => (false, false, false, false),
+        IrStmt::Barrier => (false, false, false, false, false),
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(cond),
@@ -334,7 +368,7 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool) {
     }
 }
 
-fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool) {
+fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, bool) {
     match expr {
         IrExpr::Builtin { func, args } => {
             let own = (
@@ -351,6 +385,16 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool) {
                     func,
                     BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown
                 ),
+                matches!(
+                    func,
+                    BuiltinFn::SubgroupReduceAdd
+                        | BuiltinFn::SubgroupReduceMin
+                        | BuiltinFn::SubgroupReduceMax
+                        | BuiltinFn::SubgroupReduceAnd
+                        | BuiltinFn::SubgroupReduceOr
+                        | BuiltinFn::SubgroupScanInclusiveAdd
+                        | BuiltinFn::SubgroupScanExclusiveAdd
+                ),
             );
             args.iter().fold(own, |acc, arg| {
                 merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
@@ -362,7 +406,7 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool) {
         IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_collectives(base),
         IrExpr::Construct { args, .. } => {
             args.iter()
-                .fold((false, false, false, false), |acc, arg| {
+                .fold((false, false, false, false, false), |acc, arg| {
                     merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
                 })
         }
@@ -378,7 +422,7 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool) {
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => (false, false, false, false),
+        | IrExpr::Input(_) => (false, false, false, false, false),
     }
 }
 

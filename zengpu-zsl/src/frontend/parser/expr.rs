@@ -273,6 +273,20 @@ impl<'a> Parser<'a> {
         {
             return self.err(format!("{}() takes 2 args", func.name()));
         }
+        if matches!(
+            func,
+            BuiltinFn::SubgroupReduceAdd
+                | BuiltinFn::SubgroupReduceMin
+                | BuiltinFn::SubgroupReduceMax
+                | BuiltinFn::SubgroupReduceAnd
+                | BuiltinFn::SubgroupReduceOr
+                | BuiltinFn::SubgroupScanInclusiveAdd
+                | BuiltinFn::SubgroupScanExclusiveAdd
+        ) && args.len()
+            != 1
+        {
+            return self.err(format!("{}(value) takes 1 arg", func.name()));
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 

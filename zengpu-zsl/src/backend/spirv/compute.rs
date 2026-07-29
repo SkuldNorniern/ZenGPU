@@ -31,7 +31,7 @@ mod glsl_op {
 
 use std::collections::HashMap;
 
-use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
+use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, op, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::binding::ssbo_binding_for;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
@@ -62,12 +62,14 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         uses_subgroup_ballot,
         uses_subgroup_shuffle,
         uses_subgroup_shuffle_relative,
+        uses_subgroup_arithmetic,
     ) = crate::ir::node::stmts_use_subgroup_collectives(&entry.body);
     if uses_subgroup_query
         || uses_subgroup_vote
         || uses_subgroup_ballot
         || uses_subgroup_shuffle
         || uses_subgroup_shuffle_relative
+        || uses_subgroup_arithmetic
     {
         spv.capability_group_non_uniform();
     }
@@ -82,6 +84,9 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     }
     if uses_subgroup_shuffle_relative {
         spv.capability_group_non_uniform_shuffle_relative();
+    }
+    if uses_subgroup_arithmetic {
+        spv.capability_group_non_uniform_arithmetic();
     }
     let glsl_ext = spv.ext_inst_import_glsl();
     spv.memory_model_logical_glsl450();
@@ -1223,10 +1228,102 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             };
             Ok(Val { id, ty: ctx.f32_id })
         }
+
+        // subgroup_reduce_add/min/max/and/or(value) -> same type as value (f32/u32/i32)
+        BuiltinFn::SubgroupReduceAdd
+        | BuiltinFn::SubgroupReduceMin
+        | BuiltinFn::SubgroupReduceMax
+        | BuiltinFn::SubgroupReduceAnd
+        | BuiltinFn::SubgroupReduceOr => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {}(value) takes 1 arg", func.name()));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            let opcode = reduce_opcode(func, value.ty, ctx)?;
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let ty = ctx.spv_ty(value.ty);
+            let id =
+                ctx.spv
+                    .op_group_non_uniform_arith(opcode, ty, scope, 0, value.id);
+            Ok(Val { id, ty: value.ty })
+        }
+
+        // subgroup_scan_inclusive_add/subgroup_scan_exclusive_add(value) -> same type as value
+        BuiltinFn::SubgroupScanInclusiveAdd | BuiltinFn::SubgroupScanExclusiveAdd => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {}(value) takes 1 arg", func.name()));
+            }
+            let value = lower_expr(ctx, &args[0])?;
+            let opcode = add_opcode(value.ty, ctx)?;
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
+            let ty = ctx.spv_ty(value.ty);
+            let group_op = if matches!(func, BuiltinFn::SubgroupScanInclusiveAdd) {
+                1
+            } else {
+                2
+            };
+            let id =
+                ctx.spv
+                    .op_group_non_uniform_arith(opcode, ty, scope, group_op, value.id);
+            Ok(Val { id, ty: value.ty })
+        }
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn add_opcode(ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32, String> {
+    if ty == ctx.f32_id {
+        Ok(op::GROUP_NON_UNIFORM_FADD)
+    } else if ty == ctx.u32_id || ty == ctx.i32_id {
+        Ok(op::GROUP_NON_UNIFORM_IADD)
+    } else {
+        Err("ZSL: subgroup reduce/scan add requires f32, u32, or i32".to_string())
+    }
+}
+
+fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32, String> {
+    match func {
+        BuiltinFn::SubgroupReduceAdd => add_opcode(ty, ctx),
+        BuiltinFn::SubgroupReduceMin => {
+            if ty == ctx.f32_id {
+                Ok(op::GROUP_NON_UNIFORM_FMIN)
+            } else if ty == ctx.u32_id {
+                Ok(op::GROUP_NON_UNIFORM_UMIN)
+            } else if ty == ctx.i32_id {
+                Ok(op::GROUP_NON_UNIFORM_SMIN)
+            } else {
+                Err("ZSL: subgroup_reduce_min requires f32, u32, or i32".to_string())
+            }
+        }
+        BuiltinFn::SubgroupReduceMax => {
+            if ty == ctx.f32_id {
+                Ok(op::GROUP_NON_UNIFORM_FMAX)
+            } else if ty == ctx.u32_id {
+                Ok(op::GROUP_NON_UNIFORM_UMAX)
+            } else if ty == ctx.i32_id {
+                Ok(op::GROUP_NON_UNIFORM_SMAX)
+            } else {
+                Err("ZSL: subgroup_reduce_max requires f32, u32, or i32".to_string())
+            }
+        }
+        BuiltinFn::SubgroupReduceAnd => {
+            if ty == ctx.u32_id {
+                Ok(op::GROUP_NON_UNIFORM_BITWISE_AND)
+            } else {
+                Err("ZSL: subgroup_reduce_and requires u32".to_string())
+            }
+        }
+        BuiltinFn::SubgroupReduceOr => {
+            if ty == ctx.u32_id {
+                Ok(op::GROUP_NON_UNIFORM_BITWISE_OR)
+            } else {
+                Err("ZSL: subgroup_reduce_or requires u32".to_string())
+            }
+        }
+        _ => unreachable!(),
+    }
+}
 
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {
     if val.ty == target {
