@@ -94,7 +94,12 @@ mod op {
     pub const EXT_INST: u32 = 12;
     pub const GROUP_NON_UNIFORM_ALL: u32 = 334;
     pub const GROUP_NON_UNIFORM_ANY: u32 = 335;
+    pub const GROUP_NON_UNIFORM_BROADCAST: u32 = 337;
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 339;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 345;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_XOR: u32 = 346;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_UP: u32 = 347;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_DOWN: u32 = 348;
 }
 
 #[allow(dead_code)]
@@ -129,6 +134,8 @@ mod cap {
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
+    pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
+    pub const GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u32 = 66;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
@@ -236,6 +243,22 @@ impl SpvBuilder {
             &mut self.capabilities,
             op::CAPABILITY,
             &[cap::GROUP_NON_UNIFORM_BALLOT],
+        );
+    }
+
+    pub fn capability_group_non_uniform_shuffle(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM_SHUFFLE],
+        );
+    }
+
+    pub fn capability_group_non_uniform_shuffle_relative(&mut self) {
+        emit(
+            &mut self.capabilities,
+            op::CAPABILITY,
+            &[cap::GROUP_NON_UNIFORM_SHUFFLE_RELATIVE],
         );
     }
 
@@ -999,6 +1022,86 @@ impl SpvBuilder {
             &mut self.functions,
             op::GROUP_NON_UNIFORM_BALLOT,
             &[uvec4_ty.0, id.0, scope.0, predicate.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_broadcast(
+        &mut self,
+        value_ty: Id,
+        scope: Id,
+        value: Id,
+        other: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_BROADCAST,
+            &[value_ty.0, id.0, scope.0, value.0, other.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_shuffle(
+        &mut self,
+        value_ty: Id,
+        scope: Id,
+        value: Id,
+        other: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_SHUFFLE,
+            &[value_ty.0, id.0, scope.0, value.0, other.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_shuffle_xor(
+        &mut self,
+        value_ty: Id,
+        scope: Id,
+        value: Id,
+        other: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_SHUFFLE_XOR,
+            &[value_ty.0, id.0, scope.0, value.0, other.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_shuffle_up(
+        &mut self,
+        value_ty: Id,
+        scope: Id,
+        value: Id,
+        other: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_SHUFFLE_UP,
+            &[value_ty.0, id.0, scope.0, value.0, other.0],
+        );
+        id
+    }
+
+    pub fn op_group_non_uniform_shuffle_down(
+        &mut self,
+        value_ty: Id,
+        scope: Id,
+        value: Id,
+        other: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::GROUP_NON_UNIFORM_SHUFFLE_DOWN,
+            &[value_ty.0, id.0, scope.0, value.0, other.0],
         );
         id
     }

@@ -710,6 +710,36 @@ int main() {{
         }
     "#;
 
+    const SUBGROUP_EXCHANGE: &str = r#"
+        push P { n: u32 }
+        @workgroup_size(256)
+        kernel exchange(
+            out_broadcast: device mut buffer<f32>,
+            out_shuffle: device mut buffer<f32>,
+            out_xor: device mut buffer<f32>,
+            out_up: device mut buffer<f32>,
+            out_down: device mut buffer<f32>,
+            p: P,
+            id: global_id,
+        ) {
+            if group_id().x < p.n {
+                let value = id.x * 1.0
+                out_broadcast[id.x] = subgroup_broadcast(value, 0u32)
+                out_shuffle[id.x] = subgroup_shuffle(value, 1u32)
+                out_xor[id.x] = subgroup_shuffle_xor(value, 1u32)
+                out_up[id.x] = subgroup_shuffle_up(value, 1u32)
+                out_down[id.x] = subgroup_shuffle_down(value, 1u32)
+            }
+        }
+    "#;
+
+    const SUBGROUP_SHUFFLE_XOR: &str = r#"
+        @workgroup_size(256)
+        kernel shuffle_xor(out: device mut buffer<f32>, id: global_id) {
+            out[id.x] = subgroup_shuffle_xor(id.x * 1.0, 1u32)
+        }
+    "#;
+
     #[test]
     fn subgroup_queries_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
@@ -756,6 +786,29 @@ int main() {{
         );
         assert!(msl::lower_compute(&module).is_err(), "MSL ballot must reject");
         spirv::lower_compute(&module).expect("lower ballot to SPIR-V");
+    }
+
+    #[test]
+    fn subgroup_data_exchange_lowers_on_all_compute_backends() {
+        let module = parse_compute(SUBGROUP_EXCHANGE).expect("parse subgroup exchange");
+        let hip_source = hip::lower_compute(&module).expect("lower subgroup exchange to HIP").source;
+        let cuda_source =
+            cuda::lower_compute(&module).expect("lower subgroup exchange to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower subgroup exchange to MSL").source;
+        assert!(hip_source.contains("__shfl("));
+        assert!(hip_source.contains("__shfl_xor("));
+        assert!(hip_source.contains("__shfl_up("));
+        assert!(hip_source.contains("__shfl_down("));
+        assert!(cuda_source.contains("__shfl_sync("));
+        assert!(cuda_source.contains("__shfl_xor_sync("));
+        assert!(cuda_source.contains("__shfl_up_sync("));
+        assert!(cuda_source.contains("__shfl_down_sync("));
+        assert!(msl_source.contains("simd_broadcast("));
+        assert!(msl_source.contains("simd_shuffle("));
+        assert!(msl_source.contains("simd_shuffle_xor("));
+        assert!(msl_source.contains("simd_shuffle_up("));
+        assert!(msl_source.contains("simd_shuffle_down("));
+        spirv::lower_compute(&module).expect("lower subgroup exchange to SPIR-V");
     }
 
     #[test]
@@ -916,6 +969,96 @@ int main() {{
             String::from_utf8_lossy(&run.stderr)
         );
         eprintln!("HIP subgroup vote: {}", stdout.trim());
+    }
+
+    #[test]
+    fn subgroup_shuffle_xor_hip_swaps_adjacent_lanes_when_gpu_present() {
+        let module = parse_compute(SUBGROUP_SHUFFLE_XOR).expect("parse subgroup shuffle xor");
+        let shader = hip::lower_compute(&module).expect("lower subgroup shuffle xor to HIP");
+
+        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        if !hipcc.exists() {
+            eprintln!(
+                "skipping HIP subgroup shuffle-xor proof: {} not found",
+                hipcc.display()
+            );
+            return;
+        }
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
+        let src_path = dir.join(format!(
+            "zsl_subgroup_shuffle_xor_{}_{}.hip",
+            std::process::id(),
+            tag
+        ));
+        let exe_path = dir.join(format!(
+            "zsl_subgroup_shuffle_xor_{}_{}",
+            std::process::id(),
+            tag
+        ));
+        let harness = format!(
+            r#"
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <vector>
+{}
+int main() {{
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
+    const unsigned WG = 256, GROUPS = 256, N = WG * GROUPS;
+    std::vector<float> out(N, -1.0f);
+    float *dout = nullptr;
+    if (hipMalloc(&dout, N*sizeof(float)) != hipSuccess) return 2;
+    zsl_kernel<<<dim3(GROUPS), dim3(WG)>>>(dout);
+    if (hipDeviceSynchronize() != hipSuccess) return 3;
+    hipMemcpy(out.data(), dout, N*sizeof(float), hipMemcpyDeviceToHost);
+    unsigned mismatches = 0;
+    for (unsigned i = 0; i < N; ++i) {{
+        const unsigned local = i % WG;
+        const unsigned subgroup_local = local % 32;
+        const unsigned expected_id = i - subgroup_local + (subgroup_local ^ 1u);
+        mismatches += out[i] != (float)expected_id;
+    }}
+    std::printf("SUBGROUP_SHUFFLE_XOR_EXACT mismatches=%u\n", mismatches);
+    hipFree(dout);
+    return mismatches == 0 ? 0 : 4;
+}}
+"#,
+            shader.source
+        );
+        std::fs::write(&src_path, harness).expect("write HIP subgroup shuffle-xor proof source");
+        let compile = Command::new(&hipcc)
+            .arg("-O2")
+            .arg(&src_path)
+            .arg("-o")
+            .arg(&exe_path)
+            .output()
+            .expect("run hipcc");
+        if !compile.status.success() {
+            panic!(
+                "HIP subgroup shuffle-xor compilation failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+        }
+        let run = Command::new(&exe_path)
+            .output()
+            .expect("run HIP subgroup shuffle xor");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&exe_path);
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            !stdout.contains("SKIP_NO_HIP_GPU"),
+            "HIP subgroup shuffle-xor proof unexpectedly skipped"
+        );
+        assert!(
+            run.status.success(),
+            "HIP subgroup shuffle-xor failed: {stdout}\n{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        eprintln!("HIP subgroup shuffle xor: {}", stdout.trim());
     }
 
     #[test]

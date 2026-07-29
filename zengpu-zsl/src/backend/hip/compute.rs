@@ -383,6 +383,18 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                          (needs a 128-bit-capable value representation)",
                     ));
                 }
+                BuiltinFn::SubgroupBroadcast | BuiltinFn::SubgroupShuffle => {
+                    format!("__shfl({}, (int)({}))", args_s[0], args_s[1])
+                }
+                BuiltinFn::SubgroupShuffleXor => {
+                    format!("__shfl_xor({}, (int)({}))", args_s[0], args_s[1])
+                }
+                BuiltinFn::SubgroupShuffleUp => {
+                    format!("__shfl_up({}, (unsigned int)({}))", args_s[0], args_s[1])
+                }
+                BuiltinFn::SubgroupShuffleDown => {
+                    format!("__shfl_down({}, (unsigned int)({}))", args_s[0], args_s[1])
+                }
                 BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
                 BuiltinFn::SubgroupLocalId => "__lane_id()".to_string(),
                 BuiltinFn::SubgroupId => "(threadIdx.x / warpSize)".to_string(),

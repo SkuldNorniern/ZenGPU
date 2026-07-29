@@ -257,6 +257,18 @@ impl<'a> Parser<'a> {
         {
             return self.err(format!("{}(predicate) takes 1 arg", func.name()));
         }
+        if matches!(
+            func,
+            BuiltinFn::SubgroupBroadcast
+                | BuiltinFn::SubgroupShuffle
+                | BuiltinFn::SubgroupShuffleXor
+                | BuiltinFn::SubgroupShuffleUp
+                | BuiltinFn::SubgroupShuffleDown
+        ) && args.len()
+            != 2
+        {
+            return self.err(format!("{}() takes 2 args", func.name()));
+        }
         Ok(IrExpr::Builtin { func, args })
     }
 }

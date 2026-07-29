@@ -117,6 +117,17 @@ pub enum BuiltinFn {
     ///
     /// A collective. Compute only.
     SubgroupBallot,
+    /// Returns `value` from `lane`. A collective, which needs subgroup-uniform control
+    /// flow (`ir::uniformity`).
+    SubgroupBroadcast,
+    /// A collective. Compute only.
+    SubgroupShuffle,
+    /// Returns `value` from lane `this ^ mask`. A collective. Compute only.
+    SubgroupShuffleXor,
+    /// Returns `value` from a lower lane. A collective. Compute only.
+    SubgroupShuffleUp,
+    /// Returns `value` from a higher lane. A collective. Compute only.
+    SubgroupShuffleDown,
 }
 
 impl BuiltinFn {
@@ -154,6 +165,11 @@ impl BuiltinFn {
             BuiltinFn::SubgroupAny => "subgroup_any",
             BuiltinFn::SubgroupAll => "subgroup_all",
             BuiltinFn::SubgroupBallot => "subgroup_ballot",
+            BuiltinFn::SubgroupBroadcast => "subgroup_broadcast",
+            BuiltinFn::SubgroupShuffle => "subgroup_shuffle",
+            BuiltinFn::SubgroupShuffleXor => "subgroup_shuffle_xor",
+            BuiltinFn::SubgroupShuffleUp => "subgroup_shuffle_up",
+            BuiltinFn::SubgroupShuffleDown => "subgroup_shuffle_down",
         }
     }
 }
@@ -219,18 +235,22 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
     }
 }
 
-/// Subgroup vote/ballot use, as `(uses_vote, uses_ballot)`. One walk declares both capabilities.
-pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool) {
-    stmts.iter().fold((false, false), |acc, stmt| {
+/// Subgroup collectives used by the tree, as `(vote, ballot, shuffle, shuffle_relative)`. One walk
+/// lets SPIR-V declare all four capabilities.
+pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool, bool, bool) {
+    stmts.iter().fold((false, false, false, false), |acc, stmt| {
         merge_subgroup_collective_uses(acc, stmt_uses_subgroup_collectives(stmt))
     })
 }
 
-fn merge_subgroup_collective_uses(a: (bool, bool), b: (bool, bool)) -> (bool, bool) {
-    (a.0 || b.0, a.1 || b.1)
+fn merge_subgroup_collective_uses(
+    a: (bool, bool, bool, bool),
+    b: (bool, bool, bool, bool),
+) -> (bool, bool, bool, bool) {
+    (a.0 || b.0, a.1 || b.1, a.2 || b.2, a.3 || b.3)
 }
 
-fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool) {
+fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool) {
     match stmt {
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             expr_uses_subgroup_collectives(init)
@@ -241,7 +261,7 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool) {
             expr_uses_subgroup_collectives(index),
             expr_uses_subgroup_collectives(value),
         ),
-        IrStmt::Barrier => (false, false),
+        IrStmt::Barrier => (false, false, false, false),
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(cond),
@@ -265,12 +285,23 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool) {
     }
 }
 
-fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool) {
+fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool) {
     match expr {
         IrExpr::Builtin { func, args } => {
             let own = (
                 matches!(func, BuiltinFn::SubgroupAny | BuiltinFn::SubgroupAll),
-                matches!(func, BuiltinFn::SubgroupBallot),
+                matches!(
+                    func,
+                    BuiltinFn::SubgroupBallot | BuiltinFn::SubgroupBroadcast
+                ),
+                matches!(
+                    func,
+                    BuiltinFn::SubgroupShuffle | BuiltinFn::SubgroupShuffleXor
+                ),
+                matches!(
+                    func,
+                    BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown
+                ),
             );
             args.iter().fold(own, |acc, arg| {
                 merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
@@ -280,9 +311,12 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool) {
             expr_uses_subgroup_collectives(index)
         }
         IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_collectives(base),
-        IrExpr::Construct { args, .. } => args.iter().fold((false, false), |acc, arg| {
-            merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
-        }),
+        IrExpr::Construct { args, .. } => {
+            args.iter()
+                .fold((false, false, false, false), |acc, arg| {
+                    merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
+                })
+        }
         IrExpr::Neg(inner) => expr_uses_subgroup_collectives(inner),
         IrExpr::Binary { lhs, rhs, .. } => merge_subgroup_collective_uses(
             expr_uses_subgroup_collectives(lhs),
@@ -295,7 +329,7 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool) {
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => (false, false),
+        | IrExpr::Input(_) => (false, false, false, false),
     }
 }
 
