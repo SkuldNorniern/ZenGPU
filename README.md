@@ -18,13 +18,22 @@ Version `0.0.1` is pre-alpha. APIs are expected to change before `0.1.0`.
 - Vulkan swapchains, offscreen targets, depth targets, and a lightweight frame
   graph with automatic image-layout barriers.
 - Same-device zero-copy handoff from rendered targets to sampled-image slots.
+- Compute-only backends for HIP/ROCm (`zengpu-hip`) and CUDA (`zengpu-cuda`),
+  plus a native Metal backend (`zengpu-metal`, graphics and compute, macOS/
+  iOS), all driven from the same ZSL source. A DirectX 12 backend
+  (`zengpu-dx12`) exists as an inert skeleton.
 - A deterministic CPU backend used for conformance tests.
 - `DeviceArray`, pooled allocation, `f32` add/ReLU kernels, and portable `f32`
   GEMM.
 - Small SPIR-V tooling for disassembly and structural diagnostics during shader
   bring-up.
 - `zengpu_spirv!`, a shader macro that can compile GLSL through `inline-spirv`
-  or ZSL through the local Rust-flavored shader pipeline.
+  or ZSL through the local Rust-flavored shader pipeline. ZSL compiles to
+  SPIR-V, HIP C++, CUDA C++, and MSL from one source, with a unified type
+  system (`u32`/`i32`/`f32`/`bf16`/`f16` buffer storage), typed bindless
+  storage buffers, and subgroup/workgroup cooperative reductions
+  (`subgroup_reduce_*`, `subgroup_shuffle_*`, `workgroup_reduce_*`) for
+  cross-lane and cross-workgroup math.
 
 ZenGPU does not include scene, ECS, asset, editor, tensor-graph, or application
 types. Consumer crates define planning and presentation policy; ZenGPU provides
@@ -32,7 +41,7 @@ execution, resources, synchronization, and backend translation.
 
 ## Installation
 
-The default feature set enables Vulkan, compute helpers, and BLAS:
+The default feature set enables Vulkan and compute helpers:
 
 ```toml
 [dependencies]
@@ -43,8 +52,12 @@ Feature flags:
 
 - `vulkan` (default): Vulkan graphics and compute backend.
 - `compute` (default): `DeviceArray`, `BufferPool`, and elementwise kernels.
-- `blas` (default): portable GEMM; implies `compute`.
+- `blas`: portable GEMM; implies `compute`.
 - `cpu`: CPU reference backend for conformance tests.
+- `hip`: HIP/ROCm compute backend.
+- `cuda`: CUDA compute backend.
+- `metal`: native Metal compute/graphics backend (macOS).
+- `dx12`: DirectX 12 backend (currently an inert skeleton).
 
 Foundation-only users can disable defaults:
 
@@ -119,27 +132,28 @@ const VERT: &[u32] = zengpu_spirv!(
 );
 ```
 
-ZSL is a Rust-flavored shader input compiled directly to SPIR-V by
-`zengpu-zsl`:
-
-```rust,ignore
-const COMPUTE: &[u32] = zengpu_spirv!(
-    #[compute(local_size_x = 64)]
-    fn cs_main(#[global_invocation_id] gid: UVec3) {
-        let i = gid.x;
-    }
-);
-```
+ZSL is a Rust-flavored shader language compiled by `zengpu-zsl`: from one ZSL
+source, `zsl!` produces SPIR-V (Vulkan), HIP C++ (ROCm), CUDA C++ (NVIDIA), and
+MSL (Metal) simultaneously; pick the right compiled form for the active
+backend at runtime with `ZslShader::for_backend`.
 
 This ZSL compute kernel scales one buffer into another:
 
 ```rust,ignore
-const SCALE_ZSL: &[u32] = zengpu_spirv!(
-    #[compute(local_size_x = 64)]
-    fn cs_scale(src: Buf<f32>, dst: BufMut<f32>, len: u32, scale: f32) {
-        let i: u32 = global_id().x;
-        if i < len {
-            dst[i] = src[i] * scale;
+use zengpu_spirv::zsl;
+
+const SCALE_ZSL: ZslShader = zsl!(
+    push Push { n: u32, scale: f32 }
+    @workgroup_size(64)
+    kernel scale(
+        p: Push,
+        src: device buffer<f32>,
+        dst: device mut buffer<f32>,
+        id: global_id,
+    ) {
+        let i = id.x
+        if i < p.n {
+            dst[i] = src[i] * p.scale
         }
     }
 );
@@ -175,10 +189,16 @@ const SCALE_GLSL: &[u32] = zengpu_spirv!(
 );
 ```
 
-The ZSL path currently supports the subset used by ZenGPU tests and renderer
-experiments: compute, vertex, and fragment entry points; SSBOs; push constants;
-scalars; vectors; matrices; arithmetic; comparisons; and selected control flow.
-It is available for experimentation and is still limited.
+ZSL supports compute, vertex, and fragment entry points; typed bindless
+storage buffers (`u32`/`i32`/`f32`/`bf16`/`f16`); push constants; scalars,
+vectors, and matrices; arithmetic and comparisons; `if`/`for` control flow;
+workgroup-shared memory and barriers; atomics; and subgroup/workgroup
+collectives (`subgroup_reduce_add/min/max/and/or`, `subgroup_scan_inclusive/
+exclusive_add`, `subgroup_shuffle*`, `subgroup_any/all/ballot`,
+`workgroup_reduce_add/min/max`) for cooperative cross-lane and
+cross-workgroup reductions. It remains smaller than GLSL/HLSL in absolute
+feature count (no user-defined structs, modules, or recursion yet) but covers
+real compute and graphics workloads today, not just experimentation.
 
 ## Examples
 
@@ -205,13 +225,17 @@ cargo run --example cube
 | `zengpu` | Main facade and recommended dependency |
 | `zengpu-hal` | Backend-independent types, handles, traits, descriptors, and errors |
 | `zengpu-vulkan` | Vulkan 1.2 graphics and compute backend |
+| `zengpu-hip` | HIP/ROCm compute backend |
+| `zengpu-cuda` | CUDA compute backend |
+| `zengpu-metal` | Native Metal compute/graphics backend |
+| `zengpu-dx12` | DirectX 12 backend (inert skeleton) |
 | `zengpu-cpu` | CPU reference backend |
 | `zengpu-compute` | Resident arrays, pooling, and elementwise kernels |
 | `zengpu-blas` | Portable GEMM kernel |
 | `zengpu-conformance` | Cross-backend conformance harness |
 | `zengpu-spirv` | Public shader macro and push-constant helpers |
 | `zengpu-spv` | SPIR-V decoding, disassembly, and structural validation |
-| `zengpu-zsl` | ZSL parsing and SPIR-V lowering |
+| `zengpu-zsl` | ZSL parsing and lowering to SPIR-V, HIP, CUDA, and MSL |
 
 Most users should depend on `zengpu`. The subcrates are available for backend
 work, conformance, or macro internals.
@@ -229,13 +253,18 @@ work, conformance, or macro internals.
 
 ## Current Limitations
 
-- Vulkan is the only GPU backend.
+- Vulkan and Metal are the only backends with graphics support; HIP and CUDA
+  are compute-only. DirectX 12 is an inert skeleton (no device creation yet).
+  ZSL's SPIR-V bf16/f16 typed storage is not yet implemented (HIP/CUDA/MSL
+  already have it); `dot_f32` and workgroup `any`/`all`/scan are not yet
+  implemented on any backend.
 - Dispatch and readback are synchronous.
-- Built-in elementwise and GEMM kernels support `f32` only.
+- Built-in elementwise and GEMM kernels support `f32` only (ZSL itself has
+  wider type support: `u32`/`i32`/`bf16`/`f16` storage).
 - The CPU backend is intended for correctness testing rather than production
   fallback use.
-- ZSL is intentionally small and incomplete; GLSL remains available through
-  `inline-spirv`.
+- ZSL has no user-defined structs, modules, or recursion yet; GLSL remains
+  available through `inline-spirv` for anything outside ZSL's current scope.
 - Async readback, deferred destruction, and broader memory-pool policy are
   planned optimization areas.
 - Resource synchronization and lifetime validation are still being expanded.
