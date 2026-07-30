@@ -1128,6 +1128,10 @@ impl Drop for VulkanDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of_val;
+    use std::slice::from_raw_parts;
+    use std::sync::MutexGuard;
+    use std::thread::spawn;
     use std::{env, ops::Deref, process};
 
     use super::*;
@@ -1139,7 +1143,7 @@ mod tests {
 
     struct TestDevice {
         dev: Box<dyn GpuDevice>,
-        _guard: std::sync::MutexGuard<'static, ()>,
+        _guard: MutexGuard<'static, ()>,
     }
 
     impl Deref for TestDevice {
@@ -1178,9 +1182,7 @@ mod tests {
     }
 
     fn u32s_to_bytes(words: &[u32]) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, std::mem::size_of_val(words))
-        }
+        unsafe { from_raw_parts(words.as_ptr() as *const u8, size_of_val(words)) }
     }
 
     #[test]
@@ -1756,8 +1758,7 @@ mod tests {
             })
             .unwrap();
         let values: Vec<f32> = (0..N).map(|i| i as f32 - 17.0).collect();
-        let bytes =
-            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+        let bytes = unsafe { from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
         dev.write_buffer(upload, 0, bytes).unwrap();
         let submission = dev
             .submit_compute_ops(
@@ -1862,17 +1863,13 @@ mod tests {
         dev.write_buffer(
             a,
             0,
-            u32s_to_bytes(unsafe {
-                std::slice::from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len())
-            }),
+            u32s_to_bytes(unsafe { from_raw_parts(a_vals.as_ptr() as *const u32, a_vals.len()) }),
         )
         .unwrap();
         dev.write_buffer(
             b,
             0,
-            u32s_to_bytes(unsafe {
-                std::slice::from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len())
-            }),
+            u32s_to_bytes(unsafe { from_raw_parts(b_vals.as_ptr() as *const u32, b_vals.len()) }),
         )
         .unwrap();
 
@@ -1937,8 +1934,7 @@ mod tests {
         assert_eq!(allocated_after_completion.index(), retired_sum_index);
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
-        let result: &[f32] =
-            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };
+        let result: &[f32] = unsafe { from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };
         assert_eq!(result, &[0.0; 8]);
 
         dev.destroy_shader(add_shader);
@@ -2146,7 +2142,7 @@ mod tests {
             .map(|(worker, output)| {
                 let dev = Arc::clone(&dev);
                 let start = Arc::clone(&start);
-                std::thread::spawn(move || {
+                spawn(move || {
                     let buffers = [output.index()];
                     let scalars = [Scalar::F32(worker as f32 + 0.5)];
                     start.wait();
@@ -2210,9 +2206,7 @@ mod tests {
         dev.write_buffer(
             src,
             0,
-            u32s_to_bytes(unsafe {
-                std::slice::from_raw_parts(input.as_ptr() as *const u32, input.len())
-            }),
+            u32s_to_bytes(unsafe { from_raw_parts(input.as_ptr() as *const u32, input.len()) }),
         )
         .unwrap();
 
@@ -2281,9 +2275,8 @@ mod tests {
             .collect();
         let input_i: Vec<i32> = (0..n as i32).map(|value| value - 64).collect();
         let bytes_u = u32s_to_bytes(&input_u);
-        let bytes_i = u32s_to_bytes(unsafe {
-            std::slice::from_raw_parts(input_i.as_ptr() as *const u32, input_i.len())
-        });
+        let bytes_i =
+            u32s_to_bytes(unsafe { from_raw_parts(input_i.as_ptr() as *const u32, input_i.len()) });
         dev.write_buffer(src_u, 0, bytes_u).unwrap();
         dev.write_buffer(src_i, 0, bytes_i).unwrap();
 
@@ -2343,7 +2336,7 @@ mod tests {
         let Some(dev) = try_device() else { return };
         let input = [0.0f32, -12.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
         let expected = [1u32, 1, 2, 3, 3];
-        let size = std::mem::size_of_val(&input) as u64;
+        let size = size_of_val(&input) as u64;
         let desc = BufferDesc {
             size,
             usage: BufferUsage::STORAGE | BufferUsage::READBACK,
@@ -2354,9 +2347,7 @@ mod tests {
         dev.write_buffer(
             src,
             0,
-            u32s_to_bytes(unsafe {
-                std::slice::from_raw_parts(input.as_ptr() as *const u32, input.len())
-            }),
+            u32s_to_bytes(unsafe { from_raw_parts(input.as_ptr() as *const u32, input.len()) }),
         )
         .unwrap();
 

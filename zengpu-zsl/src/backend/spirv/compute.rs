@@ -30,7 +30,10 @@ use std::collections::HashMap;
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, op, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::binding::ssbo_binding_for;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{
+    BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_subgroup_collectives, stmts_use_subgroup_query,
+    stmts_use_workgroup_reduce,
+};
 use crate::ir::types::TypeId;
 use crate::ir::{EntryKind, Module, ParamKind};
 
@@ -49,14 +52,14 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     if has_atomic_add(&entry.body) {
         spv.enable_atomic_float32_add_ext();
     }
-    let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&entry.body);
+    let uses_subgroup_query = stmts_use_subgroup_query(&entry.body);
     let (
         uses_subgroup_vote,
         uses_subgroup_ballot,
         uses_subgroup_shuffle,
         uses_subgroup_shuffle_relative,
         uses_subgroup_arithmetic,
-    ) = crate::ir::node::stmts_use_subgroup_collectives(&entry.body);
+    ) = stmts_use_subgroup_collectives(&entry.body);
     if uses_subgroup_query
         || uses_subgroup_vote
         || uses_subgroup_ballot
@@ -216,7 +219,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
         shared.insert(decl.name.clone(), var);
     }
-    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&entry.body);
+    let uses_workgroup_reduce = stmts_use_workgroup_reduce(&entry.body);
     let workgroup_reduce_len = local_size[0] * local_size[1] * local_size[2];
     let workgroup_reduce_var = if uses_workgroup_reduce {
         if !workgroup_reduce_len.is_power_of_two() {
@@ -480,6 +483,7 @@ fn has_atomic_add(stmts: &[IrStmt]) -> bool {
     })
 }
 
+#[allow(clippy::expect_used)]
 fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     match stmt {
         IrStmt::Let { name, init } => {
@@ -526,9 +530,9 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx
-                .spv
-                .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
+            let ptr_elem =
+                ctx.spv
+                    .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, info.elem);
             ctx.spv.op_store(ptr_elem, rhs_id);
@@ -673,6 +677,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::expect_used)]
 fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     match expr {
         IrExpr::LitU32(v) => {
@@ -740,9 +745,9 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
             let c0 = ctx.const_0_u32;
-            let ptr_elem = ctx
-                .spv
-                .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
+            let ptr_elem =
+                ctx.spv
+                    .op_access_chain(table.t_ptr_elem, table.var, &[buf_idx, c0, idx_id]);
             let elem_spv_ty = ctx.spv_ty(info.elem);
             let id = ctx.spv.op_load(elem_spv_ty, ptr_elem);
             Ok(Val { id, ty: info.elem })
@@ -863,7 +868,10 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
             } else {
                 return Err("ZSL: comparisons not supported on bool".into());
             };
-            Ok(Val { id, ty: ctx.bool_id })
+            Ok(Val {
+                id,
+                ty: ctx.bool_id,
+            })
         }
         IrBinOp::And | IrBinOp::Or => {
             if lhs.ty != ctx.bool_id || rhs.ty != ctx.bool_id {
@@ -875,7 +883,10 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 IrBinOp::Or => ctx.spv.op_logical_or(bool_ty, lhs.id, rhs.id),
                 _ => unreachable!(),
             };
-            Ok(Val { id, ty: ctx.bool_id })
+            Ok(Val {
+                id,
+                ty: ctx.bool_id,
+            })
         }
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
             if lhs.ty != ctx.u32_id || rhs.ty != ctx.u32_id {
@@ -895,6 +906,7 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
     }
 }
 
+#[allow(clippy::expect_used)]
 fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Result<Val, String> {
     let name = func.name();
     match func {
@@ -928,7 +940,10 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 }
                 _ => unreachable!(),
             };
-            Ok(Val { id, ty: ctx.bool_id })
+            Ok(Val {
+                id,
+                ty: ctx.bool_id,
+            })
         }
         BuiltinFn::Abs
         | BuiltinFn::Sign
@@ -1073,11 +1088,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
             let id = if matches!(func, BuiltinFn::SubgroupAny) {
-                ctx.spv
-                    .op_group_non_uniform_any(ctx.t_bool, scope, pred.id)
+                ctx.spv.op_group_non_uniform_any(ctx.t_bool, scope, pred.id)
             } else {
-                ctx.spv
-                    .op_group_non_uniform_all(ctx.t_bool, scope, pred.id)
+                ctx.spv.op_group_non_uniform_all(ctx.t_bool, scope, pred.id)
             };
             Ok(Val {
                 id,
@@ -1135,9 +1148,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let mask = coerce(ctx, mask, ctx.u32_id);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
-            let id =
-                ctx.spv
-                    .op_group_non_uniform_shuffle_xor(ctx.t_f32, scope, value.id, mask);
+            let id = ctx
+                .spv
+                .op_group_non_uniform_shuffle_xor(ctx.t_f32, scope, value.id, mask);
             Ok(Val { id, ty: ctx.f32_id })
         }
 
@@ -1174,9 +1187,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let opcode = reduce_opcode(func, value.ty, ctx)?;
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
             let ty = ctx.spv_ty(value.ty);
-            let id =
-                ctx.spv
-                    .op_group_non_uniform_arith(opcode, ty, scope, 0, value.id);
+            let id = ctx
+                .spv
+                .op_group_non_uniform_arith(opcode, ty, scope, 0, value.id);
             Ok(Val { id, ty: value.ty })
         }
 
@@ -1193,9 +1206,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             } else {
                 2
             };
-            let id =
-                ctx.spv
-                    .op_group_non_uniform_arith(opcode, ty, scope, group_op, value.id);
+            let id = ctx
+                .spv
+                .op_group_non_uniform_arith(opcode, ty, scope, group_op, value.id);
             Ok(Val { id, ty: value.ty })
         }
 
@@ -1223,9 +1236,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             ctx.spv
                 .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
 
-            let ptr = ctx
-                .spv
-                .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
             ctx.spv.op_store(ptr, value.id);
 
             ctx.spv
@@ -1238,23 +1249,18 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 let true_label = ctx.spv.fresh_id();
                 let merge_label = ctx.spv.fresh_id();
                 ctx.spv.op_selection_merge(merge_label);
-                ctx.spv
-                    .op_branch_conditional(cond, true_label, merge_label);
+                ctx.spv.op_branch_conditional(cond, true_label, merge_label);
 
                 ctx.spv.label_with_id(true_label);
                 let lid_plus_s = ctx.spv.op_iadd(ctx.t_u32, lid_x, s_const);
-                let ptr_lo =
-                    ctx.spv
-                        .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
-                let ptr_hi =
-                    ctx.spv
-                        .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_plus_s]);
+                let ptr_lo = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+                let ptr_hi = ctx
+                    .spv
+                    .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_plus_s]);
                 let v_lo = ctx.spv.op_load(ctx.t_f32, ptr_lo);
                 let v_hi = ctx.spv.op_load(ctx.t_f32, ptr_hi);
                 let combined = match func {
-                    BuiltinFn::WorkgroupReduceAdd => {
-                        ctx.spv.op_fadd(ctx.t_f32, v_lo, v_hi)
-                    }
+                    BuiltinFn::WorkgroupReduceAdd => ctx.spv.op_fadd(ctx.t_f32, v_lo, v_hi),
                     BuiltinFn::WorkgroupReduceMin => {
                         let glsl = ctx.glsl_ext;
                         ctx.spv
@@ -1278,9 +1284,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
 
             let zero_const = ctx.spv.constant_u32(ctx.t_u32, 0);
-            let ptr_zero =
-                ctx.spv
-                    .op_access_chain(ctx.t_ptr_wg_f32, var, &[zero_const]);
+            let ptr_zero = ctx
+                .spv
+                .op_access_chain(ctx.t_ptr_wg_f32, var, &[zero_const]);
             let result = ctx.spv.op_load(ctx.t_f32, ptr_zero);
             Ok(Val {
                 id: result,

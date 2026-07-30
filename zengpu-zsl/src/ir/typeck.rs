@@ -1,7 +1,6 @@
-//! Type checking over parsed compute/graphics IR, producing [`crate::ir::types::TypeId`].
+//! Typing for compute and graphics IR, producing `TypeId`s.
 //!
-//! The parser types locals, params and buffer elements through [`type_of_compute_expr`]
-//! and [`type_of_graphics_expr`].
+//! Parsers use it to store locals, params and buffer elements as `TypeId`.
 
 use std::collections::HashMap;
 
@@ -179,7 +178,7 @@ pub fn type_of_graphics_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::Type;
+    use crate::ir::types::{IntWidth, Signedness, Type};
 
     #[test]
     fn compute_literal_and_local_types() {
@@ -191,8 +190,8 @@ mod tests {
         assert_eq!(
             *arena.get(lit),
             Type::Int {
-                width: crate::ir::types::IntWidth::W32,
-                signedness: crate::ir::types::Signedness::Unsigned
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned
             }
         );
 

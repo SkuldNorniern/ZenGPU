@@ -99,10 +99,7 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
 /// Fills each `Construct` `ty`. It is `None` after parsing because the parser has no `TypeArena`.
 ///
 /// Runs once at the end of `parse_kernel_rest` and `parse_graphics_rest`.
-pub(super) fn resolve_construct_types_expr(
-    expr: &IrExpr,
-    types: &mut crate::ir::arena::TypeArena,
-) -> IrExpr {
+pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena) -> IrExpr {
     match expr {
         IrExpr::LitU32(v) => IrExpr::LitU32(*v),
         IrExpr::LitF32(v) => IrExpr::LitF32(*v),
@@ -148,10 +145,7 @@ pub(super) fn resolve_construct_types_expr(
     }
 }
 
-pub(super) fn resolve_construct_types_stmt(
-    stmt: &IrStmt,
-    types: &mut crate::ir::arena::TypeArena,
-) -> IrStmt {
+pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena) -> IrStmt {
     match stmt {
         IrStmt::Let { name, init } => IrStmt::Let {
             name: name.clone(),

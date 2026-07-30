@@ -4,6 +4,8 @@
 //! 4). Multiple GPUs: open one `HipDevice` per adapter. They are `Send + Sync` and can be driven
 //! from separate threads.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void};
@@ -321,8 +323,7 @@ impl HipInstance {
         let mut count: i32 = 0;
         unsafe { hipGetDeviceCount(&mut count) };
 
-        let devices: Vec<HipDeviceInfo> =
-            (0..count).filter_map(|i| HipDeviceInfo::query(i)).collect();
+        let devices: Vec<HipDeviceInfo> = (0..count).filter_map(HipDeviceInfo::query).collect();
 
         for d in &devices {
             log::debug!(
@@ -823,7 +824,14 @@ impl GpuDevice for HipDevice {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::manual_div_ceil, clippy::unnecessary_cast)]
+
     use super::*;
+    use std::slice::from_raw_parts;
+    use std::sync::Arc;
+    use std::thread::spawn;
+    use std::time::Instant;
+
     use zengpu_hal::{BufferUsage, GpuInstance, MemoryUsage};
 
     const VEC_ADD_SRC: &str = r#"
@@ -999,7 +1007,7 @@ void vec_add(const float* __restrict__ a,
             .enumerate()
             .map(|(idx, dev)| {
                 let label = format!("GPU {idx}");
-                std::thread::spawn(move || run_vec_add(dev.as_ref().as_ref(), &label))
+                spawn(move || run_vec_add(dev.as_ref().as_ref(), &label))
             })
             .collect();
 
@@ -1093,12 +1101,12 @@ void vec_add(const float* __restrict__ a,
     }
 
     fn bytemuck_cast(v: &[f32]) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+        unsafe { from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
     }
 
     fn bytemuck_cast_slice(v: &[u8]) -> &[f32] {
         assert_eq!(v.len() % 4, 0);
-        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const f32, v.len() / 4) }
+        unsafe { from_raw_parts(v.as_ptr() as *const f32, v.len() / 4) }
     }
 
     /// 32x32 tiled SGEMM. Fills a full WGP on gfx1200 (1024 threads/WGP).
@@ -1242,7 +1250,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
 }
 "#;
 
-    fn elapsed_ms(start: std::time::Instant) -> f64 {
+    fn elapsed_ms(start: Instant) -> f64 {
         start.elapsed().as_secs_f64() * 1000.0
     }
 
@@ -1314,7 +1322,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         device.dispatch(pipeline, bindings, grid).unwrap();
 
         const REPS: u32 = 5;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
@@ -1399,7 +1407,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .unwrap();
 
         const REPS: u32 = 3;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device
                 .dispatch(pipeline, bindings, [num_blocks, 1, 1])
@@ -1484,7 +1492,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             device.dispatch(pipeline, bindings, grid).unwrap();
 
             const REPS: u32 = 5;
-            let t0 = std::time::Instant::now();
+            let t0 = Instant::now();
             for _ in 0..REPS {
                 device.dispatch(pipeline, bindings, grid).unwrap();
             }
@@ -1527,7 +1535,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .zip(names)
             .enumerate()
             .map(|(idx, (dev, name))| {
-                std::thread::spawn(move || {
+                spawn(move || {
                     const M: usize = 2048;
                     const N: usize = 2048;
                     const K: usize = 2048;
@@ -1578,7 +1586,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                     };
                     dev.dispatch(pipeline, bindings, grid).unwrap();
                     const REPS: u32 = 5;
-                    let t0 = std::time::Instant::now();
+                    let t0 = Instant::now();
                     for _ in 0..REPS {
                         dev.dispatch(pipeline, bindings, grid).unwrap();
                     }
@@ -1652,7 +1660,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         device.dispatch(pipeline, bindings, grid).unwrap();
         device.read_buffer(bc, 0, 4).unwrap();
         const REPS: u32 = 3;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
@@ -1762,7 +1770,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         device.dispatch(pipeline, bindings, grid).unwrap();
         device.read_buffer(bc, 0, 4).unwrap();
         const REPS: u32 = 3;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
@@ -1788,10 +1796,9 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .iter()
             .enumerate()
             .map(|(idx, a)| {
-                let dev: std::sync::Arc<dyn GpuDevice> =
-                    std::sync::Arc::from(a.open(DeviceRequest::default()).unwrap());
+                let dev: Arc<dyn GpuDevice> = Arc::from(a.open(DeviceRequest::default()).unwrap());
                 let name = a.info().name.clone();
-                std::thread::spawn(move || {
+                spawn(move || {
                     let gflops = run_sgemm_opt(dev.as_ref(), 4096, 4096, 4096);
                     println!("[GPU {idx} - {name}] opt SGEMM 4096³: {gflops:.0} GFLOP/s");
                 })
@@ -1960,7 +1967,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         device.dispatch(pipeline, bindings, grid).unwrap();
 
         const REPS: u32 = 3;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device.dispatch(pipeline, bindings, grid).unwrap();
         }
@@ -2047,7 +2054,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .unwrap();
 
         const REPS: u32 = 3;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device
                 .dispatch(pipeline, bindings, [num_blocks, 1, 1])
@@ -2177,7 +2184,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             .unwrap();
 
         const REPS: u32 = 5;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         for _ in 0..REPS {
             device
                 .dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1])
@@ -2231,7 +2238,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             .zip(names)
             .enumerate()
             .map(|(idx, (dev, name))| {
-                std::thread::spawn(move || {
+                spawn(move || {
                     const M: usize = 4096;
                     const N: usize = 4096;
                     const K: usize = 4096;
@@ -2290,7 +2297,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
                     dev.dispatch(pipeline, bindings, grid).unwrap();
 
                     const REPS: u32 = 3;
-                    let t0 = std::time::Instant::now();
+                    let t0 = Instant::now();
                     for _ in 0..REPS {
                         dev.dispatch(pipeline, bindings, grid).unwrap();
                     }

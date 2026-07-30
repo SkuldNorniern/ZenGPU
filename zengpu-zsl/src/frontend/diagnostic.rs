@@ -1,6 +1,9 @@
 //! Backends return `Diagnostic` when they cannot represent an operation, so callers can match on
 //! `code`. Some still return a bare `String`.
 
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticCode {
     /// Invalid construct (bad argument count, operand shape), not merely unsupported by
@@ -44,13 +47,13 @@ impl Diagnostic {
     }
 }
 
-impl std::fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Diagnostic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.message)
     }
 }
 
-impl std::error::Error for Diagnostic {}
+impl Error for Diagnostic {}
 
 /// Lets `?` convert a bare `String` error into a `Diagnostic`.
 impl From<Diagnostic> for String {

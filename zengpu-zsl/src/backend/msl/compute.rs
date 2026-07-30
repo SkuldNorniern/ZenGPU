@@ -4,7 +4,9 @@ use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{
+    BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_subgroup_query, stmts_use_workgroup_reduce,
+};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, ParamKind};
 
@@ -33,20 +35,26 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         })
         .collect();
 
-    let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
+    let bf16_id = {
+        let mut t = module.types.clone();
+        t.bf16_id()
+    };
     let bf16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, elem)| *elem == bf16_id)
         .map(|(name, _)| *name)
         .collect();
 
-    let f16_id = { let mut t = module.types.clone(); t.f16_id() };
+    let f16_id = {
+        let mut t = module.types.clone();
+        t.f16_id()
+    };
     let f16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, elem)| *elem == f16_id)
         .map(|(name, _)| *name)
         .collect();
-    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&e.body);
+    let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
         return Err(Diagnostic::new(
@@ -100,7 +108,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     s.push_str("    uint3 gid [[thread_position_in_grid]],\n");
     s.push_str("    uint3 lid [[thread_position_in_threadgroup]],\n");
     s.push_str("    uint3 group [[threadgroup_position_in_grid]]");
-    let uses_subgroup_query = crate::ir::node::stmts_use_subgroup_query(&e.body);
+    let uses_subgroup_query = stmts_use_subgroup_query(&e.body);
     if uses_subgroup_query {
         s.push_str(",\n    uint simd_size [[threads_per_simdgroup]],\n");
         s.push_str("    uint simd_group [[simdgroup_index_in_threadgroup]],\n");
@@ -173,11 +181,7 @@ fn indent(s: &mut String, depth: usize) {
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
         IrStmt::Let { name, init } => {
-            let ty = ctx
-                .locals
-                .get(name.as_str())
-                .copied()
-                .unwrap_or("uint");
+            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("uint");
             indent(s, depth);
             let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
         }
@@ -462,6 +466,10 @@ fn msl_float(v: f32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::temp_dir;
+    use std::fs::{remove_file, write};
+    use std::process::{Command, id};
+
     use crate::frontend::parser::parse_compute;
 
     fn msl(src: &str) -> MslShader {
@@ -472,21 +480,21 @@ mod tests {
     fn metal_compiles(source: &str) -> Option<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir();
+        let dir = temp_dir();
         let uniq = N.fetch_add(1, Ordering::Relaxed);
-        let src = dir.join(format!("zsl_msl_{}_{}.metal", std::process::id(), uniq));
-        if std::fs::write(&src, source).is_err() {
+        let src = dir.join(format!("zsl_msl_{}_{}.metal", id(), uniq));
+        if write(&src, source).is_err() {
             return None;
         }
         let air = src.with_extension("air");
-        let out = std::process::Command::new("xcrun")
+        let out = Command::new("xcrun")
             .args(["metal", "-c"])
             .arg(&src)
             .arg("-o")
             .arg(&air)
             .output();
-        let _ = std::fs::remove_file(&src);
-        let _ = std::fs::remove_file(&air);
+        let _ = remove_file(&src);
+        let _ = remove_file(&air);
         match out {
             Ok(o) => Some(if o.status.success() {
                 true

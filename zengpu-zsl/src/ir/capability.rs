@@ -3,6 +3,7 @@
 //! Not yet: `requires {}` syntax and a per-backend target table.
 
 /// A capability a program needs, independent of backend or Cargo feature.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
     Int8,
@@ -26,6 +27,7 @@ pub enum Capability {
     TensorMma,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportLevel {
     Native,

@@ -14,6 +14,7 @@
 //! not collide.
 
 #![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::any::Any;
 use std::collections::HashMap;

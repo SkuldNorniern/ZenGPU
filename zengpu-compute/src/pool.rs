@@ -2,6 +2,8 @@
 //!
 //! Size-classed free list, so repeated elementwise/BLAS ops skip the device allocator.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

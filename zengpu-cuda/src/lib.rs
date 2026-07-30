@@ -2,14 +2,18 @@
 //! the adapter list is empty, not a build or link error (the stub library returns
 //! `ErrorCode::StubLibrary` from `cuInit`).
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 mod error;
 
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::ffi::{CString, c_char, c_void};
+use std::mem::take;
 use std::ptr;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::thread::yield_now;
 use std::time::{Duration, Instant};
 
 use cuda_oxide::{
@@ -364,7 +368,7 @@ impl GpuSubmission for CudaSubmission {
             {
                 return Err(GpuError::Timeout);
             }
-            std::thread::yield_now();
+            yield_now();
         }
     }
 }
@@ -397,7 +401,7 @@ fn release_cuda_in_flight(
         debug_assert!(lifetime.in_flight > 0);
         lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
         if lifetime.in_flight == 0 {
-            std::mem::take(&mut lifetime.deferred)
+            take(&mut lifetime.deferred)
         } else {
             Vec::new()
         }
@@ -1188,6 +1192,8 @@ extern "C" __global__ void vec_add_f32(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::mem::{size_of, size_of_val};
+
     use zengpu_spirv::{ZslShader, zsl};
 
     const TRIG_ZSL: ZslShader = zsl!(
@@ -1406,7 +1412,7 @@ mod tests {
         let b: Vec<f32> = (0..N).map(|i| (100 * i) as f32).collect();
         let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
 
-        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let size = (N * size_of::<f32>()) as u64;
         let buf_a = device
             .create_buffer(BufferDesc {
                 size,
@@ -1480,7 +1486,7 @@ mod tests {
         const N: usize = 1024;
         let a: Vec<f32> = (0..N).map(|i| i as f32 * 0.25).collect();
         let b: Vec<f32> = (0..N).map(|i| 1000.0 - i as f32 * 0.5).collect();
-        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let size = (N * size_of::<f32>()) as u64;
         let desc = BufferDesc {
             size,
             usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
@@ -1539,7 +1545,7 @@ mod tests {
         let Some(device) = cuda_device() else { return };
         const N: usize = 128;
         let input: Vec<f32> = (0..N).map(|i| -0.5 + i as f32 / N as f32).collect();
-        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let size = (N * size_of::<f32>()) as u64;
         let desc = BufferDesc {
             size,
             usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
@@ -1594,7 +1600,7 @@ mod tests {
             .map(|value| value.wrapping_mul(2_654_435_761))
             .collect();
         let input_i: Vec<i32> = (0..N as i32).map(|value| value - 64).collect();
-        let size = (N * std::mem::size_of::<u32>()) as u64;
+        let size = (N * size_of::<u32>()) as u64;
         let desc = BufferDesc {
             size,
             usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
@@ -1653,7 +1659,7 @@ mod tests {
         let Some(device) = cuda_device() else { return };
         let input = [0.0f32, -12.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
         let expected = [1u32, 1, 2, 3, 3];
-        let size = std::mem::size_of_val(&input) as u64;
+        let size = size_of_val(&input) as u64;
         let desc = BufferDesc {
             size,
             usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
@@ -1808,7 +1814,7 @@ mod tests {
         let b: Vec<f32> = (0..N).map(|i| (10 * i) as f32).collect();
         let expected: Vec<f32> = a.iter().zip(&b).map(|(x, y)| 2.0 * (x + y)).collect();
 
-        let size = (N * std::mem::size_of::<f32>()) as u64;
+        let size = (N * size_of::<f32>()) as u64;
         let gpu = |size| BufferDesc {
             size,
             usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,

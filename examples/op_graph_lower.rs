@@ -6,6 +6,11 @@
 //!
 //! Computes `relu(A @ B + C)`.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::error::Error;
+use std::mem::size_of_val;
+use std::slice::from_raw_parts;
 use std::sync::Arc;
 
 use zengpu::{
@@ -61,7 +66,7 @@ fn lower_and_run(
 }
 
 fn as_bytes_f32(s: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+    unsafe { from_raw_parts(s.as_ptr() as *const u8, size_of_val(s)) }
 }
 
 fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
@@ -70,7 +75,7 @@ fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let inst = VulkanInstance::new()?;
     let adapter = inst
         .request_adapter(AdapterRequest::default())

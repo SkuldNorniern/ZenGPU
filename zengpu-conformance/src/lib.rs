@@ -4,6 +4,8 @@
 //! `compare_*` runs the same op on two devices and requires byte-identical results. One of them is
 //! the CPU oracle.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::mem;
 use std::slice;
 

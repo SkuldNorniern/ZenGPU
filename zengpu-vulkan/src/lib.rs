@@ -1,5 +1,7 @@
 //! ZenGPU Vulkan backend, Vulkan 1.2+.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod adapter;
 pub(crate) mod command_list;
 pub mod depth_target;
@@ -23,8 +25,11 @@ pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 use ash::vk;
 
 #[cfg(test)]
-pub(crate) fn test_gpu_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+use std::sync::{Mutex, MutexGuard};
+
+#[cfg(test)]
+pub(crate) fn test_gpu_lock() -> MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 

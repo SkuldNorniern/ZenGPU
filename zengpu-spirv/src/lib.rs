@@ -27,6 +27,9 @@
 //! [`CompiledModule`] and the ZSL syntax changes. Code should prefer `CompiledModule` over
 //! `ZslShader` where practical.
 
+use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::slice;
 
 use zengpu_hal::{BackendPreference, ShaderDesc};
@@ -151,8 +154,8 @@ pub struct BackendUnavailable {
     pub required_cargo_feature: &'static str,
 }
 
-impl std::fmt::Display for BackendUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for BackendUnavailable {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(
             f,
             "no {:?} artifact available (enable the \"{}\" cargo feature, and confirm this shader targets that backend)",
@@ -161,13 +164,13 @@ impl std::fmt::Display for BackendUnavailable {
     }
 }
 
-impl std::error::Error for BackendUnavailable {}
+impl Error for BackendUnavailable {}
 
 /// Any set of backend artifacts for one ZSL module. Unlike the fixed fields of `ZslShader`, adding
 /// a backend needs no caller changes.
 #[derive(Debug, Clone, Default)]
 pub struct CompiledModule {
-    pub artifacts: std::collections::BTreeMap<BackendId, BackendArtifact>,
+    pub artifacts: BTreeMap<BackendId, BackendArtifact>,
 }
 
 impl CompiledModule {
@@ -190,16 +193,25 @@ impl ZslShader {
     /// or `cuda` field means the feature is off, or the shader is a graphics module that backend
     /// skips. `spv` is always included.
     pub fn into_compiled(&self) -> CompiledModule {
-        let mut artifacts = std::collections::BTreeMap::new();
+        let mut artifacts = BTreeMap::new();
         artifacts.insert(BackendId::Spirv, BackendArtifact::Spirv(self.spv.to_vec()));
         if !self.hip.is_empty() {
-            artifacts.insert(BackendId::Hip, BackendArtifact::HipSource(self.hip.to_string()));
+            artifacts.insert(
+                BackendId::Hip,
+                BackendArtifact::HipSource(self.hip.to_string()),
+            );
         }
         if !self.cuda.is_empty() {
-            artifacts.insert(BackendId::Cuda, BackendArtifact::CudaSource(self.cuda.to_string()));
+            artifacts.insert(
+                BackendId::Cuda,
+                BackendArtifact::CudaSource(self.cuda.to_string()),
+            );
         }
         if !self.msl.is_empty() {
-            artifacts.insert(BackendId::Metal, BackendArtifact::MetalSource(self.msl.to_string()));
+            artifacts.insert(
+                BackendId::Metal,
+                BackendArtifact::MetalSource(self.msl.to_string()),
+            );
         }
         CompiledModule { artifacts }
     }

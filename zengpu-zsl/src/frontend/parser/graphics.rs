@@ -68,7 +68,7 @@ impl<'a> Parser<'a> {
                 body,
                 ret,
             },
-            types: std::mem::replace(&mut self.types, crate::ir::arena::TypeArena::new()),
+            types: mem::replace(&mut self.types, TypeArena::new()),
         })
     }
 
@@ -266,9 +266,7 @@ impl<'a> Parser<'a> {
         let init = self.parse_g_expr(ctx)?;
         let ty = match annot {
             Some(ty) => ty,
-            None => {
-                crate::ir::typeck::type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types)
-            }
+            None => type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types),
         };
         ctx.locals.insert(name.clone(), ty);
         ctx.locals_order.push((name.clone(), ty));

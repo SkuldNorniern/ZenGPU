@@ -12,6 +12,7 @@ pub struct StructId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstId(pub(crate) u32);
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntWidth {
     W8,
@@ -26,6 +27,7 @@ pub enum Signedness {
     Unsigned,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatFormat {
     F16,
@@ -37,6 +39,7 @@ pub enum FloatFormat {
 }
 
 /// ZSL address space. It is explicit only where it changes behavior.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AddressSpace {
     Private,
@@ -46,6 +49,7 @@ pub enum AddressSpace {
     Push,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
     Read,
@@ -53,6 +57,7 @@ pub enum Access {
     ReadWrite,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MatrixMajor {
     Column,
@@ -61,6 +66,7 @@ pub enum MatrixMajor {
 
 /// Array length: a fixed constant, specialization-dependent, or unbounded (a trailing storage
 /// buffer member).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
     Const(u32),
@@ -68,6 +74,7 @@ pub enum ArrayLen {
     Runtime,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureDim {
     D1,
@@ -76,6 +83,7 @@ pub enum TextureDim {
     Cube,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureClass {
     Sampled,
@@ -83,6 +91,7 @@ pub enum TextureClass {
     Depth,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SamplerKind {
     Filtering,
@@ -92,6 +101,7 @@ pub enum SamplerKind {
 
 /// children are interned [`TypeId`]s, so `Type` stays hashable. built via
 /// [`crate::ir::arena::TypeArena`].
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Void,

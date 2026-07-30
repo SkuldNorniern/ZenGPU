@@ -34,6 +34,7 @@ pub enum ParamKind {
     /// checked in `ir::build`.
     Buffer {
         elem: TypeId,
+        #[allow(dead_code)]
         mutability: Mutability,
     },
     Scalar(TypeId),
@@ -61,6 +62,7 @@ pub struct SharedDecl {
     ///
     /// Not yet read by any backend, which all hardcode f32 shared memory. Meant for future non-f32
     /// shared arrays.
+    #[allow(dead_code)]
     pub elem: TypeId,
     pub len: u32,
 }

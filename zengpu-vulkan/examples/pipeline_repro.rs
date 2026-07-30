@@ -5,6 +5,10 @@
 //!
 //! Run: cargo run -p zengpu-vulkan --example pipeline_repro
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::slice::from_raw_parts;
+
 use zengpu_hal::{
     ColorTargetState, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice,
     GraphicsPipelineDesc, PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat,
@@ -112,5 +116,5 @@ fn main() {
 }
 
 fn bytemuck_cast(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) }
+    unsafe { from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) }
 }

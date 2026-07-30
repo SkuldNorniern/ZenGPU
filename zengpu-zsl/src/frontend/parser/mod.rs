@@ -44,15 +44,17 @@ use state::*;
 use types::*;
 
 use std::collections::HashMap;
+use std::mem;
 
 use crate::frontend::lex::{Tok, Token, lex};
+use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::typeck::{type_of_compute_expr, type_of_graphics_expr};
 use crate::ir::types::TypeId;
 use crate::ir::{
     Entry, EntryKind, GfxInput, GfxScalar, GraphicsEntry, GraphicsModule, Module, Mutability,
     Param, ParamKind, SharedDecl,
 };
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub msg: String,
@@ -94,7 +96,7 @@ struct Parser<'a> {
     functions: HashMap<String, FunctionDef>,
     /// Per-call-site counter that keeps inlined locals from colliding.
     call_counter: u32,
-    types: crate::ir::arena::TypeArena,
+    types: TypeArena,
 }
 
 impl<'a> Parser<'a> {
@@ -105,7 +107,7 @@ impl<'a> Parser<'a> {
             pushes: HashMap::new(),
             functions: HashMap::new(),
             call_counter: 0,
-            types: crate::ir::arena::TypeArena::new(),
+            types: TypeArena::new(),
         }
     }
 
@@ -171,8 +173,11 @@ impl<'a> Parser<'a> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::backend::spirv::lower_compute;
+    use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 
     fn lower(src: &str) -> Vec<u32> {
         let module = parse_compute(src).expect("parse");
@@ -226,7 +231,7 @@ mod tests {
             }
         "#;
         let m = parse_compute(src).expect("parse");
-        let locals: std::collections::HashMap<_, _> = m.entry.locals.iter().cloned().collect();
+        let locals: HashMap<_, _> = m.entry.locals.iter().cloned().collect();
         let mut arena = m.types.clone();
         assert_eq!(locals["i"], arena.u32_id());
         assert_eq!(locals["v"], arena.f32_id());
@@ -299,9 +304,12 @@ mod tests {
             }
         "#;
         let module = parse_compute(src).expect("parse");
-        let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
+        let bf16_id = {
+            let mut t = module.types.clone();
+            t.bf16_id()
+        };
         for p in &module.entry.params {
-            if let crate::ir::ParamKind::Buffer { elem, .. } = p.kind {
+            if let ParamKind::Buffer { elem, .. } = p.kind {
                 assert_eq!(elem, bf16_id, "buffer<bf16> param `{}`", p.name);
             }
         }
@@ -316,9 +324,12 @@ mod tests {
             }
         "#;
         let module = parse_compute(src).expect("parse");
-        let f16_id = { let mut t = module.types.clone(); t.f16_id() };
+        let f16_id = {
+            let mut t = module.types.clone();
+            t.f16_id()
+        };
         for p in &module.entry.params {
-            if let crate::ir::ParamKind::Buffer { elem, .. } = p.kind {
+            if let ParamKind::Buffer { elem, .. } = p.kind {
                 assert_eq!(elem, f16_id, "buffer<f16> param `{}`", p.name);
             }
         }
@@ -333,11 +344,7 @@ mod tests {
             }
         "#;
         let e = parse_compute(src).unwrap_err();
-        assert!(
-            e.msg.contains("incompatible value type"),
-            "got: {}",
-            e.msg
-        );
+        assert!(e.msg.contains("incompatible value type"), "got: {}", e.msg);
     }
 
     #[test]
@@ -510,7 +517,7 @@ mod tests {
             }
         "#;
         let module = parse_compute(src).expect("parse");
-        let err = crate::backend::spirv::lower_compute(&module).unwrap_err();
+        let err = lower_compute(&module).unwrap_err();
         assert!(err.message.contains("u32 operands"), "got: {err}");
     }
 
@@ -573,11 +580,11 @@ mod tests {
 
     #[test]
     fn typeck_infers_local_and_literal_types() {
-        let mut arena = crate::ir::arena::TypeArena::new();
-        let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+        let mut arena = TypeArena::new();
+        let mut new_ctx = ComputeTypeCtx::default();
         new_ctx.locals.insert("x".to_string(), arena.f32_id());
         let local_expr = IrExpr::Local("x".to_string());
-        let new_ty = crate::ir::typeck::type_of_compute_expr(&local_expr, &new_ctx, &mut arena);
+        let new_ty = type_of_compute_expr(&local_expr, &new_ctx, &mut arena);
 
         assert_eq!(new_ty, arena.f32_id());
     }
@@ -595,13 +602,13 @@ mod tests {
             rhs: Box::new(IrExpr::LitF32(2.0)),
         };
 
-        let mut arena = crate::ir::arena::TypeArena::new();
-        let new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+        let mut arena = TypeArena::new();
+        let new_ctx = ComputeTypeCtx::default();
 
-        let new_cmp_ty = crate::ir::typeck::type_of_compute_expr(&cmp, &new_ctx, &mut arena);
+        let new_cmp_ty = type_of_compute_expr(&cmp, &new_ctx, &mut arena);
         assert_eq!(new_cmp_ty, arena.bool_id());
 
-        let new_arith_ty = crate::ir::typeck::type_of_compute_expr(&arith, &new_ctx, &mut arena);
+        let new_arith_ty = type_of_compute_expr(&arith, &new_ctx, &mut arena);
         assert_eq!(new_arith_ty, arena.f32_id());
     }
 
@@ -612,10 +619,10 @@ mod tests {
             index: Box::new(IrExpr::LitU32(0)),
         };
 
-        let mut arena = crate::ir::arena::TypeArena::new();
-        let mut new_ctx = crate::ir::typeck::ComputeTypeCtx::default();
+        let mut arena = TypeArena::new();
+        let mut new_ctx = ComputeTypeCtx::default();
         new_ctx.buffers.insert("buf".to_string(), arena.i32_id());
-        let new_ty = crate::ir::typeck::type_of_compute_expr(&load, &new_ctx, &mut arena);
+        let new_ty = type_of_compute_expr(&load, &new_ctx, &mut arena);
 
         assert_eq!(new_ty, arena.i32_id());
     }
@@ -638,10 +645,10 @@ mod tests {
             rhs: Box::new(vec4),
         };
 
-        let mut arena = crate::ir::arena::TypeArena::new();
-        let mut ctx = crate::ir::typeck::GraphicsTypeCtx::default();
+        let mut arena = TypeArena::new();
+        let mut ctx = GraphicsTypeCtx::default();
         ctx.scalars.insert("mvp".to_string(), arena.mat4_id());
-        let ty = crate::ir::typeck::type_of_graphics_expr(&mat_mul, &ctx, &mut arena);
+        let ty = type_of_graphics_expr(&mat_mul, &ctx, &mut arena);
 
         assert_eq!(ty, arena.vec_id(4));
     }

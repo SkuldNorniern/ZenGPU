@@ -3,8 +3,11 @@
 //! Uniformity is tracked only as far as the one-workgroup-per-row kernels need. Buffer and shared
 //! loads count as divergent. There is no dataflow or alias analysis.
 
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
+use crate::ir::Entry;
 use crate::ir::node::{BuiltinFn, IrExpr, IrStmt};
 
 fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
@@ -75,7 +78,7 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
     }
 }
 
-pub fn check_compute_uniformity(entry: &crate::ir::Entry) -> Result<(), String> {
+pub fn check_compute_uniformity(entry: &Entry) -> Result<(), String> {
     let mut locals = HashMap::new();
     check_stmts(&entry.body, &mut locals, false)
 }
@@ -147,6 +150,8 @@ fn check_stmt(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::frontend::parser::parse_compute;
 

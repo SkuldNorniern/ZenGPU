@@ -10,8 +10,8 @@ use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::GraphicsModule;
+use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
 
 /// Push-constant buffer index for graphics shaders. High so it never overlaps vertex buffers; the
@@ -33,7 +33,12 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     if has_push {
         s.push_str("struct Push {\n");
         for sp in &e.scalar_params {
-            let _ = writeln!(s, "    {} {};", msl_ty_of(module.types.get(sp.ty))?, sp.name);
+            let _ = writeln!(
+                s,
+                "    {} {};",
+                msl_ty_of(module.types.get(sp.ty))?,
+                sp.name
+            );
         }
         s.push_str("};\n\n");
     }
@@ -228,7 +233,10 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::Binary { op, lhs, rhs } => {
             format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
         }
-        IrExpr::GlobalId(_) | IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::SharedLoad { .. } => {
+        IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::SharedLoad { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL graphics backend: compute-only expression in a graphics module",
@@ -290,7 +298,9 @@ fn msl_ty_of(t: &Type) -> Result<&'static str, Diagnostic> {
             )),
         },
         Type::Matrix {
-            rows: 4, columns: 4, ..
+            rows: 4,
+            columns: 4,
+            ..
         } => Ok("float4x4"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
@@ -302,6 +312,10 @@ fn msl_ty_of(t: &Type) -> Result<&'static str, Diagnostic> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::temp_dir;
+    use std::fs::{remove_file, write};
+    use std::process::{Command, id};
+
     use crate::frontend::parser::{Shader, parse_zsl};
 
     fn graphics(src: &str) -> MslShader {
@@ -314,21 +328,21 @@ mod tests {
     fn metal_compiles(source: &str) -> Option<bool> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let dir = std::env::temp_dir();
+        let dir = temp_dir();
         let uniq = N.fetch_add(1, Ordering::Relaxed);
-        let p = dir.join(format!("zsl_gfx_{}_{}.metal", std::process::id(), uniq));
-        if std::fs::write(&p, source).is_err() {
+        let p = dir.join(format!("zsl_gfx_{}_{}.metal", id(), uniq));
+        if write(&p, source).is_err() {
             return None;
         }
         let air = p.with_extension("air");
-        let out = std::process::Command::new("xcrun")
+        let out = Command::new("xcrun")
             .args(["metal", "-c"])
             .arg(&p)
             .arg("-o")
             .arg(&air)
             .output();
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(&air);
+        let _ = remove_file(&p);
+        let _ = remove_file(&air);
         match out {
             Ok(o) if o.status.success() => Some(true),
             Ok(o) => panic!(

@@ -1,12 +1,12 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::hip::{ENTRY, HipShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::typeck::{type_of_compute_expr, ComputeTypeCtx};
+use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
+use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
@@ -37,20 +37,26 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         })
         .collect();
 
-    let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
-    let bf16_buffers: std::collections::HashSet<&str> = buffers
+    let bf16_id = {
+        let mut t = module.types.clone();
+        t.bf16_id()
+    };
+    let bf16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, _, elem)| *elem == bf16_id)
         .map(|(name, _, _)| *name)
         .collect();
 
-    let f16_id = { let mut t = module.types.clone(); t.f16_id() };
-    let f16_buffers: std::collections::HashSet<&str> = buffers
+    let f16_id = {
+        let mut t = module.types.clone();
+        t.f16_id()
+    };
+    let f16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, _, elem)| *elem == f16_id)
         .map(|(name, _, _)| *name)
         .collect();
-    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&e.body);
+    let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
         return Err(Diagnostic::new(
@@ -113,10 +119,7 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         let _ = writeln!(s, "    __shared__ float {}[{}];", shared.name, shared.len);
     }
     if uses_workgroup_reduce {
-        let _ = writeln!(
-            s,
-            "    __shared__ float __zsl_wg_reduce_f32[{block_size}];"
-        );
+        let _ = writeln!(s, "    __shared__ float __zsl_wg_reduce_f32[{block_size}];");
     }
 
     let _ = writeln!(
@@ -169,8 +172,8 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
-    bf16_buffers: std::collections::HashSet<&'a str>,
-    f16_buffers: std::collections::HashSet<&'a str>,
+    bf16_buffers: HashSet<&'a str>,
+    f16_buffers: HashSet<&'a str>,
     type_ctx: ComputeTypeCtx,
     types: RefCell<TypeArena>,
     block_size: u32,
@@ -525,7 +528,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     ));
                 }
             };
-            format!("({} {} {})", emit_expr(ctx, lhs)?, op_s, emit_expr(ctx, rhs)?)
+            format!(
+                "({} {} {})",
+                emit_expr(ctx, lhs)?,
+                op_s,
+                emit_expr(ctx, rhs)?
+            )
         }
     })
 }

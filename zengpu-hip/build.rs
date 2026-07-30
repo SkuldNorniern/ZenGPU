@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 /// Build script for zengpu-hip.
 ///
 /// 1. Finds ROCm (`ROCM_PATH`, else a /opt/rocm scan). Without libamdhip64 and libhiprtc, it links
@@ -27,9 +29,12 @@ fn main() {
         }
     }
 
-    let has_hip = lib_dirs
-        .iter()
-        .any(|dir| has_library(dir, &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"]));
+    let has_hip = lib_dirs.iter().any(|dir| {
+        has_library(
+            dir,
+            &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"],
+        )
+    });
     if !has_hip {
         Build::new().file("src/hip_stub.c").compile("amdhip64");
     }
