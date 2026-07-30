@@ -8,6 +8,11 @@
 //!
 //! Run: cargo run -p zengpu-vulkan --example pipeline_repro
 
+// This standalone repro is meant to abort loudly when its required Vulkan setup fails.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::slice::from_raw_parts;
+
 use zengpu_hal::{
     ColorTargetState, DepthState, DeviceRequest, Format, GpuDevice, GraphicsDevice,
     GraphicsPipelineDesc, PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat,
@@ -116,5 +121,5 @@ fn main() {
 
 /// Reinterpret a `&[u32]` SPIR-V slice as `&[u8]` without pulling in bytemuck.
 fn bytemuck_cast(words: &[u32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) }
+    unsafe { from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) }
 }

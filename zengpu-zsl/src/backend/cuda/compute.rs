@@ -1,12 +1,12 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::cuda::{CudaShader, ENTRY};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::typeck::{type_of_compute_expr, ComputeTypeCtx};
+use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
+use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
@@ -44,8 +44,11 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     // `bf16_to_f32`/`f32_to_bf16` — storage is `unsigned short`, every value
     // that reaches an expression is `f32` (there is no bf16 arithmetic today,
     // per the design doc's storage/arithmetic capability split).
-    let bf16_id = { let mut t = module.types.clone(); t.bf16_id() };
-    let bf16_buffers: std::collections::HashSet<&str> = buffers
+    let bf16_id = {
+        let mut t = module.types.clone();
+        t.bf16_id()
+    };
+    let bf16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, _, elem)| *elem == bf16_id)
         .map(|(name, _, _)| *name)
@@ -56,13 +59,16 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     // `__float2half`/`__half2float` — no hand-rolled bit algorithm needed,
     // unlike bf16 (which has no dedicated hardware conversion path and must
     // match `laminax-runtime`'s existing raw-bit algorithm bit-for-bit).
-    let f16_id = { let mut t = module.types.clone(); t.f16_id() };
-    let f16_buffers: std::collections::HashSet<&str> = buffers
+    let f16_id = {
+        let mut t = module.types.clone();
+        t.f16_id()
+    };
+    let f16_buffers: HashSet<&str> = buffers
         .iter()
         .filter(|(_, _, elem)| *elem == f16_id)
         .map(|(name, _, _)| *name)
         .collect();
-    let uses_workgroup_reduce = crate::ir::node::stmts_use_workgroup_reduce(&e.body);
+    let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
         return Err(Diagnostic::new(
@@ -125,10 +131,7 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         let _ = writeln!(s, "    __shared__ float {}[{}];", shared.name, shared.len);
     }
     if uses_workgroup_reduce {
-        let _ = writeln!(
-            s,
-            "    __shared__ float __zsl_wg_reduce_f32[{block_size}];"
-        );
+        let _ = writeln!(s, "    __shared__ float __zsl_wg_reduce_f32[{block_size}];");
     }
 
     let _ = writeln!(
@@ -184,10 +187,10 @@ struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
     /// Buffer names whose element is `bf16` — every load/store on these is
     /// wrapped in `bf16_to_f32`/`f32_to_bf16`.
-    bf16_buffers: std::collections::HashSet<&'a str>,
+    bf16_buffers: HashSet<&'a str>,
     /// Buffer names whose element is `f16` — every load/store on these is
     /// wrapped in `__half2float`/`__float2half`.
-    f16_buffers: std::collections::HashSet<&'a str>,
+    f16_buffers: HashSet<&'a str>,
     /// Resolved expression symbols used only to select type-specific subgroup
     /// reduction spellings and the exclusive-scan identity literal.
     type_ctx: ComputeTypeCtx,
@@ -591,7 +594,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     ));
                 }
             };
-            format!("({} {} {})", emit_expr(ctx, lhs)?, op_s, emit_expr(ctx, rhs)?)
+            format!(
+                "({} {} {})",
+                emit_expr(ctx, lhs)?,
+                op_s,
+                emit_expr(ctx, rhs)?
+            )
         }
     })
 }

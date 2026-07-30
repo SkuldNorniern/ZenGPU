@@ -104,7 +104,7 @@ impl<'a> Parser<'a> {
                 locals,
                 body,
             },
-            types: std::mem::replace(&mut self.types, crate::ir::arena::TypeArena::new()),
+            types: mem::replace(&mut self.types, TypeArena::new()),
         })
     }
 
@@ -298,15 +298,12 @@ impl<'a> Parser<'a> {
             if buffer.elem != f32_id {
                 return self.err("atomic_add currently requires buffer<f32>");
             }
-            let index_ty =
-                crate::ir::typeck::type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
+            let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
             let u32_id = self.types.u32_id();
             if index_ty != u32_id && index_ty != f32_id {
                 return self.err("atomic_add index must be a u32- or f32-typed expression");
             }
-            if crate::ir::typeck::type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types)
-                != f32_id
-            {
+            if type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types) != f32_id {
                 return self.err("atomic_add value must be an f32-typed expression");
             }
             return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
@@ -348,12 +345,7 @@ impl<'a> Parser<'a> {
                     } else {
                         buffer.elem
                     };
-                    if crate::ir::typeck::type_of_compute_expr(
-                        &rhs,
-                        &ctx.type_ctx(),
-                        &mut self.types,
-                    ) != expected
-                    {
+                    if type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types) != expected {
                         return self.err(format!(
                             "assignment to buffer<{}> has incompatible value type",
                             buffer_elem_name(buffer.elem, &self.types)
@@ -422,12 +414,7 @@ impl<'a> Parser<'a> {
                 rename.insert(param.name.clone(), arg_name);
             } else {
                 let arg_expr = self.parse_expr(ctx)?;
-                if crate::ir::typeck::type_of_compute_expr(
-                    &arg_expr,
-                    &ctx.type_ctx(),
-                    &mut self.types,
-                ) != param.ty
-                {
+                if type_of_compute_expr(&arg_expr, &ctx.type_ctx(), &mut self.types) != param.ty {
                     return self.err(format!(
                         "argument for parameter `{}` has the wrong type",
                         param.name
@@ -476,9 +463,7 @@ impl<'a> Parser<'a> {
         let init = self.parse_expr(ctx)?;
         let ty = match annot {
             Some(ty) => ty,
-            None => {
-                crate::ir::typeck::type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types)
-            }
+            None => type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types),
         };
         ctx.locals.insert(name.clone(), ty);
         ctx.locals_order.push((name.clone(), ty));

@@ -1,5 +1,8 @@
 //! ZenGPU Vulkan backend — native-first GPU runtime on Vulkan 1.2+.
 
+// This is a thin Vulkan HAL layer; a failed Vulkan/driver call here is unrecoverable and is meant to panic loudly rather than propagate through every caller.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 pub mod adapter;
 pub(crate) mod command_list;
 pub mod depth_target;
@@ -23,11 +26,14 @@ pub use swapchain::{BeginFrame, DeviceContext, Swapchain};
 use ash::vk;
 
 #[cfg(test)]
-pub(crate) fn test_gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+use std::sync::{Mutex, MutexGuard};
+
+#[cfg(test)]
+pub(crate) fn test_gpu_lock() -> MutexGuard<'static, ()> {
     // Most unit tests need their own logical device. Keep those heavyweight
     // fixtures sequential inside one test process; explicit same-device tests
     // still exercise queue and command-recording concurrency directly.
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LOCK: Mutex<()> = Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 

@@ -45,6 +45,7 @@ pub enum ParamKind {
     /// and enforces writability in `ir::build`.
     Buffer {
         elem: TypeId,
+        #[allow(dead_code)] // Read by the feature-gated consumers described above.
         mutability: Mutability,
     },
     /// A push-constant scalar (`u32`/`f32`), interned in the owning
@@ -78,6 +79,7 @@ pub struct SharedDecl {
     /// Interned in the owning [`Module`]'s `types` arena. No backend reads
     /// this field's value today (every backend hardcodes `f32`/`float` shared
     /// memory regardless); it exists for future non-f32 shared arrays.
+    #[allow(dead_code)] // Retained for the future use described above.
     pub elem: TypeId,
     pub len: u32,
 }

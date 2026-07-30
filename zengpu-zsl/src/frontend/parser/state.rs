@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::ir::Mutability;
 use crate::ir::node::IrStmt;
+use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 use crate::ir::types::TypeId;
 
 /// One scalar `fn` parameter: `name: ty` (in, by value) or `out name: ty`
@@ -36,8 +37,8 @@ pub(super) struct Ctx {
 }
 
 impl Ctx {
-    pub(super) fn type_ctx(&self) -> crate::ir::typeck::ComputeTypeCtx {
-        crate::ir::typeck::ComputeTypeCtx {
+    pub(super) fn type_ctx(&self) -> ComputeTypeCtx {
+        ComputeTypeCtx {
             locals: self.locals.clone(),
             scalars: self.scalars.clone(),
             buffers: self
@@ -57,6 +58,8 @@ pub(super) struct BufferSymbol {
 
 /// A workgroup-shared array as accumulated during parsing.
 pub(super) struct PendingShared {
+    // Mirrors `SharedDecl::name`; retained for future shared-array consumers.
+    #[allow(dead_code)]
     pub(super) name: String,
     pub(super) elem: TypeId,
     pub(super) len: u32,
@@ -100,8 +103,8 @@ pub(super) struct GfxCtx {
 }
 
 impl GfxCtx {
-    pub(super) fn type_ctx(&self) -> crate::ir::typeck::GraphicsTypeCtx {
-        crate::ir::typeck::GraphicsTypeCtx {
+    pub(super) fn type_ctx(&self) -> GraphicsTypeCtx {
+        GraphicsTypeCtx {
             inputs: self.inputs.clone(),
             scalars: self.scalars.clone(),
             locals: self.locals.clone(),

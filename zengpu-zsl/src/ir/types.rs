@@ -18,7 +18,9 @@ pub struct StructId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConstId(pub(crate) u32);
 
+// Full aspirational type model added ahead of its consumers; several variants aren't constructible yet.
 /// Integer bit width.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IntWidth {
     W8,
@@ -34,6 +36,7 @@ pub enum Signedness {
 }
 
 /// Floating-point storage/arithmetic format.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FloatFormat {
     F16,
@@ -46,6 +49,7 @@ pub enum FloatFormat {
 
 /// ZSL memory/address space (`zen/plan.md`: "Memory space should be explicit
 /// where it affects behavior").
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AddressSpace {
     Private,
@@ -55,6 +59,7 @@ pub enum AddressSpace {
     Push,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Access {
     Read,
@@ -62,6 +67,7 @@ pub enum Access {
     ReadWrite,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MatrixMajor {
     Column,
@@ -70,6 +76,7 @@ pub enum MatrixMajor {
 
 /// Array length: a fixed constant, a specialization-constant-dependent size,
 /// or unbounded (the trailing member of a storage buffer).
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArrayLen {
     Const(u32),
@@ -77,6 +84,7 @@ pub enum ArrayLen {
     Runtime,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureDim {
     D1,
@@ -85,6 +93,7 @@ pub enum TextureDim {
     Cube,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextureClass {
     Sampled,
@@ -92,6 +101,7 @@ pub enum TextureClass {
     Depth,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SamplerKind {
     Filtering,
@@ -104,6 +114,7 @@ pub enum SamplerKind {
 /// hashable, structurally-comparable value — see
 /// [`crate::ir::arena::TypeArena`] for how instances of this enum are
 /// created and deduplicated.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Type {
     Void,

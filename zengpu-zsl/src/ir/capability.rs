@@ -21,6 +21,7 @@
 
 /// A semantic operation or storage-format requirement. Describes what a ZSL
 /// program needs, independent of which backend or Cargo feature is active.
+#[allow(dead_code)] // Deliberately inert infrastructure described in the module documentation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Capability {
     Int8,
@@ -45,6 +46,7 @@ pub enum Capability {
 }
 
 /// How well a given backend can satisfy a [`Capability`].
+#[allow(dead_code)] // Deliberately inert infrastructure described in the module documentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupportLevel {
     /// The backend has a native instruction/type for this capability.

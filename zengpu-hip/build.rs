@@ -1,3 +1,6 @@
+// A build script failing is meant to abort the build loudly.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 /// Build script for zengpu-hip.
 ///
 /// 1. Locates the ROCm installation (ROCM_PATH env → /opt/rocm scan).
@@ -31,9 +34,12 @@ fn main() {
         }
     }
 
-    let has_hip = lib_dirs
-        .iter()
-        .any(|dir| has_library(dir, &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"]));
+    let has_hip = lib_dirs.iter().any(|dir| {
+        has_library(
+            dir,
+            &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"],
+        )
+    });
     if !has_hip {
         Build::new().file("src/hip_stub.c").compile("amdhip64");
     }

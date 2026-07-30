@@ -2,6 +2,9 @@
 //!
 //! Run: `cargo run --example cube`
 
+// This standalone example is meant to abort loudly when required window or GPU setup fails.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use core::array::from_fn;
 use std::mem::{size_of, size_of_val};
 use std::slice::from_raw_parts;

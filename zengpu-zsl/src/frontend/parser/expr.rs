@@ -199,11 +199,7 @@ impl<'a> Parser<'a> {
                         });
                     }
                     if ctx.shared.contains_key(&name) {
-                        let idx_ty = crate::ir::typeck::type_of_compute_expr(
-                            &index,
-                            &ctx.type_ctx(),
-                            &mut self.types,
-                        );
+                        let idx_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
                         if idx_ty != self.types.u32_id() {
                             return self.err("shared array index must be u32");
                         }
@@ -268,8 +264,7 @@ impl<'a> Parser<'a> {
                 | BuiltinFn::SubgroupShuffleXor
                 | BuiltinFn::SubgroupShuffleUp
                 | BuiltinFn::SubgroupShuffleDown
-        ) && args.len()
-            != 2
+        ) && args.len() != 2
         {
             return self.err(format!("{}() takes 2 args", func.name()));
         }
@@ -285,8 +280,7 @@ impl<'a> Parser<'a> {
                 | BuiltinFn::WorkgroupReduceAdd
                 | BuiltinFn::WorkgroupReduceMin
                 | BuiltinFn::WorkgroupReduceMax
-        ) && args.len()
-            != 1
+        ) && args.len() != 1
         {
             return self.err(format!("{}(value) takes 1 arg", func.name()));
         }

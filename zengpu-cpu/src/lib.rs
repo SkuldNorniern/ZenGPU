@@ -21,6 +21,8 @@
 //! registry.
 
 #![forbid(unsafe_code)]
+// This is a backend HAL implementation; a failed driver/backend call here is unrecoverable and is meant to panic loudly.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::any::Any;
 use std::collections::HashMap;

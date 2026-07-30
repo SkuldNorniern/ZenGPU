@@ -8,6 +8,9 @@
 //! devices and assert byte-identical results — the CPU oracle is always one
 //! of the two.
 
+// This crate's whole purpose is asserting conformance; panicking on an unexpected failure is correct.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::mem;
 use std::slice;
 

@@ -1,3 +1,5 @@
+use std::process::exit;
+
 use zengpu::{DeviceType, detect_backends};
 
 fn main() {
@@ -5,7 +7,7 @@ fn main() {
 
     if backends.is_empty() {
         eprintln!("No GPU backends available.");
-        std::process::exit(1);
+        exit(1);
     }
 
     for b in &backends {

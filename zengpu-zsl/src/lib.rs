@@ -17,6 +17,11 @@ mod ir;
 
 use proc_macro::TokenStream;
 
+use crate::ir::arena::TypeArena;
+use crate::ir::layout::LayoutKind;
+use crate::ir::reflection::{ModuleReflection, reflect_compute, reflect_graphics};
+use crate::ir::types::TypeId;
+
 /// Derive `to_scalars()` for a push-constant struct.
 ///
 /// Every field must be `u32`, `i32`, or `f32`. The generated method returns a
@@ -35,6 +40,8 @@ pub fn derive_zsl_push_const(input: TokenStream) -> TokenStream {
 /// Hand-rolled `#[derive(ZslPushConst)]` over the builtin `proc_macro` token
 /// trees — no `syn`/`quote`. Generates `to_scalars()` returning a fixed array of
 /// `Scalar` in field order; `ZslMat4` expands to 16 column-major `Scalar::F32`.
+// The macro's own token shape guarantees the token consumed by this internal parser.
+#[allow(clippy::unwrap_used)]
 fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
     use proc_macro::{Delimiter, TokenTree};
 
@@ -159,11 +166,11 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     use frontend::parser::{Shader, parse_zsl};
     let shader = parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))?;
 
-    let reflection: crate::ir::reflection::ModuleReflection = match &shader {
-        Shader::Compute(m) => crate::ir::reflection::reflect_compute(m),
-        Shader::Graphics(m) => crate::ir::reflection::reflect_graphics(m),
+    let reflection: ModuleReflection = match &shader {
+        Shader::Compute(m) => reflect_compute(m),
+        Shader::Graphics(m) => reflect_graphics(m),
     };
-    let types: &crate::ir::arena::TypeArena = match &shader {
+    let types: &TypeArena = match &shader {
         Shader::Compute(m) => &m.types,
         Shader::Graphics(m) => &m.types,
     };
@@ -251,10 +258,7 @@ fn words_to_slice_str(words: &[u32]) -> String {
 /// The `zengpu_spirv::ScalarKind` variant name for `ty`, resolved against
 /// `types`. Used only to print a literal `zengpu_spirv::ScalarKind::…` token
 /// into generated source — see `reflection_to_slice_str`.
-fn scalar_kind_name(
-    ty: crate::ir::types::TypeId,
-    types: &crate::ir::arena::TypeArena,
-) -> &'static str {
+fn scalar_kind_name(ty: TypeId, types: &TypeArena) -> &'static str {
     use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
     match types.get(ty) {
         Type::Float {
@@ -279,10 +283,7 @@ fn scalar_kind_name(
 
 /// Print `reflection` as a `&[zengpu_spirv::ParamLayout { ... }, ...]` Rust
 /// literal expression, resolving each param's `TypeId` against `types`.
-fn reflection_to_slice_str(
-    reflection: &crate::ir::reflection::ModuleReflection,
-    types: &crate::ir::arena::TypeArena,
-) -> String {
+fn reflection_to_slice_str(reflection: &ModuleReflection, types: &TypeArena) -> String {
     let mut s = String::from("&[");
     for (i, p) in reflection.params.iter().enumerate() {
         if i > 0 {
@@ -296,14 +297,14 @@ fn reflection_to_slice_str(
         s.push_str(&p.layout.size.to_string());
         s.push_str(", kind: ");
         match (&p.layout.kind, p.binding) {
-            (crate::ir::layout::LayoutKind::BufferIndex { elem }, Some(binding)) => {
+            (LayoutKind::BufferIndex { elem }, Some(binding)) => {
                 s.push_str(&format!(
                     "::zengpu_spirv::ParamKind::BufferIndex {{ elem: ::zengpu_spirv::ScalarKind::{}, binding: {} }}",
                     scalar_kind_name(*elem, types),
                     binding.binding,
                 ));
             }
-            (crate::ir::layout::LayoutKind::Scalar { ty }, None) => {
+            (LayoutKind::Scalar { ty }, None) => {
                 s.push_str(&format!(
                     "::zengpu_spirv::ParamKind::Scalar {{ kind: ::zengpu_spirv::ScalarKind::{} }}",
                     scalar_kind_name(*ty, types),
@@ -335,6 +336,8 @@ fn push_str_lit(s: &mut String, v: &str) {
 }
 
 /// Build a `compile_error!` invocation token stream without `quote`.
+// This parses a token stream generated entirely by this internal function.
+#[allow(clippy::expect_used)]
 fn compile_error_tokens(msg: &str) -> TokenStream {
     let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
     format!("::core::compile_error!{{\"{escaped}\"}}")
@@ -342,10 +345,14 @@ fn compile_error_tokens(msg: &str) -> TokenStream {
         .expect("compile_error invocation must parse")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-all-backends"))]
 mod phase_z_tests {
-    #![cfg(feature = "test-all-backends")]
-    use std::process::Command;
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::env::{temp_dir, var};
+    use std::fs::{remove_file, write};
+    use std::path::Path;
+    use std::process::{Command, id};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::backend::{cuda, hip, msl, spirv};
@@ -448,9 +455,15 @@ mod phase_z_tests {
     #[test]
     fn finite_number_builtins_lower_on_all_compute_backends() {
         let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
-        let hip_source = hip::lower_compute(&module).expect("lower finite classification to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower finite classification to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower finite classification to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower finite classification to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower finite classification to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower finite classification to MSL")
+            .source;
         for source in [&hip_source, &cuda_source, &msl_source] {
             assert!(source.contains("isfinite(x)"));
             assert!(source.contains("isnan(x)"));
@@ -462,9 +475,15 @@ mod phase_z_tests {
     #[test]
     fn integer_storage_buffers_lower_on_all_compute_backends() {
         let module = parse_compute(TYPED_BUFFERS).expect("parse typed buffers");
-        let hip_source = hip::lower_compute(&module).expect("lower typed buffers to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower typed buffers to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower typed buffers to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower typed buffers to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower typed buffers to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower typed buffers to MSL")
+            .source;
         assert!(hip_source.contains("const unsigned int* __restrict__ src_u"));
         assert!(hip_source.contains("const int* __restrict__ src_i"));
         assert!(hip_source.contains("unsigned int* __restrict__ out_u"));
@@ -483,7 +502,9 @@ mod phase_z_tests {
     #[test]
     fn bf16_buffer_lowers_to_hip_with_conversion_helpers() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
-        let hip_source = hip::lower_compute(&module).expect("lower copy_bf16 to HIP").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower copy_bf16 to HIP")
+            .source;
         assert!(hip_source.contains("const unsigned short* __restrict__ src"));
         assert!(hip_source.contains("unsigned short* __restrict__ out"));
         assert!(hip_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
@@ -494,7 +515,9 @@ mod phase_z_tests {
     #[test]
     fn bf16_buffer_lowers_to_cuda_with_conversion_helpers() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
-        let cuda_source = cuda::lower_compute(&module).expect("lower copy_bf16 to CUDA").source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower copy_bf16 to CUDA")
+            .source;
         assert!(cuda_source.contains("const unsigned short* __restrict__ src"));
         assert!(cuda_source.contains("unsigned short* __restrict__ out"));
         assert!(cuda_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
@@ -505,7 +528,9 @@ mod phase_z_tests {
     #[test]
     fn bf16_buffer_lowers_to_msl_with_conversion_helpers() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
-        let msl_source = msl::lower_compute(&module).expect("lower copy_bf16 to MSL").source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower copy_bf16 to MSL")
+            .source;
         assert!(msl_source.contains("device ushort* src"));
         assert!(msl_source.contains("device ushort* out"));
         assert!(msl_source.contains("f32_to_bf16(bf16_to_f32(src[gid.x]))"));
@@ -520,7 +545,11 @@ mod phase_z_tests {
         // `Diagnostic`, never a panic.
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let err = spirv::lower_compute(&module).expect_err("bf16 must be rejected on SPIR-V");
-        assert!(err.message.contains("does not yet support"), "got: {}", err.message);
+        assert!(
+            err.message.contains("does not yet support"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -528,8 +557,8 @@ mod phase_z_tests {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let shader = hip::lower_compute(&module).expect("lower copy_bf16 to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!("skipping HIP bf16 proof: {} not found", hipcc.display());
             return;
@@ -537,9 +566,9 @@ mod phase_z_tests {
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_bf16_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_bf16_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_bf16_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_bf16_{}_{}", id(), tag));
         // Host-side reference conversion mirrors laminax-runtime's raw HIP
         // bf16 kernels bit-for-bit (round-to-nearest-even truncation), so a
         // future parity swap to this ZSL-lowered path changes no bits.
@@ -581,7 +610,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP bf16 proof source");
+        write(&src_path, harness).expect("write HIP bf16 proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -596,8 +625,8 @@ int main() {{
             );
         }
         let run = Command::new(&exe_path).output().expect("run HIP copy_bf16");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),
@@ -610,9 +639,15 @@ int main() {{
     #[test]
     fn f16_buffer_lowers_on_all_compute_backends() {
         let module = parse_compute(COPY_F16).expect("parse copy_f16");
-        let hip_source = hip::lower_compute(&module).expect("lower copy_f16 to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower copy_f16 to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower copy_f16 to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower copy_f16 to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower copy_f16 to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower copy_f16 to MSL")
+            .source;
         assert!(hip_source.contains("#include <hip/hip_fp16.h>"));
         assert!(hip_source.contains("const __half* __restrict__ src"));
         assert!(hip_source.contains("__half* __restrict__ out"));
@@ -631,7 +666,11 @@ int main() {{
         // be a clean `Diagnostic`, never a panic.
         let module = parse_compute(COPY_F16).expect("parse copy_f16");
         let err = spirv::lower_compute(&module).expect_err("f16 must be rejected on SPIR-V");
-        assert!(err.message.contains("does not yet support"), "got: {}", err.message);
+        assert!(
+            err.message.contains("does not yet support"),
+            "got: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -639,8 +678,8 @@ int main() {{
         let module = parse_compute(COPY_F16).expect("parse copy_f16");
         let shader = hip::lower_compute(&module).expect("lower copy_f16 to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!("skipping HIP f16 proof: {} not found", hipcc.display());
             return;
@@ -648,9 +687,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_f16_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_f16_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_f16_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_f16_{}_{}", id(), tag));
         // Every source value is first rounded to an exactly-representable
         // half (`__float2half`), so the kernel's half->float->half round
         // trip must reproduce the exact same bits — a real proof the
@@ -688,7 +727,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP f16 proof source");
+        write(&src_path, harness).expect("write HIP f16 proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -703,8 +742,8 @@ int main() {{
             );
         }
         let run = Command::new(&exe_path).output().expect("run HIP copy_f16");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),
@@ -874,9 +913,15 @@ int main() {{
     #[test]
     fn subgroup_queries_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
-        let hip_source = hip::lower_compute(&module).expect("lower query to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower query to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower query to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower query to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower query to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower query to MSL")
+            .source;
         assert!(hip_source.contains("((unsigned int)warpSize)"));
         assert!(hip_source.contains("(threadIdx.x / warpSize)"));
         assert!(hip_source.contains("__lane_id()"));
@@ -895,9 +940,15 @@ int main() {{
     #[test]
     fn subgroup_any_and_all_lower_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_VOTE).expect("parse vote");
-        let hip_source = hip::lower_compute(&module).expect("lower vote to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower vote to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower vote to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower vote to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower vote to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower vote to MSL")
+            .source;
         assert!(hip_source.contains("__any("));
         assert!(hip_source.contains("__all("));
         assert!(cuda_source.contains("__any_sync("));
@@ -910,22 +961,33 @@ int main() {{
     #[test]
     fn subgroup_ballot_is_spirv_only_for_now() {
         let module = parse_compute(SUBGROUP_BALLOT).expect("parse ballot");
-        assert!(hip::lower_compute(&module).is_err(), "HIP ballot must reject");
+        assert!(
+            hip::lower_compute(&module).is_err(),
+            "HIP ballot must reject"
+        );
         assert!(
             cuda::lower_compute(&module).is_err(),
             "CUDA ballot must reject"
         );
-        assert!(msl::lower_compute(&module).is_err(), "MSL ballot must reject");
+        assert!(
+            msl::lower_compute(&module).is_err(),
+            "MSL ballot must reject"
+        );
         spirv::lower_compute(&module).expect("lower ballot to SPIR-V");
     }
 
     #[test]
     fn subgroup_data_exchange_lowers_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_EXCHANGE).expect("parse subgroup exchange");
-        let hip_source = hip::lower_compute(&module).expect("lower subgroup exchange to HIP").source;
-        let cuda_source =
-            cuda::lower_compute(&module).expect("lower subgroup exchange to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower subgroup exchange to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower subgroup exchange to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower subgroup exchange to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower subgroup exchange to MSL")
+            .source;
         assert!(hip_source.contains("__shfl("));
         assert!(hip_source.contains("__shfl_xor("));
         assert!(hip_source.contains("__shfl_up("));
@@ -945,12 +1007,15 @@ int main() {{
     #[test]
     fn subgroup_arithmetic_lowers_on_all_compute_backends() {
         let module = parse_compute(SUBGROUP_ARITHMETIC).expect("parse subgroup arithmetic");
-        let hip_source =
-            hip::lower_compute(&module).expect("lower subgroup arithmetic to HIP").source;
-        let cuda_source =
-            cuda::lower_compute(&module).expect("lower subgroup arithmetic to CUDA").source;
-        let msl_source =
-            msl::lower_compute(&module).expect("lower subgroup arithmetic to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower subgroup arithmetic to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower subgroup arithmetic to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower subgroup arithmetic to MSL")
+            .source;
         assert!(hip_source.contains("auto o = __shfl_xor(v, off)"));
         assert!(hip_source.contains("auto o = __shfl_up(v, off)"));
         assert!(hip_source.contains("fminf(v, o)"));
@@ -1004,8 +1069,7 @@ int main() {{
             }
         "#;
         let module = parse_compute(source).expect("parse non-power-of-two workgroup reduce");
-        let expected =
-            "workgroup_reduce_* requires a power-of-two workgroup thread count, got 48";
+        let expected = "workgroup_reduce_* requires a power-of-two workgroup thread count, got 48";
         assert!(
             hip::lower_compute(&module)
                 .err()
@@ -1041,7 +1105,9 @@ int main() {{
         // MSL kernel parameters (or SPIR-V capability/vars) — same
         // byte-identical-unless-used discipline as bf16/f16.
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
-        let msl_source = msl::lower_compute(&module).expect("lower copy_bf16 to MSL").source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower copy_bf16 to MSL")
+            .source;
         assert!(!msl_source.contains("simdgroup_index_in_threadgroup"));
     }
 
@@ -1050,18 +1116,21 @@ int main() {{
         let module = parse_compute(SUBGROUP_QUERY).expect("parse query");
         let shader = hip::lower_compute(&module).expect("lower query to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
-            eprintln!("skipping HIP subgroup query proof: {} not found", hipcc.display());
+            eprintln!(
+                "skipping HIP subgroup query proof: {} not found",
+                hipcc.display()
+            );
             return;
         }
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_subgroup_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_subgroup_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_{}_{}", id(), tag));
         // Real-hardware proof, not just "compiles": every thread's
         // (subgroup_size, subgroup_id, subgroup_local_id) must reconstruct
         // its own linear thread index within the workgroup, and
@@ -1101,7 +1170,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP subgroup query proof source");
+        write(&src_path, harness).expect("write HIP subgroup query proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1116,8 +1185,8 @@ int main() {{
             );
         }
         let run = Command::new(&exe_path).output().expect("run HIP query");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),
@@ -1132,18 +1201,21 @@ int main() {{
         let module = parse_compute(SUBGROUP_VOTE).expect("parse vote");
         let shader = hip::lower_compute(&module).expect("lower vote to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
-            eprintln!("skipping HIP subgroup vote proof: {} not found", hipcc.display());
+            eprintln!(
+                "skipping HIP subgroup vote proof: {} not found",
+                hipcc.display()
+            );
             return;
         }
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_subgroup_vote_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_subgroup_vote_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_vote_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_vote_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1174,7 +1246,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP subgroup vote proof source");
+        write(&src_path, harness).expect("write HIP subgroup vote proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1189,8 +1261,8 @@ int main() {{
             );
         }
         let run = Command::new(&exe_path).output().expect("run HIP vote");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             !stdout.contains("SKIP_NO_HIP_GPU"),
@@ -1209,8 +1281,8 @@ int main() {{
         let module = parse_compute(SUBGROUP_SHUFFLE_XOR).expect("parse subgroup shuffle xor");
         let shader = hip::lower_compute(&module).expect("lower subgroup shuffle xor to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!(
                 "skipping HIP subgroup shuffle-xor proof: {} not found",
@@ -1221,17 +1293,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!(
-            "zsl_subgroup_shuffle_xor_{}_{}.hip",
-            std::process::id(),
-            tag
-        ));
-        let exe_path = dir.join(format!(
-            "zsl_subgroup_shuffle_xor_{}_{}",
-            std::process::id(),
-            tag
-        ));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_shuffle_xor_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_shuffle_xor_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1262,7 +1326,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP subgroup shuffle-xor proof source");
+        write(&src_path, harness).expect("write HIP subgroup shuffle-xor proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1279,8 +1343,8 @@ int main() {{
         let run = Command::new(&exe_path)
             .output()
             .expect("run HIP subgroup shuffle xor");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             !stdout.contains("SKIP_NO_HIP_GPU"),
@@ -1298,11 +1362,10 @@ int main() {{
     fn subgroup_arithmetic_hip_exact_invariants_when_gpu_present() {
         let module =
             parse_compute(SUBGROUP_ARITHMETIC_PROOF).expect("parse subgroup arithmetic proof");
-        let shader =
-            hip::lower_compute(&module).expect("lower subgroup arithmetic proof to HIP");
+        let shader = hip::lower_compute(&module).expect("lower subgroup arithmetic proof to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!(
                 "skipping HIP subgroup arithmetic proof: {} not found",
@@ -1313,17 +1376,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!(
-            "zsl_subgroup_arithmetic_{}_{}.hip",
-            std::process::id(),
-            tag
-        ));
-        let exe_path = dir.join(format!(
-            "zsl_subgroup_arithmetic_{}_{}",
-            std::process::id(),
-            tag
-        ));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_subgroup_arithmetic_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_subgroup_arithmetic_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1374,7 +1429,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP subgroup arithmetic proof source");
+        write(&src_path, harness).expect("write HIP subgroup arithmetic proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1394,8 +1449,8 @@ int main() {{
             .expect("run HIP subgroup arithmetic");
         let stdout = String::from_utf8_lossy(&run.stdout);
         if run.status.success() {
-            let _ = std::fs::remove_file(&src_path);
-            let _ = std::fs::remove_file(&exe_path);
+            let _ = remove_file(&src_path);
+            let _ = remove_file(&exe_path);
         }
         assert!(
             !stdout.contains("SKIP_NO_HIP_GPU"),
@@ -1415,8 +1470,8 @@ int main() {{
         let module = parse_compute(WORKGROUP_REDUCE_PROOF).expect("parse workgroup reduce proof");
         let shader = hip::lower_compute(&module).expect("lower workgroup reduce proof to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!(
                 "skipping HIP workgroup reduce proof: {} not found",
@@ -1427,17 +1482,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!(
-            "zsl_workgroup_reduce_{}_{}.hip",
-            std::process::id(),
-            tag
-        ));
-        let exe_path = dir.join(format!(
-            "zsl_workgroup_reduce_{}_{}",
-            std::process::id(),
-            tag
-        ));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_workgroup_reduce_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_workgroup_reduce_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1475,7 +1522,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP workgroup reduce proof source");
+        write(&src_path, harness).expect("write HIP workgroup reduce proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1495,8 +1542,8 @@ int main() {{
             .expect("run HIP workgroup reduce");
         let stdout = String::from_utf8_lossy(&run.stdout);
         if run.status.success() {
-            let _ = std::fs::remove_file(&src_path);
-            let _ = std::fs::remove_file(&exe_path);
+            let _ = remove_file(&src_path);
+            let _ = remove_file(&exe_path);
         }
         assert!(
             !stdout.contains("SKIP_NO_HIP_GPU"),
@@ -1514,9 +1561,15 @@ int main() {{
     #[test]
     fn mul_add_f32_lowers_on_all_compute_backends() {
         let module = parse_compute(MUL_ADD_F32).expect("parse fma3");
-        let hip_source = hip::lower_compute(&module).expect("lower fma3 to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower fma3 to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower fma3 to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower fma3 to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower fma3 to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower fma3 to MSL")
+            .source;
         assert!(hip_source.contains("fmaf(a[gx], b[gx], c[gx])"));
         assert!(cuda_source.contains("fmaf(a[gx], b[gx], c[gx])"));
         assert!(msl_source.contains("fma(a[gid.x], b[gid.x], c[gid.x])"));
@@ -1528,18 +1581,21 @@ int main() {{
         let module = parse_compute(MUL_ADD_F32).expect("parse fma3");
         let shader = hip::lower_compute(&module).expect("lower fma3 to HIP");
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
-            eprintln!("skipping HIP mul_add_f32 proof: {} not found", hipcc.display());
+            eprintln!(
+                "skipping HIP mul_add_f32 proof: {} not found",
+                hipcc.display()
+            );
             return;
         }
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_fma_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_fma_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_fma_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_fma_{}_{}", id(), tag));
         // Reference uses Rust's `f32::mul_add` (a correctly-rounded, single-
         // rounding-step IEEE 754 fused multiply-add) — proves the backend
         // emitted real hardware FMA, not a naive two-instruction `a*b+c`
@@ -1582,7 +1638,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP fma proof source");
+        write(&src_path, harness).expect("write HIP fma proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1597,8 +1653,8 @@ int main() {{
             );
         }
         let run = Command::new(&exe_path).output().expect("run HIP fma3");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),
@@ -1611,9 +1667,15 @@ int main() {{
     #[test]
     fn trigonometry_lowers_on_all_compute_backends() {
         let module = parse_compute(TRIG).expect("parse trigonometry");
-        let hip_source = hip::lower_compute(&module).expect("lower trigonometry to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower trigonometry to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower trigonometry to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower trigonometry to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower trigonometry to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower trigonometry to MSL")
+            .source;
         assert!(hip_source.contains("sinf(x)"));
         assert!(hip_source.contains("cosf(x)"));
         assert!(hip_source.contains("tanf(x)"));
@@ -1685,16 +1747,27 @@ int main() {{
                 .source
                 .contains("(unsigned int)")
         );
-        assert!(msl::lower_compute(&module).expect("lower u32 cast to MSL").source.contains("uint("));
+        assert!(
+            msl::lower_compute(&module)
+                .expect("lower u32 cast to MSL")
+                .source
+                .contains("uint(")
+        );
         spirv::lower_compute(&module).expect("lower u32 cast to SPIR-V");
     }
 
     #[test]
     fn scatter_add_lowers_on_all_backends_and_has_spirv_atomic_extension() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
-        let hip_source = hip::lower_compute(&module).expect("lower scatter_add to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower scatter_add to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower scatter_add to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower scatter_add to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower scatter_add to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower scatter_add to MSL")
+            .source;
         assert!(hip_source.contains("atomicAdd(&out["));
         assert!(cuda_source.contains("atomicAdd(&out["));
         assert!(msl_source.contains("device atomic_float* out"));
@@ -1747,8 +1820,8 @@ int main() {{
         let shader = hip::lower_compute(&module).expect("lower scatter_add to HIP");
         assert!(shader.source.contains("atomicAdd(&out["));
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!("skipping HIP scatter proof: {} not found", hipcc.display());
             return;
@@ -1756,13 +1829,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!(
-            "zsl_scatter_add_{}_{}.hip",
-            std::process::id(),
-            tag
-        ));
-        let exe_path = dir.join(format!("zsl_scatter_add_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_scatter_add_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_scatter_add_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1799,7 +1868,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP scatter proof source");
+        write(&src_path, harness).expect("write HIP scatter proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1816,8 +1885,8 @@ int main() {{
         let run = Command::new(&exe_path)
             .output()
             .expect("run HIP scatter_add");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),
@@ -1831,8 +1900,12 @@ int main() {{
     fn tiled_gemm_spirv_has_workgroup_memory_and_barrier() {
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
         assert_eq!(module.entry.shared.len(), 2);
-        let cuda_source = cuda::lower_compute(&module).expect("lower tiled GEMM to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower tiled GEMM to MSL").source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower tiled GEMM to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower tiled GEMM to MSL")
+            .source;
         assert!(cuda_source.contains("__shared__ float as_tile[256]"));
         assert!(cuda_source.contains("threadIdx.x") && cuda_source.contains("blockIdx.y"));
         assert!(cuda_source.contains("__syncthreads()"));
@@ -1878,8 +1951,8 @@ int main() {{
         assert!(shader.source.contains("__shared__ float as_tile[256]"));
         assert!(shader.source.contains("__syncthreads()"));
 
-        let rocm = std::env::var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = std::path::Path::new(&rocm).join("bin/hipcc");
+        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
+        let hipcc = Path::new(&rocm).join("bin/hipcc");
         if !hipcc.exists() {
             eprintln!(
                 "skipping HIP compile/runtime proof: {} not found",
@@ -1890,9 +1963,9 @@ int main() {{
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir();
-        let src_path = dir.join(format!("zsl_tiled_gemm_{}_{}.hip", std::process::id(), tag));
-        let exe_path = dir.join(format!("zsl_tiled_gemm_{}_{}", std::process::id(), tag));
+        let dir = temp_dir();
+        let src_path = dir.join(format!("zsl_tiled_gemm_{}_{}.hip", id(), tag));
+        let exe_path = dir.join(format!("zsl_tiled_gemm_{}_{}", id(), tag));
         let harness = format!(
             r#"
 #include <hip/hip_runtime.h>
@@ -1930,7 +2003,7 @@ int main() {{
 "#,
             shader.source
         );
-        std::fs::write(&src_path, harness).expect("write HIP proof source");
+        write(&src_path, harness).expect("write HIP proof source");
         let compile = Command::new(&hipcc)
             .arg("-O2")
             .arg(&src_path)
@@ -1947,8 +2020,8 @@ int main() {{
         let run = Command::new(&exe_path)
             .output()
             .expect("run HIP tiled GEMM");
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&exe_path);
+        let _ = remove_file(&src_path);
+        let _ = remove_file(&exe_path);
         let stdout = String::from_utf8_lossy(&run.stdout);
         assert!(
             run.status.success(),

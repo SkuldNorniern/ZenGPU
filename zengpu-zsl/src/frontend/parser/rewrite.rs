@@ -103,10 +103,7 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
 /// into children. Applied once, at the tail of `parse_kernel_rest`/
 /// `parse_graphics_rest`, using the same `TypeArena` already interning that
 /// module's locals/shared/params/inputs/scalar_params/varyings.
-pub(super) fn resolve_construct_types_expr(
-    expr: &IrExpr,
-    types: &mut crate::ir::arena::TypeArena,
-) -> IrExpr {
+pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena) -> IrExpr {
     match expr {
         IrExpr::LitU32(v) => IrExpr::LitU32(*v),
         IrExpr::LitF32(v) => IrExpr::LitF32(*v),
@@ -154,10 +151,7 @@ pub(super) fn resolve_construct_types_expr(
 
 /// Statement-level companion to [`resolve_construct_types_expr`], mirroring
 /// [`rename_stmt`]'s shape.
-pub(super) fn resolve_construct_types_stmt(
-    stmt: &IrStmt,
-    types: &mut crate::ir::arena::TypeArena,
-) -> IrStmt {
+pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena) -> IrStmt {
     match stmt {
         IrStmt::Let { name, init } => IrStmt::Let {
             name: name.clone(),

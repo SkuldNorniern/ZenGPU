@@ -1,3 +1,10 @@
+// This standalone example is meant to abort loudly when required GPU setup fails.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::env::var;
+use std::error::Error;
+use std::mem::size_of_val;
+use std::slice::from_raw_parts;
 use std::time::Instant;
 
 use zengpu::{
@@ -33,7 +40,7 @@ const SGEMM: ZslShader = zsl!(
 );
 
 fn as_bytes_f32(s: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const u8, std::mem::size_of_val(s)) }
+    unsafe { from_raw_parts(s.as_ptr() as *const u8, size_of_val(s)) }
 }
 
 fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
@@ -43,14 +50,14 @@ fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
-    std::env::var(name)
+    var(name)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&v| v != 0)
         .unwrap_or(default)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn Error>> {
     let dim = env_u32("ZENGPU_HEAVY_DIM", 1024);
     let reps = env_u32("ZENGPU_HEAVY_REPS", 4);
 
@@ -65,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Select backend from ZENGPU_BACKEND env var, default to Auto.
-    let backend_pref = match std::env::var("ZENGPU_BACKEND")
+    let backend_pref = match var("ZENGPU_BACKEND")
         .unwrap_or_default()
         .to_ascii_lowercase()
         .as_str()

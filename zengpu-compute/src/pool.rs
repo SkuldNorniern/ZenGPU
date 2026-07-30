@@ -4,6 +4,9 @@
 //! elementwise/BLAS ops without round-tripping through the device allocator on
 //! every call.
 
+// A poisoned pool mutex is an internal invariant failure and is meant to panic loudly.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

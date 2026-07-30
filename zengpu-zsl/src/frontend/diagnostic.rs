@@ -6,6 +6,9 @@
 //! parsing message text. Today's backends still return bare `String`; later
 //! commits convert them to return `Diagnostic` directly.
 
+use std::error::Error;
+use std::fmt::{Display, Formatter, Result as FmtResult};
+
 /// A coarse classification of why a backend lowering failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticCode {
@@ -59,13 +62,13 @@ impl Diagnostic {
     }
 }
 
-impl std::fmt::Display for Diagnostic {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for Diagnostic {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.message)
     }
 }
 
-impl std::error::Error for Diagnostic {}
+impl Error for Diagnostic {}
 
 /// Existing call sites return bare `String` errors; this lets `?` keep working
 /// at call sites that haven't migrated to `Diagnostic` yet.

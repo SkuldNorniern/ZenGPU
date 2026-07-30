@@ -49,7 +49,7 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     })
 }
 
-pub(super) fn buffer_elem_name(elem: TypeId, arena: &crate::ir::arena::TypeArena) -> &'static str {
+pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str {
     use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
     match arena.get(elem) {
         Type::Float {

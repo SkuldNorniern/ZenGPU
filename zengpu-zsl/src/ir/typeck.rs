@@ -1,11 +1,11 @@
 //! Type checking over already-parsed compute/graphics IR, producing
-//! [`crate::ir::types::TypeId`] values.
+//! [`TypeId`] values.
 //!
 //! The compute parser uses [`type_of_compute_expr`] to type expressions and
 //! store compute locals, parameters, and buffer elements natively as
-//! [`crate::ir::types::TypeId`]. The graphics parser similarly uses
+//! [`TypeId`]. The graphics parser similarly uses
 //! [`type_of_graphics_expr`] to type expressions and store graphics inputs,
-//! scalar parameters, and locals natively as [`crate::ir::types::TypeId`].
+//! scalar parameters, and locals natively as [`TypeId`].
 
 use std::collections::HashMap;
 
@@ -192,7 +192,7 @@ pub fn type_of_graphics_expr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::types::Type;
+    use crate::ir::types::{IntWidth, Signedness, Type};
 
     #[test]
     fn compute_literal_and_local_types() {
@@ -204,8 +204,8 @@ mod tests {
         assert_eq!(
             *arena.get(lit),
             Type::Int {
-                width: crate::ir::types::IntWidth::W32,
-                signedness: crate::ir::types::Signedness::Unsigned
+                width: IntWidth::W32,
+                signedness: Signedness::Unsigned
             }
         );
 

@@ -7,8 +7,12 @@
 //! treated conservatively as divergent. More complete dataflow and alias
 //! analysis is future work.
 
+// This pass is only reachable through the not-yet-consumed validation seam described in `ir/validate.rs`.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 
+use crate::ir::Entry;
 use crate::ir::node::{BuiltinFn, IrExpr, IrStmt};
 
 fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
@@ -82,7 +86,7 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
 
 /// Check that every subgroup collective in a compute entry occurs in
 /// subgroup-uniform control flow.
-pub fn check_compute_uniformity(entry: &crate::ir::Entry) -> Result<(), String> {
+pub fn check_compute_uniformity(entry: &Entry) -> Result<(), String> {
     let mut locals = HashMap::new();
     check_stmts(&entry.body, &mut locals, false)
 }
@@ -154,6 +158,8 @@ fn check_stmt(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     use super::*;
     use crate::frontend::parser::parse_compute;
 
