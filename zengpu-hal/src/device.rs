@@ -170,6 +170,14 @@ pub trait GpuDevice: Send + Sync {
         false
     }
 
+    /// Whether the device is lost: reset, removed, or hung. A lost device never recovers. Every
+    /// handle is dead, and calls fail with `GpuError::DeviceLost`. To recover, drop it, open a
+    /// fresh device, and re-create resources from host copies. The check is cheap enough to poll
+    /// once a frame. The default is `false`.
+    fn is_lost(&self) -> bool {
+        false
+    }
+
     /// The default returns `UnsupportedFeatures`, since there is no compute.
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         let _ = desc;
