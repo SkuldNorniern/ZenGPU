@@ -109,7 +109,7 @@ impl ElementwiseKernels {
 
         let out = pool.alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        device.dispatch(
+        let dispatched = device.dispatch(
             self.add_pipeline,
             Bindings {
                 buffers: &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
@@ -117,8 +117,8 @@ impl ElementwiseKernels {
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],
-        )?;
-        Ok(out)
+        );
+        finish(pool, out, dispatched)
     }
 
     /// `out[i] = max(a[i], 0)`. `a` must be `DType::F32`. Allocates `out`
@@ -133,7 +133,7 @@ impl ElementwiseKernels {
 
         let out = pool.alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        device.dispatch(
+        let dispatched = device.dispatch(
             self.relu_pipeline,
             Bindings {
                 buffers: &[a.buffer.index(), out.buffer.index()],
@@ -141,7 +141,19 @@ impl ElementwiseKernels {
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],
-        )?;
-        Ok(out)
+        );
+        finish(pool, out, dispatched)
+    }
+}
+
+/// `out` once its dispatch went through; given back to `pool` if it did not,
+/// so a failing op does not keep a buffer per call.
+fn finish(pool: &BufferPool, out: DeviceArray, dispatched: Result<()>) -> Result<DeviceArray> {
+    match dispatched {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            pool.free(out);
+            Err(e)
+        }
     }
 }
