@@ -540,6 +540,13 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             lower_expr(ctx, expr)?;
             Ok(())
         }
+        IrStmt::Discard => {
+            ctx.spv.op_kill();
+            // `OpKill` ends its block; whatever follows lands in a fresh,
+            // unreachable one.
+            ctx.spv.label();
+            Ok(())
+        }
         IrStmt::For { .. } => Err("for-loops are not supported in vertex/fragment shaders".into()),
         IrStmt::AssignShared { .. } | IrStmt::Barrier => {
             Err("workgroup operations are only available in compute shaders".into())
@@ -1278,6 +1285,43 @@ mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn rounded_box_discards_outside_its_edge() {
+        validate(&lower(
+            r#"
+            fragment fs(
+                @location(0) local: f32x2,
+                @location(1) color: f32x4,
+                @location(2) half: f32x2,
+                @location(3) shape: f32x2,
+            ) -> f32x4 {
+                let r = clamp(shape.x, 0.0, min(half.x, half.y))
+                let q = abs(local) - half + r
+                let d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r
+                if shape.y > 0.0 {
+                    d = abs(d) - shape.y * 0.5
+                }
+                let alpha = clamp(0.5 - d, 0.0, 1.0)
+                if alpha <= 0.0 {
+                    discard
+                }
+                f32x4(color.rgb, color.a * alpha)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn discard_is_fragment_only() {
+        assert!(
+            parse_zsl(
+                "vertex vs(@location(0) p: f32x4) -> f32x4 { discard
+ p }"
+            )
+            .is_err()
+        );
     }
 
     #[test]

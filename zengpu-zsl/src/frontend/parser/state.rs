@@ -94,6 +94,7 @@ pub(super) struct PendingGfxScalar {
 
 /// Resolved symbol tables for a graphics (vertex/fragment) body.
 pub(super) struct GfxCtx {
+    pub(super) is_fragment: bool,
     pub(super) inputs: HashMap<String, TypeId>, // @location input name → type
     pub(super) scalars: HashMap<String, TypeId>, // push-field name → type
     pub(super) push_param: Option<String>,      // the push param name

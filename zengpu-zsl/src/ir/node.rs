@@ -99,6 +99,8 @@ pub enum IrStmt {
     },
     /// A bare expression evaluated for effect.
     Eval(IrExpr),
+    /// `discard`: drops the fragment, writing nothing (fragment only).
+    Discard,
 }
 
 /// Built-in math functions (map to GLSL.std.450 / Metal stdlib).
@@ -290,7 +292,7 @@ fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
         | IrStmt::AtomicAdd { index, value, .. } => {
             expr_uses_subgroup_query(index) || expr_uses_subgroup_query(value)
         }
-        IrStmt::Barrier => false,
+        IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_subgroup_query(cond)
                 || stmts_use_subgroup_query(then)
@@ -351,7 +353,7 @@ fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
         | IrStmt::AtomicAdd { index, value, .. } => {
             expr_uses_workgroup_reduce(index) || expr_uses_workgroup_reduce(value)
         }
-        IrStmt::Barrier => false,
+        IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_workgroup_reduce(cond)
                 || stmts_use_workgroup_reduce(then)
@@ -433,7 +435,7 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, boo
             expr_uses_subgroup_collectives(index),
             expr_uses_subgroup_collectives(value),
         ),
-        IrStmt::Barrier => (false, false, false, false, false),
+        IrStmt::Barrier | IrStmt::Discard => (false, false, false, false, false),
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(cond),

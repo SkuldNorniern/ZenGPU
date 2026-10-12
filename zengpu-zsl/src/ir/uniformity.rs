@@ -139,7 +139,7 @@ fn check_stmt(
             reject_if_divergent(index, divergent)?;
             reject_if_divergent(value, divergent)
         }
-        IrStmt::Barrier => Ok(()),
+        IrStmt::Barrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             reject_if_divergent(cond, divergent)?;
             let cond_uniform = expr_is_uniform(cond, locals);

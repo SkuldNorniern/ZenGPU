@@ -83,6 +83,7 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
             value: rename_expr(value, map),
         },
         IrStmt::Barrier => IrStmt::Barrier,
+        IrStmt::Discard => IrStmt::Discard,
         IrStmt::If { cond, then, else_ } => IrStmt::If {
             cond: rename_expr(cond, map),
             then: then.iter().map(|s| rename_stmt(s, map)).collect(),
@@ -185,6 +186,7 @@ pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena)
             value: resolve_construct_types_expr(value, types),
         },
         IrStmt::Barrier => IrStmt::Barrier,
+        IrStmt::Discard => IrStmt::Discard,
         IrStmt::If { cond, then, else_ } => IrStmt::If {
             cond: resolve_construct_types_expr(cond, types),
             then: then
