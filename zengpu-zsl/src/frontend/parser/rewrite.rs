@@ -38,6 +38,11 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
             base: Box::new(rename_expr(base, map)),
             lanes: lanes.clone(),
         },
+        IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
+            index: Box::new(rename_expr(index, map)),
+            uv: Box::new(rename_expr(uv, map)),
+            lod: lod.as_ref().map(|l| Box::new(rename_expr(l, map))),
+        },
         IrExpr::Construct { ty, dim, args } => IrExpr::Construct {
             ty: *ty,
             dim: *dim,
@@ -129,6 +134,13 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
         IrExpr::Swizzle { base, lanes } => IrExpr::Swizzle {
             base: Box::new(resolve_construct_types_expr(base, types)),
             lanes: lanes.clone(),
+        },
+        IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
+            index: Box::new(resolve_construct_types_expr(index, types)),
+            uv: Box::new(resolve_construct_types_expr(uv, types)),
+            lod: lod
+                .as_ref()
+                .map(|l| Box::new(resolve_construct_types_expr(l, types))),
         },
         IrExpr::Construct { dim, args, .. } => IrExpr::Construct {
             ty: Some(types.vec_id(*dim)),

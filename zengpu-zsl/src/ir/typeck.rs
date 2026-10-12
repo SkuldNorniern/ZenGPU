@@ -116,6 +116,7 @@ pub fn type_of_graphics_expr(
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
         IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(f32_id),
         IrExpr::FieldAccess { .. } => f32_id,
+        IrExpr::Sample { .. } => vec4_id,
         IrExpr::Swizzle { lanes, .. } => match lanes.len() {
             2 => vec2_id,
             3 => vec3_id,

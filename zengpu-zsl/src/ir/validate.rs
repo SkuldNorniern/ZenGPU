@@ -93,6 +93,14 @@ fn check_expr(
             Ok(())
         }
         IrExpr::Neg(inner) => check_expr(inner, ctx, types, bool_id),
+        IrExpr::Sample { index, uv, lod } => {
+            check_expr(index, ctx, types, bool_id)?;
+            check_expr(uv, ctx, types, bool_id)?;
+            match lod {
+                Some(lod) => check_expr(lod, ctx, types, bool_id),
+                None => Ok(()),
+            }
+        }
         IrExpr::Binary { op, lhs, rhs } => {
             check_expr(lhs, ctx, types, bool_id)?;
             check_expr(rhs, ctx, types, bool_id)?;

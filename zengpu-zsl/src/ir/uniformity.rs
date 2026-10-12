@@ -31,6 +31,7 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
         IrExpr::Construct { args, .. } | IrExpr::Builtin { args, .. } => {
             args.iter().all(|arg| expr_is_uniform(arg, locals))
         }
+        IrExpr::Sample { .. } => false,
     }
 }
 
@@ -67,6 +68,13 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
             expr_contains_subgroup_collective(base)
         }
         IrExpr::Construct { args, .. } => args.iter().any(expr_contains_subgroup_collective),
+        IrExpr::Sample { index, uv, lod } => {
+            expr_contains_subgroup_collective(index)
+                || expr_contains_subgroup_collective(uv)
+                || lod
+                    .as_deref()
+                    .is_some_and(expr_contains_subgroup_collective)
+        }
         IrExpr::Neg(inner) => expr_contains_subgroup_collective(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_contains_subgroup_collective(lhs) || expr_contains_subgroup_collective(rhs)

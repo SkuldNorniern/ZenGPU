@@ -151,6 +151,10 @@ impl<'a> Parser<'a> {
                     }
                     return Ok(IrExpr::ScalarParam(field));
                 }
+                if ctx.textures.as_deref() == Some(name.as_str()) {
+                    let sample = self.parse_g_sample(ctx)?;
+                    return self.parse_g_postfix(ctx, sample);
+                }
                 if ctx.buffers.contains_key(&name) {
                     self.expect(&Tok::LBracket, "`[` to index a buffer")?;
                     let index = self.parse_g_expr(ctx)?;
@@ -171,6 +175,38 @@ impl<'a> Parser<'a> {
             }
             _ => self.err("expected an expression"),
         }
+    }
+
+    fn parse_g_sample(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        self.expect(&Tok::LBracket, "`[` to pick a texture slot")?;
+        let index = self.parse_g_expr(ctx)?;
+        self.expect(&Tok::RBracket, "`]`")?;
+        self.expect(&Tok::Dot, "`.sample(uv)` on a texture")?;
+        let method = self.ident()?;
+        let explicit = match method.as_str() {
+            "sample" => false,
+            "sample_level" => true,
+            other => {
+                return self.err(format!(
+                    "unknown texture method `.{other}()`; use `.sample` or `.sample_level`"
+                ));
+            }
+        };
+        self.expect(&Tok::LParen, "`(`")?;
+        let uv = self.parse_g_expr(ctx)?;
+        let lod = if explicit {
+            self.expect(&Tok::Comma, "`,` before the level")?;
+            Some(Box::new(self.parse_g_expr(ctx)?))
+        } else {
+            None
+        };
+        self.eat(&Tok::Comma);
+        self.expect(&Tok::RParen, "`)`")?;
+        Ok(IrExpr::Sample {
+            index: Box::new(index),
+            uv: Box::new(uv),
+            lod,
+        })
     }
 
     pub(super) fn parse_g_postfix(

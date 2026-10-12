@@ -125,6 +125,8 @@ pub struct GraphicsEntry {
     pub scalar_params: Vec<GfxScalar>,
     /// Names of the `buffer<f32>` params. The parser checks writability.
     pub buf_params: Vec<String>,
+    /// Name of the bindless texture table, sampled as `name[slot].sample(uv)`.
+    pub textures: Option<String>,
     /// Vertex varying outputs. Empty for fragment shaders and for position-only vertex shaders.
     pub varyings: Vec<TypeId>,
     pub locals: Vec<(String, TypeId)>,

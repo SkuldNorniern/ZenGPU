@@ -11,6 +11,7 @@ impl<'a> Parser<'a> {
             scalars: HashMap::new(),
             push_param: None,
             buffers: HashMap::new(),
+            textures: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
         };
@@ -64,6 +65,7 @@ impl<'a> Parser<'a> {
                 inputs,
                 scalar_params,
                 buf_params,
+                textures: ctx.textures.clone(),
                 varyings,
                 locals,
                 body,
@@ -132,6 +134,11 @@ impl<'a> Parser<'a> {
                     slot: GfxSlot::Builtin(builtin),
                     ty,
                 });
+            } else if self.eat_kw("textures") {
+                if ctx.textures.is_some() {
+                    return self.err("only one `textures` parameter is supported");
+                }
+                ctx.textures = Some(name);
             } else if self.eat_kw("device") {
                 let writable = self.eat_kw("mut");
                 if !self.eat_kw("buffer") {
