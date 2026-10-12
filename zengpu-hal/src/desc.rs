@@ -11,7 +11,7 @@ pub struct BufferDesc {
     pub memory: MemoryUsage,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TexDim {
     /// A flat image. `array_layers > 1` makes a 2D array.
     #[default]
@@ -22,7 +22,7 @@ pub enum TexDim {
     Cube,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureDesc {
     pub width: u32,
     pub height: u32,
