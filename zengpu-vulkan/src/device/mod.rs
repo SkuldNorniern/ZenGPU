@@ -585,6 +585,16 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
+    /// Marks the device lost, as a driver reset would: [`is_lost`] says so,
+    /// and a surface's acquire and present fail with
+    /// [`GpuError::DeviceLost`](zengpu_hal::GpuError::DeviceLost). For
+    /// testing recovery without hanging a real GPU; there is no way back.
+    ///
+    /// [`is_lost`]: zengpu_hal::GpuDevice::is_lost
+    pub fn simulate_loss(&self) {
+        self.inner.lost.store(true, Ordering::Release);
+    }
+
     /// Whether work that has not finished uses buffer `index`.
     pub(crate) fn buffer_busy(&self, index: u32) -> bool {
         let completed = self.inner.serials.completed();
@@ -1337,7 +1347,7 @@ mod tests {
     use super::*;
     use crate::instance::VulkanInstance;
     use zengpu_hal::{
-        AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuInstance,
+        AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuAdapter, GpuInstance,
         RenderCommands,
     };
 
@@ -1461,6 +1471,33 @@ mod tests {
         };
         assert!(!dev.is_lost());
         assert!(!dev.is_lost(), "asking twice changes nothing");
+    }
+
+    #[test]
+    fn a_simulated_loss_sticks() {
+        let _guard = crate::test_gpu_lock();
+        let Some(dev) = VulkanInstance::new()
+            .ok()
+            .and_then(|i| i.request_vulkan_adapter())
+            .and_then(|a| a.open_headless(DeviceRequest::default()).ok())
+        else {
+            return;
+        };
+        assert!(!GpuDevice::is_lost(&dev));
+        dev.simulate_loss();
+        assert!(GpuDevice::is_lost(&dev));
+    }
+
+    #[test]
+    fn adapters_are_found_again_by_uuid() {
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        for adapter in inst.vulkan_adapters() {
+            let again = inst.vulkan_adapter_by_uuid(adapter.uuid()).expect("still there");
+            assert_eq!(again.info().name, adapter.info().name);
+        }
+        assert!(inst.vulkan_adapter_by_uuid([0xAB; 16]).is_none());
     }
 
     #[test]

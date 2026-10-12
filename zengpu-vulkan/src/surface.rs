@@ -3,6 +3,7 @@
 //! never touches `vk::SwapchainKHR`/framebuffers — `configure`/`resize`/
 //! `acquire`/`present` are the whole contract.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
@@ -149,6 +150,9 @@ impl Surface for VulkanSurface {
     }
 
     fn acquire(&self) -> Result<Acquire<VulkanFrame>> {
+        if self.inner.lost.load(Ordering::Acquire) {
+            return Err(GpuError::DeviceLost);
+        }
         match self.swapchain.begin_frame()? {
             BeginFrame::Skip => Ok(Acquire::Skip),
             BeginFrame::Recreated => {
@@ -172,6 +176,9 @@ impl Surface for VulkanSurface {
     }
 
     fn present(&self, frame: VulkanFrame, list: VulkanCommandList) -> Result<()> {
+        if self.inner.lost.load(Ordering::Acquire) {
+            return Err(GpuError::DeviceLost);
+        }
         let BeginFrame::Image { current, .. } = frame.state else {
             return Err(GpuError::Backend(
                 "VulkanSurface::present called with a non-Image frame".to_string(),
