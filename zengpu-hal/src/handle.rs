@@ -55,6 +55,17 @@ impl<K> Handle<K> {
     pub const fn generation(self) -> u32 {
         self.generation
     }
+
+    /// A handle from its [`index`](Self::index) and
+    /// [`generation`](Self::generation), for handles passed through code that
+    /// can't name `K`. One that names no live resource is rejected as stale.
+    pub const fn from_parts(index: u32, generation: u32) -> Self {
+        Self {
+            idx: index,
+            generation,
+            _marker: PhantomData,
+        }
+    }
 }
 
 struct Slot<V> {
@@ -359,6 +370,17 @@ mod tests {
         let foreign = other.insert(1); // index 0 in a different map
         // `real` has no slot 0 — must not panic, must return None.
         assert_eq!(real.get(foreign), None);
+    }
+
+    #[test]
+    fn rebuilt_handles_are_checked() {
+        let mut map = Map::new();
+        let h = map.insert(5);
+        let same = Handle::from_parts(h.index(), h.generation());
+        assert_eq!(map.get(same), Some(&5));
+        map.remove(h);
+        map.insert(6);
+        assert_eq!(map.get(same), None);
     }
 
     #[test]
