@@ -220,6 +220,18 @@ pub trait GpuDevice: Send + Sync {
         false
     }
 
+    /// Whether the device is lost: reset by the driver, removed, or hung.
+    ///
+    /// A lost device does not come back. Every handle it gave out is dead
+    /// and every call on it fails with [`GpuError::DeviceLost`]. Recovering
+    /// means dropping it, opening a new device from the adapter and making
+    /// the resources again from the host's copies. Cheap enough to ask once
+    /// a frame. The default, for backends that cannot lose a device, is
+    /// `false`.
+    fn is_lost(&self) -> bool {
+        false
+    }
+
     // ── Compute API ───────────────────────────────────────────────────────────
 
     /// Upload a SPIR-V shader module. Returns a handle usable for pipeline
