@@ -2,8 +2,8 @@
 //!
 //! Dependency-free: errors are plain `String`s. Mirrors the syn-based `graphics` backend.
 
-use crate::ir::GfxInput;
 use crate::ir::layout::graphics_member;
+use crate::ir::{GfxBuiltin, GfxInput, GfxSlot};
 
 mod glsl_op {
     pub const F_ABS: u32 = 4;
@@ -33,9 +33,9 @@ use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
+use crate::ir::GraphicsModule;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::TypeId;
-use crate::ir::GraphicsModule;
 
 type R<T> = Result<T, String>;
 
@@ -170,18 +170,24 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     }
 
     let t_ptr_in_f32 = spv.type_pointer(sc::INPUT, t_f32);
+    let t_ptr_in_u32 = spv.type_pointer(sc::INPUT, t_u32);
     let t_ptr_in_vec2 = spv.type_pointer(sc::INPUT, t_vec2);
     let t_ptr_in_vec3 = spv.type_pointer(sc::INPUT, t_vec3);
     let t_ptr_in_vec4 = spv.type_pointer(sc::INPUT, t_vec4);
 
     let mut sorted_inputs: Vec<&GfxInput> = e.inputs.iter().collect();
-    sorted_inputs.sort_by_key(|i| i.location);
+    sorted_inputs.sort_by_key(|i| match i.slot {
+        GfxSlot::Location(l) => l,
+        GfxSlot::Builtin(_) => u32::MAX,
+    });
     let mut input_vars: HashMap<String, InputVar> = HashMap::new();
     let mut interface: Vec<Id> = Vec::new();
     for input in &sorted_inputs {
         let input_ty = input.ty;
-        let (ptr_ty, elem_ty) = if input_ty == f32_id || input_ty == u32_id {
+        let (ptr_ty, elem_ty) = if input_ty == f32_id {
             (t_ptr_in_f32, t_f32)
+        } else if input_ty == u32_id {
+            (t_ptr_in_u32, t_u32)
         } else if input_ty == vec2_id {
             (t_ptr_in_vec2, t_vec2)
         } else if input_ty == vec3_id {
@@ -192,7 +198,22 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             return Err("Mat4 inputs are not supported".into());
         };
         let var = spv.global_variable(ptr_ty, sc::INPUT);
-        spv.decorate(var, deco::LOCATION, &[input.location]);
+        match input.slot {
+            GfxSlot::Location(location) => {
+                spv.decorate(var, deco::LOCATION, &[location]);
+                if is_fragment && input_ty == u32_id {
+                    spv.decorate(var, deco::FLAT, &[]);
+                }
+            }
+            GfxSlot::Builtin(b) => {
+                let which = match b {
+                    GfxBuiltin::VertexIndex => builtin::VERTEX_INDEX,
+                    GfxBuiltin::InstanceIndex => builtin::INSTANCE_INDEX,
+                    GfxBuiltin::FragCoord => builtin::FRAG_COORD,
+                };
+                spv.decorate(var, deco::BUILT_IN, &[which]);
+            }
+        }
         interface.push(var);
         input_vars.insert(
             input.name.clone(),
@@ -232,6 +253,9 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         let t_ptr = spv.type_pointer(sc::OUTPUT, spv_elem);
         let var = spv.global_variable(t_ptr, sc::OUTPUT);
         spv.decorate(var, deco::LOCATION, &[loc as u32]);
+        if vty == u32_id {
+            spv.decorate(var, deco::FLAT, &[]);
+        }
         interface.push(var);
         varying_out_vars.push((var, vty));
     }
@@ -1084,10 +1108,7 @@ fn coerce(ctx: &mut Ctx<'_>, v: GVal, target: TypeId) -> R<Id> {
         let t = ctx.t_u32;
         Ok(ctx.spv.op_convert_f_to_u(t, v.id))
     } else {
-        Err(format!(
-            "cannot coerce {:?} to {:?}",
-            v.ty, target
-        ))
+        Err(format!("cannot coerce {:?} to {:?}", v.ty, target))
     }
 }
 
@@ -1188,6 +1209,38 @@ mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn quad_corners_from_the_vertex_index() {
+        validate(&lower(
+            r#"
+            push P { viewport: f32x2 }
+            vertex vs(@location(0) rect: f32x4, vi: vertex_index, ii: instance_index, p: P) -> (f32x4, u32) {
+                // Two triangles: corners 0,1,2 and 1,3,2 of the unit square.
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                let px = rect.xy + corner * rect.zw
+                (f32x4(px / p.viewport * 2.0 - 1.0, 0.0, 1.0), ii)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn fragments_read_their_position_and_flat_integers() {
+        validate(&lower(
+            r#"
+            fragment fs(@location(0) layer: u32, at: frag_coord) -> f32x4 {
+                f32x4(at.xy * 0.01, f32(layer), 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn builtins_belong_to_their_stage() {
+        assert!(parse_zsl("fragment fs(vi: vertex_index) -> f32x4 { f32x4(1.0) }").is_err());
+        assert!(parse_zsl("vertex vs(at: frag_coord) -> f32x4 { at }").is_err());
     }
 
     #[test]

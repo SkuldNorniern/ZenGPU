@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::ir::Mutability;
 use crate::ir::node::IrStmt;
 use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 use crate::ir::types::TypeId;
+use crate::ir::{GfxSlot, Mutability};
 
 /// An `out` param. The call-site argument must be a plain, pre-declared local that receives
 /// the writes.
@@ -76,7 +76,7 @@ pub(super) enum PendingParamKind {
 
 pub(super) struct PendingGfxInput {
     pub(super) name: String,
-    pub(super) location: u32,
+    pub(super) slot: GfxSlot,
     pub(super) ty: TypeId,
 }
 

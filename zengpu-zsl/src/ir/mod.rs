@@ -76,8 +76,39 @@ pub struct Module {
 #[derive(Debug)]
 pub struct GfxInput {
     pub name: String,
-    pub location: u32,
+    pub slot: GfxSlot,
     pub ty: TypeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GfxSlot {
+    Location(u32),
+    Builtin(GfxBuiltin),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GfxBuiltin {
+    /// Vertex-only `u32` value.
+    VertexIndex,
+    /// Vertex-only `u32` value.
+    InstanceIndex,
+    /// Fragment-only `f32x4` value.
+    FragCoord,
+}
+
+impl GfxBuiltin {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "vertex_index" => Self::VertexIndex,
+            "instance_index" => Self::InstanceIndex,
+            "frag_coord" => Self::FragCoord,
+            _ => return None,
+        })
+    }
+
+    pub fn in_fragment(self) -> bool {
+        matches!(self, Self::FragCoord)
+    }
 }
 
 #[derive(Debug)]
