@@ -24,7 +24,7 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_g_cmp(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
-        let lhs = self.parse_g_add(ctx)?;
+        let lhs = self.parse_g_bitor(ctx)?;
         let op = match self.peek() {
             Some(Tok::Lt) => IrBinOp::Lt,
             Some(Tok::Le) => IrBinOp::Le,
@@ -35,8 +35,50 @@ impl<'a> Parser<'a> {
             _ => return Ok(lhs),
         };
         self.pos += 1;
-        let rhs = self.parse_g_add(ctx)?;
+        let rhs = self.parse_g_bitor(ctx)?;
         Ok(bin(op, lhs, rhs))
+    }
+
+    pub(super) fn parse_g_bitor(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_bitxor(ctx)?;
+        while self.eat(&Tok::Pipe) {
+            let rhs = self.parse_g_bitxor(ctx)?;
+            lhs = bin(IrBinOp::BitOr, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    pub(super) fn parse_g_bitxor(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_bitand(ctx)?;
+        while self.eat(&Tok::Caret) {
+            let rhs = self.parse_g_bitand(ctx)?;
+            lhs = bin(IrBinOp::BitXor, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    pub(super) fn parse_g_bitand(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_shift(ctx)?;
+        while self.eat(&Tok::Amp) {
+            let rhs = self.parse_g_shift(ctx)?;
+            lhs = bin(IrBinOp::BitAnd, lhs, rhs);
+        }
+        Ok(lhs)
+    }
+
+    pub(super) fn parse_g_shift(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
+        let mut lhs = self.parse_g_add(ctx)?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Shl) => IrBinOp::Shl,
+                Some(Tok::Shr) => IrBinOp::Shr,
+                _ => break,
+            };
+            self.pos += 1;
+            let rhs = self.parse_g_add(ctx)?;
+            lhs = bin(op, lhs, rhs);
+        }
+        Ok(lhs)
     }
 
     pub(super) fn parse_g_add(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
@@ -149,20 +191,72 @@ impl<'a> Parser<'a> {
                     args: vec![base, arg],
                 };
             } else {
-                let component = match field.as_str() {
-                    "x" => 0u32,
-                    "y" => 1,
-                    "z" => 2,
-                    "w" => 3,
-                    other => return self.err(format!("unknown field `.{other}`; use .x/.y/.z/.w")),
+                let Some(lanes) = swizzle_lanes(&field) else {
+                    return self.err(format!(
+                        "unknown field `.{field}`; use up to four of x/y/z/w or r/g/b/a"
+                    ));
                 };
-                base = IrExpr::FieldAccess {
-                    base: Box::new(base),
-                    component,
+                base = match lanes[..] {
+                    [component] => IrExpr::FieldAccess {
+                        base: Box::new(base),
+                        component,
+                    },
+                    _ => IrExpr::Swizzle {
+                        base: Box::new(base),
+                        lanes,
+                    },
                 };
             }
         }
         Ok(base)
+    }
+
+    /// Component-wise builtins splat a scalar argument beside a vector to that vector's width.
+    ///
+    /// Backends then see matching argument types.
+    fn spread_scalar_args(
+        &mut self,
+        ctx: &GfxCtx,
+        func: BuiltinFn,
+        args: Vec<IrExpr>,
+    ) -> Vec<IrExpr> {
+        if !matches!(
+            func,
+            BuiltinFn::Min
+                | BuiltinFn::Max
+                | BuiltinFn::Pow
+                | BuiltinFn::Clamp
+                | BuiltinFn::Mix
+                | BuiltinFn::Step
+                | BuiltinFn::Smoothstep
+        ) {
+            return args;
+        }
+        let tcx = ctx.type_ctx();
+        let vecs = [
+            (self.types.vec_id(2), 2u8),
+            (self.types.vec_id(3), 3),
+            (self.types.vec_id(4), 4),
+        ];
+        let tys: Vec<TypeId> = args
+            .iter()
+            .map(|a| type_of_graphics_expr(a, &tcx, &mut self.types))
+            .collect();
+        let width = |ty: TypeId| vecs.iter().find(|(id, _)| *id == ty).map(|&(_, n)| n);
+        let Some(dim) = tys.iter().find_map(|&ty| width(ty)) else {
+            return args;
+        };
+        args.into_iter()
+            .zip(tys)
+            .map(|(a, ty)| match width(ty) {
+                Some(_) => a,
+                None => IrExpr::Construct {
+                    ty: None,
+                    dim,
+                    args: vec![a],
+                },
+            })
+            .collect()
     }
 
     pub(super) fn parse_g_call(&mut self, ctx: &GfxCtx, name: &str) -> Result<IrExpr, ParseError> {
@@ -202,9 +296,22 @@ impl<'a> Parser<'a> {
                     msg: format!("unknown function `{name}`"),
                     at: self.span(),
                 })?;
+                let args = self.spread_scalar_args(ctx, func, args);
                 Ok(IrExpr::Builtin { func, args })
             }
         }
     }
 }
 
+/// Lanes picked by a swizzle like `.xy` or `.rgba`, or `None` otherwise.
+///
+/// Each swizzle uses one naming set (`xyzw` or `rgba`), as in WGSL and GLSL.
+fn swizzle_lanes(field: &str) -> Option<Vec<u32>> {
+    if field.is_empty() || field.len() > 4 {
+        return None;
+    }
+    let lane = |c: char, set: &str| set.find(c).map(|i| i as u32);
+    ["xyzw", "rgba"]
+        .iter()
+        .find_map(|set| field.chars().map(|c| lane(c, set)).collect())
+}

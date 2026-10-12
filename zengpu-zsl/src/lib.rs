@@ -244,6 +244,8 @@ fn scalar_kind_name(ty: TypeId, types: &TypeArena) -> &'static str {
             columns: 4,
             ..
         } => "Mat4",
+        Type::Vector { lanes: 2, .. } => "Vec2",
+        Type::Vector { lanes: 4, .. } => "Vec4",
         other => panic!("ZSL: reflection encountered an unsupported push-constant type {other:?}"),
     }
 }

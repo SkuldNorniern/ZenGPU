@@ -46,6 +46,10 @@ pub enum ScalarKind {
     I32,
     /// A graphics push-constant `mat4x4<f32>`. Never a buffer element.
     Mat4,
+    /// A graphics push-constant `f32x2` param.
+    Vec2,
+    /// A graphics push-constant `f32x4` param.
+    Vec4,
 }
 
 /// What one push-constant-block member actually holds.

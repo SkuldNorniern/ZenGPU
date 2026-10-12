@@ -293,6 +293,9 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::F32 => format!("float({})", a[0]),
+                BuiltinFn::Step => format!("step({}, {})", a[0], a[1]),
+                BuiltinFn::Smoothstep => format!("smoothstep({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::MulAddF32 => format!("fma({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
@@ -364,7 +367,10 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 emit_expr(ctx, rhs)?
             )
         }
-        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
+        IrExpr::Input(_)
+        | IrExpr::FieldAccess { .. }
+        | IrExpr::Swizzle { .. }
+        | IrExpr::Construct { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL compute backend: graphics-only IR node in a compute module",

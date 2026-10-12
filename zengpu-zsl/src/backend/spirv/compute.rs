@@ -807,7 +807,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             lower_binary(ctx, *op, lhs, rhs)
         }
 
-        IrExpr::Input(_) | IrExpr::FieldAccess { .. } | IrExpr::Construct { .. } => {
+        IrExpr::Input(_)
+        | IrExpr::FieldAccess { .. }
+        | IrExpr::Swizzle { .. }
+        | IrExpr::Construct { .. } => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
     }
@@ -918,7 +921,15 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = coerce(ctx, v, ctx.u32_id);
             Ok(Val { id, ty: ctx.u32_id })
         }
-        BuiltinFn::Dot | BuiltinFn::Extend => {
+        BuiltinFn::F32 => {
+            if args.len() != 1 {
+                return Err("ZSL: f32() takes 1 arg".into());
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let id = coerce(ctx, v, ctx.f32_id);
+            Ok(Val { id, ty: ctx.f32_id })
+        }
+        BuiltinFn::Dot | BuiltinFn::Extend | BuiltinFn::Step | BuiltinFn::Smoothstep => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
         BuiltinFn::IsNan | BuiltinFn::IsInf | BuiltinFn::IsFinite => {
