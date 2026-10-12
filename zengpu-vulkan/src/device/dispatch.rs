@@ -474,6 +474,7 @@ impl VulkanDevice {
                         }
                     }
                 }
+                hand_off(dev, cmd);
             }
             Ok(())
         });
@@ -647,6 +648,7 @@ impl VulkanDevice {
                         );
                     }
                 }
+                hand_off(dev, cmd);
             }
             Ok(())
         });
@@ -683,4 +685,32 @@ fn mixed_buffer_uses(ops: &[ComputeOp<'_>]) -> Vec<u32> {
         }
     }
     uses
+}
+
+/// Makes what a compute or copy submission wrote visible to whatever reads
+/// it next: a later dispatch, a render pass sampling it, a copy, or the host.
+/// Without it only the next compute op in the same batch was covered, and a
+/// frame drawing a compute result could read it unfinished.
+///
+/// # Safety
+/// `cmd` must be in the recording state on `dev`.
+pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
+    let barrier = vk::MemoryBarrier {
+        src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
+        dst_access_mask: vk::AccessFlags::MEMORY_READ
+            | vk::AccessFlags::MEMORY_WRITE
+            | vk::AccessFlags::HOST_READ,
+        ..Default::default()
+    };
+    unsafe {
+        dev.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
+            vk::DependencyFlags::empty(),
+            &[barrier],
+            &[],
+            &[],
+        );
+    }
 }

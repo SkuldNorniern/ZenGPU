@@ -1005,6 +1005,7 @@ impl GpuDevice for VulkanDevice {
                         );
                     }
                 }
+                dispatch::hand_off(dev, cmd);
             }
             Ok(())
         });
