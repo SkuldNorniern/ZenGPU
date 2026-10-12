@@ -84,9 +84,9 @@ pub use zengpu_hal::{
     PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc,
     RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
     StencilFaceState, StencilOp, StencilState, StepMode, Submission, SubmissionStatus, Surface,
-    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureUsage,
-    UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor,
-    WindowHandles,
+    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureRegion,
+    TextureUsage, TextureWrite, TransferCaps, UsageError, VertexAttribute, VertexFormat,
+    VertexLayout, Viewport, ViewportScissor, WindowHandles,
 };
 
 // ── Flat re-exports for the most commonly used extension types ────────────────

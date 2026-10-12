@@ -4,7 +4,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
     GpuDevice, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc,
-    ShaderHandle, Submission, TextureDesc, TextureHandle,
+    ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -83,6 +83,41 @@ impl Device {
 
     pub fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
         self.inner.upload_texture_data(texture, data)
+    }
+
+    /// Writes rectangles of textures from host memory without waiting. See
+    /// [`GpuDevice::write_textures`]; check
+    /// [`TransferCaps::texture_region_write`](crate::hal::TransferCaps) first.
+    pub fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        self.inner.write_textures(writes)
+    }
+
+    /// Copies buffer rows into a texture region on the device. See
+    /// [`GpuDevice::copy_buffer_to_texture`].
+    pub fn copy_buffer_to_texture(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+        texture: TextureHandle,
+        region: TextureRegion,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_buffer_to_texture(buffer, offset, bytes_per_row, texture, region)
+    }
+
+    /// Copies a texture region into buffer rows on the device. See
+    /// [`GpuDevice::copy_texture_region_to_buffer`].
+    pub fn copy_texture_region_to_buffer(
+        &self,
+        texture: TextureHandle,
+        region: TextureRegion,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_texture_region_to_buffer(texture, region, buffer, offset, bytes_per_row)
     }
 
     pub fn destroy_texture(&self, texture: TextureHandle) {
