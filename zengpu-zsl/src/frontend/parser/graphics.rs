@@ -18,17 +18,23 @@ impl<'a> Parser<'a> {
         let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx, is_fragment)?;
 
         self.expect(&Tok::Arrow, "`->` return type")?;
-        let ret_types = self.parse_ret_types()?;
-        if ret_types[0] != self.types.vec_id(4) {
-            return self.err("first return type must be f32x4 (position/color)");
-        }
-        let varyings: Vec<TypeId> = if is_fragment {
-            Vec::new()
+        let (varyings, outputs) = if is_fragment {
+            let slots = self.parse_ret_slots()?;
+            (Vec::new(), self.fragment_outputs(&slots)?)
         } else {
-            ret_types[1..].to_vec()
+            let ret_types = self.parse_ret_types()?;
+            if ret_types[0] != self.types.vec_id(4) {
+                return self.err("first return type must be f32x4 (position)");
+            }
+            (ret_types[1..].to_vec(), Vec::new())
+        };
+        let expected = if is_fragment {
+            outputs.len()
+        } else {
+            1 + varyings.len()
         };
 
-        let (body, ret) = self.parse_gfx_body(&mut ctx, &varyings)?;
+        let (body, ret) = self.parse_gfx_body(&mut ctx, expected)?;
         if self.pos != self.toks.len() {
             return self.err("unexpected trailing tokens after entry point");
         }
@@ -70,6 +76,7 @@ impl<'a> Parser<'a> {
                 locals,
                 body,
                 ret,
+                outputs,
             },
             types: mem::replace(&mut self.types, TypeArena::new()),
         })
@@ -191,15 +198,52 @@ impl<'a> Parser<'a> {
         Ok((inputs, scalar_params, buf_params))
     }
 
-    /// Return type: `T` or `(T, T, …)`, each optionally with `@location` or `@builtin`.
+    /// Location of a fragment output attachment: its `@location`, else its tuple index.
+    ///
+    /// Dual-source blend uses sources 0 and 1 of location 0.
+    fn fragment_outputs(
+        &self,
+        slots: &[(TypeId, Option<u32>, u32)],
+    ) -> Result<Vec<GfxOutput>, ParseError> {
+        let outputs: Vec<GfxOutput> = slots
+            .iter()
+            .enumerate()
+            .map(|(i, &(ty, location, blend_src))| GfxOutput {
+                ty,
+                location: location.unwrap_or(i as u32),
+                blend_src,
+            })
+            .collect();
+        if outputs.iter().any(|o| o.blend_src != 0) {
+            let pair = match &outputs[..] {
+                [a, b] => (a.location, a.blend_src, b.location, b.blend_src) == (0, 0, 0, 1),
+                _ => false,
+            };
+            if !pair {
+                return self.err(
+                    "dual-source blending needs two outputs: `@location(0) @blend_src(0)` \
+                     then `@location(0) @blend_src(1)`",
+                );
+            }
+        }
+        for (i, a) in outputs.iter().enumerate() {
+            let clash = outputs[..i]
+                .iter()
+                .any(|b| (b.location, b.blend_src) == (a.location, a.blend_src));
+            if clash {
+                return self.err(format!("two outputs write location {}", a.location));
+            }
+        }
+        Ok(outputs)
+    }
+
     pub(super) fn parse_gfx_body(
         &mut self,
         ctx: &mut GfxCtx,
-        varyings: &[TypeId],
+        expected: usize,
     ) -> Result<(Vec<IrStmt>, Vec<IrExpr>), ParseError> {
         self.expect(&Tok::LBrace, "`{`")?;
         let mut body = Vec::new();
-        let expected = 1 + varyings.len();
         loop {
             match self.peek() {
                 None => return self.err("unterminated block"),
@@ -236,10 +280,8 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RBrace, "`}` after tail expression")?;
             if tail.len() != expected {
                 return self.err(format!(
-                    "return has {} value(s), expected {} (position + {} varyings)",
-                    tail.len(),
-                    expected,
-                    varyings.len()
+                    "return has {} value(s), expected {expected}",
+                    tail.len()
                 ));
             }
             return Ok((body, tail));

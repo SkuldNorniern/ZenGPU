@@ -131,8 +131,18 @@ pub struct GraphicsEntry {
     pub varyings: Vec<TypeId>,
     pub locals: Vec<(String, TypeId)>,
     pub body: Vec<IrStmt>,
-    /// Vertex: `[position, varyings…]`. Fragment: `[color]`.
+    /// Vertex: `[position, varyings...]`. Fragment: one value per `GraphicsEntry::outputs` entry.
     pub ret: Vec<IrExpr>,
+    /// One per `ret` value. Empty for vertex shaders.
+    pub outputs: Vec<GfxOutput>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GfxOutput {
+    pub ty: TypeId,
+    pub location: u32,
+    /// Blend source from `@blend_src(n)`. Source 1 feeds dual-source blending.
+    pub blend_src: u32,
 }
 
 #[derive(Debug)]

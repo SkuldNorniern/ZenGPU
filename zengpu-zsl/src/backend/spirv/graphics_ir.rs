@@ -234,14 +234,26 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         );
     }
 
-    let t_ptr_out_vec4 = spv.type_pointer(sc::OUTPUT, t_vec4);
-    let out_var = spv.global_variable(t_ptr_out_vec4, sc::OUTPUT);
+    let mut out_vars: Vec<(Id, TypeId)> = Vec::new();
     if is_fragment {
-        spv.decorate(out_var, deco::LOCATION, &[0]);
+        let dual_source = e.outputs.iter().any(|o| o.blend_src != 0);
+        for o in &e.outputs {
+            let t_ptr = spv.type_pointer(sc::OUTPUT, spv_value_ty(o.ty));
+            let var = spv.global_variable(t_ptr, sc::OUTPUT);
+            spv.decorate(var, deco::LOCATION, &[o.location]);
+            if dual_source {
+                spv.decorate(var, deco::INDEX, &[o.blend_src]);
+            }
+            interface.push(var);
+            out_vars.push((var, o.ty));
+        }
     } else {
-        spv.decorate(out_var, deco::BUILT_IN, &[builtin::POSITION]);
+        let t_ptr_out_vec4 = spv.type_pointer(sc::OUTPUT, t_vec4);
+        let var = spv.global_variable(t_ptr_out_vec4, sc::OUTPUT);
+        spv.decorate(var, deco::BUILT_IN, &[builtin::POSITION]);
+        interface.push(var);
+        out_vars.push((var, vec4_id));
     }
-    interface.push(out_var);
 
     let mut varying_out_vars: Vec<(Id, TypeId)> = Vec::new();
     for (loc, vty_id) in e.varyings.iter().enumerate() {
@@ -433,16 +445,20 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         lower_stmt(&mut ctx, stmt)?;
     }
 
-    let pos = lower_expr(&mut ctx, &e.ret[0])?;
-    if pos.ty != ctx.vec4_id {
-        return Err(format!(
-            "shader return (position/color) must be f32x4, got {:?}",
-            types.get(pos.ty)
-        ));
+    for (i, &(var, expected)) in out_vars.iter().enumerate() {
+        let v = lower_expr(&mut ctx, &e.ret[i])?;
+        let id = broadcast(&mut ctx, v, expected).map_err(|_| {
+            format!(
+                "output {i} must be {:?}, got {:?}",
+                types.get(expected),
+                types.get(v.ty)
+            )
+        })?;
+        ctx.spv.op_store(var, id);
     }
-    ctx.spv.op_store(out_var, pos.id);
+    let first_varying = out_vars.len();
     for (i, (var_id, expected)) in varying_out_vars.iter().enumerate() {
-        let v = lower_expr(&mut ctx, &e.ret[i + 1])?;
+        let v = lower_expr(&mut ctx, &e.ret[first_varying + i])?;
         if v.ty != *expected {
             return Err(format!(
                 "varying[{i}] type mismatch: expected {:?}, got {:?}",
@@ -1353,6 +1369,47 @@ mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn dual_source_text_writes_colour_and_coverage() {
+        validate(&lower(
+            r#"
+            push P { viewport: f32x2, slot: u32 }
+            fragment fs(@location(0) uv: f32x2, @location(1) color: f32x4, tex: textures, p: P)
+                -> (@location(0) @blend_src(0) f32x4, @location(0) @blend_src(1) f32x4)
+            {
+                let coverage = tex[p.slot].sample(uv).rgb * color.a
+                let alpha = max(coverage.r, max(coverage.g, coverage.b))
+                if alpha <= 0.0 {
+                    discard
+                }
+                (f32x4(color.rgb, 1.0), f32x4(coverage, alpha))
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn fragments_fill_several_attachments() {
+        validate(&lower(
+            r#"
+            fragment fs(@location(0) c: f32x4) -> (f32x4, f32, @location(3) f32x2) {
+                (c, c.a, c.xy)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn dual_source_takes_one_pair_at_location_zero() {
+        assert!(
+            parse_zsl(
+                "fragment fs(@location(0) c: f32x4) -> (f32x4, @blend_src(1) f32x4) { (c, c) }"
+            )
+            .is_err()
+        );
+        assert!(parse_zsl("fragment fs(@location(0) c: f32x4) -> (@location(1) f32x4, @location(1) f32x4) { (c, c) }").is_err());
     }
 
     #[test]

@@ -107,7 +107,24 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     });
 
     if e.is_fragment {
-        let _ = writeln!(s, "fragment float4 {ENTRY}(");
+        let single = match &e.outputs[..] {
+            [only] if only.location == 0 => Some(msl_ty_of(module.types.get(only.ty))?),
+            _ => None,
+        };
+        if single.is_none() {
+            s.push_str("struct FsOut {\n");
+            for (i, o) in e.outputs.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "    {} out{i} [[color({}), index({})]];",
+                    msl_ty_of(module.types.get(o.ty))?,
+                    o.location,
+                    o.blend_src
+                );
+            }
+            s.push_str("};\n\n");
+        }
+        let _ = writeln!(s, "fragment {} {ENTRY}(", single.unwrap_or("FsOut"));
         let mut args: Vec<String> = Vec::new();
         if stage_in {
             args.push("    StageIn in [[stage_in]]".to_string());
@@ -122,7 +139,15 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         for st in &e.body {
             emit_stmt(&mut s, &ctx, st, 1)?;
         }
-        let _ = writeln!(s, "    return {};", emit_expr(&ctx, &e.ret[0])?);
+        if single.is_some() {
+            let _ = writeln!(s, "    return {};", emit_expr(&ctx, &e.ret[0])?);
+        } else {
+            s.push_str("    FsOut out;\n");
+            for (i, ret) in e.ret.iter().enumerate() {
+                let _ = writeln!(s, "    out.out{i} = {};", emit_expr(&ctx, ret)?);
+            }
+            s.push_str("    return out;\n");
+        }
         s.push_str("}\n");
     } else {
         s.push_str("struct VsOut {\n");
@@ -504,6 +529,23 @@ mod tests {
         assert!(m.source.contains(
             "zsl_textures[pc.slot].tex.sample(zsl_textures[pc.slot].smp, in.uv)"
         ));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn dual_source_outputs_share_a_colour() {
+        let m = graphics(
+            r#"
+            fragment fs(@location(0) c: f32x4)
+                -> (@location(0) @blend_src(0) f32x4, @location(0) @blend_src(1) f32x4)
+            {
+                (c, c * 0.5)
+            }
+        "#,
+        );
+        assert!(m.source.contains("float4 out0 [[color(0), index(0)]];"));
+        assert!(m.source.contains("float4 out1 [[color(0), index(1)]];"));
+        assert!(m.source.contains("fragment FsOut zsl_main("));
         let _ = metal_compiles(&m.source);
     }
 
