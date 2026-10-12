@@ -160,6 +160,9 @@ pub struct GraphicsEntry {
     /// `buffer<f32>`/`mut buffer<f32>` param names, in declaration order
     /// (writability already enforced in the parser).
     pub buf_params: Vec<String>,
+    /// The `textures` param's name: the bindless texture table, sampled as
+    /// `name[slot].sample(uv)`.
+    pub textures: Option<String>,
     /// Vertex varying output types (empty for fragment / position-only
     /// vertex). Interned in the owning [`GraphicsModule`]'s `types` arena.
     pub varyings: Vec<TypeId>,

@@ -5,7 +5,9 @@
 //! - fragment `@location(N)` inputs arrive via `[[stage_in]]` with `[[user(locnN)]]`
 //!   (matching the vertex output varyings);
 //! - the push block, if any, binds at `[[buffer(0)]]`; storage buffers follow at
-//!   `[[buffer(1..)]]`.
+//!   `[[buffer(1..)]]`;
+//! - the texture table binds at [`TEXTURE_BUFFER_INDEX`] as an argument buffer
+//!   of `{ tex, smp }` texture and sampler pairs, one per bindless slot.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -21,6 +23,10 @@ use crate::ir::{GfxBuiltin, GfxSlot, GraphicsModule};
 /// HAL backend binds the push constant to this same index.
 pub const PUSH_BUFFER_INDEX: u32 = 16;
 
+/// Buffer index for the texture table's argument buffer, next to the push
+/// constant.
+pub const TEXTURE_BUFFER_INDEX: u32 = 17;
+
 /// Lower a graphics [`GraphicsModule`] to MSL.
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
@@ -34,7 +40,11 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         .filter(|i| matches!(i.slot, GfxSlot::Builtin(_)))
         .map(|i| i.name.as_str())
         .collect();
-    let ctx = Ctx { locals, builtins };
+    let ctx = Ctx {
+        locals,
+        builtins,
+        is_fragment: e.is_fragment,
+    };
     let stage_in = e
         .inputs
         .iter()
@@ -99,6 +109,14 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     // collides with vertex geometry buffers (which occupy `[[buffer(0..)]]` via
     // the `[[stage_in]]` vertex descriptor). The Metal backend binds to match.
     let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
+    if e.textures.is_some() {
+        s.push_str(
+            "struct ZslTexture {\n    texture2d<float> tex;\n    sampler smp;\n};\n\n",
+        );
+    }
+    let texture_arg = e.textures.as_ref().map(|_| {
+        format!("    const device ZslTexture* zsl_textures [[buffer({TEXTURE_BUFFER_INDEX})]]")
+    });
 
     if e.is_fragment {
         // fragment <ret> zsl_main(StageIn in [[stage_in]], ...)
@@ -111,6 +129,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         if has_push {
             args.push(format!("    {push_arg}"));
         }
+        args.extend(texture_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
@@ -140,6 +159,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         if has_push {
             args.push(format!("    {push_arg}"));
         }
+        args.extend(texture_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
@@ -166,6 +186,7 @@ struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
     /// Inputs passed as their own entry arguments rather than in `in`.
     builtins: HashSet<&'a str>,
+    is_fragment: bool,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -265,6 +286,18 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(ctx, index)?),
         IrExpr::FieldAccess { base, component } => {
             format!("({}).{}", emit_expr(ctx, base)?, component_char(*component))
+        }
+        IrExpr::Sample { index, uv, lod } => {
+            let slot = format!("zsl_textures[{}]", emit_expr(ctx, index)?);
+            let uv = emit_expr(ctx, uv)?;
+            match lod {
+                Some(lod) => format!(
+                    "{slot}.tex.sample({slot}.smp, {uv}, level({}))",
+                    emit_expr(ctx, lod)?
+                ),
+                None if ctx.is_fragment => format!("{slot}.tex.sample({slot}.smp, {uv})"),
+                None => format!("{slot}.tex.sample({slot}.smp, {uv}, level(0.0))"),
+            }
         }
         IrExpr::Swizzle { base, lanes } => {
             let picked: String = lanes.iter().map(|&l| component_char(l)).collect();
@@ -472,6 +505,27 @@ mod tests {
         "#,
         );
         assert!(m.source.contains("discard_fragment();"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn samples_through_the_texture_argument_buffer() {
+        let m = graphics(
+            r#"
+            push P { slot: u32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                tex[p.slot].sample(uv)
+            }
+        "#,
+        );
+        assert!(m.source.contains("struct ZslTexture {"));
+        assert!(
+            m.source
+                .contains("const device ZslTexture* zsl_textures [[buffer(17)]]")
+        );
+        assert!(m.source.contains(
+            "zsl_textures[pc.slot].tex.sample(zsl_textures[pc.slot].smp, in.uv)"
+        ));
         let _ = metal_compiles(&m.source);
     }
 

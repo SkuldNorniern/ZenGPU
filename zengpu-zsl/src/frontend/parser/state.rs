@@ -99,6 +99,7 @@ pub(super) struct GfxCtx {
     pub(super) scalars: HashMap<String, TypeId>, // push-field name → type
     pub(super) push_param: Option<String>,      // the push param name
     pub(super) buffers: HashMap<String, bool>,  // name → writable
+    pub(super) textures: Option<String>,        // the `textures` param name
     pub(super) locals: HashMap<String, TypeId>,
     pub(super) locals_order: Vec<(String, TypeId)>,
 }

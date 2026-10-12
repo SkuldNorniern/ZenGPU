@@ -61,6 +61,14 @@ struct ScalarInfo {
     gty: TypeId,
 }
 
+/// The bindless texture table and the types to read a slot of it.
+#[derive(Clone, Copy)]
+struct TextureTable {
+    var: Id,
+    t_sampled: Id,
+    t_ptr: Id,
+}
+
 struct LocalVar {
     ptr: Id,
     ty: TypeId,
@@ -91,6 +99,8 @@ struct Ctx<'a> {
     buf_params: HashMap<String, u32>, // name → pc_index
     g_bufs_var: Option<Id>,
     t_ptr_ssbo_f32: Id,
+    textures: Option<TextureTable>,
+    is_fragment: bool,
     pc_var: Option<Id>,
     /// Push-constant pointer types, by pointee type, made as first needed.
     pc_ptrs: HashMap<u32, Id>,
@@ -178,7 +188,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     };
 
     let n_buf_params = e.buf_params.len() as u32;
-    if !e.buf_params.is_empty() {
+    if !e.buf_params.is_empty() || e.textures.is_some() {
         spv.capability_runtime_descriptor_array();
     }
 
@@ -295,6 +305,23 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     } else {
         (None, Id(0))
     };
+
+    // The bindless texture table: combined image samplers at set 0,
+    // binding 1, as many as the device holds.
+    let textures = e.textures.as_ref().map(|_| {
+        let t_image = spv.type_image_2d(t_f32);
+        let t_sampled = spv.type_sampled_image(t_image);
+        let t_table = spv.type_runtime_array(t_sampled);
+        let t_ptr_table = spv.type_pointer(sc::UNIFORM_CONSTANT, t_table);
+        let var = spv.global_variable(t_ptr_table, sc::UNIFORM_CONSTANT);
+        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+        spv.decorate(var, deco::BINDING, &[1]);
+        TextureTable {
+            var,
+            t_sampled,
+            t_ptr: spv.type_pointer(sc::UNIFORM_CONSTANT, t_sampled),
+        }
+    });
 
     // Push-constant block: buf indices (u32) first, then scalars (u32/f32/mat4).
     let pc_var = if !e.buf_params.is_empty() || !e.scalar_params.is_empty() {
@@ -419,6 +446,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         buf_params: buf_param_map,
         g_bufs_var,
         t_ptr_ssbo_f32,
+        textures,
+        is_fragment,
         pc_var,
         pc_ptrs: HashMap::new(),
         const_0_u32,
@@ -717,6 +746,37 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             Ok(GVal { id, ty: gty })
         }
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
+        IrExpr::Sample { index, uv, lod } => {
+            let table = ctx.textures.ok_or("internal: no texture table")?;
+            let slot = lower_expr(ctx, index)?;
+            let slot = scalar_to_u32(ctx, slot);
+            let uv = lower_expr(ctx, uv)?;
+            if uv.ty != ctx.vec2_id {
+                return Err("texture coordinates must be f32x2".into());
+            }
+            let ptr = ctx.spv.op_access_chain(table.t_ptr, table.var, &[slot]);
+            let image = ctx.spv.op_load(table.t_sampled, ptr);
+            let t_vec4 = ctx.t_vec4;
+            // Only fragments have derivatives to pick a level from.
+            let lod = match lod {
+                Some(lod) => {
+                    let lod = lower_expr(ctx, lod)?;
+                    Some(scalar_to_f32(ctx, lod))
+                }
+                None if ctx.is_fragment => None,
+                None => Some(ctx.spv.constant_f32(ctx.t_f32, 0.0)),
+            };
+            let id = match lod {
+                Some(lod) => ctx
+                    .spv
+                    .op_image_sample_explicit_lod(t_vec4, image, uv.id, lod),
+                None => ctx.spv.op_image_sample_implicit_lod(t_vec4, image, uv.id),
+            };
+            Ok(GVal {
+                id,
+                ty: ctx.vec4_id,
+            })
+        }
         IrExpr::Neg(inner) => {
             let v = lower_expr(ctx, inner)?;
             if v.ty == ctx.u32_id {
@@ -1308,6 +1368,37 @@ mod tests {
                     discard
                 }
                 f32x4(color.rgb, color.a * alpha)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn samples_the_bindless_texture_table() {
+        validate(&lower(
+            r#"
+            push P { viewport: f32x2, slot: u32 }
+            fragment fs(@location(0) uv: f32x2, @location(1) color: f32x4, tex: textures, p: P) -> f32x4 {
+                let coverage = tex[p.slot].sample(uv)
+                let alpha = coverage.a * color.a
+                if alpha <= 0.0 {
+                    discard
+                }
+                f32x4(color.rgb, alpha)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn vertex_samples_name_their_level() {
+        validate(&lower(
+            r#"
+            push P { slot: u32 }
+            vertex vs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                let a = tex[p.slot].sample(uv)
+                let b = tex[p.slot + 1].sample_level(uv, 2.0)
+                a + b
             }
             "#,
         ));
