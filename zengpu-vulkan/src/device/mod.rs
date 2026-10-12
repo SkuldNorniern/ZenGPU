@@ -31,6 +31,7 @@ mod format;
 mod graphics;
 mod hal_impl;
 mod resources;
+mod transfer;
 
 use format::*;
 
@@ -423,6 +424,26 @@ pub(crate) struct VulkanTexture {
     pub mip_levels: u32,
     pub array_layers: u32,
     pub usage: vk::ImageUsageFlags,
+    pub texel_bytes: u32,
+    /// Per array layer, one bit per mip level that holds texels and is in the sampled layout. A
+    /// partial write to a level that is not ready leaves the rest of that level undefined.
+    pub ready: Vec<u32>,
+}
+
+impl VulkanTexture {
+    pub(crate) fn is_ready(&self, mip_level: u32, layer: u32) -> bool {
+        self.ready
+            .get(layer as usize)
+            .is_some_and(|bits| mip_level < 32 && bits & (1 << mip_level) != 0)
+    }
+
+    pub(crate) fn mark_ready(&mut self, mip_level: u32, layer: u32) {
+        if let Some(bits) = self.ready.get_mut(layer as usize)
+            && mip_level < 32
+        {
+            *bits |= 1 << mip_level;
+        }
+    }
 }
 
 unsafe impl Send for VulkanTexture {}
@@ -492,6 +513,8 @@ pub struct VulkanDevice {
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
     fence_pool: Arc<FencePool>,
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
+    /// Reused for host-visible uploads.
+    staging: Mutex<transfer::StagingRing>,
 }
 
 unsafe impl Send for VulkanDevice {}
@@ -798,6 +821,7 @@ impl VulkanDevice {
             cmd_list_pool,
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
+            staging: Mutex::new(transfer::StagingRing::default()),
         })
     }
 
@@ -1247,6 +1271,137 @@ mod tests {
         let adapter = inst.request_adapter(AdapterRequest::default())?;
         let dev = adapter.open(DeviceRequest::default()).ok()?;
         Some(TestDevice { dev, _guard: guard })
+    }
+
+    #[test]
+    fn texture_regions_round_trip_without_touching_the_rest() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        if !dev.capabilities().transfers.texture_region_write {
+            return;
+        }
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 4,
+                height: 4,
+                depth: 1,
+                format: zengpu_hal::Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let red = [255u8, 0, 0, 255];
+        let green = [0u8, 255, 0, 255];
+        let blue = [0u8, 0, 255, 255];
+        dev.upload_texture_data(tex, &red.repeat(16)).unwrap();
+        let mut wide = Vec::new();
+        for _ in 0..2 {
+            wide.extend_from_slice(&green.repeat(2));
+            wide.extend_from_slice(&[9, 9, 9, 9]);
+        }
+        let write = zengpu_hal::TextureWrite {
+            texture: tex,
+            region: zengpu_hal::TextureRegion::rect(1, 1, 2, 2),
+            data: &wide,
+            bytes_per_row: 12,
+        };
+        let wrote = dev.write_textures(&[write]).unwrap();
+        let src = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        dev.write_buffer(src, 0, &blue).unwrap();
+        let copied = dev
+            .copy_buffer_to_texture(src, 0, 4, tex, zengpu_hal::TextureRegion::rect(0, 0, 1, 1))
+            .unwrap();
+        let out = dev.create_buffer(rw_desc(64)).unwrap();
+        let read = dev
+            .copy_texture_region_to_buffer(
+                tex,
+                zengpu_hal::TextureRegion::rect(0, 0, 4, 4),
+                out,
+                0,
+                16,
+            )
+            .unwrap();
+        read.wait(Duration::from_secs(5)).unwrap();
+        wrote.wait(Duration::from_secs(5)).unwrap();
+        copied.wait(Duration::from_secs(5)).unwrap();
+        let px = dev.read_buffer(out, 0, 64).unwrap();
+        let at = |x: usize, y: usize| {
+            [
+                px[(y * 4 + x) * 4],
+                px[(y * 4 + x) * 4 + 1],
+                px[(y * 4 + x) * 4 + 2],
+                px[(y * 4 + x) * 4 + 3],
+            ]
+        };
+        assert_eq!(at(0, 0), blue);
+        for (x, y) in [(1, 1), (2, 1), (1, 2), (2, 2)] {
+            assert_eq!(at(x, y), green, "({x}, {y}) is in the tile");
+        }
+        for (x, y) in [(3, 0), (0, 3), (3, 3), (3, 1), (1, 3)] {
+            assert_eq!(at(x, y), red, "({x}, {y}) kept its texel");
+        }
+        let outside = zengpu_hal::TextureWrite {
+            region: zengpu_hal::TextureRegion::rect(3, 3, 2, 2),
+            ..write
+        };
+        assert!(dev.write_textures(&[outside]).is_err());
+        dev.destroy_buffer(src);
+        dev.destroy_buffer(out);
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn many_tile_writes_reuse_staging() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        if !dev.capabilities().transfers.staged_uploads {
+            return;
+        }
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 256,
+                height: 256,
+                depth: 1,
+                format: zengpu_hal::Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let tile = vec![7u8; 64 * 64 * 4];
+        let mut pending = Vec::new();
+        for i in 0..400u32 {
+            let (x, y) = ((i % 4) * 64, ((i / 4) % 4) * 64);
+            let write = zengpu_hal::TextureWrite {
+                texture: tex,
+                region: zengpu_hal::TextureRegion::rect(x, y, 64, 64),
+                data: &tile,
+                bytes_per_row: 64 * 4,
+            };
+            pending.push(dev.write_textures(&[write]).unwrap());
+            if pending.len() > 8 {
+                pending.remove(0).wait(Duration::from_secs(5)).unwrap();
+            }
+        }
+        for submission in pending {
+            submission.wait(Duration::from_secs(5)).unwrap();
+        }
+        dev.destroy_texture(tex);
     }
 
     fn try_graphics_device() -> Option<TestDevice> {

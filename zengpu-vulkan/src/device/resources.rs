@@ -286,6 +286,9 @@ impl VulkanDevice {
         })?;
 
         self.destroy_buffer(staging);
+        if let Some(tex) = self.textures.lock().unwrap().get_mut(texture) {
+            tex.mark_ready(mip_level, layer);
+        }
         Ok(())
     }
 
@@ -464,6 +467,14 @@ impl VulkanDevice {
                 );
             }
             Ok(())
-        })
+        })?;
+        if let Some(tex) = self.textures.lock().unwrap().get_mut(texture) {
+            for layer in 0..array_layers {
+                for mip in 0..mip_levels {
+                    tex.mark_ready(mip, layer);
+                }
+            }
+        }
+        Ok(())
     }
 }
