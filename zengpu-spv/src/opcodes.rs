@@ -75,6 +75,10 @@ pub fn lookup(opcode: u16) -> OpInfo {
         22 => OpInfo::new("OpTypeFloat", false, true, Literals),
         23 => OpInfo::new("OpTypeVector", false, true, IdsAt { idx: &[0] }),
         24 => OpInfo::new("OpTypeMatrix", false, true, IdsAt { idx: &[0] }),
+        25 => OpInfo::new("OpTypeImage", false, true, IdsAt { idx: &[0] }),
+        26 => OpInfo::new("OpTypeSampler", false, true, Literals),
+        27 => OpInfo::new("OpTypeSampledImage", false, true, IdsAt { idx: &[0] }),
+        28 => OpInfo::new("OpTypeArray", false, true, IdsAt { idx: &[0, 1] }),
         29 => OpInfo::new("OpTypeRuntimeArray", false, true, IdsAt { idx: &[0] }),
         30 => OpInfo::new("OpTypeStruct", false, true, AllIds),
         32 => OpInfo::new("OpTypePointer", false, true, IdsAt { idx: &[1] }),
@@ -104,8 +108,14 @@ pub fn lookup(opcode: u16) -> OpInfo {
         // ── Composite ───────────────────────────────────────────────────────
         80 => OpInfo::new("OpCompositeConstruct", true, true, AllIds),
         81 => OpInfo::new("OpCompositeExtract", true, true, IdsAt { idx: &[0] }),
+        79 => OpInfo::new("OpVectorShuffle", true, true, IdsAt { idx: &[0, 1] }),
+        // ── Images ──────────────────────────────────────────────────────────
+        87 => OpInfo::new("OpImageSampleImplicitLod", true, true, IdsAt { idx: &[0, 1] }),
+        88 => OpInfo::new("OpImageSampleExplicitLod", true, true, IdsAt { idx: &[0, 1, 3] }),
         // ── Conversion / unary ──────────────────────────────────────────────
         109 => OpInfo::new("OpConvertFToU", true, true, AllIds),
+        110 => OpInfo::new("OpConvertFToS", true, true, AllIds),
+        111 => OpInfo::new("OpConvertSToF", true, true, AllIds),
         112 => OpInfo::new("OpConvertUToF", true, true, AllIds),
         124 => OpInfo::new("OpBitcast", true, true, AllIds),
         126 => OpInfo::new("OpSNegate", true, true, AllIds),
@@ -118,6 +128,7 @@ pub fn lookup(opcode: u16) -> OpInfo {
         132 => OpInfo::new("OpIMul", true, true, AllIds),
         133 => OpInfo::new("OpFMul", true, true, AllIds),
         134 => OpInfo::new("OpUDiv", true, true, AllIds),
+        135 => OpInfo::new("OpSDiv", true, true, AllIds),
         136 => OpInfo::new("OpFDiv", true, true, AllIds),
         142 => OpInfo::new("OpVectorTimesScalar", true, true, AllIds),
         143 => OpInfo::new("OpMatrixTimesScalar", true, true, AllIds),
@@ -126,6 +137,8 @@ pub fn lookup(opcode: u16) -> OpInfo {
         146 => OpInfo::new("OpMatrixTimesMatrix", true, true, AllIds),
         148 => OpInfo::new("OpDot", true, true, AllIds),
         // ── Logical / comparison ────────────────────────────────────────────
+        156 => OpInfo::new("OpIsNan", true, true, AllIds),
+        157 => OpInfo::new("OpIsInf", true, true, AllIds),
         166 => OpInfo::new("OpLogicalOr", true, true, AllIds),
         167 => OpInfo::new("OpLogicalAnd", true, true, AllIds),
         170 => OpInfo::new("OpIEqual", true, true, AllIds),
@@ -142,6 +155,13 @@ pub fn lookup(opcode: u16) -> OpInfo {
         186 => OpInfo::new("OpFUnordGreaterThan", true, true, AllIds),
         188 => OpInfo::new("OpFOrdLessThanEqual", true, true, AllIds),
         190 => OpInfo::new("OpFOrdGreaterThanEqual", true, true, AllIds),
+        169 => OpInfo::new("OpSelect", true, true, AllIds),
+        194 => OpInfo::new("OpShiftRightLogical", true, true, AllIds),
+        196 => OpInfo::new("OpShiftLeftLogical", true, true, AllIds),
+        197 => OpInfo::new("OpBitwiseOr", true, true, AllIds),
+        198 => OpInfo::new("OpBitwiseXor", true, true, AllIds),
+        199 => OpInfo::new("OpBitwiseAnd", true, true, AllIds),
+        252 => OpInfo::new("OpKill", false, false, Literals),
         _ => OpInfo::new("OpUnknown", false, false, Literals),
     }
 }
