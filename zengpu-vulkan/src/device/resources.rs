@@ -195,11 +195,39 @@ impl VulkanDevice {
             usage: zengpu_hal::BufferUsage::TRANSFER_SRC,
             memory: MemoryUsage::Upload,
         })?;
+        let uploaded = self.upload_through(
+            staging,
+            image,
+            mip_level,
+            layer,
+            data,
+            [mip_width, mip_height, mip_depth],
+        );
+        self.destroy_buffer(staging);
+        uploaded?;
+        if let Some(tex) = self.textures.lock().unwrap().get_mut(texture) {
+            tex.mark_ready(mip_level, layer);
+        }
+        Ok(())
+    }
+
+    /// Copies `data` into one mip and layer of `image`. The image is left ready for sampling.
+    fn upload_through(
+        &self,
+        staging: BufferHandle,
+        image: vk::Image,
+        mip_level: u32,
+        layer: u32,
+        data: &[u8],
+        [mip_width, mip_height, mip_depth]: [u32; 3],
+    ) -> Result<()> {
         self.write_buffer(staging, 0, data)?;
 
         let staging_vk = {
             let buffers = self.buffers.lock().unwrap();
-            buffers.get(staging).map(|b| b.buffer).unwrap()
+            buffers.get(staging).map(|b| b.buffer).ok_or_else(|| {
+                GpuError::Backend("upload_texture_data: staging buffer vanished".to_string())
+            })?
         };
 
         self.one_shot_submit(|dev, cmd| {
@@ -283,13 +311,7 @@ impl VulkanDevice {
                 );
             }
             Ok(())
-        })?;
-
-        self.destroy_buffer(staging);
-        if let Some(tex) = self.textures.lock().unwrap().get_mut(texture) {
-            tex.mark_ready(mip_level, layer);
-        }
-        Ok(())
+        })
     }
 
     /// Mip chain from the base level by sequential blits, each level half the last.
