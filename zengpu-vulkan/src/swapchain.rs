@@ -15,9 +15,10 @@
 //! destroys the image views/swapchain/surface/sync those resources were
 //! built from).
 
+use std::mem;
 use std::sync::{Arc, Mutex};
 
-use ash::{khr, vk};
+use ash::{Device, khr, vk};
 use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
 
 use crate::device::{VulkanDevice, VulkanDeviceInner};
@@ -90,7 +91,19 @@ impl Swapchain {
             ));
         }
         let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
+        let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
         let surface = create_platform_surface(&shared, handles)?;
+        // Destroys what was made so far if any step below fails.
+        let mut made = Partial {
+            device: inner.device.clone(),
+            surface_loader: surface_loader.clone(),
+            swapchain_loader: swapchain_loader.clone(),
+            surface,
+            swapchain: vk::SwapchainKHR::null(),
+            image_views: Vec::new(),
+            cmd_pool: vk::CommandPool::null(),
+            sync: FrameSync::default(),
+        };
 
         let supports_present = unsafe {
             surface_loader.get_physical_device_surface_support(
@@ -116,7 +129,6 @@ impl Swapchain {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                unsafe { surface_loader.destroy_surface(surface, None) };
                 return Err(GpuError::Backend(format!(
                     "selected queue family {} cannot present to this surface",
                     inner.queue_family
@@ -124,7 +136,6 @@ impl Swapchain {
             }
         }
 
-        let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
         let present_mode = pick_present_mode(
             &surface_loader,
             inner.physical,
@@ -144,12 +155,23 @@ impl Swapchain {
             config.height,
             vk::SwapchainKHR::null(),
         )?;
-        let image_views = create_image_views(&inner.device, &images, format)?;
+        made.swapchain = swapchain;
+        made.image_views = create_image_views(&inner.device, &images, format)?;
+        made.cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
+        let cmd_buffers = allocate_cmd_buffers(&inner.device, made.cmd_pool, frames_in_flight)?;
+        made.sync = create_sync(&inner.device, frames_in_flight)?;
 
-        let cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
-        let cmd_buffers = allocate_cmd_buffers(&inner.device, cmd_pool, frames_in_flight)?;
-        let (image_available, render_finished, in_flight) =
-            create_sync(&inner.device, frames_in_flight)?;
+        // Everything is made: the swapchain owns it from here.
+        let surface = mem::replace(&mut made.surface, vk::SurfaceKHR::null());
+        let swapchain = mem::replace(&mut made.swapchain, vk::SwapchainKHR::null());
+        let image_views = mem::take(&mut made.image_views);
+        let cmd_pool = mem::replace(&mut made.cmd_pool, vk::CommandPool::null());
+        let FrameSync {
+            image_available,
+            render_finished,
+            in_flight,
+        } = mem::take(&mut made.sync);
+        drop(made);
 
         Ok(Self {
             inner,
@@ -366,14 +388,22 @@ impl Swapchain {
             old_swapchain,
         )?;
 
+        // The old swapchain and views stay until the new ones are all made, so
+        // a failure leaves `res` as it was instead of pointing at freed
+        // handles.
+        let image_views = match create_image_views(&self.inner.device, &images, self.format) {
+            Ok(views) => views,
+            Err(e) => {
+                unsafe { self.swapchain_loader.destroy_swapchain(swapchain, None) };
+                return Err(e);
+            }
+        };
         unsafe {
             for &iv in &res.image_views {
                 self.inner.device.destroy_image_view(iv, None);
             }
             self.swapchain_loader.destroy_swapchain(old_swapchain, None);
         }
-
-        let image_views = create_image_views(&self.inner.device, &images, self.format)?;
 
         res.swapchain = swapchain;
         res.images = images;
@@ -721,30 +751,33 @@ pub(crate) fn create_image_views(
     images: &[vk::Image],
     format: vk::Format,
 ) -> Result<Vec<vk::ImageView>> {
-    images
-        .iter()
-        .map(|&image| {
-            let info = vk::ImageViewCreateInfo {
-                image,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format,
-                components: vk::ComponentMapping::default(),
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                ..Default::default()
-            };
-            unsafe {
-                device
-                    .create_image_view(&info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_image_view: {e}")))
+    let mut views = Vec::with_capacity(images.len());
+    for &image in images {
+        let info = vk::ImageViewCreateInfo {
+            image,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format,
+            components: vk::ComponentMapping::default(),
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            ..Default::default()
+        };
+        match unsafe { device.create_image_view(&info, None) } {
+            Ok(view) => views.push(view),
+            Err(e) => {
+                for view in views {
+                    unsafe { device.destroy_image_view(view, None) };
+                }
+                return Err(GpuError::Backend(format!("create_image_view: {e}")));
             }
-        })
-        .collect()
+        }
+    }
+    Ok(views)
 }
 
 fn create_command_pool(device: &ash::Device, queue_family: u32) -> Result<vk::CommandPool> {
@@ -778,38 +811,94 @@ fn allocate_cmd_buffers(
     }
 }
 
-fn create_sync(
-    device: &ash::Device,
-    count: usize,
-) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>)> {
+/// A frame slot's semaphores and fence, for every slot.
+#[derive(Default)]
+struct FrameSync {
+    image_available: Vec<vk::Semaphore>,
+    render_finished: Vec<vk::Semaphore>,
+    in_flight: Vec<vk::Fence>,
+}
+
+impl FrameSync {
+    /// # Safety
+    /// Every handle must be from `device` and unused.
+    unsafe fn destroy(self, device: &Device) {
+        unsafe {
+            for semaphore in self.image_available.into_iter().chain(self.render_finished) {
+                device.destroy_semaphore(semaphore, None);
+            }
+            for fence in self.in_flight {
+                device.destroy_fence(fence, None);
+            }
+        }
+    }
+}
+
+fn create_sync(device: &Device, count: usize) -> Result<FrameSync> {
     let sem_info = vk::SemaphoreCreateInfo::default();
     let fence_info = vk::FenceCreateInfo {
         flags: vk::FenceCreateFlags::SIGNALED,
         ..Default::default()
     };
-    let mut image_available = Vec::with_capacity(count);
-    let mut render_finished = Vec::with_capacity(count);
-    let mut fences = Vec::with_capacity(count);
+    let mut sync = FrameSync {
+        image_available: Vec::with_capacity(count),
+        render_finished: Vec::with_capacity(count),
+        in_flight: Vec::with_capacity(count),
+    };
     for _ in 0..count {
-        unsafe {
-            image_available.push(
-                device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            render_finished.push(
-                device
-                    .create_semaphore(&sem_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_semaphore: {e}")))?,
-            );
-            fences.push(
-                device
-                    .create_fence(&fence_info, None)
-                    .map_err(|e| GpuError::Backend(format!("create_fence: {e}")))?,
-            );
+        let made = unsafe {
+            device
+                .create_semaphore(&sem_info, None)
+                .and_then(|available| {
+                    sync.image_available.push(available);
+                    let finished = device.create_semaphore(&sem_info, None)?;
+                    sync.render_finished.push(finished);
+                    device.create_fence(&fence_info, None)
+                })
+        };
+        match made {
+            Ok(fence) => sync.in_flight.push(fence),
+            Err(e) => {
+                unsafe { sync.destroy(device) };
+                return Err(GpuError::Backend(format!("create sync objects: {e}")));
+            }
         }
     }
-    Ok((image_available, render_finished, fences))
+    Ok(sync)
+}
+
+/// What [`Swapchain::new`] has made so far. Dropped before it finishes, it
+/// destroys all of it; null handles and empty lists are what it gave away.
+struct Partial {
+    device: Device,
+    surface_loader: khr::surface::Instance,
+    swapchain_loader: khr::swapchain::Device,
+    surface: vk::SurfaceKHR,
+    swapchain: vk::SwapchainKHR,
+    image_views: Vec<vk::ImageView>,
+    cmd_pool: vk::CommandPool,
+    sync: FrameSync,
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        unsafe {
+            mem::take(&mut self.sync).destroy(&self.device);
+            if self.cmd_pool != vk::CommandPool::null() {
+                self.device.destroy_command_pool(self.cmd_pool, None);
+            }
+            for view in self.image_views.drain(..) {
+                self.device.destroy_image_view(view, None);
+            }
+            if self.swapchain != vk::SwapchainKHR::null() {
+                self.swapchain_loader
+                    .destroy_swapchain(self.swapchain, None);
+            }
+            if self.surface != vk::SurfaceKHR::null() {
+                self.surface_loader.destroy_surface(self.surface, None);
+            }
+        }
+    }
 }
 
 // ── Per-platform surface creation ───────────────────────────────────────────
