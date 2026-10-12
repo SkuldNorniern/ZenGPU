@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ash::vk;
+use ash::{Device, vk};
 use zengpu_hal::{GpuError, Result};
 
 use crate::device::VulkanDeviceInner;
@@ -59,50 +59,15 @@ impl DepthTarget {
         }
         .map_err(|e| GpuError::Backend(format!("create depth image: {e}")))?;
 
-        let reqs = unsafe { dev.get_image_memory_requirements(image) };
-        let mem_type = find_memory_type(
-            &ctx.memory_properties(),
-            reqs.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
-
-        let memory = unsafe {
-            dev.allocate_memory(
-                &vk::MemoryAllocateInfo {
-                    allocation_size: reqs.size,
-                    memory_type_index: mem_type,
-                    ..Default::default()
-                },
-                None,
-            )
-        }
-        .map_err(|e| GpuError::Backend(format!("allocate depth memory: {e}")))?;
-
-        unsafe {
-            dev.bind_image_memory(image, memory, 0)
-                .map_err(|e| GpuError::Backend(format!("bind depth memory: {e}")))?;
-        }
-
-        let view = unsafe {
-            dev.create_image_view(
-                &vk::ImageViewCreateInfo {
-                    image,
-                    view_type: vk::ImageViewType::TYPE_2D,
-                    format: DEPTH_FORMAT,
-                    components: vk::ComponentMapping::default(),
-                    subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::DEPTH,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    ..Default::default()
-                },
-                None,
-            )
-        }
-        .map_err(|e| GpuError::Backend(format!("create depth view: {e}")))?;
+        // Each step undoes the ones before it when it fails: nothing owns
+        // these handles until `Self` exists.
+        let (memory, view) = match back_image(&inner, image, ctx) {
+            Ok(done) => done,
+            Err(e) => {
+                unsafe { dev.destroy_image(image, None) };
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             inner,
@@ -154,6 +119,70 @@ impl Drop for DepthTarget {
             dev.free_memory(self.memory, None);
         }
     }
+}
+
+/// Memory and a view for a fresh depth `image`.
+fn back_image(
+    inner: &VulkanDeviceInner,
+    image: vk::Image,
+    ctx: &DeviceContext,
+) -> Result<(vk::DeviceMemory, vk::ImageView)> {
+    let dev = &inner.device;
+    let reqs = unsafe { dev.get_image_memory_requirements(image) };
+    let mem_type = find_memory_type(
+        &ctx.memory_properties(),
+        reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+
+    let memory = unsafe {
+        dev.allocate_memory(
+            &vk::MemoryAllocateInfo {
+                allocation_size: reqs.size,
+                memory_type_index: mem_type,
+                ..Default::default()
+            },
+            None,
+        )
+    }
+    .map_err(|e| GpuError::Backend(format!("allocate depth memory: {e}")))?;
+
+    match view_on(dev, image, memory) {
+        Ok(view) => Ok((memory, view)),
+        Err(e) => {
+            unsafe { dev.free_memory(memory, None) };
+            Err(e)
+        }
+    }
+}
+
+/// Binds `memory` to `image` and makes its depth view.
+fn view_on(dev: &Device, image: vk::Image, memory: vk::DeviceMemory) -> Result<vk::ImageView> {
+    unsafe {
+        dev.bind_image_memory(image, memory, 0)
+            .map_err(|e| GpuError::Backend(format!("bind depth memory: {e}")))?;
+    }
+
+    unsafe {
+        dev.create_image_view(
+            &vk::ImageViewCreateInfo {
+                image,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: DEPTH_FORMAT,
+                components: vk::ComponentMapping::default(),
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                ..Default::default()
+            },
+            None,
+        )
+    }
+    .map_err(|e| GpuError::Backend(format!("create depth view: {e}")))
 }
 
 fn find_memory_type(
