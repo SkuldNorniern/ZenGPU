@@ -1363,6 +1363,42 @@ mod tests {
     }
 
     #[test]
+    fn a_texture_pool_hands_back_what_was_released() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let desc = TextureDesc {
+            width: 64,
+            height: 64,
+            depth: 1,
+            format: zengpu_hal::Format::Rgba8Unorm,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        };
+        let tile = 64 * 64 * 4;
+        let mut pool = zengpu_hal::TexturePool::new(2 * tile);
+        let a = pool.acquire(&*dev, desc).unwrap();
+        pool.release(&*dev, a);
+        assert_eq!(pool.free_bytes(), tile);
+        let again = pool.acquire(&*dev, desc).unwrap();
+        assert_eq!(again, a, "the released texture comes back");
+        assert_eq!(pool.free_bytes(), 0);
+        let (b, c) = (
+            pool.acquire(&*dev, desc).unwrap(),
+            pool.acquire(&*dev, desc).unwrap(),
+        );
+        for t in [again, b, c] {
+            pool.release(&*dev, t);
+        }
+        assert_eq!(pool.free_bytes(), 2 * tile);
+        pool.clear(&*dev);
+        assert_eq!((pool.free_bytes(), pool.live()), (0, 0));
+    }
+
+    #[test]
     fn many_tile_writes_reuse_staging() {
         let Some(dev) = try_device() else {
             return;
