@@ -1,7 +1,7 @@
 //! Resource and pipeline descriptors. Plain data with no backend or consumer
 //! types. Backends consume these to create resources.
 
-use crate::handle::ShaderHandle;
+use crate::handle::{ShaderHandle, TextureHandle};
 use crate::types::{BufferUsage, Format, MemoryUsage, PresentMode, TextureUsage};
 
 /// Describes a GPU buffer to create.
@@ -530,4 +530,43 @@ mod tests {
         assert_eq!(s.min_filter, FilterMode::Linear);
         assert_eq!(s.address, AddressMode::ClampToEdge);
     }
+}
+
+/// A rectangle of one mip level of one array layer (or cube face) of a
+/// texture, in texels of that level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureRegion {
+    pub mip_level: u32,
+    pub layer: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl TextureRegion {
+    /// `width` x `height` texels at `x`, `y` of mip 0, layer 0.
+    pub const fn rect(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            mip_level: 0,
+            layer: 0,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+}
+
+/// Texels to write into part of a texture.
+#[derive(Debug, Clone, Copy)]
+pub struct TextureWrite<'a> {
+    pub texture: TextureHandle,
+    pub region: TextureRegion,
+    /// Rows of tightly packed texels in the texture's format, starting with
+    /// the region's top row.
+    pub data: &'a [u8],
+    /// Bytes from one row of `data` to the next: at least the region's
+    /// width in bytes, more when `data` is part of a wider image.
+    pub bytes_per_row: u32,
 }

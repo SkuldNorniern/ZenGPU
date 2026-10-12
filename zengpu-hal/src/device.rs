@@ -8,7 +8,10 @@
 use core::any::Any;
 
 use crate::command::{Bindings, ComputeOp, DispatchOp};
-use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
+use crate::desc::{
+    BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc, TextureRegion,
+    TextureWrite,
+};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, HalCapabilities};
@@ -134,6 +137,57 @@ pub trait GpuDevice: Send + Sync {
         _data: &[u8],
     ) -> Result<()> {
         Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
+
+    /// Writes each of `writes` into its texture's region, keeping the rest
+    /// of the texture as it was, as one submission. Returns once `data` has
+    /// been copied out, before the GPU has necessarily seen it; work
+    /// submitted afterwards on this device sees the new texels. Poll the
+    /// submission to know when the copies are done.
+    ///
+    /// Check [`crate::TransferCaps::texture_region_write`]: the default
+    /// refuses.
+    fn write_textures(&self, _writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        Err(GpuError::Unsupported("texture region write".into()))
+    }
+
+    /// Copies rows of `buffer`, starting `offset` bytes in and
+    /// `bytes_per_row` apart, into `region` of `texture`, on the device.
+    /// `buffer` needs [`crate::BufferUsage::TRANSFER_SRC`]. Work submitted
+    /// afterwards sees the copy.
+    ///
+    /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default
+    /// refuses.
+    fn copy_buffer_to_texture(
+        &self,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _bytes_per_row: u32,
+        _texture: TextureHandle,
+        _region: TextureRegion,
+    ) -> Result<Submission> {
+        Err(GpuError::Unsupported("buffer-to-texture copy".into()))
+    }
+
+    /// Copies `region` of `texture` into `buffer`, starting `offset` bytes
+    /// in, rows `bytes_per_row` apart, on the device. `buffer` needs
+    /// [`crate::BufferUsage::TRANSFER_DST`], and
+    /// [`crate::BufferUsage::READBACK`] to be read on the host once the
+    /// submission completes.
+    ///
+    /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default
+    /// refuses.
+    fn copy_texture_region_to_buffer(
+        &self,
+        _texture: TextureHandle,
+        _region: TextureRegion,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _bytes_per_row: u32,
+    ) -> Result<Submission> {
+        Err(GpuError::Unsupported(
+            "texture-to-buffer region copy".into(),
+        ))
     }
 
     /// Generate the full mip chain for `texture` from its base level via

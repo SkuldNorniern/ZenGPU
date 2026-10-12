@@ -258,6 +258,19 @@ impl Format {
     pub const fn is_depth_stencil(self) -> bool {
         matches!(self, Format::Depth32Float | Format::Depth24PlusStencil8)
     }
+
+    /// Bytes one texel takes.
+    pub const fn bytes_per_texel(self) -> u32 {
+        match self {
+            Format::Rgba8Unorm
+            | Format::Rgba8UnormSrgb
+            | Format::Bgra8Unorm
+            | Format::Bgra8UnormSrgb
+            | Format::R32Float
+            | Format::Depth32Float
+            | Format::Depth24PlusStencil8 => 4,
+        }
+    }
 }
 
 /// An axis-aligned rectangle in pixels. Used for scissor and damage regions.

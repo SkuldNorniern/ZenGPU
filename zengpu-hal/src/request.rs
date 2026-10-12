@@ -26,6 +26,25 @@ pub struct DeviceRequest {
     pub pipeline_cache_path: Option<PathBuf>,
 }
 
+/// Which ways of moving data a backend implements itself. The trait has a
+/// default for every one, but the default of these refuses with
+/// `Unsupported`: check before relying on one, and fall back where it is
+/// missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransferCaps {
+    /// [`crate::GpuDevice::write_textures`] updates a rectangle of a
+    /// texture and keeps the rest.
+    pub texture_region_write: bool,
+    /// [`crate::GpuDevice::copy_buffer_to_texture`] and
+    /// [`crate::GpuDevice::copy_texture_region_to_buffer`] copy on the
+    /// device, with no trip through the host.
+    pub buffer_texture_copy: bool,
+    /// Uploads reuse staging memory instead of allocating per call.
+    pub staged_uploads: bool,
+    /// Transfers return before the copy is done, with a submission to poll.
+    pub async_transfers: bool,
+}
+
 /// Which HAL capabilities a backend implements. A backend may provide
 /// graphics, compute, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -34,6 +53,8 @@ pub struct HalCapabilities {
     pub compute: bool,
     /// Feature set implemented and enabled on this adapter/device path.
     pub features: Features,
+    /// The transfer paths it implements.
+    pub transfers: TransferCaps,
 }
 
 impl HalCapabilities {
@@ -43,6 +64,12 @@ impl HalCapabilities {
             graphics: true,
             compute: true,
             features: Features::COMPUTE | Features::GRAPHICS,
+            transfers: TransferCaps {
+                texture_region_write: false,
+                buffer_texture_copy: false,
+                staged_uploads: false,
+                async_transfers: false,
+            },
         }
     }
 
@@ -52,12 +79,24 @@ impl HalCapabilities {
             graphics: false,
             compute: true,
             features: Features::COMPUTE,
+            transfers: TransferCaps {
+                texture_region_write: false,
+                buffer_texture_copy: false,
+                staged_uploads: false,
+                async_transfers: false,
+            },
         }
     }
 
     /// Add backend-specific feature flags to this capability description.
     pub fn with_features(mut self, features: Features) -> Self {
         self.features |= features;
+        self
+    }
+
+    /// These capabilities with `transfers` as the transfer paths.
+    pub fn with_transfers(mut self, transfers: TransferCaps) -> Self {
+        self.transfers = transfers;
         self
     }
 }
