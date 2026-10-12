@@ -4,7 +4,7 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
     GpuDevice, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc,
-    ShaderHandle, Submission, TextureDesc, TextureHandle,
+    ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -75,6 +75,36 @@ impl Device {
 
     pub fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
         self.inner.upload_texture_data(texture, data)
+    }
+
+    /// Non-blocking texture rect write from host memory. Check
+    /// [`TransferCaps::texture_region_write`](crate::hal::TransferCaps) first.
+    pub fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        self.inner.write_textures(writes)
+    }
+
+    pub fn copy_buffer_to_texture(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+        texture: TextureHandle,
+        region: TextureRegion,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_buffer_to_texture(buffer, offset, bytes_per_row, texture, region)
+    }
+
+    pub fn copy_texture_region_to_buffer(
+        &self,
+        texture: TextureHandle,
+        region: TextureRegion,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_texture_region_to_buffer(texture, region, buffer, offset, bytes_per_row)
     }
 
     pub fn destroy_texture(&self, texture: TextureHandle) {
