@@ -216,9 +216,45 @@ impl VulkanInstance {
         Self::create(true)
     }
 
-    /// First available adapter as a [`VulkanAdapter`], or `None` if there is no device. Use instead
-    /// of [`GpuInstance::enumerate_adapters`] when you need `open_with_surface`, which is not on
-    /// the trait object. Headless pick: prefers discrete GPUs, ranked by `type_score`.
+    /// First adapter as a concrete `VulkanAdapter`, or `None`. Use it, not `enumerate_adapters`, to
+    /// call `open_with_surface`. Every adapter, as the concrete type.
+    pub fn vulkan_adapters(&self) -> Vec<VulkanAdapter> {
+        let physicals = unsafe {
+            self.shared
+                .instance
+                .enumerate_physical_devices()
+                .unwrap_or_default()
+        };
+        physicals
+            .into_iter()
+            .map(|phys| VulkanAdapter::new(Arc::clone(&self.shared), phys, self.adapter_info(phys)))
+            .collect()
+    }
+
+    /// The adapter with this [`VulkanAdapter::uuid`], if it is still present.
+    pub fn vulkan_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<VulkanAdapter> {
+        self.vulkan_adapters()
+            .into_iter()
+            .find(|a| a.uuid() == uuid)
+    }
+
+    fn adapter_info(&self, phys: vk::PhysicalDevice) -> AdapterInfo {
+        let props = unsafe { self.shared.instance.get_physical_device_properties(phys) };
+        let name = unsafe {
+            CStr::from_ptr(props.device_name.as_ptr())
+                .to_string_lossy()
+                .into_owned()
+        };
+        AdapterInfo {
+            name,
+            vendor: props.vendor_id,
+            device: props.device_id,
+            device_type: vk_device_type(props.device_type),
+            backend: BackendPreference::Vulkan,
+        }
+    }
+
+    /// Best adapter for headless rendering: discrete over integrated, by `type_score`.
     pub fn request_vulkan_adapter(&self) -> Option<VulkanAdapter> {
         self.request_vulkan_adapter_with_pref(PowerPreference::HighPerformance)
     }

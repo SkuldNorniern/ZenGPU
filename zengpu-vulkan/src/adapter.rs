@@ -56,6 +56,19 @@ impl GpuAdapter for VulkanAdapter {
 }
 
 impl VulkanAdapter {
+    /// Device UUID, stable for the same GPU and driver across runs. Save it to reopen this adapter
+    /// after a device loss.
+    pub fn uuid(&self) -> [u8; 16] {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        unsafe {
+            self.shared
+                .instance
+                .get_physical_device_properties2(self.physical, &mut props)
+        };
+        id.device_uuid
+    }
+
     /// Opens a headless graphics device with no swapchain extension. For windowed rendering,
     /// use `open_with_surface`.
     pub fn open_headless(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
