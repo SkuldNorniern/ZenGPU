@@ -24,6 +24,10 @@ impl GpuDevice for VulkanDevice {
         self.inner.limits
     }
 
+    fn is_lost(&self) -> bool {
+        self.inner.is_lost()
+    }
+
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         self.collect_garbage();
         if desc.usage.contains(BufferUsage::STORAGE)

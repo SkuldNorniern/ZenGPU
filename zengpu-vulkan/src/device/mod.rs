@@ -10,7 +10,7 @@ use std::{
     ptr::{copy_nonoverlapping, null, null_mut},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -377,6 +377,10 @@ pub(crate) struct VulkanDeviceInner {
     pub queue_lock: Mutex<()>,
     /// Numbers submissions to `queue` for deferred frees.
     pub serials: QueueSerials,
+    /// Set once the device is seen lost; it never comes back.
+    pub lost: AtomicBool,
+    /// Unsignalled fence, whose status is the one thing that reports device loss.
+    pub probe: vk::Fence,
     pub features: Features,
     pub limits: DeviceLimits,
     pub graphics: bool,
@@ -394,10 +398,25 @@ pub(crate) struct VulkanDeviceInner {
 unsafe impl Send for VulkanDeviceInner {}
 unsafe impl Sync for VulkanDeviceInner {}
 
+impl VulkanDeviceInner {
+    pub(crate) fn is_lost(&self) -> bool {
+        if self.lost.load(Ordering::Acquire) {
+            return true;
+        }
+        let status = unsafe { self.device.get_fence_status(self.probe) };
+        let lost = matches!(status, Err(vk::Result::ERROR_DEVICE_LOST));
+        if lost {
+            self.lost.store(true, Ordering::Release);
+        }
+        lost
+    }
+}
+
 impl Drop for VulkanDeviceInner {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            self.device.destroy_fence(self.probe, None);
             self.device.destroy_device(None);
         }
     }
@@ -746,6 +765,8 @@ impl VulkanDevice {
         let debug_utils = shared
             .debug_utils_enabled()
             .then(|| ext::debug_utils::Device::new(&shared.instance, &device));
+        let probe = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(|e| map_vk_err("vkCreateFence", e))?;
         let inner = Arc::new(VulkanDeviceInner {
             shared,
             device,
@@ -755,6 +776,8 @@ impl VulkanDevice {
             queue,
             queue_lock: Mutex::new(()),
             serials: QueueSerials::default(),
+            lost: AtomicBool::new(false),
+            probe,
             features: available_features,
             limits: device_limits,
             graphics: needs_graphics,
@@ -1360,6 +1383,15 @@ mod tests {
         dev.destroy_buffer(src);
         dev.destroy_buffer(out);
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn a_working_device_is_not_lost() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        assert!(!dev.is_lost());
+        assert!(!dev.is_lost(), "asking twice changes nothing");
     }
 
     #[test]
