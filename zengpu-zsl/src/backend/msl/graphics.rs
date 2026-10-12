@@ -227,6 +227,10 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "MSL graphics backend: atomic_add is unavailable in graphics shaders",
             ));
         }
+        IrStmt::Discard => {
+            indent(s, depth);
+            s.push_str("discard_fragment();\n");
+        }
         IrStmt::Eval(expr) => {
             indent(s, depth);
             let _ = writeln!(s, "{};", emit_expr(ctx, expr)?);
@@ -435,6 +439,20 @@ mod tests {
         assert!(m.source.contains("uint vi [[vertex_id]]"));
         assert!(m.source.contains("(in.rect).xy"));
         assert!(m.source.contains("float(((vi & 1u)))") || m.source.contains("float((vi & 1u))"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn discard_drops_the_fragment() {
+        let m = graphics(
+            r#"
+            fragment fs(@location(0) c: f32x4) -> f32x4 {
+                if c.a <= 0.0 { discard }
+                c
+            }
+        "#,
+        );
+        assert!(m.source.contains("discard_fragment();"));
         let _ = metal_compiles(&m.source);
     }
 

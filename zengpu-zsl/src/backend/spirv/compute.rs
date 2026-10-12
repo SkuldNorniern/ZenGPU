@@ -587,6 +587,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             Ok(())
         }
 
+        IrStmt::Discard => Err("ZSL: discard is only available in fragment shaders".into()),
         IrStmt::Barrier => {
             let scope = ctx.spv.constant_u32(ctx.t_u32, 2);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0x108);

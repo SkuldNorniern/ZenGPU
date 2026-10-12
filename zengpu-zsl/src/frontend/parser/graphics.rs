@@ -6,6 +6,7 @@ impl<'a> Parser<'a> {
         is_fragment: bool,
     ) -> Result<GraphicsModule, ParseError> {
         let mut ctx = GfxCtx {
+            is_fragment,
             inputs: HashMap::new(),
             scalars: HashMap::new(),
             push_param: None,
@@ -209,6 +210,10 @@ impl<'a> Parser<'a> {
                 body.push(self.parse_gfx_if(ctx)?);
                 continue;
             }
+            if self.eat_kw("discard") {
+                body.push(self.gfx_discard(ctx)?);
+                continue;
+            }
             let tail = if self.peek() == Some(&Tok::LParen) {
                 self.parse_gfx_tail(ctx)?
             } else {
@@ -280,6 +285,10 @@ impl<'a> Parser<'a> {
                 stmts.push(self.parse_gfx_if(ctx)?);
                 continue;
             }
+            if self.eat_kw("discard") {
+                stmts.push(self.gfx_discard(ctx)?);
+                continue;
+            }
             let e = self.parse_g_expr(ctx)?;
             self.expect(&Tok::Eq, "`=` (block statements must be assignments)")?;
             let rhs = self.parse_g_expr(ctx)?;
@@ -305,6 +314,14 @@ impl<'a> Parser<'a> {
         ctx.locals.insert(name.clone(), ty);
         ctx.locals_order.push((name.clone(), ty));
         Ok(IrStmt::Let { name, init })
+    }
+
+    fn gfx_discard(&mut self, ctx: &GfxCtx) -> Result<IrStmt, ParseError> {
+        if !ctx.is_fragment {
+            return self.err("`discard` is only available in fragment shaders");
+        }
+        self.eat(&Tok::Semi);
+        Ok(IrStmt::Discard)
     }
 
     pub(super) fn parse_gfx_if(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {

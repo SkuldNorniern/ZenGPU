@@ -120,7 +120,7 @@ fn check_stmt(
             check_expr(index, ctx, types, bool_id)?;
             check_expr(value, ctx, types, bool_id)
         }
-        IrStmt::Barrier => Ok(()),
+        IrStmt::Barrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             check_expr(cond, ctx, types, bool_id)?;
             for stmt in then {

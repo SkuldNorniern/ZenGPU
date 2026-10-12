@@ -86,6 +86,7 @@ pub(super) struct PendingGfxScalar {
 }
 
 pub(super) struct GfxCtx {
+    pub(super) is_fragment: bool,
     pub(super) inputs: HashMap<String, TypeId>,
     pub(super) scalars: HashMap<String, TypeId>,
     pub(super) push_param: Option<String>,
