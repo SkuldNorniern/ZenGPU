@@ -18,6 +18,7 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
+        self.collect_garbage();
         if desc.usage.contains(BufferUsage::STORAGE)
             && desc.size > self.inner.limits.max_storage_buffer_range
         {
@@ -143,10 +144,9 @@ impl GpuDevice for VulkanDevice {
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
-        if self.lifetime.lock().unwrap().in_flight != 0 {
+        if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "write_buffer cannot mutate buffers while an asynchronous submission is pending"
-                    .into(),
+                "write_buffer cannot change a buffer pending GPU work still uses".into(),
             )));
         }
 
@@ -176,10 +176,9 @@ impl GpuDevice for VulkanDevice {
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
-        if self.lifetime.lock().unwrap().in_flight != 0 {
+        if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "read_buffer cannot observe buffers while an asynchronous submission is pending"
-                    .into(),
+                "read_buffer cannot read a buffer pending GPU work still uses".into(),
             )));
         }
 
@@ -216,10 +215,9 @@ impl GpuDevice for VulkanDevice {
     fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
-        if self.lifetime.lock().unwrap().in_flight != 0 {
+        if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "read_buffer_into cannot observe buffers while an asynchronous submission is pending"
-                    .into(),
+                "read_buffer_into cannot read a buffer pending GPU work still uses".into(),
             )));
         }
         if !buf.usage.contains(BufferUsage::READBACK) {
@@ -260,9 +258,9 @@ impl GpuDevice for VulkanDevice {
         len: u64,
     ) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
-        if self.lifetime.lock().unwrap().in_flight != 0 {
+        if self.buffer_busy(src.index()) || self.buffer_busy(dst.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                "copy_buffer cannot run while an asynchronous submission is pending".into(),
+                "copy_buffer cannot touch a buffer pending GPU work still uses".into(),
             )));
         }
         let (src_buffer, dst_buffer) = {
@@ -328,13 +326,15 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
+        self.collect_garbage();
         let mut buffers = self.buffers.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
-        if lifetime.in_flight != 0 {
+        if !self.inner.serials.idle() {
             if let Some(buf) = buffers.retire(buffer) {
-                lifetime
-                    .deferred
-                    .push(DeferredVulkanResource::Buffer(buffer.index(), buf));
+                lifetime.deferred.push((
+                    self.inner.serials.submitted(),
+                    DeferredVulkanResource::Buffer(buffer.index(), buf),
+                ));
             }
         } else if let Some(buf) = buffers.remove(buffer) {
             unsafe {
@@ -348,6 +348,7 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+        self.collect_garbage();
         let mip_levels = desc.mip_levels.max(1);
         let array_layers = desc.array_layers.max(1);
         let depth = if desc.dimension == TexDim::D3 {
@@ -535,14 +536,16 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn destroy_texture(&self, texture: TextureHandle) {
+        self.collect_garbage();
         let mut textures = self.textures.lock().unwrap();
         let mut bound_textures = self.bindless.bound_textures.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
-        let (removed, tex) = if lifetime.in_flight != 0 {
+        let (removed, tex) = if !self.inner.serials.idle() {
             if let Some(tex) = textures.retire(texture) {
-                lifetime
-                    .deferred
-                    .push(DeferredVulkanResource::Texture(texture.index(), tex));
+                lifetime.deferred.push((
+                    self.inner.serials.submitted(),
+                    DeferredVulkanResource::Texture(texture.index(), tex),
+                ));
                 (true, None)
             } else {
                 (false, None)
@@ -607,13 +610,15 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn destroy_sampler(&self, sampler: SamplerHandle) {
+        self.collect_garbage();
         let mut samplers = self.samplers.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
-        if lifetime.in_flight != 0 {
+        if !self.inner.serials.idle() {
             if let Some(s) = samplers.retire(sampler) {
-                lifetime
-                    .deferred
-                    .push(DeferredVulkanResource::Sampler(sampler.index(), s));
+                lifetime.deferred.push((
+                    self.inner.serials.submitted(),
+                    DeferredVulkanResource::Sampler(sampler.index(), s),
+                ));
             }
         } else if let Some(s) = samplers.remove(sampler) {
             unsafe { self.inner.device.destroy_sampler(s, None) };
@@ -762,13 +767,15 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        self.collect_garbage();
         let mut pipelines = self.pipelines.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
-        if lifetime.in_flight != 0 {
+        if !self.inner.serials.idle() {
             if let Some(p) = pipelines.retire(pipeline) {
-                lifetime
-                    .deferred
-                    .push(DeferredVulkanResource::Pipeline(pipeline.index(), p));
+                lifetime.deferred.push((
+                    self.inner.serials.submitted(),
+                    DeferredVulkanResource::Pipeline(pipeline.index(), p),
+                ));
             }
         } else if let Some(p) = pipelines.remove(pipeline) {
             let (pipeline, layout) = p.handles();

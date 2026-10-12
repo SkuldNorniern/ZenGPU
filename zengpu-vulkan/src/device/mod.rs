@@ -2,13 +2,17 @@
 
 use std::{
     any::Any,
+    collections::HashMap,
     ffi::{CStr, CString, c_void},
     fs,
     io::ErrorKind,
     mem,
     path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -104,10 +108,80 @@ enum DeferredVulkanResource {
     Pipeline(u32, VulkanPipeline),
 }
 
+/// Work submitted to the device's queue, numbered in submission order.
+///
+/// One queue signals in the order work was submitted, so once the work
+/// numbered `n` is seen finished, everything numbered before it is too.
+/// Every submission takes a number, compute and graphics alike, which is
+/// what lets a resource be freed once the work that could still be using
+/// it is done, and not before.
+#[derive(Default)]
+pub(crate) struct QueueSerials {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+}
+
+impl QueueSerials {
+    /// Numbers a submission that has just reached the queue. Call it with
+    /// the queue lock held, right after the submit succeeded, so numbers
+    /// follow submission order.
+    pub(crate) fn next(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Notes that the work numbered `serial` has finished.
+    pub(crate) fn complete(&self, serial: u64) {
+        self.completed.fetch_max(serial, Ordering::AcqRel);
+    }
+
+    pub(crate) fn submitted(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    /// Whether every submission so far has finished.
+    pub(crate) fn idle(&self) -> bool {
+        self.completed() >= self.submitted()
+    }
+}
+
+/// Resources waiting on the GPU, and which work last used which buffer.
 #[derive(Default)]
 struct VulkanLifetimeState {
-    in_flight: usize,
-    deferred: Vec<DeferredVulkanResource>,
+    /// Destroyed while work was pending: freed once the work numbered with
+    /// it has finished.
+    deferred: Vec<(u64, DeferredVulkanResource)>,
+    /// The last submission each buffer (by bindless index) was used by.
+    buffer_use: HashMap<u32, u64>,
+}
+
+impl VulkanLifetimeState {
+    /// Whether work not yet finished uses buffer `index`.
+    fn buffer_busy(&self, index: u32, completed: u64) -> bool {
+        self.buffer_use
+            .get(&index)
+            .is_some_and(|serial| *serial > completed)
+    }
+
+    /// Notes that submission `serial` uses the buffers at `indices`.
+    fn mark_used(&mut self, indices: &[u32], serial: u64) {
+        for &index in indices {
+            self.buffer_use.insert(index, serial);
+        }
+    }
+
+    /// What can be freed now that the work up to `completed` is done.
+    fn take_ready(&mut self, completed: u64) -> Vec<DeferredVulkanResource> {
+        self.buffer_use.retain(|_, serial| *serial > completed);
+        let (ready, waiting): (Vec<_>, Vec<_>) = mem::take(&mut self.deferred)
+            .into_iter()
+            .partition(|(serial, _)| *serial <= completed);
+        self.deferred = waiting;
+        ready.into_iter().map(|(_, resource)| resource).collect()
+    }
 }
 
 /// Fence-backed Vulkan submission. Completion releases its pooled fence and
@@ -115,6 +189,8 @@ struct VulkanLifetimeState {
 /// handle so a later poll/wait is safe.
 struct VulkanSubmission {
     cycle_id: u64,
+    /// This work's number in the queue.
+    serial: u64,
     inner: Arc<VulkanDeviceInner>,
     fence_pool: Arc<FencePool>,
     cmd_pool: Arc<CmdListPool>,
@@ -142,16 +218,12 @@ impl VulkanSubmission {
     }
 
     fn release_in_flight(&self) {
-        let deferred = {
-            let mut lifetime = self.lifetime.lock().unwrap();
-            debug_assert!(lifetime.in_flight > 0);
-            lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
-            if lifetime.in_flight == 0 {
-                mem::take(&mut lifetime.deferred)
-            } else {
-                Vec::new()
-            }
-        };
+        self.inner.serials.complete(self.serial);
+        let deferred = self
+            .lifetime
+            .lock()
+            .unwrap()
+            .take_ready(self.inner.serials.completed());
         destroy_deferred_vulkan(
             &self.inner,
             &self.buffers,
@@ -336,6 +408,9 @@ pub(crate) struct VulkanDeviceInner {
     /// Vulkan queues require external host synchronization. Every internal
     /// submit/present operation using `queue` must hold this mutex.
     pub queue_lock: Mutex<()>,
+    /// Numbers every submission to `queue`, for freeing resources once the
+    /// work that used them is done.
+    pub serials: QueueSerials,
     pub features: Features,
     pub limits: DeviceLimits,
     pub graphics: bool,
@@ -464,6 +539,32 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
+    /// Whether work that has not finished uses buffer `index`.
+    pub(crate) fn buffer_busy(&self, index: u32) -> bool {
+        let completed = self.inner.serials.completed();
+        self.lifetime.lock().unwrap().buffer_busy(index, completed)
+    }
+
+    /// Frees whatever destroyed resources the finished work no longer needs.
+    pub(crate) fn collect_garbage(&self) {
+        let ready = self
+            .lifetime
+            .lock()
+            .unwrap()
+            .take_ready(self.inner.serials.completed());
+        if ready.is_empty() {
+            return;
+        }
+        destroy_deferred_vulkan(
+            &self.inner,
+            &self.buffers,
+            &self.textures,
+            &self.samplers,
+            &self.pipelines,
+            ready,
+        );
+    }
+
     pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
@@ -680,6 +781,7 @@ impl VulkanDevice {
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
+            serials: QueueSerials::default(),
             features: available_features,
             limits: device_limits,
             graphics: needs_graphics,
@@ -1966,6 +2068,12 @@ mod tests {
             )
             .unwrap();
         assert!(dev.write_buffer(a, 0, &[0; 4]).is_err());
+        // Only buffers the pending work uses are held: another one stays
+        // writable and readable while it runs.
+        let unrelated = dev.create_buffer(storage_rw(16)).unwrap();
+        dev.write_buffer(unrelated, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(dev.read_buffer(unrelated, 0, 4).unwrap(), vec![1, 2, 3, 4]);
+        dev.destroy_buffer(unrelated);
         // Destruction while pending invalidates handles immediately but must
         // not recycle descriptor/pipeline slots until this token completes.
         let retired_sum_index = sum.index();
@@ -1989,6 +2097,8 @@ mod tests {
         );
         let allocated_after_completion = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
         assert_eq!(allocated_after_completion.index(), retired_sum_index);
+        // Finished work lets go of its buffers.
+        dev.write_buffer(a, 0, &[0; 4]).unwrap();
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
         let result: &[f32] = unsafe { from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };
