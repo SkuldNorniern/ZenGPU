@@ -36,6 +36,12 @@ impl Device {
         self.inner.limits()
     }
 
+    /// Whether the device is lost; see [`GpuDevice::is_lost`] for how to
+    /// recover.
+    pub fn is_lost(&self) -> bool {
+        self.inner.is_lost()
+    }
+
     // ── Buffer API ────────────────────────────────────────────────────────────
 
     pub fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
