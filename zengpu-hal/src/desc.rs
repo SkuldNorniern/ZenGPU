@@ -16,7 +16,7 @@ pub struct BufferDesc {
 }
 
 /// Texture dimensionality.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TexDim {
     /// A flat image, or — with `array_layers > 1` — a 2D array (shadow
     /// cascades, texture atlases).
@@ -30,7 +30,7 @@ pub enum TexDim {
 }
 
 /// Describes a texture to create.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TextureDesc {
     pub width: u32,
     pub height: u32,

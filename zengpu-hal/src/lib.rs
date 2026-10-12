@@ -20,6 +20,7 @@ mod device;
 mod error;
 mod graphics;
 mod handle;
+mod pool;
 mod request;
 mod submission;
 mod surface;
@@ -32,6 +33,7 @@ pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,
     RenderPassDesc, Surface, ViewportScissor,
 };
+pub use pool::TexturePool;
 pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities, TransferCaps};
 pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
 pub use surface::WindowHandles;
