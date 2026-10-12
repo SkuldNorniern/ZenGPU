@@ -1,4 +1,5 @@
 use super::*;
+use zengpu_hal::{TextureRegion, TextureWrite, TransferCaps};
 
 impl GpuDevice for VulkanDevice {
     fn as_any(&self) -> &dyn Any {
@@ -10,7 +11,12 @@ impl GpuDevice for VulkanDevice {
             graphics: self.inner.graphics,
             compute: true,
             features: self.inner.features,
-            ..HalCapabilities::default()
+            transfers: TransferCaps {
+                texture_region_write: true,
+                buffer_texture_copy: true,
+                staged_uploads: true,
+                async_transfers: true,
+            },
         }
     }
 
@@ -497,6 +503,8 @@ impl GpuDevice for VulkanDevice {
             mip_levels,
             array_layers,
             usage,
+            texel_bytes: desc.format.bytes_per_texel(),
+            ready: vec![0; array_layers as usize],
         }))
     }
 
@@ -534,6 +542,32 @@ impl GpuDevice for VulkanDevice {
             }));
         }
         self.generate_mipmaps_impl(texture)
+    }
+
+    fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        self.write_textures_impl(writes)
+    }
+
+    fn copy_buffer_to_texture(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+        texture: TextureHandle,
+        region: TextureRegion,
+    ) -> Result<Submission> {
+        self.copy_buffer_to_texture_impl(buffer, offset, bytes_per_row, texture, region)
+    }
+
+    fn copy_texture_region_to_buffer(
+        &self,
+        texture: TextureHandle,
+        region: TextureRegion,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+    ) -> Result<Submission> {
+        self.copy_texture_region_to_buffer_impl(texture, region, buffer, offset, bytes_per_row)
     }
 
     fn destroy_texture(&self, texture: TextureHandle) {

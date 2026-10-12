@@ -141,6 +141,21 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
+        self.one_shot_submit_tracked(cycle_id, uses, record)
+            .map(|(submission, _)| submission)
+    }
+
+    /// Like `one_shot_submit_async`, also handing back the submission's
+    /// serial in the queue.
+    pub(crate) fn one_shot_submit_tracked<F>(
+        &self,
+        cycle_id: u64,
+        uses: &[u32],
+        record: F,
+    ) -> Result<(Submission, u64)>
+    where
+        F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
+    {
         let cmd = self.cmd_list_pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
@@ -180,7 +195,7 @@ impl VulkanDevice {
         };
         self.lifetime.lock().unwrap().mark_used(uses, serial);
 
-        Ok(Box::new(VulkanSubmission {
+        let submission: Submission = Box::new(VulkanSubmission {
             cycle_id,
             serial,
             inner: Arc::clone(&self.inner),
@@ -195,7 +210,8 @@ impl VulkanDevice {
                 fence: Some(fence),
                 cmd: Some(cmd),
             }),
-        }))
+        });
+        Ok((submission, serial))
     }
 
     pub(super) fn find_memory_type(
