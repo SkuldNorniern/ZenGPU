@@ -101,7 +101,7 @@ impl ElementwiseKernels {
 
         let out = pool.alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        device.dispatch(
+        let dispatched = device.dispatch(
             self.add_pipeline,
             Bindings {
                 buffers: &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
@@ -109,8 +109,8 @@ impl ElementwiseKernels {
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],
-        )?;
-        Ok(out)
+        );
+        finish(pool, out, dispatched)
     }
 
     /// `a` must be `DType::F32`. `out` is allocated from `pool`.
@@ -124,7 +124,7 @@ impl ElementwiseKernels {
 
         let out = pool.alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        device.dispatch(
+        let dispatched = device.dispatch(
             self.relu_pipeline,
             Bindings {
                 buffers: &[a.buffer.index(), out.buffer.index()],
@@ -132,7 +132,18 @@ impl ElementwiseKernels {
                 textures: &[],
             },
             [n.div_ceil(256), 1, 1],
-        )?;
-        Ok(out)
+        );
+        finish(pool, out, dispatched)
+    }
+}
+
+/// `out` is kept only if its dispatch went through. Otherwise it returns to `pool`.
+fn finish(pool: &BufferPool, out: DeviceArray, dispatched: Result<()>) -> Result<DeviceArray> {
+    match dispatched {
+        Ok(()) => Ok(out),
+        Err(e) => {
+            pool.free(out);
+            Err(e)
+        }
     }
 }
