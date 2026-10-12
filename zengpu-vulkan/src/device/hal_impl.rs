@@ -10,6 +10,7 @@ impl GpuDevice for VulkanDevice {
             graphics: self.inner.graphics,
             compute: true,
             features: self.inner.features,
+            ..HalCapabilities::default()
         }
     }
 
