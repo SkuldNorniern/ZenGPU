@@ -24,7 +24,7 @@ pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,
     RenderPassDesc, Surface, ViewportScissor,
 };
-pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities};
+pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities, TransferCaps};
 pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
 pub use surface::WindowHandles;
 
@@ -33,7 +33,8 @@ pub use desc::{
     BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, CullMode, DepthState, FilterMode,
     FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology, RasterState, RenderTargetDesc,
     SamplerDesc, ShaderDesc, ShaderSource, StencilFaceState, StencilOp, StencilState, StepMode,
-    SurfaceConfig, TexDim, TextureDesc, VertexAttribute, VertexFormat, VertexLayout,
+    SurfaceConfig, TexDim, TextureDesc, TextureRegion, TextureWrite, VertexAttribute, VertexFormat,
+    VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{

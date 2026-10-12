@@ -4,7 +4,10 @@
 use core::any::Any;
 
 use crate::command::{Bindings, ComputeOp, DispatchOp};
-use crate::desc::{BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc};
+use crate::desc::{
+    BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc, TextureRegion,
+    TextureWrite,
+};
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, HalCapabilities};
@@ -105,6 +108,45 @@ pub trait GpuDevice: Send + Sync {
         _data: &[u8],
     ) -> Result<()> {
         Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
+    }
+
+    /// Writes each of `writes` into its region and keeps the rest of the texture. This is one
+    /// submission. It returns once `data` is copied out, before the GPU has seen it. Later work
+    /// sees the texels. Check `TransferCaps::texture_region_write`, since the default refuses.
+    fn write_textures(&self, _writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        Err(GpuError::Unsupported("texture region write".into()))
+    }
+
+    /// Copies rows of `buffer` (from `offset`, `bytes_per_row` apart) into `region`. `buffer` needs
+    /// `TRANSFER_SRC`. Later work sees the copy. Check `TransferCaps::buffer_texture_copy`, since
+    /// the default refuses.
+    fn copy_buffer_to_texture(
+        &self,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _bytes_per_row: u32,
+        _texture: TextureHandle,
+        _region: TextureRegion,
+    ) -> Result<Submission> {
+        Err(GpuError::Unsupported("buffer-to-texture copy".into()))
+    }
+
+    /// Copies `region` of `texture` into `buffer` at `offset`, rows `bytes_per_row` apart, on the
+    /// device. `buffer` needs [`crate::BufferUsage::TRANSFER_DST`], and
+    /// [`crate::BufferUsage::READBACK`] to read it on the host once the submission completes.
+    ///
+    /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default refuses.
+    fn copy_texture_region_to_buffer(
+        &self,
+        _texture: TextureHandle,
+        _region: TextureRegion,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _bytes_per_row: u32,
+    ) -> Result<Submission> {
+        Err(GpuError::Unsupported(
+            "texture-to-buffer region copy".into(),
+        ))
     }
 
     /// Fills the mip chain by blitting each level from the previous one at half size. Needs

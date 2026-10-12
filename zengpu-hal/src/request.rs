@@ -22,11 +22,25 @@ pub struct DeviceRequest {
     pub pipeline_cache_path: Option<PathBuf>,
 }
 
+/// Transfer paths a backend may implement.
+///
+/// The default of each refuses with `Unsupported`, so check before relying on one and fall back
+/// when it is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TransferCaps {
+    pub texture_region_write: bool,
+    pub buffer_texture_copy: bool,
+    /// Uploads reuse staging memory instead of allocating per call.
+    pub staged_uploads: bool,
+    pub async_transfers: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HalCapabilities {
     pub graphics: bool,
     pub compute: bool,
     pub features: Features,
+    pub transfers: TransferCaps,
 }
 
 impl HalCapabilities {
@@ -35,6 +49,12 @@ impl HalCapabilities {
             graphics: true,
             compute: true,
             features: Features::COMPUTE | Features::GRAPHICS,
+            transfers: TransferCaps {
+                texture_region_write: false,
+                buffer_texture_copy: false,
+                staged_uploads: false,
+                async_transfers: false,
+            },
         }
     }
 
@@ -43,11 +63,22 @@ impl HalCapabilities {
             graphics: false,
             compute: true,
             features: Features::COMPUTE,
+            transfers: TransferCaps {
+                texture_region_write: false,
+                buffer_texture_copy: false,
+                staged_uploads: false,
+                async_transfers: false,
+            },
         }
     }
 
     pub fn with_features(mut self, features: Features) -> Self {
         self.features |= features;
+        self
+    }
+
+    pub fn with_transfers(mut self, transfers: TransferCaps) -> Self {
+        self.transfers = transfers;
         self
     }
 }
