@@ -136,6 +136,21 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen, "`)`")?;
                 self.parse_g_postfix(ctx, e)
             }
+            Some(Tok::LBracket) => {
+                self.pos += 1;
+                let mut elems = Vec::new();
+                while !self.eat(&Tok::RBracket) {
+                    elems.push(self.parse_g_expr(ctx)?);
+                    self.eat(&Tok::Comma);
+                    if self.peek().is_none() {
+                        return self.err("unterminated array");
+                    }
+                }
+                if elems.is_empty() {
+                    return self.err("an array needs at least one element");
+                }
+                Ok(IrExpr::ArrayLit(elems))
+            }
             Some(Tok::Ident(_)) => {
                 let name = self.ident()?;
                 // A value name before `(` is a value followed by a tuple
@@ -171,6 +186,14 @@ impl<'a> Parser<'a> {
                 }
                 let base = if ctx.inputs.contains_key(&name) {
                     IrExpr::Input(name)
+                } else if ctx.arrays.contains(&name) {
+                    self.expect(&Tok::LBracket, "`[` to index an array")?;
+                    let index = self.parse_g_expr(ctx)?;
+                    self.expect(&Tok::RBracket, "`]`")?;
+                    IrExpr::Index {
+                        array: name,
+                        index: Box::new(index),
+                    }
                 } else if ctx.locals.contains_key(&name) {
                     IrExpr::Local(name)
                 } else {

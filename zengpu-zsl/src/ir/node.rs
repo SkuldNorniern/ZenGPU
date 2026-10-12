@@ -35,6 +35,11 @@ pub enum IrExpr {
     /// A multi-lane swizzle `expr.xy`/`expr.rgb`/… → a vector of
     /// `lanes.len()` (2 to 4) components picked from `base` (graphics only).
     Swizzle { base: Box<IrExpr>, lanes: Vec<u32> },
+    /// `[a, b, …]`: an array of same-typed values, bound by a `let`
+    /// (graphics only).
+    ArrayLit(Vec<IrExpr>),
+    /// `array[index]`: an element of a local array (graphics only).
+    Index { array: String, index: Box<IrExpr> },
     /// `table[index].sample(uv)` / `.sample_level(uv, lod)` → `f32x4`: the
     /// texture in bindless slot `index`, sampled at `uv` (graphics only).
     Sample {
@@ -327,7 +332,10 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
             expr_uses_subgroup_query(base)
         }
-        IrExpr::Construct { args, .. } => args.iter().any(expr_uses_subgroup_query),
+        IrExpr::Construct { args, .. } | IrExpr::ArrayLit(args) => {
+            args.iter().any(expr_uses_subgroup_query)
+        }
+        IrExpr::Index { index, .. } => expr_uses_subgroup_query(index),
         IrExpr::Sample { index, uv, lod } => {
             expr_uses_subgroup_query(index)
                 || expr_uses_subgroup_query(uv)
@@ -395,7 +403,10 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
             expr_uses_workgroup_reduce(base)
         }
-        IrExpr::Construct { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
+        IrExpr::Construct { args, .. } | IrExpr::ArrayLit(args) => {
+            args.iter().any(expr_uses_workgroup_reduce)
+        }
+        IrExpr::Index { index, .. } => expr_uses_workgroup_reduce(index),
         IrExpr::Sample { index, uv, lod } => {
             expr_uses_workgroup_reduce(index)
                 || expr_uses_workgroup_reduce(uv)
@@ -520,7 +531,14 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
                     merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
                 })
         }
-        IrExpr::Neg(inner) => expr_uses_subgroup_collectives(inner),
+        IrExpr::Neg(inner) | IrExpr::Index { index: inner, .. } => {
+            expr_uses_subgroup_collectives(inner)
+        }
+        IrExpr::ArrayLit(elems) => elems
+            .iter()
+            .fold((false, false, false, false, false), |acc, e| {
+                merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(e))
+            }),
         IrExpr::Sample { index, uv, lod } => {
             let uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(index),

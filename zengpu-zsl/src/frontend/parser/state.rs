@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ir::node::IrStmt;
 use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
@@ -102,6 +102,8 @@ pub(super) struct GfxCtx {
     pub(super) textures: Option<String>,        // the `textures` param name
     pub(super) locals: HashMap<String, TypeId>,
     pub(super) locals_order: Vec<(String, TypeId)>,
+    /// Locals bound to an array literal, read only through `name[i]`.
+    pub(super) arrays: HashSet<String>,
 }
 
 impl GfxCtx {

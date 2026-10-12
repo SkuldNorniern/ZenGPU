@@ -38,6 +38,13 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
             base: Box::new(rename_expr(base, map)),
             lanes: lanes.clone(),
         },
+        IrExpr::ArrayLit(elems) => {
+            IrExpr::ArrayLit(elems.iter().map(|e| rename_expr(e, map)).collect())
+        }
+        IrExpr::Index { array, index } => IrExpr::Index {
+            array: renamed(array),
+            index: Box::new(rename_expr(index, map)),
+        },
         IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
             index: Box::new(rename_expr(index, map)),
             uv: Box::new(rename_expr(uv, map)),
@@ -138,6 +145,16 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
         IrExpr::Swizzle { base, lanes } => IrExpr::Swizzle {
             base: Box::new(resolve_construct_types_expr(base, types)),
             lanes: lanes.clone(),
+        },
+        IrExpr::ArrayLit(elems) => IrExpr::ArrayLit(
+            elems
+                .iter()
+                .map(|e| resolve_construct_types_expr(e, types))
+                .collect(),
+        ),
+        IrExpr::Index { array, index } => IrExpr::Index {
+            array: array.clone(),
+            index: Box::new(resolve_construct_types_expr(index, types)),
         },
         IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
             index: Box::new(resolve_construct_types_expr(index, types)),

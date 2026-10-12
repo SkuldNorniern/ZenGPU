@@ -398,10 +398,13 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 .unwrap_or("x");
             format!("{}.{}", emit_expr(ctx, base)?, field)
         }
-        IrExpr::Swizzle { .. } | IrExpr::Sample { .. } => {
+        IrExpr::Swizzle { .. }
+        | IrExpr::Sample { .. }
+        | IrExpr::ArrayLit(_)
+        | IrExpr::Index { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
-                "swizzles and texture samples are graphics-only and never reach a compute backend",
+                "swizzles, arrays and texture samples are graphics-only and never reach a compute backend",
             ));
         }
         IrExpr::Construct { dim, args, .. } => {

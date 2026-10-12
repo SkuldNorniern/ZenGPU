@@ -884,6 +884,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         | IrExpr::FieldAccess { .. }
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
+        | IrExpr::ArrayLit(_)
+        | IrExpr::Index { .. }
         | IrExpr::Construct { .. } => {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }

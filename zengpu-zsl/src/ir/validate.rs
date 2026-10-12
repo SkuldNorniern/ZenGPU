@@ -113,6 +113,13 @@ fn check_expr(
             Ok(())
         }
         IrExpr::Neg(inner) => check_expr(inner, ctx, types, bool_id),
+        IrExpr::ArrayLit(elems) => {
+            for e in elems {
+                check_expr(e, ctx, types, bool_id)?;
+            }
+            Ok(())
+        }
+        IrExpr::Index { index, .. } => check_expr(index, ctx, types, bool_id),
         IrExpr::Sample { index, uv, lod } => {
             check_expr(index, ctx, types, bool_id)?;
             check_expr(uv, ctx, types, bool_id)?;

@@ -37,6 +37,10 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
             args.iter().all(|arg| expr_is_uniform(arg, locals))
         }
         IrExpr::Sample { .. } => false,
+        IrExpr::ArrayLit(elems) => elems.iter().all(|e| expr_is_uniform(e, locals)),
+        IrExpr::Index { array, index } => {
+            locals.get(array).copied().unwrap_or(false) && expr_is_uniform(index, locals)
+        }
     }
 }
 
@@ -73,7 +77,10 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
             expr_contains_subgroup_collective(base)
         }
-        IrExpr::Construct { args, .. } => args.iter().any(expr_contains_subgroup_collective),
+        IrExpr::Construct { args, .. } | IrExpr::ArrayLit(args) => {
+            args.iter().any(expr_contains_subgroup_collective)
+        }
+        IrExpr::Index { index, .. } => expr_contains_subgroup_collective(index),
         IrExpr::Sample { index, uv, lod } => {
             expr_contains_subgroup_collective(index)
                 || expr_contains_subgroup_collective(uv)
