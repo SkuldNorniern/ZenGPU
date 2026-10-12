@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use crate::ir::Mutability;
 use crate::ir::node::IrStmt;
 use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 use crate::ir::types::TypeId;
+use crate::ir::{GfxSlot, Mutability};
 
 /// One scalar `fn` parameter: `name: ty` (in, by value) or `out name: ty`
 /// (out — the call-site argument must be a plain pre-declared local; writes
@@ -79,10 +79,10 @@ pub(super) enum PendingParamKind {
     Scalar(TypeId),
 }
 
-/// A `@location` input as accumulated during parsing.
+/// A graphics input as accumulated during parsing.
 pub(super) struct PendingGfxInput {
     pub(super) name: String,
-    pub(super) location: u32,
+    pub(super) slot: GfxSlot,
     pub(super) ty: TypeId,
 }
 

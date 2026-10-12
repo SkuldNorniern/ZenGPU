@@ -13,7 +13,7 @@ impl<'a> Parser<'a> {
             locals: HashMap::new(),
             locals_order: Vec::new(),
         };
-        let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx)?;
+        let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx, is_fragment)?;
 
         self.expect(&Tok::Arrow, "`->` return type")?;
         let ret_types = self.parse_ret_types()?;
@@ -35,7 +35,7 @@ impl<'a> Parser<'a> {
             .into_iter()
             .map(|i| GfxInput {
                 name: i.name,
-                location: i.location,
+                slot: i.slot,
                 ty: i.ty,
             })
             .collect();
@@ -76,6 +76,7 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_gfx_params(
         &mut self,
         ctx: &mut GfxCtx,
+        is_fragment: bool,
     ) -> Result<(Vec<PendingGfxInput>, Vec<PendingGfxScalar>, Vec<String>), ParseError> {
         self.expect(&Tok::LParen, "`(` after entry name")?;
         let mut inputs = Vec::new();
@@ -110,7 +111,25 @@ impl<'a> Parser<'a> {
                 ctx.inputs.insert(name.clone(), ty);
                 inputs.push(PendingGfxInput {
                     name,
-                    location: loc,
+                    slot: GfxSlot::Location(loc),
+                    ty,
+                });
+            } else if let Some(builtin) = self.peek_builtin_input() {
+                self.pos += 1;
+                if builtin.in_fragment() != is_fragment {
+                    let stage = if is_fragment { "fragment" } else { "vertex" };
+                    return self.err(format!(
+                        "this builtin input is not available in a {stage} shader"
+                    ));
+                }
+                let ty = match builtin {
+                    GfxBuiltin::FragCoord => self.types.vec_id(4),
+                    GfxBuiltin::VertexIndex | GfxBuiltin::InstanceIndex => self.types.u32_id(),
+                };
+                ctx.inputs.insert(name.clone(), ty);
+                inputs.push(PendingGfxInput {
+                    name,
+                    slot: GfxSlot::Builtin(builtin),
                     ty,
                 });
             } else if self.eat_kw("device") {
@@ -185,6 +204,7 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("let") {
                 body.push(self.parse_gfx_let(ctx)?);
+                self.eat(&Tok::Semi);
                 continue;
             }
             if self.eat_kw("if") {
@@ -199,6 +219,7 @@ impl<'a> Parser<'a> {
                 if self.eat(&Tok::Eq) {
                     let rhs = self.parse_g_expr(ctx)?;
                     body.push(self.gfx_assign(ctx, e, rhs)?);
+                    self.eat(&Tok::Semi);
                     continue;
                 }
                 vec![e]
@@ -213,6 +234,13 @@ impl<'a> Parser<'a> {
                 ));
             }
             return Ok((body, tail));
+        }
+    }
+
+    fn peek_builtin_input(&self) -> Option<GfxBuiltin> {
+        match self.peek() {
+            Some(Tok::Ident(name)) => GfxBuiltin::from_name(name),
+            _ => None,
         }
     }
 
@@ -249,6 +277,7 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("let") {
                 stmts.push(self.parse_gfx_let(ctx)?);
+                self.eat(&Tok::Semi);
                 continue;
             }
             if self.eat_kw("if") {
@@ -259,6 +288,7 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::Eq, "`=` (block statements must be assignments)")?;
             let rhs = self.parse_g_expr(ctx)?;
             stmts.push(self.gfx_assign(ctx, e, rhs)?);
+            self.eat(&Tok::Semi);
         }
         Ok(stmts)
     }

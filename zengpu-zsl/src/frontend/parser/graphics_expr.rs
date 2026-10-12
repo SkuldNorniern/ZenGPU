@@ -138,7 +138,10 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Ident(_)) => {
                 let name = self.ident()?;
-                if self.peek() == Some(&Tok::LParen) {
+                // A value name before `(` is a value followed by a tuple
+                // tail on the next line, not a call.
+                let is_value = ctx.inputs.contains_key(&name) || ctx.locals.contains_key(&name);
+                if !is_value && self.peek() == Some(&Tok::LParen) {
                     let call = self.parse_g_call(ctx, &name)?;
                     return self.parse_g_postfix(ctx, call);
                 }
@@ -181,10 +184,7 @@ impl<'a> Parser<'a> {
     ) -> Result<IrExpr, ParseError> {
         while self.eat(&Tok::Dot) {
             let field = self.ident()?;
-            if self.peek() == Some(&Tok::LParen) {
-                if field != "extend" {
-                    return self.err(format!("unknown method `.{field}()`; use `.extend()`"));
-                }
+            if field == "extend" {
                 self.expect(&Tok::LParen, "`(`")?;
                 let arg = self.parse_g_expr(ctx)?;
                 self.expect(&Tok::RParen, "`)`")?;

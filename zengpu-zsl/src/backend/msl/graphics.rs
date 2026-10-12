@@ -7,14 +7,14 @@
 //! - the push block, if any, binds at `[[buffer(0)]]`; storage buffers follow at
 //!   `[[buffer(1..)]]`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
-use crate::ir::GraphicsModule;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
+use crate::ir::{GfxBuiltin, GfxSlot, GraphicsModule};
 
 /// Buffer index for the push-constant block in graphics shaders. Kept high so it
 /// never overlaps vertex geometry buffers bound for `[[stage_in]]`. The Metal
@@ -28,7 +28,30 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     for (n, tid) in &e.locals {
         locals.insert(n.as_str(), msl_ty_of(module.types.get(*tid))?);
     }
-    let ctx = Ctx { locals };
+    let builtins = e
+        .inputs
+        .iter()
+        .filter(|i| matches!(i.slot, GfxSlot::Builtin(_)))
+        .map(|i| i.name.as_str())
+        .collect();
+    let ctx = Ctx { locals, builtins };
+    let stage_in = e
+        .inputs
+        .iter()
+        .any(|i| matches!(i.slot, GfxSlot::Location(_)));
+    let builtin_args: Vec<String> = e
+        .inputs
+        .iter()
+        .filter_map(|i| match i.slot {
+            GfxSlot::Builtin(b) => Some((b, &i.name)),
+            GfxSlot::Location(_) => None,
+        })
+        .map(|(b, name)| match b {
+            GfxBuiltin::VertexIndex => format!("    uint {name} [[vertex_id]]"),
+            GfxBuiltin::InstanceIndex => format!("    uint {name} [[instance_id]]"),
+            GfxBuiltin::FragCoord => format!("    float4 {name} [[position]]"),
+        })
+        .collect();
 
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
@@ -54,16 +77,19 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     } else {
         "attribute("
     };
-    if !e.inputs.is_empty() {
+    if stage_in {
         s.push_str("struct StageIn {\n");
         for inp in &e.inputs {
+            let GfxSlot::Location(location) = inp.slot else {
+                continue;
+            };
             let _ = writeln!(
                 s,
                 "    {} {} [[{}{})]];",
                 msl_ty_of(module.types.get(inp.ty))?,
                 inp.name,
                 in_qualifier,
-                inp.location,
+                location,
             );
         }
         s.push_str("};\n\n");
@@ -78,9 +104,10 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         // fragment <ret> zsl_main(StageIn in [[stage_in]], ...)
         let _ = writeln!(s, "fragment float4 {ENTRY}(");
         let mut args: Vec<String> = Vec::new();
-        if !e.inputs.is_empty() {
+        if stage_in {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
+        args.extend(builtin_args.iter().cloned());
         if has_push {
             args.push(format!("    {push_arg}"));
         }
@@ -89,7 +116,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         for st in &e.body {
             emit_stmt(&mut s, &ctx, st, 1)?;
         }
-        let _ = writeln!(s, "    return {};", emit_expr(&e.ret[0])?);
+        let _ = writeln!(s, "    return {};", emit_expr(&ctx, &e.ret[0])?);
         s.push_str("}\n");
     } else {
         // VsOut struct: position + varyings.
@@ -106,9 +133,10 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
         let _ = writeln!(s, "vertex VsOut {ENTRY}(");
         let mut args: Vec<String> = Vec::new();
-        if !e.inputs.is_empty() {
+        if stage_in {
             args.push("    StageIn in [[stage_in]]".to_string());
         }
+        args.extend(builtin_args.iter().cloned());
         if has_push {
             args.push(format!("    {push_arg}"));
         }
@@ -118,9 +146,9 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             emit_stmt(&mut s, &ctx, st, 1)?;
         }
         s.push_str("    VsOut out;\n");
-        let _ = writeln!(s, "    out.position = {};", emit_expr(&e.ret[0])?);
+        let _ = writeln!(s, "    out.position = {};", emit_expr(&ctx, &e.ret[0])?);
         for i in 0..e.varyings.len() {
-            let _ = writeln!(s, "    out.vary{i} = {};", emit_expr(&e.ret[i + 1])?);
+            let _ = writeln!(s, "    out.vary{i} = {};", emit_expr(&ctx, &e.ret[i + 1])?);
         }
         s.push_str("    return out;\n}\n");
     }
@@ -136,6 +164,8 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    /// Inputs passed as their own entry arguments rather than in `in`.
+    builtins: HashSet<&'a str>,
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -149,19 +179,25 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         IrStmt::Let { name, init } => {
             let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("float");
             indent(s, depth);
-            let _ = writeln!(s, "{ty} {} = {};", name, emit_expr(init)?);
+            let _ = writeln!(s, "{ty} {} = {};", name, emit_expr(ctx, init)?);
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(value)?);
+            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{}[{}] = {};", buf, emit_expr(index)?, emit_expr(value)?);
+            let _ = writeln!(
+                s,
+                "{}[{}] = {};",
+                buf,
+                emit_expr(ctx, index)?,
+                emit_expr(ctx, value)?
+            );
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
-            let _ = writeln!(s, "if ({}) {{", emit_expr(cond)?);
+            let _ = writeln!(s, "if ({}) {{", emit_expr(ctx, cond)?);
             for st in then {
                 emit_stmt(s, ctx, st, depth + 1)?;
             }
@@ -182,8 +218,8 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let _ = writeln!(
                 s,
                 "for (uint {var} = {}; {var} < {}; {var}++) {{",
-                emit_expr(lo)?,
-                emit_expr(hi)?
+                emit_expr(ctx, lo)?,
+                emit_expr(ctx, hi)?
             );
             for st in body {
                 emit_stmt(s, ctx, st, depth + 1)?;
@@ -208,38 +244,39 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::Eval(expr) => {
             indent(s, depth);
-            let _ = writeln!(s, "{};", emit_expr(expr)?);
+            let _ = writeln!(s, "{};", emit_expr(ctx, expr)?);
         }
     }
     Ok(())
 }
 
-fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
+fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => format!("{v:?}"),
         IrExpr::Local(n) => n.clone(),
+        IrExpr::Input(n) if ctx.builtins.contains(n.as_str()) => n.clone(),
         IrExpr::Input(n) => format!("in.{n}"),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
-        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(index)?),
+        IrExpr::BufferLoad { buf, index } => format!("{buf}[{}]", emit_expr(ctx, index)?),
         IrExpr::FieldAccess { base, component } => {
-            format!("({}).{}", emit_expr(base)?, component_char(*component))
+            format!("({}).{}", emit_expr(ctx, base)?, component_char(*component))
         }
         IrExpr::Swizzle { base, lanes } => {
             let picked: String = lanes.iter().map(|&l| component_char(l)).collect();
-            format!("({}).{picked}", emit_expr(base)?)
+            format!("({}).{picked}", emit_expr(ctx, base)?)
         }
         IrExpr::Construct { dim, args, .. } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
-                a.push(emit_expr(arg)?);
+                a.push(emit_expr(ctx, arg)?);
             }
             format!("float{dim}({})", a.join(", "))
         }
         IrExpr::Builtin { func, args } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
-                a.push(emit_expr(arg)?);
+                a.push(emit_expr(ctx, arg)?);
             }
             match func {
                 BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
@@ -249,9 +286,14 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }
-        IrExpr::Neg(e) => format!("(-{})", emit_expr(e)?),
+        IrExpr::Neg(e) => format!("(-{})", emit_expr(ctx, e)?),
         IrExpr::Binary { op, lhs, rhs } => {
-            format!("({} {} {})", emit_expr(lhs)?, binop(*op)?, emit_expr(rhs)?)
+            format!(
+                "({} {} {})",
+                emit_expr(ctx, lhs)?,
+                binop(*op)?,
+                emit_expr(ctx, rhs)?
+            )
         }
         // These are compute-only IR nodes; this crate's own parser never
         // constructs them inside a graphics module. Hitting this is a
@@ -397,6 +439,21 @@ mod tests {
                 .contains("out.position = (pc.mvp * float4(in.pos, 1.0));")
         );
         assert!(m.source.contains("out.vary0 = in.col;"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn builtin_inputs_are_entry_arguments() {
+        let m = graphics(
+            r#"
+            vertex vs(@location(0) rect: f32x4, vi: vertex_index) -> f32x4 {
+                f32x4(rect.xy + f32x2(f32(vi & 1), 0.0), 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("uint vi [[vertex_id]]"));
+        assert!(m.source.contains("(in.rect).xy"));
+        assert!(m.source.contains("float(((vi & 1u)))") || m.source.contains("float((vi & 1u))"));
         let _ = metal_compiles(&m.source);
     }
 

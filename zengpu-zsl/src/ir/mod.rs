@@ -98,13 +98,47 @@ pub struct Module {
 // than compute's scalars, so they carry their own entry shape; `IrExpr`/
 // `IrStmt` nodes are shared. Values are `zen.md` `Type`s throughout.
 
-/// A `@location` vertex/fragment input.
+/// A vertex/fragment input: a `@location` attribute or varying, or a value
+/// the pipeline supplies.
 #[derive(Debug)]
 pub struct GfxInput {
     pub name: String,
-    pub location: u32,
+    pub slot: GfxSlot,
     /// Interned in the owning [`GraphicsModule`]'s `types` arena.
     pub ty: TypeId,
+}
+
+/// Where a graphics input comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GfxSlot {
+    Location(u32),
+    Builtin(GfxBuiltin),
+}
+
+/// A pipeline-supplied graphics input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GfxBuiltin {
+    /// `vertex_index`: the vertex's index in its draw (`u32`, vertex only).
+    VertexIndex,
+    /// `instance_index`: the instance's index in its draw (`u32`, vertex only).
+    InstanceIndex,
+    /// `frag_coord`: the fragment's window position (`f32x4`, fragment only).
+    FragCoord,
+}
+
+impl GfxBuiltin {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "vertex_index" => Self::VertexIndex,
+            "instance_index" => Self::InstanceIndex,
+            "frag_coord" => Self::FragCoord,
+            _ => return None,
+        })
+    }
+
+    pub fn in_fragment(self) -> bool {
+        matches!(self, Self::FragCoord)
+    }
 }
 
 /// A push-constant scalar/matrix param (`f32`/`u32`/`mat4x4`).
