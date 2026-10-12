@@ -131,6 +131,41 @@ impl<'a> Parser<'a> {
 
     // ── Statements ─────────────────────────────────────────────────────────────
 
+    /// Like [`Self::parse_ret_types`], keeping each value's `@location(n)`
+    /// and `@blend_src(n)` (fragment outputs).
+    pub(super) fn parse_ret_slots(
+        &mut self,
+    ) -> Result<Vec<(TypeId, Option<u32>, u32)>, ParseError> {
+        let tuple = self.eat(&Tok::LParen);
+        let mut out = Vec::new();
+        loop {
+            let (mut location, mut blend_src) = (None, 0);
+            while self.eat(&Tok::At) {
+                let attr = self.ident()?;
+                self.expect(&Tok::LParen, "`(`")?;
+                let value = match self.peek() {
+                    Some(Tok::Int(v)) => *v as u32,
+                    _ => return self.err("expected an index"),
+                };
+                self.pos += 1;
+                self.expect(&Tok::RParen, "`)`")?;
+                match attr.as_str() {
+                    "location" => location = Some(value),
+                    "blend_src" => blend_src = value,
+                    other => return self.err(format!("unknown output attribute `@{other}`")),
+                }
+            }
+            out.push((self.parse_any_type()?, location, blend_src));
+            if !tuple || !self.eat(&Tok::Comma) || self.peek() == Some(&Tok::RParen) {
+                break;
+            }
+        }
+        if tuple {
+            self.expect(&Tok::RParen, "`)`")?;
+        }
+        Ok(out)
+    }
+
     pub(super) fn parse_ret_types(&mut self) -> Result<Vec<TypeId>, ParseError> {
         if self.eat(&Tok::LParen) {
             let mut v = vec![self.parse_ret_one()?];

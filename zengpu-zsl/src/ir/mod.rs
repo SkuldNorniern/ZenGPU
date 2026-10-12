@@ -171,8 +171,20 @@ pub struct GraphicsEntry {
     /// Leading statements (everything before the tail expression).
     pub body: Vec<IrStmt>,
     /// Tail outputs: `[position]` / `[position, varyings…]` for vertex,
-    /// `[color]` for fragment.
+    /// one per [`GraphicsEntry::outputs`] for fragment.
     pub ret: Vec<IrExpr>,
+    /// Fragment outputs, one per `ret` value (empty for vertex).
+    pub outputs: Vec<GfxOutput>,
+}
+
+/// A fragment output: its type and the colour attachment it writes.
+#[derive(Debug, Clone, Copy)]
+pub struct GfxOutput {
+    pub ty: TypeId,
+    pub location: u32,
+    /// `@blend_src(n)`: which blend source it is at its location. Source 1
+    /// feeds dual-source blending.
+    pub blend_src: u32,
 }
 
 /// A graphics module — one vertex or fragment entry point.

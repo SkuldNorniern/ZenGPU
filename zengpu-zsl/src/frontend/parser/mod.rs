@@ -53,8 +53,8 @@ use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::typeck::{type_of_compute_expr, type_of_graphics_expr};
 use crate::ir::types::TypeId;
 use crate::ir::{
-    Entry, EntryKind, GfxBuiltin, GfxInput, GfxScalar, GfxSlot, GraphicsEntry, GraphicsModule,
-    Module, Mutability, Param, ParamKind, SharedDecl,
+    Entry, EntryKind, GfxBuiltin, GfxInput, GfxOutput, GfxScalar, GfxSlot, GraphicsEntry,
+    GraphicsModule, Module, Mutability, Param, ParamKind, SharedDecl,
 };
 /// A parse error: a message and the byte offset where it occurred (if known).
 #[derive(Debug, Clone, PartialEq)]
