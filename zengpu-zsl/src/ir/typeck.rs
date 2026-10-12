@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr};
-use crate::ir::types::TypeId;
+use crate::ir::types::{ArrayLen, Type, TypeId};
 
 /// Symbol tables for typing a compute expression. Standalone, not shared with the parser's `Ctx`.
 #[derive(Debug, Default)]
@@ -117,6 +117,20 @@ pub fn type_of_graphics_expr(
         IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(f32_id),
         IrExpr::FieldAccess { .. } => f32_id,
         IrExpr::Sample { .. } => vec4_id,
+        IrExpr::ArrayLit(elems) => {
+            let element = elems
+                .first()
+                .map(|e| type_of_graphics_expr(e, ctx, arena))
+                .unwrap_or(f32_id);
+            arena.intern(Type::Array {
+                element,
+                length: ArrayLen::Const(elems.len() as u32),
+            })
+        }
+        IrExpr::Index { array, .. } => match ctx.locals.get(array).map(|&t| arena.get(t)) {
+            Some(Type::Array { element, .. }) => *element,
+            _ => f32_id,
+        },
         IrExpr::Swizzle { lanes, .. } => match lanes.len() {
             2 => vec2_id,
             3 => vec3_id,

@@ -14,6 +14,7 @@ impl<'a> Parser<'a> {
             textures: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
+            arrays: HashSet::new(),
         };
         let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx, is_fragment)?;
 
@@ -356,6 +357,12 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_g_expr(ctx)?;
+        if matches!(init, IrExpr::ArrayLit(_)) {
+            if annot.is_some() {
+                return self.err("an array's type comes from its elements");
+            }
+            ctx.arrays.insert(name.clone());
+        }
         let ty = match annot {
             Some(ty) => ty,
             None => type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types),
@@ -393,7 +400,9 @@ impl<'a> Parser<'a> {
         rhs: IrExpr,
     ) -> Result<IrStmt, ParseError> {
         match lhs {
-            IrExpr::Local(name) => Ok(IrStmt::AssignLocal { name, value: rhs }),
+            IrExpr::Local(name) if !ctx.arrays.contains(&name) => {
+                Ok(IrStmt::AssignLocal { name, value: rhs })
+            }
             IrExpr::BufferLoad { buf, index } => {
                 if !*ctx.buffers.get(&buf).unwrap_or(&false) {
                     return self.err(format!(

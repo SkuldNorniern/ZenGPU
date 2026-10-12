@@ -35,7 +35,7 @@ use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::GraphicsModule;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::types::TypeId;
+use crate::ir::types::{ArrayLen, Type, TypeId};
 
 type R<T> = Result<T, String>;
 
@@ -63,6 +63,12 @@ struct TextureTable {
     var: Id,
     t_sampled: Id,
     t_ptr: Id,
+}
+
+struct ArrayInfo {
+    element: TypeId,
+    elem_ty: Id,
+    elem_ptr: Id,
 }
 
 struct LocalVar {
@@ -99,6 +105,7 @@ struct Ctx<'a> {
     pc_ptrs: HashMap<u32, Id>,
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
+    arrays: HashMap<String, ArrayInfo>,
 }
 
 impl Ctx<'_> {
@@ -383,8 +390,37 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut t_ptr_func_vec3 = Id(0);
     let mut t_ptr_func_vec4 = Id(0);
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
+    let mut arrays: HashMap<String, ArrayInfo> = HashMap::new();
     for (name, tid) in &e.locals {
         let gty = *tid;
+        if let Type::Array {
+            element,
+            length: ArrayLen::Const(n),
+        } = *types.get(gty)
+        {
+            let elem_ty = spv_value_ty(element);
+            let len = spv.constant_u32(t_u32, n);
+            let t_array = spv.type_array(elem_ty, len);
+            let t_ptr = spv.type_pointer_global(sc::FUNCTION, t_array);
+            let ptr = spv.op_variable(t_ptr, sc::FUNCTION);
+            locals.insert(
+                name.clone(),
+                LocalVar {
+                    ptr,
+                    ty: gty,
+                    elem_ty: t_array,
+                },
+            );
+            arrays.insert(
+                name.clone(),
+                ArrayInfo {
+                    element,
+                    elem_ty,
+                    elem_ptr: spv.type_pointer(sc::FUNCTION, elem_ty),
+                },
+            );
+            continue;
+        }
         let (elem_ty, slot) = if gty == f32_id {
             (t_f32, &mut t_ptr_func_f32)
         } else if gty == u32_id {
@@ -437,6 +473,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         is_fragment,
         pc_var,
         pc_ptrs: HashMap::new(),
+        arrays,
         const_0_u32,
         locals,
     };
@@ -476,6 +513,32 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
 fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
     match stmt {
+        IrStmt::Let {
+            name,
+            init: IrExpr::ArrayLit(elems),
+        } => {
+            let element = ctx
+                .arrays
+                .get(name)
+                .map(|a| a.element)
+                .ok_or_else(|| format!("undeclared array `{name}`"))?;
+            let (ptr, t_array) = ctx
+                .locals
+                .get(name)
+                .map(|l| (l.ptr, l.elem_ty))
+                .ok_or_else(|| format!("undeclared local `{name}`"))?;
+            let mut ids = Vec::with_capacity(elems.len());
+            for el in elems {
+                let v = lower_expr(ctx, el)?;
+                ids.push(
+                    broadcast(ctx, v, element)
+                        .map_err(|_| format!("`{name}` mixes element types"))?,
+                );
+            }
+            let value = ctx.spv.op_composite_construct(t_array, &ids);
+            ctx.spv.op_store(ptr, value);
+            Ok(())
+        }
         IrStmt::Let { name, init } => {
             let gty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ctx.f32_id);
             let val = lower_expr(ctx, init)?;
@@ -728,6 +791,24 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             Ok(GVal { id, ty: gty })
         }
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
+        IrExpr::ArrayLit(_) => Err("an array is only bound by `let`".into()),
+        IrExpr::Index { array, index } => {
+            let (element, elem_ty, elem_ptr) = ctx
+                .arrays
+                .get(array)
+                .map(|a| (a.element, a.elem_ty, a.elem_ptr))
+                .ok_or_else(|| format!("`{array}` is not an array"))?;
+            let base = ctx
+                .locals
+                .get(array)
+                .map(|l| l.ptr)
+                .ok_or("internal: no array")?;
+            let i = lower_expr(ctx, index)?;
+            let i = scalar_to_u32(ctx, i);
+            let ptr = ctx.spv.op_access_chain(elem_ptr, base, &[i]);
+            let id = ctx.spv.op_load(elem_ty, ptr);
+            Ok(GVal { id, ty: element })
+        }
         IrExpr::Sample { index, uv, lod } => {
             let table = ctx.textures.ok_or("internal: no texture table")?;
             let slot = lower_expr(ctx, index)?;
@@ -1410,6 +1491,35 @@ mod tests {
             .is_err()
         );
         assert!(parse_zsl("fragment fs(@location(0) c: f32x4) -> (@location(1) f32x4, @location(1) f32x4) { (c, c) }").is_err());
+    }
+
+    #[test]
+    fn constant_arrays_pick_by_vertex_index() {
+        validate(&lower(
+            r#"
+            push P { angle: f32 }
+            vertex vs(vi: vertex_index, p: P) -> (f32x4, f32x3) {
+                let pos = [f32x2(-0.6, 0.6), f32x2(0.6, 0.6), f32x2(0.0, -0.6)]
+                let col = [f32x3(1.0, 0.0, 0.0), f32x3(0.0, 1.0, 0.0), f32x3(0.0, 0.0, 1.0)]
+                let c = cos(p.angle)
+                let s = sin(p.angle)
+                let q = pos[vi]
+                (f32x4(c * q.x - s * q.y, s * q.x + c * q.y, 0.0, 1.0), col[vi])
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn arrays_are_read_only() {
+        assert!(
+            parse_zsl(
+                "vertex vs(vi: vertex_index) -> f32x4 { let a = [1.0, 2.0]
+ a = 1.0
+ f32x4(a[vi]) }"
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
-use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type};
+use crate::ir::types::{ArrayLen, FloatFormat, IntWidth, Signedness, Type};
 use crate::ir::{GfxBuiltin, GfxSlot, GraphicsModule};
 
 /// Push-constant buffer index for graphics shaders. High so it never overlaps vertex buffers; the
@@ -24,8 +24,19 @@ pub const TEXTURE_BUFFER_INDEX: u32 = 17;
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    let mut arrays: HashMap<&str, (&'static str, u32)> = HashMap::new();
     for (n, tid) in &e.locals {
-        locals.insert(n.as_str(), msl_ty_of(module.types.get(*tid))?);
+        match module.types.get(*tid) {
+            Type::Array {
+                element,
+                length: ArrayLen::Const(len),
+            } => {
+                arrays.insert(n.as_str(), (msl_ty_of(module.types.get(*element))?, *len));
+            }
+            ty => {
+                locals.insert(n.as_str(), msl_ty_of(ty)?);
+            }
+        }
     }
     let builtins = e
         .inputs
@@ -35,6 +46,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         .collect();
     let ctx = Ctx {
         locals,
+        arrays,
         builtins,
         is_fragment: e.is_fragment,
     };
@@ -98,9 +110,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
     let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
     if e.textures.is_some() {
-        s.push_str(
-            "struct ZslTexture {\n    texture2d<float> tex;\n    sampler smp;\n};\n\n",
-        );
+        s.push_str("struct ZslTexture {\n    texture2d<float> tex;\n    sampler smp;\n};\n\n");
     }
     let texture_arg = e.textures.as_ref().map(|_| {
         format!("    const device ZslTexture* zsl_textures [[buffer({TEXTURE_BUFFER_INDEX})]]")
@@ -195,6 +205,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    arrays: HashMap<&'a str, (&'static str, u32)>,
     builtins: HashSet<&'a str>,
     is_fragment: bool,
 }
@@ -207,6 +218,11 @@ fn indent(s: &mut String, depth: usize) {
 
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
+        IrStmt::Let { name, init } if ctx.arrays.contains_key(name.as_str()) => {
+            let (ty, len) = ctx.arrays[name.as_str()];
+            indent(s, depth);
+            let _ = writeln!(s, "{ty} {name}[{len}] = {};", emit_expr(ctx, init)?);
+        }
         IrStmt::Let { name, init } => {
             let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("float");
             indent(s, depth);
@@ -294,6 +310,14 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::FieldAccess { base, component } => {
             format!("({}).{}", emit_expr(ctx, base)?, component_char(*component))
         }
+        IrExpr::ArrayLit(elems) => {
+            let mut a = Vec::with_capacity(elems.len());
+            for el in elems {
+                a.push(emit_expr(ctx, el)?);
+            }
+            format!("{{{}}}", a.join(", "))
+        }
+        IrExpr::Index { array, index } => format!("{array}[{}]", emit_expr(ctx, index)?),
         IrExpr::Sample { index, uv, lod } => {
             let slot = format!("zsl_textures[{}]", emit_expr(ctx, index)?);
             let uv = emit_expr(ctx, uv)?;
@@ -526,9 +550,10 @@ mod tests {
             m.source
                 .contains("const device ZslTexture* zsl_textures [[buffer(17)]]")
         );
-        assert!(m.source.contains(
-            "zsl_textures[pc.slot].tex.sample(zsl_textures[pc.slot].smp, in.uv)"
-        ));
+        assert!(
+            m.source
+                .contains("zsl_textures[pc.slot].tex.sample(zsl_textures[pc.slot].smp, in.uv)")
+        );
         let _ = metal_compiles(&m.source);
     }
 
@@ -546,6 +571,21 @@ mod tests {
         assert!(m.source.contains("float4 out0 [[color(0), index(0)]];"));
         assert!(m.source.contains("float4 out1 [[color(0), index(1)]];"));
         assert!(m.source.contains("fragment FsOut zsl_main("));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn arrays_are_local_initialised_arrays() {
+        let m = graphics(
+            r#"
+            vertex vs(vi: vertex_index) -> f32x4 {
+                let pos = [f32x2(-1.0, 1.0), f32x2(1.0, 1.0), f32x2(0.0, -1.0)]
+                f32x4(pos[vi], 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("float2 pos[3] = {float2("));
+        assert!(m.source.contains("float4(pos[vi], 0.0, 1.0)"));
         let _ = metal_compiles(&m.source);
     }
 

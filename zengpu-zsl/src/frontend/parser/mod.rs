@@ -43,7 +43,7 @@ use state::*;
 #[allow(unused_imports)]
 use types::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 
 use crate::frontend::lex::{Tok, Token, lex};

@@ -377,6 +377,8 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
         | IrExpr::FieldAccess { .. }
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
+        | IrExpr::ArrayLit(_)
+        | IrExpr::Index { .. }
         | IrExpr::Construct { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
