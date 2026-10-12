@@ -11,6 +11,7 @@
 //! holding a `Module`/`GraphicsModule` can inspect or validate against it
 //! instead of relying on the two sides staying in sync by convention.
 
+use crate::ir::arena::TypeArena;
 use crate::ir::types::TypeId;
 use crate::ir::{Entry, GraphicsEntry, GraphicsModule, Module, ParamKind};
 
@@ -88,7 +89,6 @@ pub fn graphics_layout(module: &GraphicsModule) -> Vec<(String, LayoutInfo)> {
     let e: &GraphicsEntry = &module.entry;
     let mut types = module.types.clone();
     let f32_id = types.f32_id();
-    let mat4_id = types.mat4_id();
 
     let mut out = Vec::new();
     let mut offset = 0u32;
@@ -104,30 +104,33 @@ pub fn graphics_layout(module: &GraphicsModule) -> Vec<(String, LayoutInfo)> {
         offset += 4;
     }
     for s in &e.scalar_params {
-        if s.ty == mat4_id {
-            offset = (offset + 15) & !15;
-            out.push((
-                s.name.clone(),
-                LayoutInfo {
-                    offset,
-                    size: 64,
-                    kind: LayoutKind::Scalar { ty: s.ty },
-                },
-            ));
-            offset += 64;
-        } else {
-            out.push((
-                s.name.clone(),
-                LayoutInfo {
-                    offset,
-                    size: 4,
-                    kind: LayoutKind::Scalar { ty: s.ty },
-                },
-            ));
-            offset += 4;
-        }
+        let (align, size) = graphics_member(s.ty, &mut types);
+        offset = offset.next_multiple_of(align);
+        out.push((
+            s.name.clone(),
+            LayoutInfo {
+                offset,
+                size,
+                kind: LayoutKind::Scalar { ty: s.ty },
+            },
+        ));
+        offset += size;
     }
     out
+}
+
+/// The alignment and size of a graphics push-constant member, by the std430
+/// rules Vulkan applies to push-constant blocks.
+pub fn graphics_member(ty: TypeId, types: &mut TypeArena) -> (u32, u32) {
+    if ty == types.mat4_id() {
+        (16, 64)
+    } else if ty == types.vec_id(4) {
+        (16, 16)
+    } else if ty == types.vec_id(2) {
+        (8, 8)
+    } else {
+        (4, 4)
+    }
 }
 
 #[cfg(test)]

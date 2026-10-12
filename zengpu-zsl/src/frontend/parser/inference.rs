@@ -75,6 +75,10 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str 
 
 pub(super) fn gfx_builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
+        "u32" => BuiltinFn::U32,
+        "f32" => BuiltinFn::F32,
+        "step" => BuiltinFn::Step,
+        "smoothstep" => BuiltinFn::Smoothstep,
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
         "exp" => BuiltinFn::Exp,

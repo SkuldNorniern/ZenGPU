@@ -130,6 +130,11 @@ pub fn type_of_graphics_expr(
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
         IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(f32_id),
         IrExpr::FieldAccess { .. } => f32_id,
+        IrExpr::Swizzle { lanes, .. } => match lanes.len() {
+            2 => vec2_id,
+            3 => vec3_id,
+            _ => vec4_id,
+        },
         IrExpr::Construct { dim, .. } => match dim {
             2 => vec2_id,
             3 => vec3_id,
@@ -141,7 +146,12 @@ pub fn type_of_graphics_expr(
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 => u32_id,
-            BuiltinFn::Length => f32_id,
+            BuiltinFn::F32 | BuiltinFn::Length => f32_id,
+            // The value's shape, not the edges', sets the result's.
+            BuiltinFn::Step | BuiltinFn::Smoothstep => args
+                .last()
+                .map(|a| type_of_graphics_expr(a, ctx, arena))
+                .unwrap_or(f32_id),
             BuiltinFn::Dot => f32_id,
             BuiltinFn::Extend => {
                 let base_ty = args.first().map(|a| type_of_graphics_expr(a, ctx, arena));

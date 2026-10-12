@@ -103,7 +103,9 @@ fn check_expr(
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
             check_expr(index, ctx, types, bool_id)
         }
-        IrExpr::FieldAccess { base, .. } => check_expr(base, ctx, types, bool_id),
+        IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
+            check_expr(base, ctx, types, bool_id)
+        }
         IrExpr::Construct { args, .. } | IrExpr::Builtin { args, .. } => {
             for arg in args {
                 check_expr(arg, ctx, types, bool_id)?;

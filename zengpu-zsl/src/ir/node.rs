@@ -32,6 +32,9 @@ pub enum IrExpr {
     Input(String),
     /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
     FieldAccess { base: Box<IrExpr>, component: u32 },
+    /// A multi-lane swizzle `expr.xy`/`expr.rgb`/… → a vector of
+    /// `lanes.len()` (2 to 4) components picked from `base` (graphics only).
+    Swizzle { base: Box<IrExpr>, lanes: Vec<u32> },
     /// A vector constructor `f32xN(args…)`. `dim` is `2`/`3`/`4`; `ty` is
     /// `None` immediately after parsing (a `TypeArena` isn't available deep
     /// inside expression parsing) and is filled to `Some(..)` by
@@ -102,6 +105,13 @@ pub enum IrStmt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     U32,
+    /// `f32(x)` — a `u32` converted to `f32` (graphics only).
+    F32,
+    /// `step(edge, x)` — `0.0` below `edge`, else `1.0` (graphics only).
+    Step,
+    /// `smoothstep(lo, hi, x)` — Hermite ease between `lo` and `hi`
+    /// (graphics only).
+    Smoothstep,
     Abs,
     Sign,
     Exp,
@@ -207,6 +217,9 @@ impl BuiltinFn {
     pub fn name(self) -> &'static str {
         match self {
             BuiltinFn::U32 => "u32",
+            BuiltinFn::F32 => "f32",
+            BuiltinFn::Step => "step",
+            BuiltinFn::Smoothstep => "smoothstep",
             BuiltinFn::Abs => "abs",
             BuiltinFn::Sign => "sign",
             BuiltinFn::Exp => "exp",
@@ -302,7 +315,9 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
             expr_uses_subgroup_query(index)
         }
-        IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_query(base),
+        IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
+            expr_uses_subgroup_query(base)
+        }
         IrExpr::Construct { args, .. } => args.iter().any(expr_uses_subgroup_query),
         IrExpr::Neg(inner) => expr_uses_subgroup_query(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
@@ -363,7 +378,9 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
             expr_uses_workgroup_reduce(index)
         }
-        IrExpr::FieldAccess { base, .. } => expr_uses_workgroup_reduce(base),
+        IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
+            expr_uses_workgroup_reduce(base)
+        }
         IrExpr::Construct { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
         IrExpr::Neg(inner) => expr_uses_workgroup_reduce(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
@@ -475,7 +492,9 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
             expr_uses_subgroup_collectives(index)
         }
-        IrExpr::FieldAccess { base, .. } => expr_uses_subgroup_collectives(base),
+        IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
+            expr_uses_subgroup_collectives(base)
+        }
         IrExpr::Construct { args, .. } => {
             args.iter()
                 .fold((false, false, false, false, false), |acc, arg| {

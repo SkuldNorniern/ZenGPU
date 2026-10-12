@@ -225,6 +225,10 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::FieldAccess { base, component } => {
             format!("({}).{}", emit_expr(base)?, component_char(*component))
         }
+        IrExpr::Swizzle { base, lanes } => {
+            let picked: String = lanes.iter().map(|&l| component_char(l)).collect();
+            format!("({}).{picked}", emit_expr(base)?)
+        }
         IrExpr::Construct { dim, args, .. } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
@@ -240,6 +244,8 @@ fn emit_expr(expr: &IrExpr) -> Result<String, Diagnostic> {
             match func {
                 BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", a[0], a[1]),
+                BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::F32 => format!("float({})", a[0]),
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }
@@ -285,16 +291,11 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
         IrBinOp::Ne => "!=",
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
-        // Not yet supported on this backend; see the SPIR-V-only note on
-        // `IrBinOp`. Previously emitted a deliberately invalid marker
-        // comment; now fails ZSL compilation itself instead.
-        IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            return Err(Diagnostic::new(
-                DiagnosticCode::Unsupported,
-                "MSL backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
-                 this ZSL source is SPIR-V-only today",
-            ));
-        }
+        IrBinOp::BitAnd => "&",
+        IrBinOp::BitOr => "|",
+        IrBinOp::BitXor => "^",
+        IrBinOp::Shl => "<<",
+        IrBinOp::Shr => ">>",
     })
 }
 

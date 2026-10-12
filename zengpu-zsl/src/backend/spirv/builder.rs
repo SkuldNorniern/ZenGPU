@@ -70,7 +70,14 @@ pub(crate) mod op {
     pub const FLESS_THAN: u32 = 185;
     pub const IS_NAN: u32 = 156;
     pub const IS_INF: u32 = 157;
+    pub const VECTOR_SHUFFLE: u32 = 79;
     pub const COMPOSITE_CONSTRUCT: u32 = 80;
+    pub const TYPE_IMAGE: u32 = 25;
+    pub const TYPE_SAMPLED_IMAGE: u32 = 27;
+    pub const IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
+    pub const IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
+    pub const SELECT: u32 = 169;
+    pub const KILL: u32 = 252;
     pub const COMPOSITE_EXTRACT: u32 = 81;
     pub const CONVERT_F_TO_U: u32 = 109;
     pub const CONVERT_F_TO_S: u32 = 110;
@@ -130,6 +137,8 @@ pub mod deco {
     pub const BUILT_IN: u32 = 11;
     pub const NON_WRITABLE: u32 = 24;
     pub const LOCATION: u32 = 30;
+    pub const INDEX: u32 = 32;
+    pub const FLAT: u32 = 14;
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;
@@ -141,6 +150,7 @@ pub mod sc {
     pub const INPUT: u32 = 1;
     pub const OUTPUT: u32 = 3;
     pub const UNIFORM: u32 = 2;
+    pub const UNIFORM_CONSTANT: u32 = 0;
     pub const STORAGE_BUFFER: u32 = 12;
     pub const PUSH_CONSTANT: u32 = 9;
     pub const FUNCTION: u32 = 7;
@@ -171,6 +181,9 @@ mod exec_model {
 /// SPIR-V built-in constants.
 pub mod builtin {
     pub const POSITION: u32 = 0;
+    pub const FRAG_COORD: u32 = 15;
+    pub const VERTEX_INDEX: u32 = 42;
+    pub const INSTANCE_INDEX: u32 = 43;
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
     pub const LOCAL_INVOCATION_ID: u32 = 27;
     pub const WORKGROUP_ID: u32 = 26;
@@ -648,6 +661,70 @@ impl SpvBuilder {
         let mut words = vec![ty.0, id.0, composite.0];
         words.extend_from_slice(indices);
         emit_raw(&mut self.functions, op::COMPOSITE_EXTRACT, &words);
+        id
+    }
+
+    /// `OpVectorShuffle` of `a` alone: picks `lanes` from it into a `ty` vector.
+    pub fn op_vector_shuffle(&mut self, ty: Id, a: Id, lanes: &[u32]) -> Id {
+        let id = self.fresh_id();
+        let mut words = vec![ty.0, id.0, a.0, a.0];
+        words.extend_from_slice(lanes);
+        emit_raw(&mut self.functions, op::VECTOR_SHUFFLE, &words);
+        id
+    }
+
+    pub fn op_select(&mut self, ty: Id, cond: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SELECT,
+            &[ty.0, id.0, cond.0, a.0, b.0],
+        );
+        id
+    }
+
+    /// `OpKill`: ends the fragment invocation. Terminates its block.
+    pub fn op_kill(&mut self) {
+        emit(&mut self.functions, op::KILL, &[]);
+    }
+
+    /// A sampled 2D float image (`OpTypeImage` with `Sampled = 1`).
+    pub fn type_image_2d(&mut self, sampled: Id) -> Id {
+        let id = self.fresh_id();
+        // Dim 2D = 1, depth 0, arrayed 0, MS 0, sampled 1, format Unknown 0.
+        emit(
+            &mut self.types,
+            op::TYPE_IMAGE,
+            &[id.0, sampled.0, 1, 0, 0, 0, 1, 0],
+        );
+        id
+    }
+
+    pub fn type_sampled_image(&mut self, image: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.types, op::TYPE_SAMPLED_IMAGE, &[id.0, image.0]);
+        id
+    }
+
+    /// Sample with implicit derivatives (fragment shaders).
+    pub fn op_image_sample_implicit_lod(&mut self, ty: Id, image: Id, coord: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_SAMPLE_IMPLICIT_LOD,
+            &[ty.0, id.0, image.0, coord.0],
+        );
+        id
+    }
+
+    /// Sample at an explicit level of detail (`Lod` operand, mask `0x2`).
+    pub fn op_image_sample_explicit_lod(&mut self, ty: Id, image: Id, coord: Id, lod: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_SAMPLE_EXPLICIT_LOD,
+            &[ty.0, id.0, image.0, coord.0, 0x2, lod.0],
+        );
         id
     }
 

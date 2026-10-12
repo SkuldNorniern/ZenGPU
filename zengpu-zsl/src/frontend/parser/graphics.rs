@@ -140,13 +140,17 @@ impl<'a> Parser<'a> {
                     return self.err("only one push parameter is supported");
                 }
                 ctx.push_param = Some(name);
-                let f32_id = self.types.f32_id();
-                let u32_id = self.types.u32_id();
-                let mat4_id = self.types.mat4_id();
+                let allowed = [
+                    self.types.f32_id(),
+                    self.types.u32_id(),
+                    self.types.vec_id(2),
+                    self.types.vec_id(4),
+                    self.types.mat4_id(),
+                ];
                 for (field, ty) in fields {
-                    if ty != f32_id && ty != u32_id && ty != mat4_id {
+                    if !allowed.contains(&ty) {
                         return self.err(format!(
-                            "graphics push field `{field}` must be f32/u32/mat4x4"
+                            "graphics push field `{field}` must be f32/u32/f32x2/f32x4/mat4x4"
                         ));
                     }
                     ctx.scalars.insert(field.clone(), ty);
@@ -280,10 +284,12 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_gfx_if(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
         let cond = self.parse_g_expr(ctx)?;
         let then = self.parse_gfx_stmts(ctx)?;
-        let else_ = if self.eat_kw("else") {
-            Some(self.parse_gfx_stmts(ctx)?)
-        } else {
+        let else_ = if !self.eat_kw("else") {
             None
+        } else if self.eat_kw("if") {
+            Some(vec![self.parse_gfx_if(ctx)?])
+        } else {
+            Some(self.parse_gfx_stmts(ctx)?)
         };
         Ok(IrStmt::If { cond, then, else_ })
     }

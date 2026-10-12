@@ -392,6 +392,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 .unwrap_or("x");
             format!("{}.{}", emit_expr(ctx, base)?, field)
         }
+        IrExpr::Swizzle { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "swizzles are graphics-only and never reach a compute backend",
+            ));
+        }
         IrExpr::Construct { dim, args, .. } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
@@ -408,6 +414,13 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::Extend => format!("make_float4({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),
+                BuiltinFn::F32 => format!("((float)({}))", args_s[0]),
+                BuiltinFn::Step | BuiltinFn::Smoothstep => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Internal,
+                        "step and smoothstep are graphics-only",
+                    ));
+                }
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
                 BuiltinFn::Exp => format!("expf({})", args_s[0]),
