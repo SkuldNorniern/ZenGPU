@@ -26,6 +26,8 @@ struct SwapchainResources {
 
 struct FrameState {
     current: usize,
+    /// Queue serial of the last frame submitted from each slot, for the fence wait.
+    serials: Vec<u64>,
 }
 
 #[derive(Copy, Clone)]
@@ -149,7 +151,10 @@ impl Swapchain {
                 image_views,
                 extent,
             }),
-            frame_state: Mutex::new(FrameState { current: 0 }),
+            frame_state: Mutex::new(FrameState {
+                current: 0,
+                serials: vec![0; frames_in_flight],
+            }),
         })
     }
 
@@ -197,7 +202,10 @@ impl Swapchain {
     /// Wait for the next in-flight slot, then acquire an image. `Skip` (minimised) and `Recreated`
     /// both mean skip the frame, with no `end_frame` call.
     pub fn begin_frame(&self) -> Result<BeginFrame> {
-        let current = self.frame_state.lock().unwrap().current;
+        let (current, last_serial) = {
+            let state = self.frame_state.lock().unwrap();
+            (state.current, state.serials[state.current])
+        };
 
         unsafe {
             self.inner
@@ -205,6 +213,7 @@ impl Swapchain {
                 .wait_for_fences(&[self.in_flight[current]], true, u64::MAX)
                 .map_err(|e| map_vk_err("wait_for_fences", e))?;
         }
+        self.inner.serials.complete(last_serial);
 
         let mut res = self.resources.lock().unwrap();
         if res.extent.width == 0 || res.extent.height == 0 {
@@ -260,7 +269,7 @@ impl Swapchain {
             p_signal_semaphores: signal_semaphores.as_ptr(),
             ..Default::default()
         };
-        {
+        let serial = {
             let _queue = self.inner.queue_lock.lock().unwrap();
             unsafe {
                 self.inner
@@ -268,7 +277,9 @@ impl Swapchain {
                     .queue_submit(self.inner.queue, &[submit_info], self.in_flight[current])
                     .map_err(|e| map_vk_err("queue_submit", e))?;
             }
-        }
+            self.inner.serials.next()
+        };
+        self.frame_state.lock().unwrap().serials[current] = serial;
 
         let mut res = self.resources.lock().unwrap();
         let swapchains = [res.swapchain];
@@ -500,8 +511,13 @@ impl DeviceContext {
             )
             .map_err(|e| map_vk_err("one_shot queue_submit", e))
         };
+        if submit_result.is_ok() {
+            self.inner.serials.next();
+        }
         unsafe {
-            let _ = dev.device_wait_idle();
+            if dev.device_wait_idle().is_ok() {
+                self.inner.serials.complete(self.inner.serials.submitted());
+            }
             dev.destroy_command_pool(pool, None);
         }
         submit_result

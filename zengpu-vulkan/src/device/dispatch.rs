@@ -6,13 +6,18 @@ impl VulkanDevice {
     }
 
     pub fn wait_idle(&self) -> Result<()> {
-        let _queue = self.inner.queue_lock.lock().unwrap();
-        unsafe {
-            self.inner
-                .device
-                .device_wait_idle()
-                .map_err(|e| GpuError::Backend(format!("device_wait_idle: {e}")))
+        {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            unsafe {
+                self.inner
+                    .device
+                    .device_wait_idle()
+                    .map_err(|e| GpuError::Backend(format!("device_wait_idle: {e}")))?;
+            }
+            self.inner.serials.complete(self.inner.serials.submitted());
         }
+        self.collect_garbage();
+        Ok(())
     }
 
     /// Blocks until the GPU finishes it.
@@ -39,8 +44,10 @@ impl VulkanDevice {
                 .queue_submit(self.inner.queue, &[submit_info], fence)
                 .map_err(|e| map_vk_err("vkQueueSubmit", e))
         };
+        let mut serial = None;
         if submit_result.is_ok() {
             submitted = true;
+            serial = Some(self.inner.serials.next());
         }
         let wait_result = submit_result.and_then(|()| unsafe {
             self.inner
@@ -48,6 +55,9 @@ impl VulkanDevice {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| map_vk_err("vkWaitForFences", e))
         });
+        if let (Some(serial), Ok(())) = (serial, &wait_result) {
+            self.inner.serials.complete(serial);
+        }
         if !submitted || wait_result.is_ok() {
             self.fence_pool.release(fence);
             pool.release(cmd);
@@ -93,8 +103,10 @@ impl VulkanDevice {
                 .queue_submit(self.inner.queue, &[submit_info], fence)
                 .map_err(|e| map_vk_err("vkQueueSubmit", e))
         };
+        let mut serial = None;
         if submit_result.is_ok() {
             submitted = true;
+            serial = Some(self.inner.serials.next());
         }
         let wait_result = submit_result.and_then(|()| unsafe {
             self.inner
@@ -102,6 +114,9 @@ impl VulkanDevice {
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| map_vk_err("vkWaitForFences", e))
         });
+        if let (Some(serial), Ok(())) = (serial, &wait_result) {
+            self.inner.serials.complete(serial);
+        }
         if !submitted || wait_result.is_ok() {
             self.fence_pool.release(fence);
             self.cmd_list_pool.release(cmd);
@@ -115,7 +130,7 @@ impl VulkanDevice {
     }
 
     /// The submission owns the fence and command buffer until it completes.
-    fn one_shot_submit_async<F>(&self, cycle_id: u64, record: F) -> Result<Submission>
+    fn one_shot_submit_async<F>(&self, cycle_id: u64, uses: &[u32], record: F) -> Result<Submission>
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
@@ -138,10 +153,6 @@ impl VulkanDevice {
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        {
-            let mut lifetime = self.lifetime.lock().unwrap();
-            lifetime.in_flight += 1;
-        }
         let submit_result = {
             let _queue = self.inner.queue_lock.lock().unwrap();
             unsafe {
@@ -150,16 +161,21 @@ impl VulkanDevice {
                     .queue_submit(self.inner.queue, &[submit_info], fence)
                     .map_err(|e| map_vk_err("vkQueueSubmit", e))
             }
+            .map(|()| self.inner.serials.next())
         };
-        if let Err(e) = submit_result {
-            self.lifetime.lock().unwrap().in_flight -= 1;
-            self.fence_pool.release(fence);
-            self.cmd_list_pool.release(cmd);
-            return Err(e);
-        }
+        let serial = match submit_result {
+            Ok(serial) => serial,
+            Err(e) => {
+                self.fence_pool.release(fence);
+                self.cmd_list_pool.release(cmd);
+                return Err(e);
+            }
+        };
+        self.lifetime.lock().unwrap().mark_used(uses, serial);
 
         Ok(Box::new(VulkanSubmission {
             cycle_id,
+            serial,
             inner: Arc::clone(&self.inner),
             fence_pool: Arc::clone(&self.fence_pool),
             cmd_pool: Arc::clone(&self.cmd_list_pool),
@@ -359,8 +375,9 @@ impl VulkanDevice {
             }
         }
 
+        let uses = mixed_buffer_uses(ops);
         let bindless_set = self.bindless.set;
-        let submission = self.one_shot_submit_async(cycle_id, move |dev, cmd| {
+        let submission = self.one_shot_submit_async(cycle_id, &uses, move |dev, cmd| {
             let barrier = vk::MemoryBarrier {
                 src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                 dst_access_mask: vk::AccessFlags::SHADER_READ
@@ -559,9 +576,13 @@ impl VulkanDevice {
             out
         };
 
+        let uses: Vec<u32> = ops
+            .iter()
+            .flat_map(|op| op.bindings.buffers.iter().copied())
+            .collect();
         let bindless_set = self.bindless.set;
         let last = resolved.len() - 1;
-        let submission = self.one_shot_submit_async(cycle_id, move |dev, cmd| {
+        let submission = self.one_shot_submit_async(cycle_id, &uses, move |dev, cmd| {
             let barrier = vk::MemoryBarrier {
                 src_access_mask: vk::AccessFlags::SHADER_WRITE,
                 dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
@@ -621,4 +642,17 @@ impl VulkanDevice {
             self.bindless.set,
         ))
     }
+}
+
+/// Buffers a mixed batch reads or writes, by bindless index: dispatch bindings and both ends of
+/// each copy.
+fn mixed_buffer_uses(ops: &[ComputeOp<'_>]) -> Vec<u32> {
+    let mut uses = Vec::new();
+    for op in ops {
+        match op {
+            ComputeOp::Dispatch(dispatch) => uses.extend_from_slice(dispatch.bindings.buffers),
+            ComputeOp::CopyBuffer(copy) => uses.extend([copy.src.index(), copy.dst.index()]),
+        }
+    }
+    uses
 }

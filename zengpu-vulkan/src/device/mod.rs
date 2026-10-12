@@ -1,13 +1,17 @@
 
 use std::{
     any::Any,
+    collections::HashMap,
     ffi::{CStr, CString, c_void},
     fs,
     io::ErrorKind,
     mem,
     path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -94,16 +98,76 @@ enum DeferredVulkanResource {
     Pipeline(u32, VulkanPipeline),
 }
 
+/// Queue work, numbered in submission order. Once `n` is finished, everything before it is too.
+///
+/// Every submission takes a number, so a resource is freed only after the work that could
+/// still use it.
+#[derive(Default)]
+pub(crate) struct QueueSerials {
+    submitted: AtomicU64,
+    completed: AtomicU64,
+}
+
+impl QueueSerials {
+    /// Numbers a submission that reached the queue. Call with the queue lock held, right after the
+    /// submit, so numbers follow queue order.
+    pub(crate) fn next(&self) -> u64 {
+        self.submitted.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub(crate) fn complete(&self, serial: u64) {
+        self.completed.fetch_max(serial, Ordering::AcqRel);
+    }
+
+    pub(crate) fn submitted(&self) -> u64 {
+        self.submitted.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn idle(&self) -> bool {
+        self.completed() >= self.submitted()
+    }
+}
+
 #[derive(Default)]
 struct VulkanLifetimeState {
-    in_flight: usize,
-    deferred: Vec<DeferredVulkanResource>,
+    /// Destroyed while work pending: freed when that work finishes.
+    deferred: Vec<(u64, DeferredVulkanResource)>,
+    /// Last submission per buffer (by bindless index).
+    buffer_use: HashMap<u32, u64>,
+}
+
+impl VulkanLifetimeState {
+    fn buffer_busy(&self, index: u32, completed: u64) -> bool {
+        self.buffer_use
+            .get(&index)
+            .is_some_and(|serial| *serial > completed)
+    }
+
+    fn mark_used(&mut self, indices: &[u32], serial: u64) {
+        for &index in indices {
+            self.buffer_use.insert(index, serial);
+        }
+    }
+
+    fn take_ready(&mut self, completed: u64) -> Vec<DeferredVulkanResource> {
+        self.buffer_use.retain(|_, serial| *serial > completed);
+        let (ready, waiting): (Vec<_>, Vec<_>) = mem::take(&mut self.deferred)
+            .into_iter()
+            .partition(|(serial, _)| *serial <= completed);
+        self.deferred = waiting;
+        ready.into_iter().map(|(_, resource)| resource).collect()
+    }
 }
 
 /// Fence-backed submission. Completion releases its fence and command buffer once. After a
 /// timed-out wait this handle still owns both, so a later poll or wait is safe.
 struct VulkanSubmission {
     cycle_id: u64,
+    serial: u64,
     inner: Arc<VulkanDeviceInner>,
     fence_pool: Arc<FencePool>,
     cmd_pool: Arc<CmdListPool>,
@@ -131,16 +195,12 @@ impl VulkanSubmission {
     }
 
     fn release_in_flight(&self) {
-        let deferred = {
-            let mut lifetime = self.lifetime.lock().unwrap();
-            debug_assert!(lifetime.in_flight > 0);
-            lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
-            if lifetime.in_flight == 0 {
-                mem::take(&mut lifetime.deferred)
-            } else {
-                Vec::new()
-            }
-        };
+        self.inner.serials.complete(self.serial);
+        let deferred = self
+            .lifetime
+            .lock()
+            .unwrap()
+            .take_ready(self.inner.serials.completed());
         destroy_deferred_vulkan(
             &self.inner,
             &self.buffers,
@@ -314,6 +374,8 @@ pub(crate) struct VulkanDeviceInner {
     pub queue: vk::Queue,
     /// Queue needs external sync: every submit or present on `queue` holds this mutex.
     pub queue_lock: Mutex<()>,
+    /// Numbers submissions to `queue` for deferred frees.
+    pub serials: QueueSerials,
     pub features: Features,
     pub limits: DeviceLimits,
     pub graphics: bool,
@@ -436,6 +498,30 @@ unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
+    pub(crate) fn buffer_busy(&self, index: u32) -> bool {
+        let completed = self.inner.serials.completed();
+        self.lifetime.lock().unwrap().buffer_busy(index, completed)
+    }
+
+    pub(crate) fn collect_garbage(&self) {
+        let ready = self
+            .lifetime
+            .lock()
+            .unwrap()
+            .take_ready(self.inner.serials.completed());
+        if ready.is_empty() {
+            return;
+        }
+        destroy_deferred_vulkan(
+            &self.inner,
+            &self.buffers,
+            &self.textures,
+            &self.samplers,
+            &self.pipelines,
+            ready,
+        );
+    }
+
     pub(crate) fn create(
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
@@ -645,6 +731,7 @@ impl VulkanDevice {
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
+            serials: QueueSerials::default(),
             features: available_features,
             limits: device_limits,
             graphics: needs_graphics,
@@ -1913,6 +2000,10 @@ mod tests {
             )
             .unwrap();
         assert!(dev.write_buffer(a, 0, &[0; 4]).is_err());
+        let unrelated = dev.create_buffer(storage_rw(16)).unwrap();
+        dev.write_buffer(unrelated, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(dev.read_buffer(unrelated, 0, 4).unwrap(), vec![1, 2, 3, 4]);
+        dev.destroy_buffer(unrelated);
         let retired_sum_index = sum.index();
         dev.destroy_buffer(sum);
         dev.destroy_pipeline(add_pipeline);
@@ -1932,6 +2023,7 @@ mod tests {
         );
         let allocated_after_completion = dev.create_buffer(storage_rw(n as u64 * 4)).unwrap();
         assert_eq!(allocated_after_completion.index(), retired_sum_index);
+        dev.write_buffer(a, 0, &[0; 4]).unwrap();
 
         let bytes = dev.read_buffer(out, 0, n as u64 * 4).unwrap();
         let result: &[f32] = unsafe { from_raw_parts(bytes.as_ptr() as *const f32, n as usize) };

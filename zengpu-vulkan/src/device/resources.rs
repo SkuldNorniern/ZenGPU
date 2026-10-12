@@ -19,10 +19,6 @@ impl VulkanDevice {
         let view = textures.get(texture)?.view;
         let samplers = self.samplers.lock().unwrap();
         let vk_sampler = *samplers.get(sampler)?;
-        let lifetime = self.lifetime.lock().unwrap();
-        if lifetime.in_flight != 0 {
-            return None;
-        }
         let info = vk::DescriptorImageInfo {
             sampler: vk_sampler,
             image_view: view,
