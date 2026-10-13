@@ -1445,8 +1445,11 @@ mod tests {
     use super::*;
     use crate::instance::VulkanInstance;
     use zengpu_hal::{
-        AdapterRequest, AddressMode, BorderColor, DeviceRequest, Format, GpuAdapter, GpuInstance,
-        RenderCommands,
+        AdapterRequest, AddressMode, Bindings, BlendState, BorderColor, ColorAttachment,
+        ColorTargetState, DepthState, DeviceRequest, FilterMode, Format, GpuAdapter, GpuInstance,
+        GraphicsDevice, GraphicsPipelineDesc, LoadOp, PipelineHandle, PrimitiveTopology,
+        RasterState, RenderCommands, RenderPassDesc, SamplerDesc, Scalar, TargetHandle, TexDim,
+        TextureHandle, TextureRegion, Viewport, ViewportScissor,
     };
 
     struct TestDevice {
@@ -1958,6 +1961,448 @@ mod tests {
         }
         dev.destroy_buffer(out);
         dev.destroy_texture(tex);
+    }
+
+    const CLEAR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
+    /// Sampled texels, left to right: 2x1 source texture.
+    const TEXELS: [[f32; 4]; 2] = [[0.25, 0.5, 0.75, 1.0], [1.0, 0.75, 0.5, 0.25]];
+
+    const QUAD_VS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+            let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+            (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+        }
+    );
+    const HALF_RED_FS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 0.5) }
+    );
+    const SAMPLE_FS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        push P { slot: u32 }
+        fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+            tex[p.slot].sample(uv)
+        }
+    );
+
+    /// How one channel of a format is stored.
+    #[derive(Clone, Copy)]
+    enum Lane {
+        Unorm8,
+        Unorm16,
+        Half,
+        Float,
+    }
+
+    fn lane(format: Format) -> Lane {
+        match format {
+            Format::Rgba8Unorm
+            | Format::Rgba8UnormSrgb
+            | Format::Bgra8Unorm
+            | Format::Bgra8UnormSrgb
+            | Format::R8Unorm => Lane::Unorm8,
+            Format::Rgba16Unorm | Format::R16Unorm => Lane::Unorm16,
+            Format::Rgba16Float | Format::R16Float => Lane::Half,
+            _ => Lane::Float,
+        }
+    }
+
+    fn lane_bytes(lane: Lane) -> usize {
+        match lane {
+            Lane::Unorm8 => 1,
+            Lane::Unorm16 | Lane::Half => 2,
+            Lane::Float => 4,
+        }
+    }
+
+    /// Stored channels: one for the red-only formats, otherwise four.
+    fn channels(format: Format) -> usize {
+        usize::try_from(format.bytes_per_texel()).unwrap() / lane_bytes(lane(format))
+    }
+
+    /// Absolute error a readback of `format` may show.
+    fn tolerance(format: Format) -> f32 {
+        match lane(format) {
+            Lane::Unorm8 => 2.0 / 255.0,
+            Lane::Unorm16 => 1e-4,
+            Lane::Half => 1e-3,
+            Lane::Float => 1e-6,
+        }
+    }
+
+    fn is_srgb(format: Format) -> bool {
+        matches!(format, Format::Rgba8UnormSrgb | Format::Bgra8UnormSrgb)
+    }
+
+    fn is_bgra(format: Format) -> bool {
+        matches!(format, Format::Bgra8Unorm | Format::Bgra8UnormSrgb)
+    }
+
+    fn half_to_f32(bits: u16) -> f32 {
+        let exp = i32::from((bits >> 10) & 0x1f);
+        let frac = f32::from(bits & 0x3ff);
+        let sign = if bits & 0x8000 != 0 { -1.0 } else { 1.0 };
+        if exp == 0 {
+            sign * frac * 2f32.powi(-24)
+        } else {
+            sign * (1.0 + frac / 1024.0) * 2f32.powi(exp - 15)
+        }
+    }
+
+    /// Half bits by truncating the mantissa: exact for the normal test values.
+    fn f32_to_half(v: f32) -> u16 {
+        if v == 0.0 {
+            return 0;
+        }
+        let bits = v.to_bits();
+        let sign = (bits >> 16) & 0x8000;
+        let exp = ((bits >> 23) & 0xff) + 15 - 127;
+        let frac = (bits >> 13) & 0x3ff;
+        u16::try_from(sign | (exp << 10) | frac).unwrap()
+    }
+
+    fn srgb_to_linear(c: f32) -> f32 {
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn linear_to_srgb(c: f32) -> f32 {
+        if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        }
+    }
+
+    fn decode_lane(lane: Lane, bytes: &[u8]) -> f32 {
+        match lane {
+            Lane::Unorm8 => f32::from(bytes[0]) / 255.0,
+            Lane::Unorm16 => f32::from(u16::from_le_bytes(bytes.try_into().unwrap())) / 65535.0,
+            Lane::Half => half_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())),
+            Lane::Float => f32::from_le_bytes(bytes.try_into().unwrap()),
+        }
+    }
+
+    /// The unorm level (0..=`max`) nearest to `c`.
+    fn nearest_level(c: f32, max: u16) -> u16 {
+        let dist = |level: u16| (f32::from(level) / f32::from(max) - c).abs();
+        (0..=max)
+            .min_by(|a, b| dist(*a).total_cmp(&dist(*b)))
+            .unwrap()
+    }
+
+    fn encode_lane(lane: Lane, c: f32) -> Vec<u8> {
+        match lane {
+            Lane::Unorm8 => vec![u8::try_from(nearest_level(c, 255)).unwrap()],
+            Lane::Unorm16 => nearest_level(c, 65535).to_le_bytes().to_vec(),
+            Lane::Half => f32_to_half(c).to_le_bytes().to_vec(),
+            Lane::Float => c.to_le_bytes().to_vec(),
+        }
+    }
+
+    /// One texel as linear RGBA. A one-channel format gives (r, 0, 0, 1).
+    fn decode(format: Format, texel: &[u8]) -> [f32; 4] {
+        let lane = lane(format);
+        let mut out = [0.0, 0.0, 0.0, 1.0];
+        for (i, bytes) in texel.chunks_exact(lane_bytes(lane)).enumerate() {
+            out[i] = decode_lane(lane, bytes);
+        }
+        if is_bgra(format) {
+            out.swap(0, 2);
+        }
+        if is_srgb(format) {
+            for c in &mut out[..3] {
+                *c = srgb_to_linear(*c);
+            }
+        }
+        out
+    }
+
+    /// The bytes of one texel holding linear RGBA `rgba`.
+    fn encode(format: Format, rgba: [f32; 4]) -> Vec<u8> {
+        let order = if is_bgra(format) {
+            [2, 1, 0, 3]
+        } else {
+            [0, 1, 2, 3]
+        };
+        (0..channels(format))
+            .flat_map(|i| {
+                let mut c = rgba[order[i]];
+                if is_srgb(format) && i < 3 {
+                    c = linear_to_srgb(c);
+                }
+                encode_lane(lane(format), c)
+            })
+            .collect()
+    }
+
+    fn assert_texels(format: Format, got: &[[f32; 4]], want: &[[f32; 4]]) {
+        let tol = tolerance(format);
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            for c in 0..channels(format) {
+                assert!(
+                    (g[c] - w[c]).abs() <= tol,
+                    "{format:?} texel {i} channel {c}: got {g:?}, want {w:?}"
+                );
+            }
+        }
+    }
+
+    /// A `w` x `h` render target, primed so its readback starts from the
+    /// shader-read layout.
+    fn render_target(
+        device: &VulkanDevice,
+        format: Format,
+        w: u32,
+        h: u32,
+    ) -> (TextureHandle, TargetHandle) {
+        let tex = device
+            .create_texture(TextureDesc {
+                width: w,
+                height: h,
+                depth: 1,
+                format,
+                usage: TextureUsage::RENDER_TARGET
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let zeros = vec![0u8; (w * h * format.bytes_per_texel()) as usize];
+        device.upload_texture_data(tex, &zeros).unwrap();
+        let target = device.register_color_target(tex).unwrap();
+        (tex, target)
+    }
+
+    /// Every texel of a `w` x `h` texture, decoded to linear RGBA.
+    fn read_texels(
+        device: &VulkanDevice,
+        tex: TextureHandle,
+        format: Format,
+        w: u32,
+        h: u32,
+    ) -> Vec<[f32; 4]> {
+        let row = w * format.bytes_per_texel();
+        let len = u64::from(row * h);
+        let buf = device.create_buffer(rw_desc(len)).unwrap();
+        device
+            .copy_texture_region_to_buffer(tex, TextureRegion::rect(0, 0, w, h), buf, 0, row)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let raw = device.read_buffer(buf, 0, len).unwrap();
+        device.destroy_buffer(buf);
+        let texel = usize::try_from(format.bytes_per_texel()).unwrap();
+        raw.chunks_exact(texel).map(|t| decode(format, t)).collect()
+    }
+
+    /// A pipeline drawing `vs` and `fs` into one `format` target.
+    fn quad_pipeline(
+        device: &VulkanDevice,
+        fs: &zengpu_spirv::ZslShader,
+        format: Format,
+        blend: Option<BlendState>,
+    ) -> PipelineHandle {
+        let vs_shader = device.create_shader(QUAD_VS.spirv_desc()).unwrap();
+        let fs_shader = device.create_shader(fs.spirv_desc()).unwrap();
+        let pipeline = device
+            .create_graphics_pipeline(GraphicsPipelineDesc {
+                vertex_shader: vs_shader,
+                fragment_shader: fs_shader,
+                vertex_layouts: &[],
+                topology: PrimitiveTopology::TriangleList,
+                color_targets: &[ColorTargetState { format, blend }],
+                depth_format: None,
+                depth: DepthState::default(),
+                stencil: None,
+                raster: RasterState::default(),
+                samples: 1,
+            })
+            .unwrap();
+        device.destroy_shader(vs_shader);
+        device.destroy_shader(fs_shader);
+        pipeline
+    }
+
+    /// Draws a full-screen quad over `target` and waits for it.
+    fn draw_quad(
+        device: &VulkanDevice,
+        target: TargetHandle,
+        load: LoadOp,
+        pipeline: PipelineHandle,
+        scalars: &[Scalar],
+        (w, h): (u16, u16),
+    ) {
+        let mut cmd = device.create_command_list().unwrap();
+        let color = [ColorAttachment {
+            target,
+            load,
+            store: true,
+            sample_after: true,
+        }];
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &color,
+            depth: None,
+        });
+        cmd.set_pipeline(pipeline);
+        cmd.set_viewport_scissor(ViewportScissor {
+            viewport: Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: f32::from(w),
+                height: f32::from(h),
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        });
+        cmd.bind(Bindings {
+            scalars,
+            ..Default::default()
+        });
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        device.submit_and_wait(cmd).unwrap();
+    }
+
+    fn clear_round_trip(device: &VulkanDevice, format: Format) {
+        let (tex, target) = render_target(device, format, 2, 2);
+        let mut cmd = device.create_command_list().unwrap();
+        let color = [ColorAttachment {
+            target,
+            load: LoadOp::Clear(CLEAR),
+            store: true,
+            sample_after: true,
+        }];
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &color,
+            depth: None,
+        });
+        cmd.end_render_pass();
+        device.submit_and_wait(cmd).unwrap();
+        let got = read_texels(device, tex, format, 2, 2);
+        assert_texels(format, &got, &[CLEAR; 4]);
+        device.destroy_texture(tex);
+    }
+
+    fn blend_round_trip(device: &VulkanDevice, format: Format) {
+        let (tex, target) = render_target(device, format, 2, 2);
+        let pipeline = quad_pipeline(device, &HALF_RED_FS, format, Some(BlendState::ALPHA_BLEND));
+        draw_quad(
+            device,
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 1.0),
+            pipeline,
+            &[],
+            (2, 2),
+        );
+        let got = read_texels(device, tex, format, 2, 2);
+        // Half-red at alpha 0.5 over opaque blue.
+        assert_texels(format, &got, &[[0.5, 0.0, 0.5, 1.0]; 4]);
+        device.destroy_pipeline(pipeline);
+        device.destroy_texture(tex);
+    }
+
+    fn sample_round_trip(device: &VulkanDevice, format: Format) {
+        let src = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 1,
+                depth: 1,
+                format,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let bytes: Vec<u8> = TEXELS.iter().flat_map(|t| encode(format, *t)).collect();
+        device.upload_texture_data(src, &bytes).unwrap();
+        let sampler = device
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                mip_filter: FilterMode::Nearest,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let slot = device.bind_texture(src, sampler).unwrap();
+
+        let out_format = Format::Rgba32Float;
+        let (out, target) = render_target(device, out_format, 2, 1);
+        let pipeline = quad_pipeline(device, &SAMPLE_FS, out_format, None);
+        draw_quad(
+            device,
+            target,
+            LoadOp::Clear([0.0; 4]),
+            pipeline,
+            &[Scalar::U32(slot)],
+            (2, 1),
+        );
+        let got = read_texels(device, out, out_format, 2, 1);
+        assert_texels(format, &got, &TEXELS);
+        device.destroy_pipeline(pipeline);
+        device.destroy_texture(out);
+        device.destroy_sampler(sampler);
+        device.destroy_texture(src);
+    }
+
+    fn vulkan(dev: &TestDevice) -> &VulkanDevice {
+        dev.dev
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("vulkan device")
+    }
+
+    /// Clearing each colour render target reads back its clear value.
+    #[test]
+    fn colour_formats_clear_to_their_value() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        for format in Format::ALL {
+            if !format.is_depth_stencil() && device.format_caps(format).render_target {
+                clear_round_trip(device, format);
+            }
+        }
+    }
+
+    /// Source-over alpha blending of half-red over opaque blue, per blendable format.
+    #[test]
+    fn colour_formats_alpha_blend() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        for format in Format::ALL {
+            let caps = device.format_caps(format);
+            if !format.is_depth_stencil() && caps.render_target && caps.blendable {
+                blend_round_trip(device, format);
+            }
+        }
+    }
+
+    /// Nearest sampling at each texel centre returns the uploaded value.
+    #[test]
+    fn colour_formats_sample_nearest() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        if !device.format_caps(Format::Rgba32Float).render_target {
+            return;
+        }
+        for format in Format::ALL {
+            if !format.is_depth_stencil() && device.format_caps(format).sampled {
+                sample_round_trip(device, format);
+            }
+        }
     }
 
     fn try_graphics_device() -> Option<TestDevice> {
