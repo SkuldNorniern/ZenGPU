@@ -1385,6 +1385,7 @@ mod tests {
     use std::slice::from_raw_parts;
     use std::sync::MutexGuard;
     use std::thread::{sleep, spawn};
+    use std::time::Instant;
     use std::{env, ops::Deref, process};
 
     use super::*;
@@ -1548,6 +1549,84 @@ mod tests {
         }
         assert!(after.budget <= after.device_local);
         assert!(after.usage > 0);
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn readback_polls_while_frames_keep_going() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        if !dev.capabilities().transfers.buffer_texture_copy {
+            return;
+        }
+        let desc = |width, height| TextureDesc {
+            width,
+            height,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        };
+        let tex = dev.create_texture(desc(256, 256)).unwrap();
+        let scratch = dev.create_texture(desc(16, 16)).unwrap();
+        // One distinct texel per pixel, so a misplaced row fails the check.
+        let pixels: Vec<u8> = (0..256 * 256u32).flat_map(|i| i.to_le_bytes()).collect();
+        dev.upload_texture_data(tex, &pixels).unwrap();
+        let tile = vec![0x7f; 16 * 16 * 4];
+        let out = dev
+            .create_buffer(rw_desc(u64::try_from(pixels.len()).unwrap()))
+            .unwrap();
+
+        let started = Instant::now();
+        let read = dev
+            .copy_texture_region_to_buffer(
+                tex,
+                zengpu_hal::TextureRegion::rect(0, 0, 256, 256),
+                out,
+                0,
+                256 * 4,
+            )
+            .unwrap();
+        // Work submitted each frame is kept until it completes: dropping a
+        // pending submission waits for the GPU.
+        let mut frame_work: Vec<Submission> = Vec::new();
+        let mut status = read.poll().unwrap();
+        while status == SubmissionStatus::Pending {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "readback still pending after 5 s"
+            );
+            let frame = Instant::now();
+            frame_work.push(
+                dev.write_textures(&[zengpu_hal::TextureWrite {
+                    texture: scratch,
+                    region: zengpu_hal::TextureRegion::rect(0, 0, 16, 16),
+                    data: &tile,
+                    bytes_per_row: 64,
+                }])
+                .unwrap(),
+            );
+            frame_work.retain(|work| work.poll().unwrap() == SubmissionStatus::Pending);
+            status = read.poll().unwrap();
+            assert!(
+                frame.elapsed() < Duration::from_millis(50),
+                "a frame and its poll took {:?}",
+                frame.elapsed()
+            );
+        }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let mut back = vec![0u8; pixels.len()];
+        dev.read_buffer_into(out, 0, &mut back).unwrap();
+        assert!(back == pixels, "readback bytes differ from the upload");
+        for work in frame_work {
+            work.wait(Duration::from_secs(5)).unwrap();
+        }
+        dev.destroy_buffer(out);
+        dev.destroy_texture(scratch);
         dev.destroy_texture(tex);
     }
 

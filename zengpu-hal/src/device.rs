@@ -189,6 +189,42 @@ pub trait GpuDevice: Send + Sync {
     /// [`crate::BufferUsage::READBACK`] to be read on the host once the
     /// submission completes.
     ///
+    /// Reading back without stalling a frame:
+    ///
+    /// 1. Create the buffer once, with `READBACK | TRANSFER_DST`, and reuse it.
+    /// 2. Call this and keep the returned [`Submission`]. Do not wait on it.
+    /// 3. Each frame, `poll` it. Polling never blocks.
+    /// 4. When it reports `Complete`, `read_buffer_into` a caller-owned slice.
+    ///    Reading before completion fails rather than waiting.
+    ///
+    /// Drop the submission only after it completes: on Vulkan, dropping a
+    /// pending one waits for the GPU. Metal's copy currently waits inside
+    /// this call, so the pattern does not hide latency there yet.
+    ///
+    /// ```rust,no_run
+    /// # use zengpu_hal::{BufferDesc, BufferHandle, BufferUsage, GpuDevice, MemoryUsage};
+    /// # use zengpu_hal::{Result, Submission, SubmissionStatus, TextureHandle, TextureRegion};
+    /// # fn example(dev: &dyn GpuDevice, tex: TextureHandle) -> Result<()> {
+    /// let buf = dev.create_buffer(BufferDesc {
+    ///     size: 256 * 256 * 4,
+    ///     usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+    ///     memory: MemoryUsage::Readback,
+    /// })?;
+    /// // Allocated once, outside the frame loop.
+    /// let mut pixels = vec![0u8; 256 * 256 * 4];
+    /// let mut copy: Option<Submission> =
+    ///     Some(dev.copy_texture_region_to_buffer(tex, TextureRegion::rect(0, 0, 256, 256), buf, 0, 1024)?);
+    /// // Once per frame, after this frame's own work is submitted:
+    /// if let Some(sub) = &copy {
+    ///     if sub.poll()? == SubmissionStatus::Complete {
+    ///         dev.read_buffer_into(buf, 0, &mut pixels)?;
+    ///         copy = None;
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default
     /// refuses.
     fn copy_texture_region_to_buffer(
