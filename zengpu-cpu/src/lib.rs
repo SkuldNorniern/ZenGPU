@@ -621,6 +621,7 @@ mod tests {
                 buffers: &[ha.index(), hb.index(), hout.index()],
                 scalars: &[Scalar::U32(n)],
                 textures: &[],
+                images: &[],
             },
             [1, 1, 1],
         )

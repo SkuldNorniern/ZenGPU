@@ -664,6 +664,7 @@ impl GpuDevice for MetalDevice {
             max_storage_buffer_range: self.inner.device.max_buffer_length(),
             max_push_constant_size: 4096,
             max_sampled_textures: TABLE_CAPACITY,
+            max_storage_textures: TABLE_CAPACITY,
             ..DeviceLimits::default()
         }
     }

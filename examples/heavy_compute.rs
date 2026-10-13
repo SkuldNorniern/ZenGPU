@@ -141,6 +141,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bindings = Bindings {
         buffers: &[ba.index(), bb.index(), bc.index()],
         textures: &[],
+        images: &[],
         scalars: &[
             Scalar::U32(m as u32),
             Scalar::U32(n as u32),

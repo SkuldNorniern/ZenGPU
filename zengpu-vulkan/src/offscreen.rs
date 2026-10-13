@@ -349,6 +349,7 @@ mod zsl_parity_tests {
             Bindings {
                 buffers: &[],
                 textures: &[slot],
+                images: &[],
                 scalars: &scalars,
             },
         );

@@ -1515,6 +1515,7 @@ mod tests {
                     buffers: &[buf_a.index(), buf_b.index(), buf_out.index()],
                     scalars: &[Scalar::U32(N as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 [(N as u32).div_ceil(256), 1, 1],
             )
@@ -1576,6 +1577,7 @@ mod tests {
                     buffers: &[buf_a.index(), buf_b.index(), buf_out.index()],
                     scalars: &[Scalar::U32(N as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 [(N as u32).div_ceil(256), 1, 1],
             )
@@ -1632,6 +1634,7 @@ mod tests {
                     buffers: &[src.index(), out.index()],
                     scalars: &[Scalar::U32(N as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 [(N as u32).div_ceil(64), 1, 1],
             )
@@ -1697,6 +1700,7 @@ mod tests {
                     buffers: &[src_u.index(), src_i.index(), out_u.index(), out_i.index()],
                     scalars: &[Scalar::U32(N as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 [(N as u32).div_ceil(64), 1, 1],
             )
@@ -1746,6 +1750,7 @@ mod tests {
                     buffers: &[src.index(), out.index()],
                     scalars: &[Scalar::U32(input.len() as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 [1, 1, 1],
             )
@@ -1833,6 +1838,7 @@ mod tests {
                             buffers: &[a.index(), b.index(), output.index()],
                             scalars: &[Scalar::U32(N as u32)],
                             textures: &[],
+                            images: &[],
                         },
                         grid: [1, 1, 1],
                     }),
@@ -1911,6 +1917,7 @@ mod tests {
                             buffers: &[buf_a.index(), buf_b.index(), buf_sum.index()],
                             scalars: &[Scalar::U32(N as u32)],
                             textures: &[],
+                            images: &[],
                         },
                         grid,
                     },
@@ -1920,6 +1927,7 @@ mod tests {
                             buffers: &[buf_sum.index(), buf_sum.index(), buf_out.index()],
                             scalars: &[Scalar::U32(N as u32)],
                             textures: &[],
+                            images: &[],
                         },
                         grid,
                     },
@@ -1936,6 +1944,7 @@ mod tests {
                     buffers: &[buf_a.index(), buf_b.index(), second_out.index()],
                     scalars: &[Scalar::U32(N as u32)],
                     textures: &[],
+                    images: &[],
                 },
                 grid,
             )

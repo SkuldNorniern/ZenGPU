@@ -20,8 +20,14 @@ pub enum Scalar {
 pub struct Bindings<'a> {
     /// Bindless indices into the storage-buffer table.
     pub buffers: &'a [u32],
-    /// Bindless indices into the texture table.
+    /// Bindless indices into the sampled-texture table. A compute kernel
+    /// reads its `texture` params from these, in declaration order.
     pub textures: &'a [u32],
+    /// Bindless indices into the storage-image table, one per `image` param
+    /// of a compute kernel, in declaration order. A texture made with
+    /// [`crate::TextureUsage::STORAGE`] sits there at its own
+    /// [`crate::Handle::index`].
+    pub images: &'a [u32],
     /// Inline scalar arguments.
     pub scalars: &'a [Scalar],
 }
@@ -60,6 +66,7 @@ mod tests {
         let b = Bindings::default();
         assert!(b.buffers.is_empty());
         assert!(b.textures.is_empty());
+        assert!(b.images.is_empty());
         assert!(b.scalars.is_empty());
     }
 
@@ -68,6 +75,7 @@ mod tests {
         let b = Bindings {
             buffers: &[3, 7],
             textures: &[],
+            images: &[],
             scalars: &[Scalar::U32(256)],
         };
         assert_eq!(b.buffers, &[3, 7]);

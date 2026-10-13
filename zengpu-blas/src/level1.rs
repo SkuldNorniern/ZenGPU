@@ -105,6 +105,7 @@ impl Level1Kernels {
                 buffers: &[x.buffer.index(), y.buffer.index()],
                 scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(256), 1, 1],
         )
@@ -133,6 +134,7 @@ impl Level1Kernels {
                 buffers: &[x.buffer.index()],
                 scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(256), 1, 1],
         )

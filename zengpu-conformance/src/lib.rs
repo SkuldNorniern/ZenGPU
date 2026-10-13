@@ -291,6 +291,7 @@ pub fn run_dispatch(
             buffers: &buf_indices,
             scalars,
             textures: &[],
+            images: &[],
         },
         grid,
     )

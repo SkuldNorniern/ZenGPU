@@ -90,6 +90,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             buffers: &[ha.index(), hb.index(), hout.index()],
             scalars: &[Scalar::U32(N)],
             textures: &[],
+            images: &[],
         },
         [groups, 1, 1],
     )?;
