@@ -20,12 +20,17 @@ pub enum LayoutKind {
     /// A `device buffer<elem>` param. The member is a `u32` slot index, and
     /// `elem` is informational.
     BufferIndex { elem: TypeId },
+    /// Slot in the sampled-texture table, as a `u32`.
+    TextureIndex,
+    /// Slot in the storage-image table, as a `u32`.
+    ImageIndex,
     Scalar { ty: TypeId },
 }
 
-/// Push-constant layout of a compute entry point: buffer-index members first, then
-/// scalars, each in declaration order, 4 bytes, tightly packed. Must match
-/// `backend::spirv::compute`'s `pc_members`/`member_decorate`.
+/// Members come in this order: buffer slots, texture slots, image slots, then scalars.
+///
+/// Each group keeps declaration order. Every member is 4 bytes and tightly packed, as
+/// in `backend::spirv::compute`.
 pub fn compute_layout(module: &Module) -> Vec<(String, LayoutInfo)> {
     entry_layout(&module.entry)
 }
@@ -44,6 +49,29 @@ fn entry_layout(entry: &Entry) -> Vec<(String, LayoutInfo)> {
                 },
             ));
             offset += 4;
+        }
+    }
+    for (image, kind) in [
+        (false, LayoutKind::TextureIndex),
+        (true, LayoutKind::ImageIndex),
+    ] {
+        for p in &entry.params {
+            let wanted = match p.kind {
+                ParamKind::Texture => !image,
+                ParamKind::Image => image,
+                _ => false,
+            };
+            if wanted {
+                out.push((
+                    p.name.clone(),
+                    LayoutInfo {
+                        offset,
+                        size: 4,
+                        kind,
+                    },
+                ));
+                offset += 4;
+            }
         }
     }
     for p in &entry.params {

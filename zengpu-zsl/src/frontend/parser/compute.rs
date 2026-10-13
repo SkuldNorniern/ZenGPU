@@ -54,6 +54,7 @@ impl<'a> Parser<'a> {
             locals_order: Vec::new(),
             shared: HashMap::new(),
             shared_order: Vec::new(),
+            textures: HashMap::new(),
         };
         let params = self.parse_params(&mut ctx)?;
         let body = self.parse_block(&mut ctx)?;
@@ -67,6 +68,8 @@ impl<'a> Parser<'a> {
                         ParamKind::Buffer { elem, mutability }
                     }
                     PendingParamKind::Scalar(ty) => ParamKind::Scalar(ty),
+                    PendingParamKind::Texture => ParamKind::Texture,
+                    PendingParamKind::Image => ParamKind::Image,
                 },
             })
             .collect();
@@ -161,6 +164,7 @@ impl<'a> Parser<'a> {
             locals_order: Vec::new(),
             shared: HashMap::new(),
             shared_order: Vec::new(),
+            textures: HashMap::new(),
         };
         let mut params = Vec::new();
         while !self.eat(&Tok::RParen) {
@@ -302,6 +306,25 @@ impl<'a> Parser<'a> {
                 return self.err("atomic_add value must be an f32-typed expression");
             }
             return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
+        }
+        if let Some(Tok::Ident(name)) = self.peek()
+            && let Some(&storage) = ctx.textures.get(name)
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Dot))
+            && matches!(
+                self.toks.get(self.pos + 2).map(|t| &t.tok),
+                Some(Tok::Ident(m)) if m == "store"
+            )
+        {
+            let image = name.clone();
+            if !storage {
+                return self.err(format!(
+                    "`{image}` is a texture, which only reads; declare it `image` to store"
+                ));
+            }
+            self.pos += 3;
+            let (u, f) = (self.types.u32_id(), self.types.f32_id());
+            let args = self.parse_texel_args(ctx, "store", &[u, u, f, f, f, f])?;
+            return Ok(vec![IrStmt::ImageStore { image, args }]);
         }
         if let Some(Tok::Ident(name)) = self.peek() {
             let name = name.clone();

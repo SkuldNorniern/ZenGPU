@@ -25,7 +25,10 @@ pub fn ssbo_binding_for(elem: TypeId, f32_id: TypeId, u32_id: TypeId, i32_id: Ty
     }
 }
 
-/// Bindless table assignment for each buffer param, in declaration order.
+pub const TEXTURE_BINDING: u32 = 1;
+pub const IMAGE_BINDING: u32 = 4;
+
+/// Slots are assigned in param declaration order.
 pub fn compute_bindings(module: &Module) -> Vec<(String, BindingInfo)> {
     let mut types = module.types.clone();
     let f32_id = types.f32_id();
@@ -42,7 +45,19 @@ pub fn compute_bindings(module: &Module) -> Vec<(String, BindingInfo)> {
                     binding: ssbo_binding_for(*elem, f32_id, u32_id, i32_id),
                 },
             )),
-            _ => None,
+            ParamKind::Texture => Some((
+                p.name.clone(),
+                BindingInfo {
+                    binding: TEXTURE_BINDING,
+                },
+            )),
+            ParamKind::Image => Some((
+                p.name.clone(),
+                BindingInfo {
+                    binding: IMAGE_BINDING,
+                },
+            )),
+            ParamKind::Scalar(_) => None,
         })
         .collect()
 }

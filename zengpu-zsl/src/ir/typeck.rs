@@ -40,6 +40,8 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             }
         }
         IrExpr::SharedLoad { .. } => f32_id,
+        IrExpr::Texel { .. } => f32_id,
+        IrExpr::TexSize { .. } => u32_id,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32
             | BuiltinFn::SubgroupId
@@ -143,8 +145,8 @@ pub fn type_of_graphics_expr(
         },
         IrExpr::BufferLoad { .. } => f32_id,
         IrExpr::GlobalId(_) => u32_id,
-        IrExpr::SharedLoad { .. } => f32_id,
-        IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
+        IrExpr::SharedLoad { .. } | IrExpr::Texel { .. } => f32_id,
+        IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::TexSize { .. } => u32_id,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 => u32_id,
             BuiltinFn::F32 | BuiltinFn::Length => f32_id,

@@ -165,6 +165,9 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat(&Tok::Dot) {
                     let field = self.ident()?;
+                    if let Some(&storage) = ctx.textures.get(&name) {
+                        return self.parse_texel(ctx, name, storage, &field);
+                    }
                     if ctx.push_param.as_deref() == Some(name.as_str()) {
                         if !ctx.scalars.contains_key(&field) {
                             return self.err(format!("push struct has no field `{field}`"));
@@ -217,6 +220,95 @@ impl<'a> Parser<'a> {
             }
             _ => self.err("expected an expression"),
         }
+    }
+
+    pub(super) fn parse_texel_args(
+        &mut self,
+        ctx: &Ctx,
+        method: &str,
+        types: &[TypeId],
+    ) -> Result<Vec<IrExpr>, ParseError> {
+        self.expect(&Tok::LParen, "`(`")?;
+        let mut args = Vec::new();
+        while !self.eat(&Tok::RParen) {
+            args.push(self.parse_expr(ctx)?);
+            self.eat(&Tok::Comma);
+            if self.peek().is_none() {
+                return self.err("unterminated call arguments");
+            }
+        }
+        if args.len() != types.len() {
+            return self.err(format!(".{method}() takes {} args", types.len()));
+        }
+        for (arg, &want) in args.iter().zip(types) {
+            if type_of_compute_expr(arg, &ctx.type_ctx(), &mut self.types) != want {
+                let what = if want == self.types.u32_id() {
+                    "u32 texel coordinates"
+                } else {
+                    "f32 values"
+                };
+                return self.err(format!(".{method}() takes {what}"));
+            }
+        }
+        Ok(args)
+    }
+
+    /// Parses what follows `tex.method`: a size query or a texel read. `.r`, `.g`, `.b` and `.a`
+    /// pick one channel.
+    pub(super) fn parse_texel(
+        &mut self,
+        ctx: &Ctx,
+        tex: String,
+        storage: bool,
+        method: &str,
+    ) -> Result<IrExpr, ParseError> {
+        let (u, f) = (self.types.u32_id(), self.types.f32_id());
+        let (op, args) = match method {
+            "width" | "height" => {
+                self.parse_texel_args(ctx, method, &[])?;
+                let axis = u32::from(method == "height");
+                return Ok(IrExpr::TexSize { tex, axis });
+            }
+            "load" => (TexelOp::Load, self.parse_texel_args(ctx, method, &[u, u])?),
+            "sample" | "sample_level" if storage => {
+                return self.err(format!(
+                    "`{tex}` is an image, which only loads and stores; declare it `texture` to sample"
+                ));
+            }
+            "sample" => (
+                TexelOp::Sample,
+                self.parse_texel_args(ctx, method, &[f, f])?,
+            ),
+            "sample_level" => (
+                TexelOp::SampleLevel,
+                self.parse_texel_args(ctx, method, &[f, f, f])?,
+            ),
+            "store" => return self.err("`.store(…)` is a statement, not a value"),
+            other => {
+                return self.err(format!(
+                    "unknown texture method `.{other}()`; use .load, .sample, .sample_level, .width or .height"
+                ));
+            }
+        };
+        self.expect(&Tok::Dot, "`.r`/`.g`/`.b`/`.a` to pick a channel")?;
+        let channel = self.ident()?;
+        let component = match channel.as_str() {
+            "r" | "x" => 0,
+            "g" | "y" => 1,
+            "b" | "z" => 2,
+            "a" | "w" => 3,
+            other => {
+                return self.err(format!(
+                    "a texel has no channel `.{other}`; use .r/.g/.b/.a"
+                ));
+            }
+        };
+        Ok(IrExpr::Texel {
+            tex,
+            op,
+            args,
+            component,
+        })
     }
 
     pub(super) fn parse_call(&mut self, ctx: &Ctx, name: &str) -> Result<IrExpr, ParseError> {

@@ -630,6 +630,9 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             Err("workgroup operations are only available in compute shaders".into())
         }
         IrStmt::AtomicAdd { .. } => Err("atomic_add is only available in compute shaders".into()),
+        IrStmt::ImageStore { .. } => {
+            Err("image stores are only available in compute shaders".into())
+        }
     }
 }
 
@@ -861,6 +864,9 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
         | IrExpr::GroupId(_)
         | IrExpr::SharedLoad { .. } => {
             Err("workgroup expressions are only available in compute shaders".into())
+        }
+        IrExpr::Texel { .. } | IrExpr::TexSize { .. } => {
+            Err("texture and image params are only available in compute shaders; sample the `textures` table".into())
         }
     }
 }
@@ -1289,7 +1295,7 @@ fn unify_scalars(ctx: &mut Ctx<'_>, lhs: GVal, rhs: GVal) -> (GVal, GVal) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::env::temp_dir;
     use std::fs::{remove_file, write};
     use std::process::{Command, id};
@@ -1308,7 +1314,7 @@ mod tests {
     /// Runs `spirv-val` over `words` when the tool is installed.
     ///
     /// A failing validation prints the reason.
-    fn validate(words: &[u32]) {
+    pub(crate) fn validate(words: &[u32]) {
         static N: AtomicU64 = AtomicU64::new(0);
         let path = temp_dir().join(format!(
             "zsl_gfx_{}_{}.spv",

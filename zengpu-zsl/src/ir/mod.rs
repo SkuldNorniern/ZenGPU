@@ -38,6 +38,10 @@ pub enum ParamKind {
         mutability: Mutability,
     },
     Scalar(TypeId),
+    /// A 2D float texture, sampled or loaded. The slot comes from `Bindings::textures`.
+    Texture,
+    /// A 2D float storage image. The slot comes from `Bindings::images`.
+    Image,
 }
 
 #[derive(Debug)]

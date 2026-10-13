@@ -58,6 +58,10 @@ pub enum ParamKind {
     /// Buffer param: the push member is a `u32` slot in the table for `binding`, not `elem`.
     /// `binding` is an `SSBO_BINDING_*` in zengpu-vulkan.
     BufferIndex { elem: ScalarKind, binding: u32 },
+    /// A `u32` slot in the sampled-texture table at `binding`.
+    TextureIndex { binding: u32 },
+    /// A `u32` slot in the storage-image table at `binding`.
+    ImageIndex { binding: u32 },
     /// A push-constant scalar, stored as its declared type.
     Scalar { kind: ScalarKind },
 }

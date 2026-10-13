@@ -5,7 +5,8 @@ use std::fmt::Write;
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::node::{
-    BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_subgroup_query, stmts_use_workgroup_reduce,
+    BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
+    stmts_use_workgroup_reduce,
 };
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -33,6 +34,18 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
             ParamKind::Scalar(t) => Some((p.name.as_str(), *t)),
             _ => None,
         })
+        .collect();
+    let textures: Vec<&str> = e
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Texture))
+        .map(|p| p.name.as_str())
+        .collect();
+    let images: Vec<&str> = e
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Image))
+        .map(|p| p.name.as_str())
         .collect();
 
     let bf16_id = {
@@ -105,6 +118,17 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     if has_push {
         let _ = writeln!(s, "    constant Push& pc [[buffer({slot})]],");
     }
+    for (i, t) in textures.iter().enumerate() {
+        let _ = writeln!(s, "    texture2d<float> {t} [[texture({i})]],");
+        let _ = writeln!(s, "    sampler {t}_smp [[sampler({i})]],");
+    }
+    for (i, t) in images.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "    texture2d<float, access::read_write> {t} [[texture({})]],",
+            textures.len() + i
+        );
+    }
     s.push_str("    uint3 gid [[thread_position_in_grid]],\n");
     s.push_str("    uint3 lid [[thread_position_in_threadgroup]],\n");
     s.push_str("    uint3 group [[threadgroup_position_in_grid]]");
@@ -132,6 +156,7 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         bf16_buffers,
         f16_buffers,
         block_size,
+        has_images: !images.is_empty(),
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -152,6 +177,8 @@ struct Ctx<'a> {
     bf16_buffers: HashSet<&'a str>,
     f16_buffers: HashSet<&'a str>,
     block_size: u32,
+    /// Kernel writes images: barriers must order texture memory too.
+    has_images: bool,
 }
 
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
@@ -222,6 +249,23 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 emit_expr(ctx, value)?
             );
         }
+        IrStmt::ImageStore { image, args } => {
+            let a = args
+                .iter()
+                .map(|a| emit_expr(ctx, a))
+                .collect::<Result<Vec<_>, _>>()?;
+            let [x, y, r, g, b, alpha] = a.as_slice() else {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::Internal,
+                    "image store without x, y and four channels",
+                ));
+            };
+            indent(s, depth);
+            let _ = writeln!(
+                s,
+                "{image}.write(float4({r}, {g}, {b}, {alpha}), uint2({x}, {y}));"
+            );
+        }
         IrStmt::Discard => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
@@ -230,7 +274,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::Barrier => {
             indent(s, depth);
-            s.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+            if ctx.has_images {
+                s.push_str(
+                    "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_texture);\n",
+                );
+            } else {
+                s.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+            }
         }
         IrStmt::If { cond, then, else_ } => {
             indent(s, depth);
@@ -363,6 +413,37 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
+        }
+        IrExpr::Texel {
+            tex,
+            op,
+            args,
+            component: c,
+        } => {
+            let a = args
+                .iter()
+                .map(|a| emit_expr(ctx, a))
+                .collect::<Result<Vec<_>, _>>()?;
+            let read = match (op, a.as_slice()) {
+                (TexelOp::Load, [x, y]) => format!("{tex}.read(uint2({x}, {y}))"),
+                (TexelOp::Sample, [u, v]) => {
+                    format!("{tex}.sample({tex}_smp, float2({u}, {v}), level(0.0))")
+                }
+                (TexelOp::SampleLevel, [u, v, lod]) => {
+                    format!("{tex}.sample({tex}_smp, float2({u}, {v}), level({lod}))")
+                }
+                _ => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Internal,
+                        "texel read with the wrong argument count",
+                    ));
+                }
+            };
+            format!("{read}.{}", ["r", "g", "b", "a"][*c as usize & 3])
+        }
+        IrExpr::TexSize { tex, axis } => {
+            let side = if *axis == 0 { "width" } else { "height" };
+            format!("{tex}.get_{side}()")
         }
         IrExpr::Neg(e) => format!("(-{})", emit_expr(ctx, e)?),
         IrExpr::Binary { op, lhs, rhs } => {

@@ -59,6 +59,21 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
             func: *func,
             args: args.iter().map(|a| rename_expr(a, map)).collect(),
         },
+        IrExpr::Texel {
+            tex,
+            op,
+            args,
+            component,
+        } => IrExpr::Texel {
+            tex: tex.clone(),
+            op: *op,
+            args: args.iter().map(|a| rename_expr(a, map)).collect(),
+            component: *component,
+        },
+        IrExpr::TexSize { tex, axis } => IrExpr::TexSize {
+            tex: tex.clone(),
+            axis: *axis,
+        },
         IrExpr::Neg(inner) => IrExpr::Neg(Box::new(rename_expr(inner, map))),
         IrExpr::Binary { op, lhs, rhs } => IrExpr::Binary {
             op: *op,
@@ -93,6 +108,10 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
             name: name.clone(),
             index: rename_expr(index, map),
             value: rename_expr(value, map),
+        },
+        IrStmt::ImageStore { image, args } => IrStmt::ImageStore {
+            image: image.clone(),
+            args: args.iter().map(|a| rename_expr(a, map)).collect(),
         },
         IrStmt::Barrier => IrStmt::Barrier,
         IrStmt::Discard => IrStmt::Discard,
@@ -174,6 +193,24 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
                 .map(|a| resolve_construct_types_expr(a, types))
                 .collect(),
         },
+        IrExpr::Texel {
+            tex,
+            op,
+            args,
+            component,
+        } => IrExpr::Texel {
+            tex: tex.clone(),
+            op: *op,
+            args: args
+                .iter()
+                .map(|a| resolve_construct_types_expr(a, types))
+                .collect(),
+            component: *component,
+        },
+        IrExpr::TexSize { tex, axis } => IrExpr::TexSize {
+            tex: tex.clone(),
+            axis: *axis,
+        },
         IrExpr::Neg(inner) => IrExpr::Neg(Box::new(resolve_construct_types_expr(inner, types))),
         IrExpr::Binary { op, lhs, rhs } => IrExpr::Binary {
             op: *op,
@@ -207,6 +244,13 @@ pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena)
             name: name.clone(),
             index: resolve_construct_types_expr(index, types),
             value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::ImageStore { image, args } => IrStmt::ImageStore {
+            image: image.clone(),
+            args: args
+                .iter()
+                .map(|a| resolve_construct_types_expr(a, types))
+                .collect(),
         },
         IrStmt::Barrier => IrStmt::Barrier,
         IrStmt::Discard => IrStmt::Discard,
