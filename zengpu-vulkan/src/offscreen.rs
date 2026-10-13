@@ -173,3 +173,173 @@ mod tests {
         assert_eq!(target.format(), Format::Rgba8Unorm);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod zsl_parity_tests {
+    //! Runs the same ZSL shaders and checks the same expected pixels as the `zengpu-metal`
+    //! graphics tests.
+
+    use crate::{OffscreenTarget, VulkanDevice, VulkanInstance};
+    use zengpu_hal::{
+        Bindings, BufferDesc, BufferUsage, ColorAttachment, ColorTargetState, DepthState,
+        DeviceRequest, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, LoadOp,
+        MemoryUsage, PipelineHandle, PrimitiveTopology, RasterState, RenderCommands,
+        RenderPassDesc, SamplerDesc, Scalar, TexDim, TextureDesc, TextureHandle, TextureUsage,
+        Viewport, ViewportScissor,
+    };
+    use zengpu_spirv::{ZslShader, zsl};
+
+    fn open() -> Option<VulkanDevice> {
+        VulkanInstance::new_with_surface()
+            .ok()?
+            .request_graphics_adapter()?
+            .open_graphics(DeviceRequest::default())
+            .ok()
+    }
+
+    fn pipeline(dev: &VulkanDevice, vs: &ZslShader, fs: &ZslShader) -> PipelineHandle {
+        let v = dev.create_shader(vs.spirv_desc()).expect("vertex shader");
+        let f = dev.create_shader(fs.spirv_desc()).expect("fragment shader");
+        dev.create_graphics_pipeline(GraphicsPipelineDesc {
+            vertex_shader: v,
+            fragment_shader: f,
+            vertex_layouts: &[],
+            topology: PrimitiveTopology::TriangleList,
+            color_targets: &[ColorTargetState {
+                format: Format::Rgba8Unorm,
+                blend: None,
+            }],
+            depth_format: None,
+            depth: DepthState::default(),
+            stencil: None,
+            raster: RasterState::default(),
+            samples: 1,
+        })
+        .expect("pipeline")
+    }
+
+    fn draw(
+        dev: &VulkanDevice,
+        target: &OffscreenTarget,
+        p: PipelineHandle,
+        bindings: Bindings<'_>,
+    ) -> Vec<[u8; 4]> {
+        let (w, h) = target.extent();
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &[ColorAttachment {
+                target: target.target_handle(),
+                load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                store: true,
+                sample_after: false,
+            }],
+            depth: None,
+        });
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(ViewportScissor {
+            viewport: Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: w as f32,
+                height: h as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        });
+        cmd.bind(bindings);
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        let len = u64::from(w * h * 4);
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size: len,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Readback,
+            })
+            .expect("readback buffer");
+        dev.copy_offscreen_to_buffer(target, buf).expect("copy");
+        let raw = dev.read_buffer(buf, 0, len).expect("read");
+        raw.chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect()
+    }
+
+    const RED_FS: ZslShader = zsl!(
+        fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
+    );
+
+    #[test]
+    fn clip_space_y_points_down() {
+        let _guard = crate::test_gpu_lock();
+        const TOP_HALF: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(corner.x * 2.0 - 1.0, corner.y - 1.0, 0.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let target = OffscreenTarget::new(&dev, Format::Rgba8Unorm, 4, 4).expect("target");
+        let p = pipeline(&dev, &TOP_HALF, &RED_FS);
+        let px = draw(&dev, &target, p, Bindings::default());
+        for (i, p) in px.iter().enumerate() {
+            let want = if i / 4 < 2 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 0, 255]
+            };
+            assert_eq!(*p, want, "pixel {i} (row {})", i / 4);
+        }
+    }
+
+    #[test]
+    fn texture_indices_follow_scalars_in_the_push_block() {
+        let _guard = crate::test_gpu_lock();
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+            }
+        );
+        const TINTED_FS: ZslShader = zsl!(
+            push P { tint: f32x2, slot: u32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                tex[p.slot].sample(uv) * f32x4(p.tint.x, p.tint.y, 1.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let src: TextureHandle = dev
+            .create_texture(TextureDesc {
+                width: 1,
+                height: 1,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .expect("texture");
+        dev.upload_texture_data(src, &[255, 255, 255, 255])
+            .expect("upload");
+        let sampler = dev.create_sampler(SamplerDesc::default()).expect("sampler");
+        let slot = dev.bind_texture(src, sampler).expect("slot");
+        let target = OffscreenTarget::new(&dev, Format::Rgba8Unorm, 2, 2).expect("target");
+        let p = pipeline(&dev, &QUAD_VS, &TINTED_FS);
+        let scalars = [Scalar::F32(1.0), Scalar::F32(0.0)];
+        let px = draw(
+            &dev,
+            &target,
+            p,
+            Bindings {
+                buffers: &[],
+                textures: &[slot],
+                scalars: &scalars,
+            },
+        );
+        assert!(px.iter().all(|p| *p == [255, 0, 255, 255]), "{px:?}");
+    }
+}
