@@ -1349,6 +1349,18 @@ mod tests {
     }
 
     #[test]
+    fn push_vector_fields_take_swizzles() {
+        validate(&lower(
+            r#"
+            push P { tint: f32x4, scale: f32x2 }
+            fragment fs(p: P) -> f32x4 {
+                f32x4(p.tint.x, p.scale.y, p.tint.zw)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
     fn colour_swizzles_casts_bits_and_else_if() {
         validate(&lower(
             r#"

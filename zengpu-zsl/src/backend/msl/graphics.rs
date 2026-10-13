@@ -509,6 +509,20 @@ mod tests {
     }
 
     #[test]
+    fn push_vector_fields_take_swizzles() {
+        let m = graphics(
+            r#"
+            push P { tint: f32x4, scale: f32x2 }
+            fragment fs(p: P) -> f32x4 {
+                f32x4(p.tint.x, p.scale.y, p.tint.zw)
+            }
+            "#,
+        );
+        assert!(m.source.contains("pc.tint"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
     fn vertex_position_uses_vulkan_clip_space() {
         let m = graphics(
             r#"

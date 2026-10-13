@@ -302,3 +302,510 @@ mod tests {
         assert_eq!(result, &[11.0, 22.0, 33.0, 44.0]);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod graphics_tests {
+    //! Offscreen graphics via the HAL. Output must match Vulkan for the same ZSL shader.
+
+    use std::mem::size_of_val;
+    use std::slice::from_raw_parts;
+
+    use crate::{MetalDevice, MetalInstance};
+    use zengpu_hal::{
+        Bindings, BlendState, BufferDesc, BufferHandle, BufferUsage, ColorAttachment,
+        ColorTargetState, CompareFn, DepthAttachment, DepthState, DeviceRequest, DeviceType,
+        FilterMode, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, LoadOp, MemoryUsage,
+        PipelineHandle, PrimitiveTopology, RasterState, RenderCommands, RenderPassDesc,
+        SamplerDesc, Scalar, ShaderDesc, StepMode, TargetHandle, TexDim, TextureDesc,
+        TextureHandle, TextureUsage, VertexAttribute, VertexFormat, VertexLayout, Viewport,
+        ViewportScissor,
+    };
+    use zengpu_spirv::{ZslShader, zsl};
+
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    const BLACK: [u8; 4] = [0, 0, 0, 255];
+
+    fn open() -> Option<MetalDevice> {
+        MetalInstance::new()
+            .request_metal_adapter()?
+            .open_metal(DeviceRequest::default())
+            .ok()
+    }
+
+    fn bytes<T>(data: &[T]) -> &[u8] {
+        // SAFETY: only plain f32/u32 arrays are viewed, which have no padding.
+        unsafe { from_raw_parts(data.as_ptr().cast(), size_of_val(data)) }
+    }
+
+    fn texture(
+        dev: &MetalDevice,
+        format: Format,
+        w: u32,
+        h: u32,
+        usage: TextureUsage,
+    ) -> TextureHandle {
+        dev.create_texture(TextureDesc {
+            width: w,
+            height: h,
+            depth: 1,
+            format,
+            usage,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        })
+        .expect("texture")
+    }
+
+    fn color_target(dev: &MetalDevice, w: u32, h: u32) -> (TextureHandle, TargetHandle) {
+        let usage =
+            TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED | TextureUsage::TRANSFER_SRC;
+        let tex = texture(dev, Format::Rgba8Unorm, w, h, usage);
+        let target = dev.register_color_target(tex).expect("target");
+        (tex, target)
+    }
+
+    fn buffer(dev: &MetalDevice, data: &[u8], usage: BufferUsage) -> BufferHandle {
+        let b = dev
+            .create_buffer(BufferDesc {
+                size: data.len() as u64,
+                usage,
+                memory: MemoryUsage::Upload,
+            })
+            .expect("buffer");
+        dev.write_buffer(b, 0, data).expect("write");
+        b
+    }
+
+    /// Returns every pixel of `tex`, row by row from the top.
+    fn pixels(dev: &MetalDevice, tex: TextureHandle, w: u32, h: u32) -> Vec<[u8; 4]> {
+        let len = u64::from(w * h * 4);
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size: len,
+                usage: BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .expect("readback buffer");
+        dev.copy_texture_to_buffer(tex, buf).expect("copy");
+        let raw = dev.read_buffer(buf, 0, len).expect("read");
+        raw.chunks_exact(4)
+            .map(|c| [c[0], c[1], c[2], c[3]])
+            .collect()
+    }
+
+    fn pipeline(
+        dev: &MetalDevice,
+        vs: &ZslShader,
+        fs: &ZslShader,
+        layouts: &[VertexLayout<'_>],
+        blend: Option<BlendState>,
+        depth: Option<DepthState>,
+    ) -> PipelineHandle {
+        let v = dev
+            .create_shader(ShaderDesc::msl(vs.msl))
+            .expect("vertex shader");
+        let f = dev
+            .create_shader(ShaderDesc::msl(fs.msl))
+            .expect("fragment shader");
+        let p = dev
+            .create_graphics_pipeline(GraphicsPipelineDesc {
+                vertex_shader: v,
+                fragment_shader: f,
+                vertex_layouts: layouts,
+                topology: PrimitiveTopology::TriangleList,
+                color_targets: &[ColorTargetState {
+                    format: Format::Rgba8Unorm,
+                    blend,
+                }],
+                depth_format: depth.map(|_| Format::Depth32Float),
+                depth: depth.unwrap_or_default(),
+                stencil: None,
+                raster: RasterState::default(),
+                samples: 1,
+            })
+            .expect("pipeline");
+        dev.destroy_shader(v);
+        dev.destroy_shader(f);
+        p
+    }
+
+    fn pass<'a>(
+        target: TargetHandle,
+        load: LoadOp,
+        depth: Option<DepthAttachment>,
+        color: &'a mut [ColorAttachment; 1],
+    ) -> RenderPassDesc<'a> {
+        color[0] = ColorAttachment {
+            target,
+            load,
+            store: true,
+            sample_after: false,
+        };
+        RenderPassDesc {
+            color: &color[..],
+            depth,
+        }
+    }
+
+    fn viewport(w: u32, h: u32) -> ViewportScissor {
+        ViewportScissor {
+            viewport: Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: w as f32,
+                height: h as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        }
+    }
+
+    const RED_FS: ZslShader = zsl!(
+        fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
+    );
+
+    /// ZSL clip space has +y down, as on Vulkan: y in -1..0 is the top half.
+    #[test]
+    fn clip_space_y_points_down() {
+        const TOP_HALF: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(corner.x * 2.0 - 1.0, corner.y - 1.0, 0.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let (tex, target) = color_target(&dev, 4, 4);
+        let p = pipeline(&dev, &TOP_HALF, &RED_FS, &[], None, None);
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 4));
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        let px = pixels(&dev, tex, 4, 4);
+        for (i, p) in px.iter().enumerate() {
+            let want = if i / 4 < 2 { RED } else { BLACK };
+            assert_eq!(*p, want, "pixel {i} (row {})", i / 4);
+        }
+    }
+
+    /// Texture picked by a push slot: the top-left texel lands at the top left.
+    #[test]
+    fn samples_the_texture_table_through_push_constants() {
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+            }
+        );
+        const SAMPLE_FS: ZslShader = zsl!(
+            push P { slot: u32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                tex[p.slot].sample(uv)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let texels: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        let src = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            2,
+            2,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        );
+        dev.upload_texture_data(src, texels.as_flattened())
+            .expect("upload");
+        let sampler = dev
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                mip_filter: FilterMode::Nearest,
+                ..SamplerDesc::default()
+            })
+            .expect("sampler");
+        let slot = dev.bind_texture(src, sampler).expect("slot");
+
+        let (tex, target) = color_target(&dev, 2, 2);
+        let p = pipeline(&dev, &QUAD_VS, &SAMPLE_FS, &[], None, None);
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(2, 2));
+        cmd.bind(Bindings {
+            buffers: &[],
+            textures: &[],
+            scalars: &[Scalar::U32(slot)],
+        });
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        assert_eq!(pixels(&dev, tex, 2, 2), texels.to_vec());
+    }
+
+    /// Push block packed as on Vulkan, padded to the MSL struct size.
+    ///
+    /// A `float2` followed by a texture slot is a 16-byte struct fed from 12 bytes.
+    #[test]
+    fn texture_indices_follow_scalars_in_the_push_block() {
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+            }
+        );
+        const TINTED_FS: ZslShader = zsl!(
+            push P { tint: f32x2, slot: u32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                tex[p.slot].sample(uv) * f32x4(p.tint.x, p.tint.y, 1.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let src = texture(&dev, Format::Rgba8Unorm, 1, 1, TextureUsage::SAMPLED);
+        dev.upload_texture_data(src, &[255, 255, 255, 255])
+            .expect("upload");
+        let sampler = dev.create_sampler(SamplerDesc::default()).expect("sampler");
+        let slot = dev.bind_texture(src, sampler).expect("slot");
+        let (tex, target) = color_target(&dev, 2, 2);
+        let p = pipeline(&dev, &QUAD_VS, &TINTED_FS, &[], None, None);
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(2, 2));
+        cmd.bind(Bindings {
+            buffers: &[],
+            textures: &[slot],
+            scalars: &[Scalar::F32(1.0), Scalar::F32(0.0)],
+        });
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        assert!(
+            pixels(&dev, tex, 2, 2)
+                .iter()
+                .all(|p| *p == [255, 0, 255, 255])
+        );
+    }
+
+    /// Indexed draws honour the instance range: two instances fill the target.
+    #[test]
+    fn indexed_draws_draw_every_instance() {
+        const HALF_VS: ZslShader = zsl!(
+            vertex vs(@location(0) left: f32, vi: vertex_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(left + corner.x, corner.y * 2.0 - 1.0, 0.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let (tex, target) = color_target(&dev, 4, 2);
+        let attrs = [VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32,
+        }];
+        let layouts = [VertexLayout {
+            stride: 4,
+            attributes: &attrs,
+            step_mode: StepMode::Instance,
+        }];
+        let p = pipeline(&dev, &HALF_VS, &RED_FS, &layouts, None, None);
+        let lefts = buffer(&dev, bytes(&[-1.0f32, 0.0]), BufferUsage::VERTEX);
+        let indices = buffer(&dev, bytes(&[0u32, 1, 2, 3, 4, 5]), BufferUsage::INDEX);
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 2));
+        cmd.set_vertex_buffer(0, lefts);
+        cmd.set_index_buffer(indices);
+        cmd.draw_indexed(0..6, 0..2);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        assert!(pixels(&dev, tex, 4, 2).iter().all(|p| *p == RED));
+    }
+
+    #[test]
+    fn alpha_blends_over_the_clear_colour() {
+        const FULL_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(corner * 2.0 - 1.0, 0.0, 1.0)
+            }
+        );
+        const HALF_RED_FS: ZslShader = zsl!(
+            fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 0.5) }
+        );
+        let Some(dev) = open() else { return };
+        let (tex, target) = color_target(&dev, 2, 2);
+        let p = pipeline(
+            &dev,
+            &FULL_VS,
+            &HALF_RED_FS,
+            &[],
+            Some(BlendState::ALPHA_BLEND),
+            None,
+        );
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 1.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(2, 2));
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        for p in pixels(&dev, tex, 2, 2) {
+            assert!(
+                p[0].abs_diff(128) <= 1 && p[1] == 0 && p[2].abs_diff(127) <= 1,
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn depth_test_keeps_the_nearest() {
+        const DEPTH_VS: ZslShader = zsl!(
+            push P { z: f32, r: f32, g: f32, b: f32 }
+            vertex vs(vi: vertex_index, p: P) -> (f32x4, f32x4) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, p.z, 1.0), f32x4(p.r, p.g, p.b, 1.0))
+            }
+        );
+        const COLOR_FS: ZslShader = zsl!(
+            fragment fs(@location(0) c: f32x4) -> f32x4 { c }
+        );
+        let Some(dev) = open() else { return };
+        let (tex, target) = color_target(&dev, 2, 2);
+        let depth_buffer = dev.create_depth_target(2, 2).expect("depth buffer");
+        let depth_target = dev.register_depth_target(&depth_buffer);
+        let depth = DepthState {
+            test: true,
+            write: true,
+            compare: CompareFn::Less,
+        };
+        let p = pipeline(&dev, &DEPTH_VS, &COLOR_FS, &[], None, Some(depth));
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        let depth_att = DepthAttachment {
+            target: depth_target,
+            load: LoadOp::clear_depth(1.0),
+            store: false,
+        };
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            Some(depth_att),
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(2, 2));
+        for (z, rgb) in [
+            (0.8, [1.0, 0.0, 0.0]),
+            (0.2, [0.0, 1.0, 0.0]),
+            (0.5, [0.0, 0.0, 1.0]),
+        ] {
+            let scalars = [
+                Scalar::F32(z),
+                Scalar::F32(rgb[0]),
+                Scalar::F32(rgb[1]),
+                Scalar::F32(rgb[2]),
+            ];
+            cmd.bind(Bindings {
+                buffers: &[],
+                textures: &[],
+                scalars: &scalars,
+            });
+            cmd.draw(0..6, 0..1);
+        }
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        assert!(
+            pixels(&dev, tex, 2, 2)
+                .iter()
+                .all(|p| *p == [0, 255, 0, 255])
+        );
+    }
+
+    #[test]
+    fn adapters_keep_their_uuid_and_open_themselves() {
+        let inst = MetalInstance::new();
+        let Some(first) = inst.metal_adapters().into_iter().next() else {
+            return;
+        };
+        let again = inst
+            .metal_adapter_by_uuid(first.uuid())
+            .expect("same adapter by uuid");
+        assert_eq!(again.uuid(), first.uuid());
+        let dev = again.open_metal(DeviceRequest::default()).expect("open");
+        if dev.raw_device().has_unified_memory() {
+            use zengpu_hal::GpuAdapter;
+            assert_eq!(first.info().device_type, DeviceType::Integrated);
+        }
+    }
+}

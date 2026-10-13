@@ -164,7 +164,7 @@ impl<'a> Parser<'a> {
                     if !ctx.scalars.contains_key(&field) {
                         return self.err(format!("push struct has no field `{field}`"));
                     }
-                    return Ok(IrExpr::ScalarParam(field));
+                    return self.parse_g_postfix(ctx, IrExpr::ScalarParam(field));
                 }
                 if ctx.textures.as_deref() == Some(name.as_str()) {
                     let sample = self.parse_g_sample(ctx)?;
