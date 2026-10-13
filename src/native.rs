@@ -19,6 +19,7 @@ pub use zengpu_metal::{
     DepthTarget as NativeDepthTarget, MetalAdapter as NativeAdapter,
     MetalCommandList as NativeCommandList, MetalDevice as NativeDevice, MetalFrame as NativeFrame,
     MetalInstance as NativeInstance, MetalSurface as NativeSurface,
+    OffscreenTarget as NativeOffscreenTarget,
 };
 
 /// The backend the aliases stand for.
@@ -27,9 +28,10 @@ pub const BACKEND: BackendPreference = BackendPreference::Metal;
 
 #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "vulkan"))]
 pub use zengpu_vulkan::{
-    DepthTarget as NativeDepthTarget, VulkanAdapter as NativeAdapter,
-    VulkanCommandList as NativeCommandList, VulkanDevice as NativeDevice,
-    VulkanFrame as NativeFrame, VulkanInstance as NativeInstance, VulkanSurface as NativeSurface,
+    DepthTarget as NativeDepthTarget, OffscreenTarget as NativeOffscreenTarget,
+    VulkanAdapter as NativeAdapter, VulkanCommandList as NativeCommandList,
+    VulkanDevice as NativeDevice, VulkanFrame as NativeFrame, VulkanInstance as NativeInstance,
+    VulkanSurface as NativeSurface,
 };
 
 /// The backend the aliases stand for.
