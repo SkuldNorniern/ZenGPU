@@ -36,7 +36,8 @@ pub enum PowerPreference {
 /// memory types/heaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryUsage {
-    /// Device-local, no host visibility (resident arrays, render targets).
+    /// Device-local memory for resident arrays and render targets. May also
+    /// be host-visible on devices with shared CPU/GPU memory.
     GpuOnly,
     /// Host-visible, write-combined — staging into `GpuOnly`.
     Upload,

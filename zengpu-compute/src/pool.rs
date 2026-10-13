@@ -38,6 +38,7 @@ impl BufferPool {
 
     /// Allocate a [`DeviceArray`] of `shape`/`dtype`, reusing a pooled buffer
     /// from the matching size class if one is free.
+    /// Contents are unspecified, including when reusing a freed buffer.
     pub fn alloc(&self, shape: Vec<u32>, dtype: DType) -> Result<DeviceArray> {
         let len = checked_len(&shape)?;
         let requested = len as u64 * dtype.size_bytes() as u64;

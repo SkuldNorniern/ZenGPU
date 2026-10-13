@@ -35,7 +35,7 @@ pub fn run_buffer_suite(label: &str, dev: &dyn GpuDevice) {
     buffer_roundtrip(label, dev);
     buffer_partial_read(label, dev);
     buffer_read_into(label, dev);
-    buffer_zero_init(label, dev);
+    buffer_explicit_init(label, dev);
     buffer_missing_readback_usage(label, dev);
     buffer_stale_after_destroy(label, dev);
     buffer_out_of_bounds_write(label, dev);
@@ -69,10 +69,15 @@ fn buffer_partial_read(label: &str, dev: &dyn GpuDevice) {
     dev.destroy_buffer(h);
 }
 
-fn buffer_zero_init(label: &str, dev: &dyn GpuDevice) {
+fn buffer_explicit_init(label: &str, dev: &dyn GpuDevice) {
     let h = dev.create_buffer(rw_desc(16)).unwrap();
+    // Native GPU allocations have unspecified initial contents. Check that an
+    // explicit zero upload overwrites existing data instead of relying on a
+    // driver returning freshly zeroed pages.
+    dev.write_buffer(h, 0, &[0xA5; 16]).unwrap();
+    dev.write_buffer(h, 0, &[0; 16]).unwrap();
     let out = dev.read_buffer(h, 0, 16).unwrap();
-    assert_eq!(out, vec![0u8; 16], "[{label}] buffer_zero_init");
+    assert_eq!(out, vec![0u8; 16], "[{label}] buffer_explicit_init");
     dev.destroy_buffer(h);
 }
 
@@ -164,10 +169,13 @@ fn buffer_copy_ranges(label: &str, dev: &dyn GpuDevice) {
     let dst = dev.create_buffer(rw_desc(16)).unwrap();
     dev.write_buffer(src, 0, &(0u8..16).collect::<Vec<_>>())
         .unwrap();
+    dev.write_buffer(dst, 0, &[0xA5; 16]).unwrap();
     dev.copy_buffer(src, 3, dst, 7, 6).unwrap();
     assert_eq!(
         dev.read_buffer(dst, 0, 16).unwrap(),
-        [0, 0, 0, 0, 0, 0, 0, 3, 4, 5, 6, 7, 8, 0, 0, 0],
+        [
+            0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 0xA5, 3, 4, 5, 6, 7, 8, 0xA5, 0xA5, 0xA5
+        ],
         "[{label}] buffer_copy_ranges"
     );
     dev.destroy_buffer(src);

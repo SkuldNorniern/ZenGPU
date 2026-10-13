@@ -48,6 +48,9 @@ pub trait GpuDevice: Send + Sync {
     }
 
     /// Create a buffer. The returned handle is generational.
+    ///
+    /// Initial contents are unspecified. Initialize every byte that will be
+    /// read with an upload, copy, or shader write before reading it.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 
     /// Upload `data` into `buffer` starting at byte `offset`.
