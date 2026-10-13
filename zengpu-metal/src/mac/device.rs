@@ -7,6 +7,8 @@ use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, DepthStencilState,
@@ -19,11 +21,11 @@ use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, CompletedSubmission, ComputePipelineDesc, DeviceLimits,
-    Features, Format, FormatCaps, GpuDevice, GpuError, HalCapabilities, MemoryBudget,
-    PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
-    ShaderSource, SlotMap, Submission, TargetHandle, TexDim, TextureDesc, TextureHandle,
-    TextureRegion, TextureUsage, TextureWrite, TransferCaps, marker,
+    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, Features, Format,
+    FormatCaps, GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle,
+    Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
+    TextureUsage, TextureWrite, TransferCaps, marker,
 };
 
 use super::convert;
@@ -108,6 +110,11 @@ impl Inner {
     /// Commit `cmd`, wait for it, and report whether the GPU ran it cleanly.
     pub(crate) fn commit_and_wait(&self, cmd: &CommandBufferRef) -> Result<()> {
         self.commit(cmd);
+        self.wait_for(cmd)
+    }
+
+    /// Block until `cmd` finishes, then report its outcome.
+    pub(crate) fn wait_for(&self, cmd: &CommandBufferRef) -> Result<()> {
         cmd.wait_until_completed();
         self.check(cmd)
     }
@@ -178,6 +185,61 @@ impl Drop for DepthTarget {
         if let Ok(mut textures) = self.inner.textures.lock() {
             textures.remove(self.texture);
         }
+    }
+}
+
+/// Pause between polls while a submission is waited on with a deadline.
+const WAIT_POLL: Duration = Duration::from_micros(100);
+
+/// Committed copies the GPU may still be running. Holding the command
+/// buffers keeps what they reference alive; dropping one never waits.
+pub(crate) struct MetalSubmission {
+    inner: Arc<Inner>,
+    cmds: Vec<CommandBuffer>,
+}
+
+impl MetalSubmission {
+    pub(crate) fn boxed(inner: &Arc<Inner>, cmds: Vec<CommandBuffer>) -> Submission {
+        Box::new(Self {
+            inner: Arc::clone(inner),
+            cmds,
+        })
+    }
+}
+
+impl GpuSubmission for MetalSubmission {
+    fn cycle_id(&self) -> u64 {
+        0
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        let mut status = SubmissionStatus::Complete;
+        for cmd in &self.cmds {
+            match cmd.status() {
+                MTLCommandBufferStatus::Completed => {}
+                MTLCommandBufferStatus::Error => self.inner.check(cmd)?,
+                _ => status = SubmissionStatus::Pending,
+            }
+        }
+        Ok(status)
+    }
+
+    /// A timeout too long to add to the clock waits with no deadline.
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        let Some(deadline) = Instant::now().checked_add(timeout) else {
+            for cmd in &self.cmds {
+                self.inner.wait_for(cmd)?;
+            }
+            return Ok(());
+        };
+        while self.poll()? == SubmissionStatus::Pending {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(GpuError::Timeout);
+            }
+            thread::sleep((deadline - now).min(WAIT_POLL));
+        }
+        Ok(())
     }
 }
 
@@ -401,7 +463,7 @@ impl MetalDevice {
         region: TextureRegion,
         data: &[u8],
         bytes_per_row: u32,
-    ) -> Result<()> {
+    ) -> Result<CommandBuffer> {
         let row = if bytes_per_row == 0 {
             region.width * desc.format.bytes_per_texel()
         } else {
@@ -433,9 +495,12 @@ impl MetalDevice {
             );
             blit.end_encoding();
         });
-        self.inner.commit_and_wait(&cmd)
+        // The command buffer retains the staging buffer until the GPU is done.
+        self.inner.commit(&cmd);
+        Ok(cmd)
     }
 
+    /// Write `data` into `handle`'s region and wait until it has landed.
     fn write_region(
         &self,
         handle: TextureHandle,
@@ -443,11 +508,28 @@ impl MetalDevice {
         data: &[u8],
         bytes_per_row: u32,
     ) -> Result<()> {
+        if let Some(cmd) = self.queue_region(handle, region, data, bytes_per_row)? {
+            self.inner.wait_for(&cmd)?;
+        }
+        Ok(())
+    }
+
+    /// Write `data` into `handle`'s region. A Private texture gets a committed
+    /// copy the GPU may still be running; shared memory is written at once.
+    fn queue_region(
+        &self,
+        handle: TextureHandle,
+        region: TextureRegion,
+        data: &[u8],
+        bytes_per_row: u32,
+    ) -> Result<Option<CommandBuffer>> {
         let (tex, desc) = self.texture(handle)?;
         if tex.storage_mode() == MTLStorageMode::Private {
             self.stage_into(&tex, &desc, region, data, bytes_per_row)
+                .map(Some)
         } else {
-            Self::replace(&tex, &desc, region, data, bytes_per_row)
+            Self::replace(&tex, &desc, region, data, bytes_per_row)?;
+            Ok(None)
         }
     }
 
@@ -671,14 +753,15 @@ impl GpuDevice for MetalDevice {
     fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
         let (_, desc) = self.texture(texture)?;
         let row = desc.width * desc.format.bytes_per_texel();
+        // No deadline: the caller reads the buffer straight after this.
         self.copy_texture_region_to_buffer(
             texture,
             TextureRegion::rect(0, 0, desc.width, desc.height),
             buffer,
             0,
             row,
-        )
-        .map(|_| ())
+        )?
+        .wait(Duration::MAX)
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
@@ -777,10 +860,13 @@ impl GpuDevice for MetalDevice {
     }
 
     fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        let mut cmds = Vec::new();
         for w in writes {
-            self.write_region(w.texture, w.region, w.data, w.bytes_per_row)?;
+            if let Some(cmd) = self.queue_region(w.texture, w.region, w.data, w.bytes_per_row)? {
+                cmds.push(cmd);
+            }
         }
-        Ok(Box::new(CompletedSubmission::new(0)))
+        Ok(MetalSubmission::boxed(&self.inner, cmds))
     }
 
     fn copy_buffer_to_texture(
@@ -814,8 +900,8 @@ impl GpuDevice for MetalDevice {
             );
             blit.end_encoding();
         });
-        self.inner.commit_and_wait(&cmd)?;
-        Ok(Box::new(CompletedSubmission::new(0)))
+        self.inner.commit(&cmd);
+        Ok(MetalSubmission::boxed(&self.inner, vec![cmd]))
     }
 
     fn copy_texture_region_to_buffer(
@@ -857,8 +943,8 @@ impl GpuDevice for MetalDevice {
             );
             blit.end_encoding();
         });
-        self.inner.commit_and_wait(&cmd)?;
-        Ok(Box::new(CompletedSubmission::new(0)))
+        self.inner.commit(&cmd);
+        Ok(MetalSubmission::boxed(&self.inner, vec![cmd]))
     }
 
     fn generate_mipmaps(&self, texture: TextureHandle) -> Result<()> {

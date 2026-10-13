@@ -202,8 +202,8 @@ pub trait GpuDevice: Send + Sync {
     ///    Reading before completion fails rather than waiting.
     ///
     /// Drop the submission only after it completes: on Vulkan, dropping a
-    /// pending one waits for the GPU. Metal's copy currently waits inside
-    /// this call, so the pattern does not hide latency there yet.
+    /// pending one waits for the GPU. Metal does not wait on drop; it keeps the
+    /// command buffer alive until the GPU finishes.
     ///
     /// ```rust,no_run
     /// # use zengpu_hal::{BufferDesc, BufferHandle, BufferUsage, GpuDevice, MemoryUsage};
