@@ -81,6 +81,14 @@ Metal needs nothing extra. For Vulkan on macOS:
 brew install vulkan-loader molten-vk
 ```
 
+Before publishing Metal support, run the offscreen graphics and transfer
+regressions on a real Mac. This mode fails if no Metal adapter opens and prints
+the selected adapter:
+
+```sh
+ZENGPU_REQUIRE_METAL=1 cargo test -p zengpu-metal graphics_tests -- --test-threads=1 --nocapture
+```
+
 ## License
 
 [Apache-2.0](LICENSE).

@@ -8,6 +8,8 @@
 
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(any(target_os = "macos", test))]
+mod transfer;
 #[cfg(target_os = "macos")]
 pub use mac::{
     DepthTarget, MetalAdapter, MetalCommandList, MetalDevice, MetalFrame, MetalInstance,
@@ -322,7 +324,9 @@ mod tests {
                 height: 2,
                 depth: 1,
                 format: Format::Rgba8Unorm,
-                usage: TextureUsage::SAMPLED,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
                 samples: 1,
                 dimension: TexDim::D2,
                 mip_levels: 1,
@@ -383,10 +387,18 @@ mod graphics_tests {
     const BLACK: [u8; 4] = [0, 0, 0, 255];
 
     fn open() -> Option<MetalDevice> {
-        MetalInstance::new()
-            .request_metal_adapter()?
-            .open_metal(DeviceRequest::default())
-            .ok()
+        use std::env;
+        use zengpu_hal::GpuAdapter;
+        let adapter = MetalInstance::new().request_metal_adapter();
+        let dev = adapter.as_ref().and_then(|adapter| {
+            eprintln!("Metal regression adapter: {}", adapter.info().name);
+            adapter.open_metal(DeviceRequest::default()).ok()
+        });
+        assert!(
+            env::var_os("ZENGPU_REQUIRE_METAL").is_none() || dev.is_some(),
+            "GPU-required Metal tests could not open an adapter"
+        );
+        dev
     }
 
     fn bytes<T>(data: &[T]) -> &[u8] {
@@ -423,6 +435,107 @@ mod graphics_tests {
         (tex, target)
     }
 
+    #[test]
+    fn region_transfers_validate_shared_and_private_textures() {
+        use std::time::Duration;
+        use zengpu_hal::{TextureRegion, TextureWrite};
+        let Some(dev) = open() else { return };
+        for (format, storage) in [
+            (Format::Rgba8Unorm, TextureUsage::SAMPLED),
+            (Format::Depth32Float, TextureUsage::DEPTH_STENCIL),
+        ] {
+            let tex = texture(
+                &dev,
+                format,
+                4,
+                4,
+                storage | TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+            );
+            let valid = TextureRegion::rect(0, 0, 4, 4);
+            assert!(
+                dev.write_textures(&[TextureWrite {
+                    texture: tex,
+                    region: valid,
+                    data: &[0; 63],
+                    bytes_per_row: 16
+                }])
+                .is_err()
+            );
+            for region in [
+                TextureRegion {
+                    mip_level: 32,
+                    ..valid
+                },
+                TextureRegion { layer: 1, ..valid },
+                TextureRegion {
+                    x: u32::MAX,
+                    ..valid
+                },
+            ] {
+                assert!(
+                    dev.write_textures(&[TextureWrite {
+                        texture: tex,
+                        region,
+                        data: &[0; 64],
+                        bytes_per_row: 16
+                    }])
+                    .is_err()
+                );
+            }
+            for pitch in [0, 15, 17] {
+                assert!(
+                    dev.write_textures(&[TextureWrite {
+                        texture: tex,
+                        region: valid,
+                        data: &[0; 64],
+                        bytes_per_row: pitch
+                    }])
+                    .is_err()
+                );
+            }
+            let invalid_buffer = buffer(&dev, &[0; 64], BufferUsage::STORAGE);
+            assert!(
+                dev.copy_buffer_to_texture(invalid_buffer, 0, 16, tex, valid)
+                    .is_err()
+            );
+            assert!(
+                dev.copy_texture_region_to_buffer(tex, valid, invalid_buffer, 0, 16)
+                    .is_err()
+            );
+            let upload = buffer(&dev, &[0; 64], BufferUsage::TRANSFER_SRC);
+            assert!(
+                dev.copy_buffer_to_texture(upload, 4, 16, tex, valid)
+                    .is_err()
+            );
+            let readback = buffer(
+                &dev,
+                &[0; 64],
+                BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+            );
+            assert!(
+                dev.copy_texture_region_to_buffer(tex, valid, readback, u64::MAX - 3, 16)
+                    .is_err()
+            );
+            for byte in 1..=16 {
+                let data = [byte; 64];
+                let wrote = dev
+                    .write_textures(&[TextureWrite {
+                        texture: tex,
+                        region: valid,
+                        data: &data,
+                        bytes_per_row: 16,
+                    }])
+                    .unwrap();
+                let read = dev
+                    .copy_texture_region_to_buffer(tex, valid, readback, 0, 16)
+                    .unwrap();
+                read.wait(Duration::MAX).unwrap();
+                wrote.wait(Duration::MAX).unwrap();
+                assert_eq!(dev.read_buffer(readback, 0, 64).unwrap(), data);
+            }
+        }
+    }
+
     fn buffer(dev: &MetalDevice, data: &[u8], usage: BufferUsage) -> BufferHandle {
         let b = dev
             .create_buffer(BufferDesc {
@@ -441,7 +554,7 @@ mod graphics_tests {
         let buf = dev
             .create_buffer(BufferDesc {
                 size: len,
-                usage: BufferUsage::READBACK,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
                 memory: MemoryUsage::Readback,
             })
             .expect("readback buffer");
@@ -651,7 +764,13 @@ mod graphics_tests {
             }
         );
         let Some(dev) = open() else { return };
-        let src = texture(&dev, Format::Rgba8Unorm, 1, 1, TextureUsage::SAMPLED);
+        let src = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            1,
+            1,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        );
         dev.upload_texture_data(src, &[255, 255, 255, 255])
             .expect("upload");
         let sampler = dev.create_sampler(SamplerDesc::default()).expect("sampler");
