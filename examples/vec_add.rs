@@ -30,8 +30,10 @@ fn as_bytes<T>(s: &[T]) -> &[u8] {
 }
 
 fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

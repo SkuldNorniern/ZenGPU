@@ -90,11 +90,11 @@ fn detect_rocm_version(rocm_path: &str) -> (u32, u32) {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Some(ver) = s.split("HIP version:").nth(1) {
             let parts: Vec<&str> = ver.trim().splitn(3, '.').collect();
-            if parts.len() >= 2 {
-                if let (Ok(maj), Ok(min)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                    println!("cargo:warning=zengpu-hip: detected ROCm {maj}.{min} via hipconfig");
-                    return (maj, min);
-                }
+            if parts.len() >= 2
+                && let (Ok(maj), Ok(min)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+            {
+                println!("cargo:warning=zengpu-hip: detected ROCm {maj}.{min} via hipconfig");
+                return (maj, min);
             }
         }
     }
@@ -192,20 +192,18 @@ int main(void) {
             cmd.arg(format!("-I{rocm_path}/include"))
                 .arg("-D__HIP_PLATFORM_AMD__");
         }
-        if let Ok(o) = cmd.output() {
-            if o.status.success() {
-                if let Ok(run) = Command::new(&bin).output() {
-                    if run.status.success() {
-                        let s = String::from_utf8_lossy(&run.stdout);
-                        let n: Vec<usize> = s
-                            .split_whitespace()
-                            .filter_map(|t| t.parse().ok())
-                            .collect();
-                        if n.len() == 5 {
-                            return Ok((n[0], n[1], n[2], n[3], n[4]));
-                        }
-                    }
-                }
+        if let Ok(o) = cmd.output()
+            && o.status.success()
+            && let Ok(run) = Command::new(&bin).output()
+            && run.status.success()
+        {
+            let s = String::from_utf8_lossy(&run.stdout);
+            let n: Vec<usize> = s
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            if n.len() == 5 {
+                return Ok((n[0], n[1], n[2], n[3], n[4]));
             }
         }
     }

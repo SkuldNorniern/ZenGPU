@@ -449,7 +449,7 @@ fn stale_texture() -> GpuError {
 
 /// Row pitch in texels, for a buffer-image copy.
 fn rows_in_texels(bytes_per_row: u32, width: u32, texel: u32) -> Result<u32> {
-    if bytes_per_row % texel != 0 || bytes_per_row / texel < width {
+    if !bytes_per_row.is_multiple_of(texel) || bytes_per_row / texel < width {
         return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
             format!("rows of {bytes_per_row} bytes do not hold {width} texels of {texel} bytes"),
         )));

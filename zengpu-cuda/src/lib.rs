@@ -1702,8 +1702,10 @@ mod tests {
             .read_buffer(out, 0, size)
             .expect("read classifications");
         let actual: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(actual, expected);
         device.destroy_pipeline(pipeline);
@@ -1797,11 +1799,8 @@ mod tests {
         assert_eq!(submission.cycle_id(), 0x4d_49_58_45_44);
         submission.wait(Duration::from_secs(5)).unwrap();
         let actual = device.read_buffer(readback, 0, size).unwrap();
-        for (index, bytes) in actual.chunks_exact(4).enumerate() {
-            assert_eq!(
-                f32::from_le_bytes(bytes.try_into().unwrap()),
-                values[index] * 2.0
-            );
+        for (index, bytes) in actual.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(f32::from_le_bytes(*bytes), values[index] * 2.0);
         }
         device.destroy_buffer(upload);
         device.destroy_buffer(a);

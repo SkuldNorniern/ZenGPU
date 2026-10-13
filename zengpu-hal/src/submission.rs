@@ -20,8 +20,14 @@ pub trait GpuSubmission: Send + Sync {
 
     fn poll(&self) -> Result<SubmissionStatus>;
 
-    /// Wait at most `timeout`. Returns [`GpuError::Timeout`] on expiry. The GPU work keeps running,
-    /// and the handle stays valid for another poll or wait.
+    /// Waits for the work to finish, or returns early on timeout.
+    ///
+    /// A timeout does not cancel the GPU work. The handle stays valid and can be polled or waited
+    /// on again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuError::Timeout`](crate::GpuError::Timeout) on expiry.
     fn wait(&self, timeout: Duration) -> Result<()>;
 }
 
