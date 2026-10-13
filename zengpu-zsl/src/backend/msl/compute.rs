@@ -557,6 +557,8 @@ mod tests {
         let _ = remove_file(&src);
         let _ = remove_file(&air);
         match out {
+            // xcrun is there but the offline compiler is not installed.
+            Ok(o) if String::from_utf8_lossy(&o.stderr).contains("missing Metal Toolchain") => None,
             Ok(o) => Some(if o.status.success() {
                 true
             } else {
