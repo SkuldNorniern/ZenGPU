@@ -10,7 +10,8 @@
 mod mac;
 #[cfg(target_os = "macos")]
 pub use mac::{
-    MetalAdapter, MetalCommandList, MetalDevice, MetalFrame, MetalInstance, MetalSurface,
+    DepthTarget, MetalAdapter, MetalCommandList, MetalDevice, MetalFrame, MetalInstance,
+    MetalSurface,
 };
 
 #[cfg(not(target_os = "macos"))]

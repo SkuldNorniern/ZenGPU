@@ -20,6 +20,23 @@ impl MetalInstance {
         Self
     }
 
+    /// Same as `new`. Metal needs nothing extra to present. Named to match Vulkan.
+    pub fn new_with_surface() -> Result<Self> {
+        Ok(Self)
+    }
+
+    pub fn graphics_adapters(&self) -> Vec<MetalAdapter> {
+        self.metal_adapters()
+    }
+
+    pub fn request_graphics_adapter(&self) -> Option<MetalAdapter> {
+        self.request_metal_adapter()
+    }
+
+    pub fn graphics_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<MetalAdapter> {
+        self.metal_adapter_by_uuid(uuid)
+    }
+
     pub fn metal_adapters(&self) -> Vec<MetalAdapter> {
         Device::all().into_iter().map(MetalAdapter::new).collect()
     }
@@ -103,6 +120,10 @@ impl MetalAdapter {
 
     pub fn open_metal(&self, _req: DeviceRequest) -> Result<MetalDevice> {
         MetalDevice::new(self.device.clone())
+    }
+
+    pub fn open_graphics(&self, req: DeviceRequest) -> Result<MetalDevice> {
+        self.open_metal(req)
     }
 }
 

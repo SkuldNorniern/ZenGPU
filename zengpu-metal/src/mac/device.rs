@@ -147,6 +147,27 @@ impl Inner {
     }
 }
 
+/// A depth buffer made by [`MetalDevice::create_depth_target`]. Its texture goes with it.
+pub struct DepthTarget {
+    inner: Arc<Inner>,
+    texture: TextureHandle,
+    extent: (u32, u32),
+}
+
+impl DepthTarget {
+    pub fn extent(&self) -> (u32, u32) {
+        self.extent
+    }
+}
+
+impl Drop for DepthTarget {
+    fn drop(&mut self) {
+        if let Ok(mut textures) = self.inner.textures.lock() {
+            textures.remove(self.texture);
+        }
+    }
+}
+
 pub struct MetalDevice {
     pub(crate) inner: Arc<Inner>,
 }
@@ -228,10 +249,41 @@ impl MetalDevice {
         )
     }
 
-    /// Register a depth texture as a render target. Same as
-    /// [`register_color_target`](Self::register_color_target).
-    pub fn register_depth_target(&self, texture: TextureHandle) -> Option<TargetHandle> {
-        self.register_color_target(texture)
+    /// `Depth32Float` buffer for `register_depth_target`.
+    pub fn create_depth_target(&self, width: u32, height: u32) -> Result<DepthTarget> {
+        let texture = self.create_texture(TextureDesc {
+            width: width.max(1),
+            height: height.max(1),
+            depth: 1,
+            format: Format::Depth32Float,
+            usage: TextureUsage::DEPTH_STENCIL,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        })?;
+        Ok(DepthTarget {
+            inner: Arc::clone(&self.inner),
+            texture,
+            extent: (width.max(1), height.max(1)),
+        })
+    }
+
+    /// Re-register after recreating the depth buffer. Unregister the old one first.
+    pub fn register_depth_target(&self, depth: &DepthTarget) -> TargetHandle {
+        let tex = self
+            .inner
+            .textures
+            .lock()
+            .ok()
+            .and_then(|t| t.get(depth.texture).map(|t| t.tex.clone()));
+        match (tex, self.inner.targets.lock()) {
+            (Some(tex), Ok(mut targets)) => targets.insert(MetalTarget {
+                tex,
+                format: Format::Depth32Float,
+            }),
+            _ => TargetHandle::from_parts(u32::MAX, 0),
+        }
     }
 
     pub fn unregister_render_target(&self, handle: TargetHandle) {
