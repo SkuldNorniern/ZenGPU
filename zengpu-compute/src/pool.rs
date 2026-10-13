@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use zengpu_hal::{BufferDesc, BufferHandle, BufferUsage, DType, GpuDevice, MemoryUsage, Result};
+use zengpu_hal::{
+    BufferDesc, BufferHandle, BufferUsage, DType, GpuDevice, MemoryUsage, Result, UsageError,
+};
 
 use crate::DeviceArray;
 
@@ -37,7 +39,7 @@ impl BufferPool {
     /// Allocate a [`DeviceArray`] of `shape`/`dtype`, reusing a pooled buffer
     /// from the matching size class if one is free.
     pub fn alloc(&self, shape: Vec<u32>, dtype: DType) -> Result<DeviceArray> {
-        let len: u32 = shape.iter().product();
+        let len = checked_len(&shape)?;
         let requested = len as u64 * dtype.size_bytes() as u64;
         let allocation_size = size_class(requested);
 
@@ -75,6 +77,20 @@ impl BufferPool {
     }
 }
 
+// Check suffix products too: even a zero-length array needs representable strides.
+fn checked_len(shape: &[u32]) -> Result<u32> {
+    let multiply = |len: u32, &dim: &u32| -> Result<u32> {
+        len.checked_mul(dim).ok_or_else(|| {
+            UsageError::BindingMismatch("array shape exceeds u32 element or stride capacity".into())
+                .into()
+        })
+    };
+    // DeviceArray's element count uses forward products; strides use suffixes.
+    let len = shape.iter().try_fold(1u32, multiply)?;
+    shape.iter().rev().try_fold(1u32, multiply)?;
+    Ok(len)
+}
+
 fn size_class(size: u64) -> u64 {
     const MIN_CLASS: u64 = 256;
     size.max(1).next_power_of_two().max(MIN_CLASS)
@@ -93,7 +109,17 @@ impl Drop for BufferPool {
 
 #[cfg(test)]
 mod tests {
-    use super::size_class;
+    use super::{checked_len, size_class};
+
+    #[test]
+    fn rejects_overflowing_shapes_and_strides() {
+        assert!(checked_len(&[65536, 65536]).is_err());
+        assert!(checked_len(&[0, 65536, 65536]).is_err());
+        assert!(checked_len(&[65536, 65536, 0]).is_err());
+        assert_eq!(checked_len(&[2, 3, 4]).unwrap(), 24);
+        assert_eq!(checked_len(&[2, 0, 4]).unwrap(), 0);
+        assert_eq!(checked_len(&[]).unwrap(), 1);
+    }
 
     #[test]
     fn size_classes_are_power_of_two_with_minimum() {
