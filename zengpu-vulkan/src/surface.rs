@@ -206,9 +206,138 @@ impl Surface for VulkanSurface {
 
 impl Drop for VulkanSurface {
     fn drop(&mut self) {
+        // Otherwise each closed surface strands up to three command buffers
+        // in the shared device pool, forcing later surfaces to allocate more.
+        if self.swapchain.wait_idle().is_ok() {
+            for cmd in self
+                .pending_cmd
+                .get_mut()
+                .unwrap()
+                .iter_mut()
+                .filter_map(Option::take)
+            {
+                self.cmd_list_pool.release(cmd);
+            }
+        }
         let mut render_targets = self.render_targets.lock().unwrap();
         for handle in self.targets.lock().unwrap().drain(..) {
             render_targets.remove(handle);
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+    use crate::instance::VulkanInstance;
+    use std::{collections::HashSet, ffi::c_void, num::NonZeroIsize, ptr};
+    use zen_window_handle::{DisplayHandle, Win32WindowHandle, WindowHandle};
+    use zengpu_hal::{
+        ColorAttachment, DeviceRequest, GraphicsDevice, LoadOp, RenderCommands, RenderPassDesc,
+    };
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn CreateWindowExW(
+            ex: u32,
+            class: *const u16,
+            title: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            width: i32,
+            height: i32,
+            parent: *mut c_void,
+            menu: *mut c_void,
+            instance: *mut c_void,
+            param: *mut c_void,
+        ) -> *mut c_void;
+        fn DestroyWindow(window: *mut c_void) -> i32;
+    }
+
+    struct Window(*mut c_void);
+    impl Drop for Window {
+        fn drop(&mut self) {
+            unsafe {
+                DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Windows desktop and Vulkan presentation device"]
+    fn closing_surfaces_reuses_their_in_flight_command_buffers() {
+        let _guard = crate::test_gpu_lock();
+        let instance = VulkanInstance::new_with_surface().expect("Vulkan instance");
+        let adapter = instance.request_graphics_adapter().expect("adapter");
+        let device = adapter
+            .open_graphics(DeviceRequest::default())
+            .expect("device");
+        let class: Vec<u16> = "STATIC\0".encode_utf16().collect();
+        let window = Window(unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                0,
+                0,
+                0,
+                64,
+                64,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        });
+        let handles = WindowHandles::from_raw(
+            WindowHandle::Win32(Win32WindowHandle {
+                hwnd: NonZeroIsize::new(window.0 as isize).expect("window"),
+                hinstance: None,
+            }),
+            DisplayHandle::Windows,
+        );
+        let mut commands = HashSet::new();
+        for _ in 0..3 {
+            let surface = device
+                .create_surface(
+                    &handles,
+                    SurfaceConfig {
+                        width: 64,
+                        height: 64,
+                        format: zengpu_hal::Format::Bgra8Unorm,
+                        present_mode: zengpu_hal::PresentMode::Fifo,
+                    },
+                )
+                .expect("surface");
+            for _ in 0..FRAMES_IN_FLIGHT {
+                let frame = (0..10)
+                    .find_map(|_| match surface.acquire().expect("acquire") {
+                        Acquire::Frame(frame) => Some(frame),
+                        Acquire::Skip => None,
+                    })
+                    .expect("drawable surface");
+                let mut list = device.create_command_list().expect("command list");
+                commands.insert(list.raw());
+                list.begin_render_pass(&RenderPassDesc {
+                    color: &[ColorAttachment {
+                        target: frame.target(),
+                        load: LoadOp::Clear([0.0, 0.0, 0.0, 1.0]),
+                        store: true,
+                        sample_after: false,
+                    }],
+                    depth: None,
+                });
+                list.end_render_pass();
+                surface.present(frame, list).expect("present");
+            }
+            // No caller-side wait: closing the surface owns retirement.
+            drop(surface);
+            assert_eq!(
+                commands.len(),
+                FRAMES_IN_FLIGHT,
+                "opening another surface must reuse completed command buffers"
+            );
         }
     }
 }

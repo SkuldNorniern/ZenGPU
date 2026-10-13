@@ -98,6 +98,12 @@ impl Swapchain {
                 "Swapchain::new requires VulkanInstance::new_with_surface()".to_string(),
             ));
         }
+        if !inner.swapchain_enabled {
+            return Err(GpuError::Backend(
+                "Swapchain::new requires VulkanAdapter::open_with_surface() or open_graphics()"
+                    .to_string(),
+            ));
+        }
         let surface_loader = khr::surface::Instance::new(&shared.entry, &shared.instance);
         let swapchain_loader = khr::swapchain::Device::new(&shared.instance, &inner.device);
         let surface = create_platform_surface(&shared, handles)?;
@@ -376,6 +382,19 @@ impl Swapchain {
         self.recreate(&mut res, width, height)
     }
 
+    /// Wait before retiring surface-owned resources or returning command buffers.
+    pub(crate) fn wait_idle(&self) -> Result<()> {
+        let _queue = self.inner.queue_lock.lock().unwrap();
+        unsafe {
+            self.inner
+                .device
+                .device_wait_idle()
+                .map_err(|e| map_vk_err("device_wait_idle", e))?;
+        }
+        self.inner.serials.complete(self.inner.serials.submitted());
+        Ok(())
+    }
+
     /// Recreate the swapchain + image views in place. Keeps the surface,
     /// format, and present mode.
     fn recreate(&self, res: &mut SwapchainResources, width: u32, height: u32) -> Result<()> {
@@ -440,6 +459,9 @@ impl Swapchain {
 
 impl Drop for Swapchain {
     fn drop(&mut self) {
+        // The logical device may outlive this surface and still be executing
+        // its last frame or presentation operation.
+        let _ = self.wait_idle();
         let dev = &self.inner.device;
         unsafe {
             let res = self.resources.lock().unwrap();
