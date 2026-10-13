@@ -15,9 +15,11 @@ impl Instance {
     ///
     /// ```no_run
     /// # use zengpu::Instance;
+    /// # #[cfg(feature = "vulkan")] {
     /// let instance = Instance::builder()
     ///     .vulkan_with_surface()?   // Err if Vulkan loader absent
     ///     .build();
+    /// # }
     /// # Ok::<(), zengpu::GpuError>(())
     /// ```
     pub fn builder() -> InstanceBuilder {
@@ -57,6 +59,7 @@ impl Instance {
 ///
 /// ```no_run
 /// # use zengpu::Instance;
+/// # #[cfg(feature = "vulkan")] {
 /// // Error on Vulkan absence:
 /// let inst = Instance::builder().vulkan_with_surface()?.build();
 ///
@@ -65,6 +68,7 @@ impl Instance {
 ///     Ok(b) | Err(b) => b,
 /// };
 /// let inst = b.build();
+/// # }
 /// # Ok::<(), zengpu::GpuError>(())
 /// ```
 pub struct InstanceBuilder {

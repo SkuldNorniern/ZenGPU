@@ -5,6 +5,7 @@
 //! ```no_run
 //! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
 //!
+//! # #[cfg(feature = "vulkan")] {
 //! // Explicitly opt in to the backends you need.
 //! let instance = Instance::builder()
 //!     .vulkan_with_surface()          // Err if Vulkan loader absent
@@ -23,6 +24,7 @@
 //!     memory: MemoryUsage::CpuToGpu,
 //! }).unwrap();
 //! device.write_buffer(buf, 0, &[0u8; 1024]).unwrap();
+//! # }
 //! ```
 //!
 //! # Cargo features
