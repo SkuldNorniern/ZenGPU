@@ -19,11 +19,11 @@ use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, BufferUsage, CompareFn, ComputeOp, ComputePipelineDesc,
     DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, GpuDevice, GpuError,
-    GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryUsage,
-    PipelineHandle, PolygonMode, QueryPoolHandle, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, SurfaceConfig,
-    TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError, WindowHandles,
-    marker,
+    GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryBudget,
+    MemoryUsage, PipelineHandle, PolygonMode, QueryPoolHandle, Result, SamplerDesc, SamplerHandle,
+    Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus,
+    SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
+    WindowHandles, marker,
 };
 
 mod dispatch;
@@ -371,6 +371,7 @@ pub(crate) struct VulkanDeviceInner {
     pub device: Device,
     pub physical: vk::PhysicalDevice,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
+    pub budget_enabled: bool,
     pub queue_family: u32,
     pub queue: vk::Queue,
     /// Queue needs external sync: every submit or present on `queue` holds this mutex.
@@ -399,6 +400,40 @@ unsafe impl Send for VulkanDeviceInner {}
 unsafe impl Sync for VulkanDeviceInner {}
 
 impl VulkanDeviceInner {
+    /// Device-local heap sizes with the driver's budget and usage. `None` without
+    /// `VK_EXT_memory_budget`.
+    pub(crate) fn memory_budget(&self) -> Option<MemoryBudget> {
+        if !self.budget_enabled {
+            return None;
+        }
+        let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let (count, heaps) = {
+            let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+            unsafe {
+                self.shared
+                    .instance
+                    .get_physical_device_memory_properties2(self.physical, &mut props);
+            }
+            (
+                props.memory_properties.memory_heap_count as usize,
+                props.memory_properties.memory_heaps,
+            )
+        };
+        let mut out = MemoryBudget {
+            device_local: 0,
+            budget: 0,
+            usage: 0,
+        };
+        for (i, heap) in heaps.iter().enumerate().take(count) {
+            if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                out.device_local = out.device_local.saturating_add(heap.size);
+                out.budget = out.budget.saturating_add(budget.heap_budget[i]);
+                out.usage = out.usage.saturating_add(budget.heap_usage[i]);
+            }
+        }
+        Some(out)
+    }
+
     pub(crate) fn is_lost(&self) -> bool {
         if self.lost.load(Ordering::Acquire) {
             return true;
@@ -680,6 +715,10 @@ impl VulkanDevice {
         if shader_atomic_float {
             extensions.push(ext::shader_atomic_float::NAME.as_ptr());
         }
+        let budget_enabled = supports_extension(ext::memory_budget::NAME);
+        if budget_enabled {
+            extensions.push(ext::memory_budget::NAME.as_ptr());
+        }
 
         let supported_features = supported_features2.features;
         let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
@@ -781,6 +820,7 @@ impl VulkanDevice {
             device,
             physical,
             memory_properties,
+            budget_enabled,
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
@@ -1274,7 +1314,7 @@ mod tests {
     use std::mem::size_of_val;
     use std::slice::from_raw_parts;
     use std::sync::MutexGuard;
-    use std::thread::spawn;
+    use std::thread::{sleep, spawn};
     use std::{env, ops::Deref, process};
 
     use super::*;
@@ -1391,6 +1431,47 @@ mod tests {
         assert!(dev.write_textures(&[outside]).is_err());
         dev.destroy_buffer(src);
         dev.destroy_buffer(out);
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn memory_budget_grows_with_device_allocations() {
+        const MIB: u64 = 1024 * 1024;
+        let Some(dev) = try_device() else { return };
+        let Some(before) = dev.memory_budget() else {
+            return;
+        };
+        assert!(before.budget <= before.device_local);
+        assert!(before.usage > 0);
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 4096,
+                height: 4096,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .expect("create 64 MiB texture");
+        let mut after = before;
+        for _ in 0..20 {
+            after = dev.memory_budget().expect("budget stays available");
+            if after.usage >= before.usage + 32 * MIB {
+                break;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        if after.usage < before.usage + 32 * MIB {
+            eprintln!(
+                "memory usage did not grow: {} -> {} bytes",
+                before.usage, after.usage
+            );
+        }
+        assert!(after.budget <= after.device_local);
+        assert!(after.usage > 0);
         dev.destroy_texture(tex);
     }
 

@@ -10,7 +10,7 @@ use crate::desc::{
 };
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
-use crate::request::{DeviceLimits, FormatCaps, HalCapabilities};
+use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
 use crate::submission::{CompletedSubmission, Submission};
 use crate::types::{Features, Format};
 
@@ -30,6 +30,11 @@ pub trait GpuDevice: Send + Sync {
     fn format_caps(&self, format: Format) -> FormatCaps {
         let _ = format;
         FormatCaps::default()
+    }
+
+    /// `None` when the backend cannot report a budget.
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        None
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;

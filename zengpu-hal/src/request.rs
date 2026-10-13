@@ -46,6 +46,22 @@ pub struct FormatCaps {
     pub storage: bool,
 }
 
+/// Drivers move `budget` and `usage` over time. Read them again rather than caching them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    /// Device-local memory in total (all device-local heaps).
+    pub device_local: u64,
+    /// Budget, in bytes, before the driver starts evicting or failing.
+    pub budget: u64,
+    pub usage: u64,
+}
+
+impl MemoryBudget {
+    pub fn headroom(&self) -> u64 {
+        self.budget.saturating_sub(self.usage)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HalCapabilities {
     pub graphics: bool,
