@@ -1916,8 +1916,11 @@ dependencies = [
 name = "zengpu-metal"
 version = "0.0.1"
 dependencies = [
+ "core-graphics-types",
  "log",
  "metal",
+ "objc",
+ "zen-window-handle",
  "zengpu-hal",
  "zengpu-spirv",
 ]
