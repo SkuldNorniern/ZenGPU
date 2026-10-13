@@ -16,7 +16,8 @@ pub struct BackendAvailability {
 ///
 /// Only features compiled in are checked; a build with only `--features cuda`
 /// will never probe Vulkan. The returned list is in probe order:
-/// Vulkan → CUDA → Metal → HIP → DX12 → CPU.
+/// Metal (on macOS) → Vulkan → CUDA → HIP → DX12 → CPU: the native backend
+/// first.
 ///
 /// # Example
 ///
@@ -50,6 +51,12 @@ fn push_if_nonempty(
 }
 
 fn probe_all(out: &mut Vec<BackendAvailability>) {
+    #[cfg(feature = "metal")]
+    {
+        let inst = zengpu_metal::MetalInstance::new();
+        push_if_nonempty(out, "metal", &inst);
+    }
+
     #[cfg(feature = "vulkan")]
     {
         if let Ok(inst) = zengpu_vulkan::VulkanInstance::new() {
@@ -61,12 +68,6 @@ fn probe_all(out: &mut Vec<BackendAvailability>) {
     {
         let inst = zengpu_cuda::CudaInstance::new();
         push_if_nonempty(out, "cuda", &inst);
-    }
-
-    #[cfg(feature = "metal")]
-    {
-        let inst = zengpu_metal::MetalInstance::new();
-        push_if_nonempty(out, "metal", &inst);
     }
 
     #[cfg(feature = "hip")]
