@@ -1,4 +1,6 @@
-//! ZenGPU 3D cube rendered through the unified graphics API.
+//! ZenGPU 3D cube rendered through the unified graphics API, on the
+//! platform's own backend: Metal on macOS, Vulkan elsewhere. The shaders are
+//! one `zsl!` each either way.
 //!
 //! Run: `cargo run --example cube`
 
@@ -15,14 +17,13 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 use zengpu::hal::{CompareFn, RasterState};
-use zengpu::vulkan::{DepthTarget, VulkanSurface};
+use zengpu::native::{NativeDepthTarget, NativeDevice, NativeInstance, NativeSurface, shader};
 use zengpu::{
     Acquire, Bindings, BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ColorTargetState,
     DepthAttachment, DepthState, DeviceRequest, Format, Frame, GpuDevice, GraphicsDevice,
     GraphicsPipelineDesc, LoadOp, MemoryUsage, PipelineHandle, PresentMode, PrimitiveTopology,
-    Rect, RenderCommands, RenderPassDesc, Scalar, ShaderDesc, Surface, SurfaceConfig, TargetHandle,
-    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, VulkanDevice,
-    VulkanInstance, WindowHandles, zsl,
+    Rect, RenderCommands, RenderPassDesc, Scalar, Surface, SurfaceConfig, TargetHandle,
+    VertexAttribute, VertexFormat, VertexLayout, Viewport, ViewportScissor, WindowHandles, zsl,
 };
 
 /// Bridge a winit window (which speaks `raw-window-handle`) into ZenGPU's
@@ -142,7 +143,7 @@ fn rotate_x(a: f32) -> Mat4 {
     m
 }
 
-/// Standard right-handed perspective for Vulkan NDC.
+/// Standard right-handed perspective for ZSL's (Vulkan's) NDC.
 ///
 /// Uses a **negative viewport** (`y = H, height = -H`) to flip Y in the
 /// rasterizer, so this matrix uses the natural `+f` (no manual Y-flip) and
@@ -173,25 +174,21 @@ const FRAG_ZSL: ZslShader = zsl!(
     }
 );
 
-fn spv_bytes(words: &[u32]) -> &[u8] {
-    unsafe { from_raw_parts(words.as_ptr() as *const u8, size_of_val(words)) }
-}
-
 fn as_bytes<T: Copy>(slice: &[T]) -> &[u8] {
     unsafe { from_raw_parts(slice.as_ptr() as *const u8, size_of_val(slice)) }
 }
 
 struct CubeRenderState {
-    surface: VulkanSurface,
+    surface: NativeSurface,
     pipeline: PipelineHandle,
     vertex_buffer: BufferHandle,
     index_buffer: BufferHandle,
-    depth: DepthTarget,
+    depth: NativeDepthTarget,
     depth_target: TargetHandle,
 }
 
 impl CubeRenderState {
-    fn new(device: &VulkanDevice, window: &Window) -> zengpu::Result<Self> {
+    fn new(device: &NativeDevice, window: &Window) -> zengpu::Result<Self> {
         let size = window.inner_size();
         let config = SurfaceConfig {
             format: Format::Bgra8Unorm,
@@ -200,8 +197,8 @@ impl CubeRenderState {
             present_mode: PresentMode::Mailbox,
         };
         let surface = device.create_surface(&zen_handles(window), config)?;
-        let vertex_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(VERT_ZSL.spv)))?;
-        let fragment_shader = device.create_shader(ShaderDesc::spirv(spv_bytes(FRAG_ZSL.spv)))?;
+        let vertex_shader = device.create_shader(shader(&VERT_ZSL))?;
+        let fragment_shader = device.create_shader(shader(&FRAG_ZSL))?;
         let pipeline = device.create_graphics_pipeline(GraphicsPipelineDesc {
             vertex_shader,
             fragment_shader,
@@ -253,7 +250,7 @@ impl CubeRenderState {
         })?;
         device.write_buffer(index_buffer, 0, index_bytes)?;
 
-        let depth = DepthTarget::new(&device.context(), config.width, config.height)?;
+        let depth = device.create_depth_target(config.width, config.height)?;
         let depth_target = device.register_depth_target(&depth);
         Ok(Self {
             surface,
@@ -265,11 +262,11 @@ impl CubeRenderState {
         })
     }
 
-    fn ensure_depth_size(&mut self, device: &VulkanDevice) -> zengpu::Result<(u32, u32)> {
+    fn ensure_depth_size(&mut self, device: &NativeDevice) -> zengpu::Result<(u32, u32)> {
         let (width, height) = self.surface.size();
         if self.depth.extent() != (width, height) {
             device.unregister_render_target(self.depth_target);
-            self.depth = DepthTarget::new(&device.context(), width.max(1), height.max(1))?;
+            self.depth = device.create_depth_target(width.max(1), height.max(1))?;
             self.depth_target = device.register_depth_target(&self.depth);
         }
         Ok((width, height))
@@ -278,8 +275,8 @@ impl CubeRenderState {
 
 struct App {
     render: Option<CubeRenderState>,
-    device: Option<VulkanDevice>,
-    _instance: Option<VulkanInstance>,
+    device: Option<NativeDevice>,
+    _instance: Option<NativeInstance>,
     window: Option<Window>,
     start: Instant,
 }
@@ -304,12 +301,10 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(Window::default_attributes().with_title("ZenGPU — 3D cube"))
             .expect("create window");
-        let instance = VulkanInstance::new_with_surface().expect("vulkan instance");
-        let adapter = instance
-            .request_vulkan_adapter()
-            .expect("no vulkan adapter");
+        let instance = NativeInstance::new_with_surface().expect("gpu instance");
+        let adapter = instance.request_graphics_adapter().expect("no gpu adapter");
         let device = adapter
-            .open_with_surface(DeviceRequest::default())
+            .open_graphics(DeviceRequest::default())
             .expect("open device");
         let render = CubeRenderState::new(&device, &window).expect("create cube renderer");
         self.render = Some(render);
