@@ -5,6 +5,13 @@ and ZSL, a Rust-flavoured shader language that compiles to every backend.
 
 > Pre-alpha. APIs still move before `0.1.0`.
 
+Resource handles preserve a process-unique table identity as well as their slot
+and generation. Handles from another device, including a replacement device,
+are rejected. Keep the complete typed handle in wrappers; code that reconstructs
+one must use `Handle::from_owned_parts(index, generation, owner)`.
+`Handle::from_parts` now creates an invalid, unowned sentinel. Raw bindless slot
+indices in `Bindings` remain local to the submitting device.
+
 ## Quick Start
 
 ```toml
