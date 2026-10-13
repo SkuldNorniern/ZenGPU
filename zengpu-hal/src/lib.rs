@@ -26,7 +26,9 @@ pub use graphics::{
     RenderPassDesc, Surface, ViewportScissor,
 };
 pub use pool::TexturePool;
-pub use request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilities, TransferCaps};
+pub use request::{
+    AdapterRequest, DeviceLimits, DeviceRequest, FormatCaps, HalCapabilities, TransferCaps,
+};
 pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
 pub use surface::WindowHandles;
 

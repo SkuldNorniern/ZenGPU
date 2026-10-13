@@ -35,6 +35,17 @@ pub struct TransferCaps {
     pub async_transfers: bool,
 }
 
+/// `false` means refused or undefined. Check before relying on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatCaps {
+    pub sampled: bool,
+    /// Sampled with linear filtering, not only nearest.
+    pub filterable: bool,
+    pub render_target: bool,
+    pub blendable: bool,
+    pub storage: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HalCapabilities {
     pub graphics: bool,

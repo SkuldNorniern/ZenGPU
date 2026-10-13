@@ -9,19 +9,20 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, DepthStencilState,
-    Device, Library, MTLBlitOption, MTLCommandBufferStatus, MTLOrigin, MTLPrimitiveType, MTLRegion,
-    MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage,
-    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    Device, Library, MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin,
+    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType,
+    MTLTextureUsage, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
+    TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, CompletedSubmission, ComputePipelineDesc, DeviceLimits,
-    Features, Format, GpuDevice, GpuError, HalCapabilities, PipelineHandle, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
-    TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion, TextureUsage, TextureWrite,
-    TransferCaps, marker,
+    Features, Format, FormatCaps, GpuDevice, GpuError, HalCapabilities, PipelineHandle, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion, TextureUsage,
+    TextureWrite, TransferCaps, marker,
 };
 
 use super::convert;
@@ -526,6 +527,13 @@ impl GpuDevice for MetalDevice {
             caps.features = Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING;
         }
         caps
+    }
+
+    fn format_caps(&self, format: Format) -> FormatCaps {
+        let device = &self.inner.device;
+        let float32_filtering = device.supports_family(MTLGPUFamily::Apple7)
+            || device.supports_family(MTLGPUFamily::Mac2);
+        convert::format_caps(format, float32_filtering)
     }
 
     fn limits(&self) -> DeviceLimits {

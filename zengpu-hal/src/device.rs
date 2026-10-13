@@ -10,9 +10,9 @@ use crate::desc::{
 };
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
-use crate::request::{DeviceLimits, HalCapabilities};
+use crate::request::{DeviceLimits, FormatCaps, HalCapabilities};
 use crate::submission::{CompletedSubmission, Submission};
-use crate::types::Features;
+use crate::types::{Features, Format};
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
 pub trait GpuDevice: Send + Sync {
@@ -24,6 +24,12 @@ pub trait GpuDevice: Send + Sync {
 
     fn limits(&self) -> DeviceLimits {
         DeviceLimits::default()
+    }
+
+    /// What textures of `format` can do here. The default claims nothing.
+    fn format_caps(&self, format: Format) -> FormatCaps {
+        let _ = format;
+        FormatCaps::default()
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;

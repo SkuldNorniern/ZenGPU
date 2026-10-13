@@ -212,13 +212,21 @@ pub enum PresentMode {
     Immediate,
 }
 
-/// Texture and surface pixel formats (a subset).
+/// Ways a format can be used on a device, as reported by
+/// [`GpuDevice::format_caps`](crate::GpuDevice::format_caps).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
     Bgra8Unorm,
     Bgra8UnormSrgb,
+    /// Half float. Works for compositing.
+    Rgba16Float,
+    Rgba32Float,
+    Rgba16Unorm,
+    R8Unorm,
+    R16Float,
+    R16Unorm,
     R32Float,
     Depth32Float,
     Depth24PlusStencil8,
@@ -231,6 +239,8 @@ impl Format {
 
     pub const fn bytes_per_texel(self) -> u32 {
         match self {
+            Format::R8Unorm => 1,
+            Format::R16Float | Format::R16Unorm => 2,
             Format::Rgba8Unorm
             | Format::Rgba8UnormSrgb
             | Format::Bgra8Unorm
@@ -238,8 +248,26 @@ impl Format {
             | Format::R32Float
             | Format::Depth32Float
             | Format::Depth24PlusStencil8 => 4,
+            Format::Rgba16Float | Format::Rgba16Unorm => 8,
+            Format::Rgba32Float => 16,
         }
     }
+
+    pub const ALL: [Format; 13] = [
+        Format::Rgba8Unorm,
+        Format::Rgba8UnormSrgb,
+        Format::Bgra8Unorm,
+        Format::Bgra8UnormSrgb,
+        Format::Rgba16Float,
+        Format::Rgba32Float,
+        Format::Rgba16Unorm,
+        Format::R8Unorm,
+        Format::R16Float,
+        Format::R16Unorm,
+        Format::R32Float,
+        Format::Depth32Float,
+        Format::Depth24PlusStencil8,
+    ];
 }
 
 /// Axis-aligned pixel rectangle, for scissor and damage regions.
