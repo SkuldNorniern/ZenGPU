@@ -62,8 +62,10 @@ log = "0.4"
 name = "zengpu"
 
 [features]
-default = ["vulkan", "compute"]
-# Vulkan backend (graphics + compute). The only GPU backend so far.
+# Metal is on by default and builds everywhere; off Apple platforms it simply
+# finds no adapters. `zengpu::native` picks it on macOS, Vulkan elsewhere.
+default = ["vulkan", "metal", "compute"]
+# Vulkan backend (graphics + compute): Windows, Linux, and macOS via MoltenVK.
 vulkan = ["zengpu-vulkan"]
 # CPU reference backend: the conformance oracle, not a product fallback.
 cpu = ["zengpu-cpu"]
@@ -73,8 +75,8 @@ compute = ["zengpu-compute"]
 blas = ["zengpu-blas", "compute"]
 # CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
 cuda = ["zengpu-cuda"]
-# Apple Metal backend (macOS/iOS, graphics + compute).
-metal = ["zengpu-metal"]
+# Apple Metal backend (macOS, graphics + compute). Turns on ZSL's MSL output.
+metal = ["zengpu-metal", "zengpu-spirv/metal"]
 # AMD ROCm/HIP compute backend (compute HAL only).
 hip = ["zengpu-hip"]
 # DirectX 12 backend (Windows, graphics + compute).

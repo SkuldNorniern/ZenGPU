@@ -10,9 +10,12 @@ pub struct BackendAvailability {
     pub adapters: Vec<AdapterInfo>,
 }
 
-/// Probes every compiled-in backend and returns those with at least one device.
+/// Probes every backend enabled at compile time and returns those with at least one device at
+/// runtime.
 ///
-/// Order: Vulkan, CUDA, Metal, HIP, DX12, then CPU. Only features compiled in are checked.
+/// Only compiled-in features are checked. A build with only `--features cuda` never probes Vulkan.
+/// The list is in probe order: Metal (on macOS), Vulkan, CUDA, HIP, DX12, CPU. The native backend
+/// comes first.
 ///
 /// # Example
 ///
@@ -46,6 +49,12 @@ fn push_if_nonempty(
 }
 
 fn probe_all(out: &mut Vec<BackendAvailability>) {
+    #[cfg(feature = "metal")]
+    {
+        let inst = zengpu_metal::MetalInstance::new();
+        push_if_nonempty(out, "metal", &inst);
+    }
+
     #[cfg(feature = "vulkan")]
     {
         if let Ok(inst) = zengpu_vulkan::VulkanInstance::new() {
@@ -57,12 +66,6 @@ fn probe_all(out: &mut Vec<BackendAvailability>) {
     {
         let inst = zengpu_cuda::CudaInstance::new();
         push_if_nonempty(out, "cuda", &inst);
-    }
-
-    #[cfg(feature = "metal")]
-    {
-        let inst = zengpu_metal::MetalInstance::new();
-        push_if_nonempty(out, "metal", &inst);
     }
 
     #[cfg(feature = "hip")]

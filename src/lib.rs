@@ -30,13 +30,18 @@
 //! | Feature   | Default | Description |
 //! |-----------|---------|-------------|
 //! | `vulkan`  | yes     | Vulkan 1.2+ backend (graphics + compute). |
+//! | `metal`   | yes     | Metal backend (macOS, graphics + compute); finds nothing elsewhere. |
 //! | `compute` | yes     | Device arrays, pooled allocation, elementwise kernels. |
-//! | `blas`    | yes     | GEMM kernel on top of `compute`. |
+//! | `blas`    | no      | GEMM kernel on top of `compute`. |
 //! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
-//! | `metal`   | no      | Metal backend (Apple, compute only: no graphics pipeline yet). |
 //! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
-//! | `dx12`    | no      | DirectX 12 backend (Windows): not yet implemented. |
+//! | `dx12`    | no      | DirectX 12 backend (Windows), not yet implemented. |
+//!
+//! # The native graphics backend
+//!
+//! [`native`] names the platform's graphics backend: Metal on macOS, Vulkan elsewhere. One `zsl!`
+//! shader serves both through [`native::shader`].
 //!
 //! # Backend-specific access
 //!
@@ -49,6 +54,8 @@ pub mod detect;
 pub mod device;
 pub mod instance;
 pub mod log;
+#[cfg(any(feature = "vulkan", all(target_os = "macos", feature = "metal")))]
+pub mod native;
 
 pub use adapter::Adapter;
 pub use detect::{BackendAvailability, detect_backends};
