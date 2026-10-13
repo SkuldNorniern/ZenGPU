@@ -407,6 +407,7 @@ pub(crate) struct VulkanDeviceInner {
     pub physical: vk::PhysicalDevice,
     pub memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub budget_enabled: bool,
+    pub swapchain_enabled: bool,
     pub queue_family: u32,
     pub queue: vk::Queue,
     /// Queue needs external sync: every submit or present on `queue` holds this mutex.
@@ -905,6 +906,9 @@ impl VulkanDevice {
             physical,
             memory_properties,
             budget_enabled,
+            swapchain_enabled: extra_extensions
+                .iter()
+                .any(|&name| unsafe { CStr::from_ptr(name) == khr::swapchain::NAME }),
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
@@ -1419,6 +1423,7 @@ impl Drop for VulkanDevice {
 mod tests {
     use std::collections::VecDeque;
     use std::mem::size_of_val;
+    use std::num::NonZeroIsize;
     use std::slice::from_raw_parts;
     use std::sync::MutexGuard;
     use std::thread::{sleep, spawn};
@@ -1488,6 +1493,39 @@ mod tests {
         }
         dev.upload_texture_data(tex, &[0; 4]).unwrap();
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn headless_devices_reject_surfaces_before_touching_native_handles() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(instance) = VulkanInstance::new_with_surface() else {
+            return;
+        };
+        let Some(adapter) = instance.request_graphics_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+        let handles = zengpu_hal::WindowHandles::from_raw(
+            zen_window_handle::WindowHandle::Win32(zen_window_handle::Win32WindowHandle {
+                hwnd: NonZeroIsize::new(1).unwrap(),
+                hinstance: None,
+            }),
+            zen_window_handle::DisplayHandle::Windows,
+        );
+        let outcome = device.create_surface(
+            &handles,
+            zengpu_hal::SurfaceConfig {
+                width: 64,
+                height: 64,
+                format: Format::Bgra8Unorm,
+                present_mode: zengpu_hal::PresentMode::Fifo,
+            },
+        );
+        assert!(matches!(outcome, Err(GpuError::Backend(message))
+            if message.contains("open_with_surface")));
+        device.wait_idle().expect("device remains usable");
     }
 
     #[test]
