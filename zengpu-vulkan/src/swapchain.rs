@@ -27,6 +27,10 @@ struct SwapchainResources {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     extent: vk::Extent2D,
+    /// Signalled when a frame's commands finish. One per swapchain image: presentation can hold it
+    /// after the next acquire returns a different image, so a per-slot set could be re-signalled
+    /// while in use.
+    render_finished: Vec<vk::Semaphore>,
 }
 
 struct FrameState {
@@ -56,7 +60,6 @@ pub struct Swapchain {
     cmd_pool: vk::CommandPool,
     cmd_buffers: Vec<vk::CommandBuffer>,
     image_available: Vec<vk::Semaphore>,
-    render_finished: Vec<vk::Semaphore>,
     in_flight: Vec<vk::Fence>,
     frames_in_flight: usize,
     resources: Mutex<SwapchainResources>,
@@ -143,7 +146,7 @@ impl Swapchain {
         made.image_views = create_image_views(&inner.device, &images, format)?;
         made.cmd_pool = create_command_pool(&inner.device, inner.queue_family)?;
         let cmd_buffers = allocate_cmd_buffers(&inner.device, made.cmd_pool, frames_in_flight)?;
-        made.sync = create_sync(&inner.device, frames_in_flight)?;
+        made.sync = create_sync(&inner.device, frames_in_flight, images.len())?;
 
         let surface = mem::replace(&mut made.surface, vk::SurfaceKHR::null());
         let swapchain = mem::replace(&mut made.swapchain, vk::SwapchainKHR::null());
@@ -166,7 +169,6 @@ impl Swapchain {
             cmd_pool,
             cmd_buffers,
             image_available,
-            render_finished,
             in_flight,
             frames_in_flight,
             resources: Mutex::new(SwapchainResources {
@@ -174,6 +176,7 @@ impl Swapchain {
                 images,
                 image_views,
                 extent,
+                render_finished,
             }),
             frame_state: Mutex::new(FrameState {
                 current: 0,
@@ -280,7 +283,7 @@ impl Swapchain {
         };
 
         let wait_semaphores = [self.image_available[current]];
-        let signal_semaphores = [self.render_finished[current]];
+        let signal_semaphores = [self.resources.lock().unwrap().render_finished[index as usize]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let cmd_bufs = [cmd];
         let submit_info = vk::SubmitInfo {
@@ -370,6 +373,22 @@ impl Swapchain {
                 return Err(e);
             }
         };
+        if images.len() != res.render_finished.len() {
+            match create_semaphores(&self.inner.device, images.len()) {
+                Ok(fresh) => unsafe {
+                    for sem in mem::replace(&mut res.render_finished, fresh) {
+                        self.inner.device.destroy_semaphore(sem, None);
+                    }
+                },
+                Err(e) => unsafe {
+                    for &iv in &image_views {
+                        self.inner.device.destroy_image_view(iv, None);
+                    }
+                    self.swapchain_loader.destroy_swapchain(swapchain, None);
+                    return Err(e);
+                },
+            }
+        }
         unsafe {
             for &iv in &res.image_views {
                 self.inner.device.destroy_image_view(iv, None);
@@ -393,6 +412,9 @@ impl Drop for Swapchain {
             for &iv in &res.image_views {
                 dev.destroy_image_view(iv, None);
             }
+            for &sem in &res.render_finished {
+                dev.destroy_semaphore(sem, None);
+            }
             self.swapchain_loader.destroy_swapchain(res.swapchain, None);
             drop(res);
 
@@ -400,7 +422,6 @@ impl Drop for Swapchain {
             dev.destroy_command_pool(self.cmd_pool, None);
             for i in 0..self.frames_in_flight {
                 dev.destroy_semaphore(self.image_available[i], None);
-                dev.destroy_semaphore(self.render_finished[i], None);
                 dev.destroy_fence(self.in_flight[i], None);
             }
             self.surface_loader.destroy_surface(self.surface, None);
@@ -757,7 +778,6 @@ fn allocate_cmd_buffers(
     }
 }
 
-/// Semaphores and fence for one frame slot.
 #[derive(Default)]
 struct FrameSync {
     image_available: Vec<vk::Semaphore>,
@@ -780,25 +800,23 @@ impl FrameSync {
     }
 }
 
-fn create_sync(device: &Device, count: usize) -> Result<FrameSync> {
+fn create_sync(device: &Device, slots: usize, images: usize) -> Result<FrameSync> {
     let sem_info = vk::SemaphoreCreateInfo::default();
     let fence_info = vk::FenceCreateInfo {
         flags: vk::FenceCreateFlags::SIGNALED,
         ..Default::default()
     };
     let mut sync = FrameSync {
-        image_available: Vec::with_capacity(count),
-        render_finished: Vec::with_capacity(count),
-        in_flight: Vec::with_capacity(count),
+        image_available: Vec::with_capacity(slots),
+        render_finished: Vec::new(),
+        in_flight: Vec::with_capacity(slots),
     };
-    for _ in 0..count {
+    for _ in 0..slots {
         let made = unsafe {
             device
                 .create_semaphore(&sem_info, None)
                 .and_then(|available| {
                     sync.image_available.push(available);
-                    let finished = device.create_semaphore(&sem_info, None)?;
-                    sync.render_finished.push(finished);
                     device.create_fence(&fence_info, None)
                 })
         };
@@ -810,7 +828,32 @@ fn create_sync(device: &Device, count: usize) -> Result<FrameSync> {
             }
         }
     }
+    match create_semaphores(device, images) {
+        Ok(finished) => sync.render_finished = finished,
+        Err(e) => {
+            unsafe { sync.destroy(device) };
+            return Err(e);
+        }
+    }
     Ok(sync)
+}
+
+/// Creates `count` semaphores, all or nothing.
+fn create_semaphores(device: &Device, count: usize) -> Result<Vec<vk::Semaphore>> {
+    let info = vk::SemaphoreCreateInfo::default();
+    let mut made = Vec::with_capacity(count);
+    for _ in 0..count {
+        match unsafe { device.create_semaphore(&info, None) } {
+            Ok(sem) => made.push(sem),
+            Err(e) => {
+                for sem in made {
+                    unsafe { device.destroy_semaphore(sem, None) };
+                }
+                return Err(GpuError::Backend(format!("create semaphore: {e}")));
+            }
+        }
+    }
+    Ok(made)
 }
 
 /// Partial state from [`Swapchain::new`]: dropping it destroys whatever was made.
