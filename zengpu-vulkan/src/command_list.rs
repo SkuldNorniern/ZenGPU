@@ -280,13 +280,15 @@ impl VulkanCommandList {
     }
 
     /// Emit a barrier transitioning `image` from `COLOR_ATTACHMENT_OPTIMAL` to
-    /// `SHADER_READ_ONLY_OPTIMAL`, for [`ColorAttachment::sample_after`].
-    fn transition_to_shader_read(&self, image: vk::Image) {
+    /// its texture's resting layout (`SHADER_READ_ONLY_OPTIMAL` for a sampled
+    /// texture), for [`ColorAttachment::sample_after`]: shaders and copies
+    /// read it next.
+    fn transition_to_shader_read(&self, image: vk::Image, resting: vk::ImageLayout) {
         let barrier = vk::ImageMemoryBarrier {
             old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            new_layout: resting,
             src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-            dst_access_mask: vk::AccessFlags::SHADER_READ,
+            dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::TRANSFER_READ,
             image,
             subresource_range: COLOR_SUBRESOURCE,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -297,7 +299,9 @@ impl VulkanCommandList {
             self.inner.device.cmd_pipeline_barrier(
                 self.cmd,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
@@ -730,8 +734,8 @@ impl RenderCommands for VulkanCommandList {
         for target in pending.into_iter().flatten() {
             if let Some(rt) = targets.get_mut(target) {
                 let image = rt.image;
-                rt.layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-                self.transition_to_shader_read(image);
+                rt.layout = rt.resting;
+                self.transition_to_shader_read(image, rt.resting);
             }
         }
     }
