@@ -28,13 +28,14 @@ const SCALE: ZslShader = zsl!(
 ```
 
 One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
+`zengpu::native` names the platform's graphics backend (Metal on macOS, Vulkan elsewhere) and `native::shader` picks its artifact.
 
 ## Support
 
 | Backend | Graphics | Compute | Platforms |
 | --- | --- | --- | --- |
 | Vulkan 1.2 (`vulkan`, default) | yes | yes | Windows, Linux, macOS via MoltenVK |
-| Metal (`metal`) | yes | yes | macOS, iOS |
+| Metal (`metal`, default) | yes | yes | macOS |
 | HIP/ROCm (`hip`) | no | yes | Linux |
 | CUDA (`cuda`) | no | yes | Linux, Windows |
 | CPU (`cpu`) | no | yes | all, for conformance tests |
@@ -47,7 +48,7 @@ ZSL covers compute, vertex and fragment shaders: bindless buffers
 (`u32`/`i32`/`f32`/`bf16`/`f16`), push constants, vectors and matrices,
 `if`/`for`, shared memory, atomics, subgroup and workgroup reductions.
 Graphics adds swizzles, constant arrays, `vertex_index`/`frag_coord`, bindless
-texture sampling, `discard` and dual-source output.
+texture sampling, `discard` and dual-source output. Clip space is Vulkan's (+y down) on every backend; MSL output flips y to match.
 
 Limits: no structs, modules or recursion in ZSL yet. SPIR-V lacks
 `bf16`/`f16` storage. Dispatch and readback are synchronous. Built-in kernels
@@ -72,12 +73,12 @@ backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-cpu`),
 
 ## Building
 
-Rust 1.85+. Vulkan needs a driver with descriptor indexing. On macOS:
+Rust 1.85+. Vulkan needs a driver with descriptor indexing.
+
+Metal needs nothing extra. For Vulkan on macOS:
 
 ```sh
 brew install vulkan-loader molten-vk
-ln -sf /opt/homebrew/lib/libvulkan.dylib /usr/local/lib/libvulkan.dylib
-ln -sf /opt/homebrew/lib/libvulkan.1.dylib /usr/local/lib/libvulkan.1.dylib
 ```
 
 ## License
