@@ -92,6 +92,17 @@ struct VulkanSubmissionState {
     cmd: Option<vk::CommandBuffer>,
 }
 
+impl VulkanSubmissionState {
+    const DONE: Self = Self {
+        fence: None,
+        cmd: None,
+    };
+}
+
+/// Submissions dropped while their work still ran. `reap_orphans` recycles their fence, command
+/// buffer and deferred frees once the work finishes.
+type Orphans = Arc<Mutex<Vec<VulkanSubmission>>>;
+
 enum DeferredVulkanResource {
     Buffer(u32, VulkanBuffer),
     Texture(u32, VulkanTexture),
@@ -177,6 +188,7 @@ struct VulkanSubmission {
     samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
     pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
+    orphans: Orphans,
     state: Mutex<VulkanSubmissionState>,
 }
 
@@ -260,25 +272,41 @@ impl GpuSubmission for VulkanSubmission {
 
 impl Drop for VulkanSubmission {
     fn drop(&mut self) {
-        let state = self.state.get_mut().unwrap();
+        let mut state = mem::replace(self.state.get_mut().unwrap(), VulkanSubmissionState::DONE);
         let Some(fence) = state.fence else {
             return;
         };
-        let waited = unsafe { self.inner.device.wait_for_fences(&[fence], true, u64::MAX) };
-        if waited.is_ok() {
-            if let Some(fence) = state.fence.take() {
-                self.fence_pool.release(fence);
+        match unsafe { self.inner.device.get_fence_status(fence) } {
+            Ok(true) => self.complete_locked(&mut state),
+            Ok(false) => {
+                let orphan = self.orphan(state);
+                self.orphans.lock().unwrap().push(orphan);
             }
-            if let Some(cmd) = state.cmd.take() {
-                self.cmd_pool.release(cmd);
-            }
-        } else {
-            if let Some(fence) = state.fence.take() {
+            Err(_) => {
                 unsafe { self.inner.device.destroy_fence(fence, None) };
+                self.release_in_flight();
             }
-            state.cmd.take();
         }
-        self.release_in_flight();
+    }
+}
+
+impl VulkanSubmission {
+    /// Copy of this submission holding `state`, outlives the original.
+    fn orphan(&self, state: VulkanSubmissionState) -> Self {
+        Self {
+            cycle_id: self.cycle_id,
+            serial: self.serial,
+            inner: Arc::clone(&self.inner),
+            fence_pool: Arc::clone(&self.fence_pool),
+            cmd_pool: Arc::clone(&self.cmd_pool),
+            buffers: Arc::clone(&self.buffers),
+            textures: Arc::clone(&self.textures),
+            samplers: Arc::clone(&self.samplers),
+            pipelines: Arc::clone(&self.pipelines),
+            lifetime: Arc::clone(&self.lifetime),
+            orphans: Arc::clone(&self.orphans),
+            state: Mutex::new(state),
+        }
     }
 }
 
@@ -569,12 +597,27 @@ pub struct VulkanDevice {
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
     /// Reused for host-visible uploads.
     staging: Mutex<transfer::StagingRing>,
+    orphans: Orphans,
 }
 
 unsafe impl Send for VulkanDevice {}
 unsafe impl Sync for VulkanDevice {}
 
 impl VulkanDevice {
+    /// Dropped submissions whose work is done. Drop them after unlocking: a drop can add to
+    /// this list.
+    pub(crate) fn reap_orphans(&self) {
+        let done: Vec<VulkanSubmission> = {
+            let mut orphans = self.orphans.lock().unwrap();
+            let (done, running): (Vec<_>, Vec<_>) = mem::take(&mut *orphans)
+                .into_iter()
+                .partition(|orphan| !matches!(orphan.poll(), Ok(SubmissionStatus::Pending)));
+            *orphans = running;
+            done
+        };
+        drop(done);
+    }
+
     /// Marks the device lost, as a driver reset would: [`is_lost`] reports it, and surface acquire
     /// and present fail with [`GpuError::DeviceLost`](zengpu_hal::GpuError::DeviceLost). For
     /// testing recovery. There is no way back.
@@ -894,6 +937,7 @@ impl VulkanDevice {
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
             staging: Mutex::new(transfer::StagingRing::default()),
+            orphans: Arc::default(),
         })
     }
 
@@ -1186,6 +1230,10 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        unsafe {
+            let _ = self.inner.device.device_wait_idle();
+        }
+        self.reap_orphans();
         #[cfg(debug_assertions)]
         {
             let mut outstanding = Vec::new();
@@ -1473,6 +1521,61 @@ mod tests {
         }
         assert!(after.budget <= after.device_local);
         assert!(after.usage > 0);
+        dev.destroy_texture(tex);
+    }
+
+    /// Dropping a pending submission hands it over instead of waiting. The next submit recycles it.
+    #[test]
+    fn dropping_pending_work_does_not_wait() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        if !dev.capabilities().transfers.buffer_texture_copy {
+            return;
+        }
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 4096,
+                height: 4096,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let size = 4096 * 4096 * 4;
+        let out = dev.create_buffer(rw_desc(size)).unwrap();
+        let region = zengpu_hal::TextureRegion::rect(0, 0, 4096, 4096);
+        let copy = dev
+            .copy_texture_region_to_buffer(tex, region, out, 0, 4096 * 4)
+            .unwrap();
+        let started = Instant::now();
+        let pending = matches!(copy.poll(), Ok(SubmissionStatus::Pending));
+        drop(copy);
+        assert!(
+            started.elapsed() < Duration::from_millis(5),
+            "the drop waited"
+        );
+        if pending {
+            assert_eq!(
+                vk_dev.orphans.lock().unwrap().len(),
+                1,
+                "kept, not waited for"
+            );
+        }
+        unsafe { vk_dev.inner.device.device_wait_idle().unwrap() };
+        vk_dev.reap_orphans();
+        assert!(
+            vk_dev.orphans.lock().unwrap().is_empty(),
+            "recycled once done"
+        );
+        dev.destroy_buffer(out);
         dev.destroy_texture(tex);
     }
 
