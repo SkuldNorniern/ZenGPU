@@ -37,6 +37,7 @@ pub trait GpuDevice: Send + Sync {
         None
     }
 
+    /// The handle is generational. Contents are unspecified, so write every byte before reading it.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()>;

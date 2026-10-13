@@ -31,7 +31,7 @@ pub enum PowerPreference {
 /// Residency intent. The allocator maps it to backend memory types and heaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryUsage {
-    /// Device-local, no host visibility (resident arrays, render targets).
+    /// Device-local. Host-visible too on shared CPU/GPU memory.
     GpuOnly,
     /// Host-visible and write-combined. Staging for `GpuOnly`.
     Upload,

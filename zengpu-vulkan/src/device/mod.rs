@@ -2609,7 +2609,16 @@ mod tests {
             .map(|i| (i as u32).wrapping_mul(31).wrapping_add(7) as u8)
             .collect();
         dev.write_buffer(upload, 0, &data).unwrap();
-        assert!(dev.write_buffer(gpu, 0, &[1]).is_err());
+        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        let host_visible = !vk_dev
+            .buffers
+            .lock()
+            .unwrap()
+            .get(gpu)
+            .unwrap()
+            .mapped
+            .is_null();
+        assert_eq!(dev.write_buffer(gpu, 0, &[1]).is_ok(), host_visible);
         dev.copy_buffer(upload, 0, gpu, 0, SIZE as u64).unwrap();
         dev.copy_buffer(gpu, 0, readback, 0, SIZE as u64).unwrap();
         assert_eq!(dev.read_buffer(readback, 0, SIZE as u64).unwrap(), data);
