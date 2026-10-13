@@ -85,4 +85,10 @@ impl VulkanAdapter {
     pub fn open_with_surface(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
         VulkanDevice::new_with_swapchain(Arc::clone(&self.shared), self.physical, req)
     }
+
+    /// Open a device that can present, under the name every graphics backend
+    /// shares (see `zengpu::native`).
+    pub fn open_graphics(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
+        self.open_with_surface(req)
+    }
 }

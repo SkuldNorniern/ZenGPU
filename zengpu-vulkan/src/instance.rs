@@ -281,6 +281,22 @@ impl VulkanInstance {
     }
 
     /// The adapter with this [`VulkanAdapter::uuid`], if it is still here.
+    /// Every adapter, under the name every graphics backend shares (see
+    /// `zengpu::native`).
+    pub fn graphics_adapters(&self) -> Vec<VulkanAdapter> {
+        self.vulkan_adapters()
+    }
+
+    /// The preferred adapter, under the shared graphics-backend name.
+    pub fn request_graphics_adapter(&self) -> Option<VulkanAdapter> {
+        self.request_vulkan_adapter()
+    }
+
+    /// The adapter with this UUID, under the shared graphics-backend name.
+    pub fn graphics_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<VulkanAdapter> {
+        self.vulkan_adapter_by_uuid(uuid)
+    }
+
     pub fn vulkan_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<VulkanAdapter> {
         self.vulkan_adapters()
             .into_iter()
