@@ -9,14 +9,16 @@ pub struct Instance {
 }
 
 impl Instance {
-    /// Start composing an [`Instance`] by adding backends with the `with_*` methods, then
-    /// call [`InstanceBuilder::build`].
+    /// Starts composing an [`Instance`]. Add backends with the builder methods, then call
+    /// [`InstanceBuilder::build`].
     ///
     /// ```no_run
     /// # use zengpu::Instance;
+    /// # #[cfg(feature = "vulkan")] {
     /// let instance = Instance::builder()
     ///     .vulkan_with_surface()?   // Err if Vulkan loader absent
     ///     .build();
+    /// # }
     /// # Ok::<(), zengpu::GpuError>(())
     /// ```
     pub fn builder() -> InstanceBuilder {
@@ -45,13 +47,14 @@ impl Instance {
     }
 }
 
-/// Constructs an [`Instance`] by explicitly adding backends.
+/// Builds an [`Instance`] by explicitly adding backends.
 ///
-/// Fallible methods (Vulkan) return `Result<Self>`, so the caller decides whether a missing backend
-/// is an error or a skip:
+/// Fallible methods (Vulkan, HIP) return `Result<Self>`, so the caller decides whether a missing
+/// backend is an error or a graceful skip:
 ///
 /// ```no_run
 /// # use zengpu::Instance;
+/// # #[cfg(feature = "vulkan")] {
 /// // Error on Vulkan absence:
 /// let inst = Instance::builder().vulkan_with_surface()?.build();
 ///
@@ -60,6 +63,7 @@ impl Instance {
 ///     Ok(b) | Err(b) => b,
 /// };
 /// let inst = b.build();
+/// # }
 /// # Ok::<(), zengpu::GpuError>(())
 /// ```
 pub struct InstanceBuilder {

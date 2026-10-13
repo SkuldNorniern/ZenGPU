@@ -1,10 +1,11 @@
-//! ZenGPU: native-first GPU runtime for Rust (graphics and compute).
+//! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
 //!
 //! # Quick start
 //!
 //! ```no_run
 //! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
 //!
+//! # #[cfg(feature = "vulkan")] {
 //! // Explicitly opt in to the backends you need.
 //! let instance = Instance::builder()
 //!     .vulkan_with_surface()          // Err if Vulkan loader absent
@@ -23,6 +24,7 @@
 //!     memory: MemoryUsage::CpuToGpu,
 //! }).unwrap();
 //! device.write_buffer(buf, 0, &[0u8; 1024]).unwrap();
+//! # }
 //! ```
 //!
 //! # Cargo features
@@ -36,18 +38,19 @@
 //! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
 //! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
-//! | `dx12`    | no      | DirectX 12 backend (Windows), not yet implemented. |
+//! | `dx12`    | no      | DirectX 12 backend for Windows. Not yet implemented. |
 //!
 //! # The native graphics backend
 //!
-//! [`native`] names the platform's graphics backend: Metal on macOS, Vulkan elsewhere. One `zsl!`
-//! shader serves both through [`native::shader`].
+//! [`native`] names the platform's own graphics backend as concrete types: Metal on macOS, Vulkan
+//! elsewhere. One `zsl!` shader serves both through [`native::shader`].
 //!
 //! # Backend-specific access
 //!
-//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain and frame-graph work.
-//! `Device::as_cpu` gives the CPU conformance oracle. Sub-crates are re-exported under
-//! [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`, [`metal`], `hip`, `dx12`.
+//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain / frame-graph work;
+//! `Device::as_cpu` gives access to the CPU conformance oracle. The sub-crates are re-exported
+//! under [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`, [`metal`], `hip`, `dx12` for
+//! power users who need their full surface.
 
 pub mod adapter;
 pub mod detect;
