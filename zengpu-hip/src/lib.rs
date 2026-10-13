@@ -1066,6 +1066,7 @@ void vec_add(const float* __restrict__ a,
                 Bindings {
                     buffers: &[buf_a.index(), buf_b.index(), buf_c.index()],
                     textures: &[],
+                    images: &[],
                     scalars: &[zengpu_hal::Scalar::U32(N as u32)],
                 },
                 [blocks, 1, 1],
@@ -1313,6 +1314,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
+            images: &[],
             scalars: &[
                 zengpu_hal::Scalar::U32(M as u32),
                 zengpu_hal::Scalar::U32(N as u32),
@@ -1399,6 +1401,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
+            images: &[],
             scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
@@ -1483,6 +1486,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             let bindings = Bindings {
                 buffers: &[buf_in.index(), buf_out.index()],
                 textures: &[],
+                images: &[],
                 scalars: &[
                     zengpu_hal::Scalar::F32(2.0f32),
                     zengpu_hal::Scalar::U32(N as u32),
@@ -1578,6 +1582,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                     let bindings = Bindings {
                         buffers: &[ba.index(), bb.index(), bc.index()],
                         textures: &[],
+                        images: &[],
                         scalars: &[
                             zengpu_hal::Scalar::U32(M as u32),
                             zengpu_hal::Scalar::U32(N as u32),
@@ -1650,6 +1655,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
+            images: &[],
             scalars: &[
                 zengpu_hal::Scalar::U32(m as u32),
                 zengpu_hal::Scalar::U32(n as u32),
@@ -1761,6 +1767,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
+            images: &[],
             scalars: &[
                 zengpu_hal::Scalar::U32(sz as u32),
                 zengpu_hal::Scalar::U32(sz as u32),
@@ -1864,6 +1871,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[src.index(), dst.index()],
             textures: &[],
+            images: &[],
             scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
         let grid = [(N as u32 + 255) / 256, 1, 1];
@@ -1956,6 +1964,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[ba.index(), bb.index(), bc.index()],
             textures: &[],
+            images: &[],
             scalars: &[
                 zengpu_hal::Scalar::U32(M as u32),
                 zengpu_hal::Scalar::U32(N as u32),
@@ -2046,6 +2055,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
+            images: &[],
             scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
@@ -2176,6 +2186,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
         let bindings = Bindings {
             buffers: &[buf_in.index(), buf_out.index()],
             textures: &[],
+            images: &[],
             scalars: &[zengpu_hal::Scalar::U32(N as u32)],
         };
 
@@ -2286,6 +2297,7 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
                     let bindings = Bindings {
                         buffers: &[ba.index(), bb.index(), bc.index()],
                         textures: &[],
+                        images: &[],
                         scalars: &[
                             zengpu_hal::Scalar::U32(M as u32),
                             zengpu_hal::Scalar::U32(N as u32),

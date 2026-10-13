@@ -107,6 +107,7 @@ impl ElementwiseKernels {
                 buffers: &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
                 scalars: &[Scalar::U32(n)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(256), 1, 1],
         );
@@ -130,6 +131,7 @@ impl ElementwiseKernels {
                 buffers: &[a.buffer.index(), out.buffer.index()],
                 scalars: &[Scalar::U32(n)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(256), 1, 1],
         );

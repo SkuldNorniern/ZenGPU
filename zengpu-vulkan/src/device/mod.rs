@@ -1212,6 +1212,9 @@ pub(crate) fn physical_device_limits(
         max_sampled_textures: descriptor
             .max_per_stage_descriptor_update_after_bind_sampled_images
             .min(descriptor.max_descriptor_set_update_after_bind_sampled_images),
+        max_storage_textures: descriptor
+            .max_per_stage_descriptor_update_after_bind_storage_images
+            .min(descriptor.max_descriptor_set_update_after_bind_storage_images),
         max_update_after_bind_descriptors: descriptor
             .max_update_after_bind_descriptors_in_all_pools,
         max_memory_allocations: limits.max_memory_allocation_count,
@@ -2967,6 +2970,7 @@ mod tests {
                         bindings: Bindings {
                             buffers: &[input.index(), output.index()],
                             textures: &[],
+                            images: &[],
                             scalars: &[Scalar::U32(N)],
                         },
                         grid: [1, 1, 1],
@@ -3073,6 +3077,7 @@ mod tests {
                         bindings: Bindings {
                             buffers: &[a.index(), b.index(), sum.index()],
                             textures: &[],
+                            images: &[],
                             scalars: &[Scalar::U32(n)],
                         },
                         grid: [n.div_ceil(64), 1, 1],
@@ -3082,6 +3087,7 @@ mod tests {
                         bindings: Bindings {
                             buffers: &[sum.index(), out.index()],
                             textures: &[],
+                            images: &[],
                             scalars: &[Scalar::U32(n)],
                         },
                         grid: [n.div_ceil(64), 1, 1],
@@ -3098,6 +3104,7 @@ mod tests {
                 Bindings {
                     buffers: &[a.index(), second_out.index()],
                     textures: &[],
+                    images: &[],
                     scalars: &[Scalar::U32(n)],
                 },
                 [n.div_ceil(64), 1, 1],
@@ -3275,6 +3282,7 @@ mod tests {
                 Bindings {
                     buffers: &[output.index()],
                     textures: &[texture_index],
+                    images: &[],
                     scalars: &[],
                 },
                 [1, 1, 1],
@@ -3347,6 +3355,7 @@ mod tests {
                         Bindings {
                             buffers: &buffers,
                             textures: &[],
+                            images: &[],
                             scalars: &scalars,
                         },
                         [LEN.div_ceil(64) as u32, 1, 1],
@@ -3420,6 +3429,7 @@ mod tests {
                 buffers: &[src.index(), out.index()],
                 scalars: &[Scalar::U32(n)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(64), 1, 1],
         )
@@ -3490,6 +3500,7 @@ mod tests {
                 buffers: &[src_u.index(), src_i.index(), out_u.index(), out_i.index()],
                 scalars: &[Scalar::U32(n)],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(64), 1, 1],
         )
@@ -3561,6 +3572,7 @@ mod tests {
                 buffers: &[src.index(), out.index()],
                 scalars: &[Scalar::U32(input.len() as u32)],
                 textures: &[],
+                images: &[],
             },
             [1, 1, 1],
         )

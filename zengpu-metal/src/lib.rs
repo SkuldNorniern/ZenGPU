@@ -109,6 +109,7 @@ mod tests {
             Bindings {
                 buffers: &[bx.index(), by.index()],
                 textures: &[],
+                images: &[],
                 scalars: &[Scalar::U32(n as u32), Scalar::F32(2.0)],
             },
             [groups, 1, 1],
@@ -155,6 +156,7 @@ mod tests {
             Bindings {
                 buffers: &[ba.index(), bb.index(), bout.index()],
                 textures: &[],
+                images: &[],
                 scalars: &[Scalar::U32(n as u32)],
             },
             [groups, 1, 1],
@@ -291,6 +293,7 @@ mod tests {
                 Bindings {
                     buffers: &[ba.index(), bb.index(), bout.index()],
                     textures: &[],
+                    images: &[],
                     scalars: &[Scalar::U32(n as u32)],
                 },
                 [1, 1, 1],
@@ -617,6 +620,7 @@ mod graphics_tests {
         cmd.bind(Bindings {
             buffers: &[],
             textures: &[],
+            images: &[],
             scalars: &[Scalar::U32(slot)],
         });
         cmd.draw(0..6, 0..1);
@@ -668,6 +672,7 @@ mod graphics_tests {
         cmd.bind(Bindings {
             buffers: &[],
             textures: &[slot],
+            images: &[],
             scalars: &[Scalar::F32(1.0), Scalar::F32(0.0)],
         });
         cmd.draw(0..6, 0..1);
@@ -830,6 +835,7 @@ mod graphics_tests {
             cmd.bind(Bindings {
                 buffers: &[],
                 textures: &[],
+                images: &[],
                 scalars: &scalars,
             });
             cmd.draw(0..6, 0..1);

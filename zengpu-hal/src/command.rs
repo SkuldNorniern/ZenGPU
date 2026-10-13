@@ -15,8 +15,11 @@ pub enum Scalar {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bindings<'a> {
     pub buffers: &'a [u32],
-    /// Bindless indices into the texture table.
+    /// Sampled-texture table indices, in `texture` param declaration order.
     pub textures: &'a [u32],
+    /// One per `image` param, in declaration order. Textures made with
+    /// [`crate::TextureUsage::STORAGE`] sit at their own [`crate::Handle::index`].
+    pub images: &'a [u32],
     pub scalars: &'a [Scalar],
 }
 
@@ -51,6 +54,7 @@ mod tests {
         let b = Bindings::default();
         assert!(b.buffers.is_empty());
         assert!(b.textures.is_empty());
+        assert!(b.images.is_empty());
         assert!(b.scalars.is_empty());
     }
 
@@ -59,6 +63,7 @@ mod tests {
         let b = Bindings {
             buffers: &[3, 7],
             textures: &[],
+            images: &[],
             scalars: &[Scalar::U32(256)],
         };
         assert_eq!(b.buffers, &[3, 7]);

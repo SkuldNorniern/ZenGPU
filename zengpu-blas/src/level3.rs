@@ -152,6 +152,7 @@ impl GemmKernel {
                     Scalar::F32(alpha),
                 ],
                 textures: &[],
+                images: &[],
             },
             [n.div_ceil(16), m.div_ceil(16), 1],
         )?;
