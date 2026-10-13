@@ -106,11 +106,11 @@ pub trait GpuDevice: Send + Sync {
     /// Blocks until done.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
 
-    /// Uploads `data` to one mip level of one array layer (or cube face). Use this for texture
-    /// arrays, cubemaps and pre-baked mip chains.
+    /// Replaces one whole mip of one layer (or cube face). For a sub-rectangle, use
+    /// `write_textures` (check `TransferCaps::texture_region_write`). `upload_texture_data` only
+    /// targets mip 0, layer 0.
     ///
-    /// [`Self::upload_texture_data`] only targets mip `0` and layer `0`. Backends without an
-    /// implementation return [`GpuError::UnsupportedFeatures`].
+    /// The default returns `GpuError::UnsupportedFeatures`.
     fn upload_texture_data_region(
         &self,
         _texture: TextureHandle,

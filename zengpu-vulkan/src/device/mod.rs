@@ -1359,6 +1359,7 @@ impl Drop for VulkanDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::mem::size_of_val;
     use std::slice::from_raw_parts;
     use std::sync::MutexGuard;
@@ -2368,6 +2369,56 @@ mod tests {
         dev.upload_texture_data_region(tex, 1, 0, &[0x80u8; 4 * 4 * 4])
             .unwrap();
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn textures_destroyed_while_in_flight_are_recovered() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        if !dev.capabilities().transfers.texture_region_write {
+            return;
+        }
+        let desc = TextureDesc {
+            width: 256,
+            height: 256,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        };
+        let pixels = vec![0x7Fu8; 256 * 256 * 4];
+        let write_full = |tex| zengpu_hal::TextureWrite {
+            texture: tex,
+            region: zengpu_hal::TextureRegion::rect(0, 0, 256, 256),
+            data: &pixels,
+            bytes_per_row: 256 * 4,
+        };
+        let mut window: VecDeque<Submission> = VecDeque::new();
+        for _ in 0..200 {
+            let tex = dev.create_texture(desc).unwrap();
+            window.push_back(dev.write_textures(&[write_full(tex)]).unwrap());
+            dev.destroy_texture(tex);
+            if window.len() == 8 {
+                window
+                    .pop_front()
+                    .unwrap()
+                    .wait(Duration::from_secs(5))
+                    .unwrap();
+            }
+        }
+        for work in window {
+            work.wait(Duration::from_secs(5)).unwrap();
+        }
+        let fresh = dev.create_texture(desc).unwrap();
+        dev.write_textures(&[write_full(fresh)])
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        dev.destroy_texture(fresh);
     }
 
     #[test]
