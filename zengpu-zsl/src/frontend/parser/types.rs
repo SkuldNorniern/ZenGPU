@@ -90,6 +90,24 @@ impl<'a> Parser<'a> {
                 },
             });
             Ok(())
+        } else if self.at_kw("texture") || self.at_kw("image") {
+            let storage = self.eat_kw("image");
+            if !storage {
+                self.eat_kw("texture");
+            }
+            if ctx.buffers.contains_key(name) || ctx.textures.contains_key(name) {
+                return self.err(format!("duplicate parameter `{name}`"));
+            }
+            ctx.textures.insert(name.to_string(), storage);
+            params.push(PendingParam {
+                name: name.to_string(),
+                kind: if storage {
+                    PendingParamKind::Image
+                } else {
+                    PendingParamKind::Texture
+                },
+            });
+            Ok(())
         } else if self.eat_kw("uniform") {
             self.err("uniform buffers are not yet supported in compute")
         } else if self.eat_kw("global_id") {

@@ -33,10 +33,10 @@ use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, op, sc};
 use crate::frontend::diagnostic::Diagnostic;
-use crate::ir::binding::ssbo_binding_for;
+use crate::ir::binding::{IMAGE_BINDING, TEXTURE_BINDING, ssbo_binding_for};
 use crate::ir::node::{
-    BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_subgroup_collectives, stmts_use_subgroup_query,
-    stmts_use_workgroup_reduce,
+    BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_collectives,
+    stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
 use crate::ir::types::TypeId;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -135,6 +135,19 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             _ => None,
         })
         .collect();
+    // Texture params, then image params, each a u32 slot after the buffers'.
+    let tex_params: Vec<(&str, bool)> = entry
+        .params
+        .iter()
+        .filter(|p| matches!(p.kind, ParamKind::Texture))
+        .chain(
+            entry
+                .params
+                .iter()
+                .filter(|p| matches!(p.kind, ParamKind::Image)),
+        )
+        .map(|p| (p.name.as_str(), matches!(p.kind, ParamKind::Image)))
+        .collect();
 
     // ── SSBO types — bindless model, one typed table per element type ───────
     // Generates one `layout(set=0,binding=N) buffer Buf{T data[];} g_bufs[];`
@@ -190,10 +203,50 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         ssbo_tables.insert(elem_ty, SsboTable { var, t_ptr_elem });
     }
 
-    // ── Push-constant block — buffer indices (u32) then user scalars ─────────
+    // ── Texture tables: set 0, sampled and storage, as zengpu-vulkan lays
+    // them out ──────────────────────────────────────────────────────────
+    let images = if tex_params.is_empty() {
+        None
+    } else {
+        spv.capability_image_query();
+        if tex_params.iter().any(|(_, storage)| *storage) {
+            spv.capability_storage_image_without_format();
+        }
+        let t_vec2 = spv.type_vector(t_f32, 2);
+        let t_vec4 = spv.type_vector(t_f32, 4);
+        let t_ivec2 = spv.type_vector(t_i32, 2);
+        let t_image = spv.type_image_2d(t_f32);
+        let t_sampled = spv.type_sampled_image(t_image);
+        let t_storage = spv.type_storage_image_2d(t_f32);
+        let mut table = |elem: Id, binding: u32| {
+            let t_table = spv.type_runtime_array(elem);
+            let t_ptr_table = spv.type_pointer(sc::UNIFORM_CONSTANT, t_table);
+            let var = spv.global_variable(t_ptr_table, sc::UNIFORM_CONSTANT);
+            spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+            spv.decorate(var, deco::BINDING, &[binding]);
+            (var, spv.type_pointer(sc::UNIFORM_CONSTANT, elem))
+        };
+        let (sampled_var, t_ptr_sampled) = table(t_sampled, TEXTURE_BINDING);
+        let (storage_var, t_ptr_storage) = table(t_storage, IMAGE_BINDING);
+        Some(ImageTypes {
+            t_vec2,
+            t_vec4,
+            t_ivec2,
+            t_image,
+            t_sampled,
+            t_storage,
+            sampled_var,
+            t_ptr_sampled,
+            storage_var,
+            t_ptr_storage,
+        })
+    };
+
+    // ── Push-constant block — slot indices (u32) then user scalars ──────────
     let n_buf_params = buf_params.len() as u32;
-    let pc_var = if !buf_params.is_empty() || !scalar_params.is_empty() {
-        let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
+    let n_slot_params = n_buf_params + tex_params.len() as u32;
+    let pc_var = if n_slot_params != 0 || !scalar_params.is_empty() {
+        let mut pc_members: Vec<Id> = (0..n_slot_params).map(|_| t_u32).collect();
         pc_members.extend(scalar_params.iter().map(|(_, ty)| {
             if *ty == u32_id {
                 t_u32
@@ -303,6 +356,20 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         })
         .collect();
 
+    let tex_param_map: HashMap<String, TexInfo> = tex_params
+        .iter()
+        .enumerate()
+        .map(|(i, (name, storage))| {
+            (
+                name.to_string(),
+                TexInfo {
+                    pc_index: n_buf_params + i as u32,
+                    storage: *storage,
+                },
+            )
+        })
+        .collect();
+
     let scalar_param_map: HashMap<String, ScalarInfo> = scalar_params
         .iter()
         .enumerate()
@@ -360,8 +427,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let mut t_ptr_pc_i32 = Id(0);
     let mut t_ptr_pc_f32 = Id(0);
     if pc_var.is_some() {
-        // Buffer indices are always u32 — allocate the u32 PC pointer when there are buf params.
-        if n_buf_params > 0 {
+        // Slot indices are always u32 — allocate the u32 PC pointer when there are any.
+        if n_slot_params > 0 {
             t_ptr_pc_u32 = spv.type_pointer(sc::PUSH_CONSTANT, t_u32);
         }
         for (_, ty) in &scalar_params {
@@ -389,9 +456,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         t_uvec3,
         t_uvec4,
         ssbo_tables,
-        n_buf_params,
+        n_slot_params,
         glsl_ext,
         buf_params: buf_param_map,
+        tex_params: tex_param_map,
+        images,
         scalar_params: scalar_param_map,
         pc_var,
         gid_var,
@@ -432,6 +501,30 @@ struct BufInfo {
 struct SsboTable {
     var: Id,
     t_ptr_elem: Id,
+}
+
+/// A `texture` or `image` param: where its slot sits in the push constants,
+/// and which table it indexes.
+#[derive(Clone, Copy)]
+struct TexInfo {
+    pc_index: u32,
+    storage: bool,
+}
+
+/// The types and tables texel access needs, declared once when a kernel has
+/// any `texture` or `image` param.
+#[derive(Clone, Copy)]
+struct ImageTypes {
+    t_vec2: Id,
+    t_vec4: Id,
+    t_ivec2: Id,
+    t_image: Id,
+    t_sampled: Id,
+    t_storage: Id,
+    sampled_var: Id,
+    t_ptr_sampled: Id,
+    storage_var: Id,
+    t_ptr_storage: Id,
 }
 
 #[derive(Clone, Copy)]
@@ -484,9 +577,12 @@ struct LowerCtx<'a> {
     ssbo_tables: HashMap<TypeId, SsboTable>,
     glsl_ext: Id,
     buf_params: HashMap<String, BufInfo>,
+    tex_params: HashMap<String, TexInfo>,
+    images: Option<ImageTypes>,
     scalar_params: HashMap<String, ScalarInfo>,
-    /// Number of buffer params — scalar PC indices are offset by this.
-    n_buf_params: u32,
+    /// Number of buffer, texture and image params — scalar PC indices are
+    /// offset by this.
+    n_slot_params: u32,
     pc_var: Option<Id>,
     gid_var: Id,
     lid_var: Id,
@@ -630,6 +726,25 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
             ctx.spv
                 .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
+            Ok(())
+        }
+
+        IrStmt::ImageStore { image, args } => {
+            let [x, y, rgba @ ..] = args.as_slice() else {
+                return Err("ZSL: image store needs x, y and four channels".into());
+            };
+            let (info, ty, handle) = load_texture(ctx, image)?;
+            if !info.storage || rgba.len() != 4 {
+                return Err(format!("ZSL: bad image store on `{image}`"));
+            }
+            let coord = texel_coord(ctx, &ty, x, y)?;
+            let mut lanes = [Id(0); 4];
+            for (lane, e) in lanes.iter_mut().zip(rgba) {
+                let val = lower_expr(ctx, e)?;
+                *lane = coerce(ctx, val, ctx.f32_id);
+            }
+            let texel = ctx.spv.op_composite_construct(ty.t_vec4, &lanes);
+            ctx.spv.op_image_write(handle, coord, texel);
             Ok(())
         }
 
@@ -788,8 +903,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             if pc_ptr_ty == Id(0) {
                 return Err("ZSL: push-constant pointer type not allocated".to_string());
             }
-            // Buffer index fields come first; scalar fields start at offset n_buf_params.
-            let actual_idx = ctx.n_buf_params + info.pc_index;
+            // Slot index fields come first; scalar fields start after them.
+            let actual_idx = ctx.n_slot_params + info.pc_index;
             let pc_idx = ctx.spv.constant_u32(ctx.t_u32, actual_idx);
             let chain = ctx.spv.op_access_chain(pc_ptr_ty, pc_var, &[pc_idx]);
             let id = ctx.spv.op_load(spv_scalar_ty, chain);
@@ -860,6 +975,27 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             Ok(Val { id, ty: ctx.u32_id })
         }
 
+        IrExpr::Texel {
+            tex,
+            op,
+            args,
+            component,
+        } => lower_texel(ctx, tex, *op, args, *component),
+
+        IrExpr::TexSize { tex, axis } => {
+            let (info, ty, handle) = load_texture(ctx, tex)?;
+            let zero = ctx.spv.constant_u32(ctx.t_i32, 0);
+            let size = if info.storage {
+                ctx.spv.op_image_query_size(ty.t_ivec2, handle)
+            } else {
+                let image = ctx.spv.op_image(ty.t_image, handle);
+                ctx.spv.op_image_query_size_lod(ty.t_ivec2, image, zero)
+            };
+            let n = ctx.spv.op_composite_extract(ctx.t_i32, size, &[*axis]);
+            let id = ctx.spv.op_bitcast(ctx.t_u32, n);
+            Ok(Val { id, ty: ctx.u32_id })
+        }
+
         IrExpr::Builtin { func, args } => lower_builtin(ctx, *func, args),
 
         IrExpr::Neg(inner) => {
@@ -890,6 +1026,97 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             Err("ZSL: vector/graphics expression not supported in compute shaders".to_string())
         }
     }
+}
+
+/// The texture or image param `name`'s handle, a sampled image for a
+/// `texture` and a storage image for an `image`, found through its
+/// push-constant slot.
+fn load_texture(ctx: &mut LowerCtx<'_>, name: &str) -> Result<(TexInfo, ImageTypes, Id), String> {
+    let info = *ctx
+        .tex_params
+        .get(name)
+        .ok_or_else(|| format!("ZSL: `{name}` is not a texture or image param"))?;
+    let ty = ctx
+        .images
+        .ok_or_else(|| "ZSL: no texture tables".to_string())?;
+    let pc_var = ctx
+        .pc_var
+        .ok_or_else(|| "ZSL: no push constant block".to_string())?;
+    let pc_field = ctx.spv.constant_u32(ctx.t_u32, info.pc_index);
+    let t_ptr_pc_u32 = ctx.t_ptr_pc_u32;
+    let pc_chain = ctx.spv.op_access_chain(t_ptr_pc_u32, pc_var, &[pc_field]);
+    let slot = ctx.spv.op_load(ctx.t_u32, pc_chain);
+    let handle = if info.storage {
+        let ptr = ctx
+            .spv
+            .op_access_chain(ty.t_ptr_storage, ty.storage_var, &[slot]);
+        ctx.spv.op_load(ty.t_storage, ptr)
+    } else {
+        let ptr = ctx
+            .spv
+            .op_access_chain(ty.t_ptr_sampled, ty.sampled_var, &[slot]);
+        ctx.spv.op_load(ty.t_sampled, ptr)
+    };
+    Ok((info, ty, handle))
+}
+
+/// Two `u32` expressions as the `ivec2` texel coordinate images take.
+fn texel_coord(
+    ctx: &mut LowerCtx<'_>,
+    ty: &ImageTypes,
+    x: &IrExpr,
+    y: &IrExpr,
+) -> Result<Id, String> {
+    let mut lanes = [Id(0); 2];
+    for (lane, e) in lanes.iter_mut().zip([x, y]) {
+        let v = lower_expr(ctx, e)?;
+        let v = coerce(ctx, v, ctx.u32_id);
+        *lane = ctx.spv.op_bitcast(ctx.t_i32, v);
+    }
+    Ok(ctx.spv.op_composite_construct(ty.t_ivec2, &lanes))
+}
+
+fn lower_texel(
+    ctx: &mut LowerCtx<'_>,
+    tex: &str,
+    op: TexelOp,
+    args: &[IrExpr],
+    component: u32,
+) -> Result<Val, String> {
+    let (info, ty, handle) = load_texture(ctx, tex)?;
+    let texel = match (op, args) {
+        (TexelOp::Load, [x, y]) => {
+            let coord = texel_coord(ctx, &ty, x, y)?;
+            if info.storage {
+                ctx.spv.op_image_read(ty.t_vec4, handle, coord)
+            } else {
+                let image = ctx.spv.op_image(ty.t_image, handle);
+                let zero = ctx.spv.constant_u32(ctx.t_i32, 0);
+                ctx.spv.op_image_fetch(ty.t_vec4, image, coord, zero)
+            }
+        }
+        (TexelOp::Sample | TexelOp::SampleLevel, [u, v, lod @ ..]) if !info.storage => {
+            let mut lanes = [Id(0); 2];
+            for (lane, e) in lanes.iter_mut().zip([u, v]) {
+                let val = lower_expr(ctx, e)?;
+                *lane = coerce(ctx, val, ctx.f32_id);
+            }
+            let coord = ctx.spv.op_composite_construct(ty.t_vec2, &lanes);
+            // Compute has no derivatives to pick a level from.
+            let lod = match lod {
+                [lod] => {
+                    let val = lower_expr(ctx, lod)?;
+                    coerce(ctx, val, ctx.f32_id)
+                }
+                _ => ctx.spv.constant_f32(ctx.t_f32, 0.0),
+            };
+            ctx.spv
+                .op_image_sample_explicit_lod(ty.t_vec4, handle, coord, lod)
+        }
+        _ => return Err(format!("ZSL: bad texel access on `{tex}`")),
+    };
+    let id = ctx.spv.op_composite_extract(ctx.t_f32, texel, &[component]);
+    Ok(Val { id, ty: ctx.f32_id })
 }
 
 fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Result<Val, String> {
@@ -1535,4 +1762,32 @@ fn binary_arith(
         int_op(ctx.spv, ty, lhs.id, rhs.id)
     };
     Ok(Val { id, ty: lhs.ty })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lower_compute;
+    use crate::backend::spirv::graphics_ir::tests::validate;
+    use crate::frontend::parser::parse_compute;
+
+    #[test]
+    fn texture_and_image_params_lower_to_valid_spirv() {
+        let module = parse_compute(
+            r#"
+            push P { scale: f32 }
+            @workgroup_size(8, 8)
+            kernel k(src: texture, mid: image, dst: image, p: P, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < dst.width() && y < src.height() {
+                    let u = (x + 0.5) / src.width()
+                    let a = src.load(x, y).r + src.sample(u, 0.5).g + src.sample_level(u, 0.5, 1.0).b
+                    dst.store(x, y, a * p.scale, mid.load(x, y).g, 0.0, 1.0)
+                }
+            }
+        "#,
+        )
+        .expect("parse");
+        validate(&lower_compute(&module).expect("lower"));
+    }
 }

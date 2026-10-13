@@ -71,6 +71,12 @@ pub enum ParamKind {
     /// (matching `zengpu-vulkan`'s `SSBO_BINDING_F32`=0/`SSBO_BINDING_U32`=2/
     /// `SSBO_BINDING_I32`=3) it routes to.
     BufferIndex { elem: ScalarKind, binding: u32 },
+    /// A `texture` param: a `u32` slot in the sampled-texture table at
+    /// `binding`, filled from `Bindings::textures`.
+    TextureIndex { binding: u32 },
+    /// An `image` param: a `u32` slot in the storage-image table at
+    /// `binding`, filled from `Bindings::images`.
+    ImageIndex { binding: u32 },
     /// A push-constant scalar (or graphics `mat4x4<f32>`) param, stored as
     /// its own declared type.
     Scalar { kind: ScalarKind },

@@ -13,6 +13,15 @@ use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
+    if e.params
+        .iter()
+        .any(|p| matches!(p.kind, ParamKind::Texture | ParamKind::Image))
+    {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            "CUDA has no texture or image params",
+        ));
+    }
 
     // Locals carry their pre-resolved C-type spelling so `emit_stmt` needs no
     // arena access. Every local is a scalar today; a non-scalar `TypeId` here
@@ -319,6 +328,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "discard is fragment-only and never reaches a compute backend",
             ));
         }
+        IrStmt::ImageStore { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "kernels with image params are rejected before emission",
+            ));
+        }
         IrStmt::Barrier => {
             indent(s, depth);
             s.push_str("__syncthreads();\n");
@@ -405,6 +420,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "swizzles, arrays and texture samples are graphics-only and never reach a compute backend",
+            ));
+        }
+        IrExpr::Texel { .. } | IrExpr::TexSize { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "kernels with texture params are rejected before emission",
             ));
         }
         IrExpr::Construct { dim, args, .. } => {

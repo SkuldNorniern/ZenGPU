@@ -308,6 +308,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "MSL graphics backend: atomic_add is unavailable in graphics shaders",
             ));
         }
+        IrStmt::ImageStore { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL graphics backend: image stores are unavailable in graphics shaders",
+            ));
+        }
         IrStmt::Discard => {
             indent(s, depth);
             s.push_str("discard_fragment();\n");
@@ -340,6 +346,12 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             format!("{{{}}}", a.join(", "))
         }
         IrExpr::Index { array, index } => format!("{array}[{}]", emit_expr(ctx, index)?),
+        IrExpr::Texel { .. } | IrExpr::TexSize { .. } => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL graphics backend: texture and image params are compute-only",
+            ));
+        }
         IrExpr::Sample { index, uv, lod } => {
             let slot = format!("zsl_textures[{}]", emit_expr(ctx, index)?);
             let uv = emit_expr(ctx, uv)?;

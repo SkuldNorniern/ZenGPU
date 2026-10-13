@@ -41,6 +41,7 @@ fn compute_type_ctx(entry: &Entry) -> ComputeTypeCtx {
             ParamKind::Buffer { elem, .. } => {
                 ctx.buffers.insert(p.name.clone(), *elem);
             }
+            ParamKind::Texture | ParamKind::Image => {}
         }
     }
     ctx
@@ -99,14 +100,17 @@ fn check_expr(
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => Ok(()),
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => Ok(()),
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
             check_expr(index, ctx, types, bool_id)
         }
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
             check_expr(base, ctx, types, bool_id)
         }
-        IrExpr::Construct { args, .. } | IrExpr::Builtin { args, .. } => {
+        IrExpr::Construct { args, .. }
+        | IrExpr::Builtin { args, .. }
+        | IrExpr::Texel { args, .. } => {
             for arg in args {
                 check_expr(arg, ctx, types, bool_id)?;
             }
@@ -154,6 +158,12 @@ fn check_stmt(
         | IrStmt::AtomicAdd { index, value, .. } => {
             check_expr(index, ctx, types, bool_id)?;
             check_expr(value, ctx, types, bool_id)
+        }
+        IrStmt::ImageStore { args, .. } => {
+            for arg in args {
+                check_expr(arg, ctx, types, bool_id)?;
+            }
+            Ok(())
         }
         IrStmt::Barrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {

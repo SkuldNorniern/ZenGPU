@@ -33,14 +33,19 @@ pub enum LayoutKind {
     /// holds a bindless-table `u32` slot index, not `elem` — `elem` is
     /// carried here so a caller can still see what the buffer holds.
     BufferIndex { elem: TypeId },
+    /// A `texture` param: a `u32` slot in the sampled-texture table.
+    TextureIndex,
+    /// An `image` param: a `u32` slot in the storage-image table.
+    ImageIndex,
     /// A push-constant scalar (or, for graphics, `mat4x4<f32>`) param, stored
     /// as its own declared type.
     Scalar { ty: TypeId },
 }
 
 /// Compute a compute entry point's push-constant layout: buffer-index members
-/// first (in param declaration order), then scalar members (in param
-/// declaration order), each exactly 4 bytes, tightly packed — matching
+/// first, then texture-index members, then image-index members, then scalar
+/// members (each group in param declaration order), each exactly 4 bytes,
+/// tightly packed — matching
 /// `backend::spirv::compute`'s `pc_members`/`member_decorate` construction.
 pub fn compute_layout(module: &Module) -> Vec<(String, LayoutInfo)> {
     entry_layout(&module.entry)
@@ -60,6 +65,29 @@ fn entry_layout(entry: &Entry) -> Vec<(String, LayoutInfo)> {
                 },
             ));
             offset += 4;
+        }
+    }
+    for (image, kind) in [
+        (false, LayoutKind::TextureIndex),
+        (true, LayoutKind::ImageIndex),
+    ] {
+        for p in &entry.params {
+            let wanted = match p.kind {
+                ParamKind::Texture => !image,
+                ParamKind::Image => image,
+                _ => false,
+            };
+            if wanted {
+                out.push((
+                    p.name.clone(),
+                    LayoutInfo {
+                        offset,
+                        size: 4,
+                        kind,
+                    },
+                ));
+                offset += 4;
+            }
         }
     }
     for p in &entry.params {

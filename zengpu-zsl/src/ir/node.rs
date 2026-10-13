@@ -28,6 +28,17 @@ pub enum IrExpr {
     LocalId(u32),
     /// `group_id().{x|y|z}` (compute only).
     GroupId(u32),
+    /// Channel `component` (0..4 for r/g/b/a) of a texel of the `texture` or
+    /// `image` param `tex` (compute only). See [`TexelOp`] for `args`.
+    Texel {
+        tex: String,
+        op: TexelOp,
+        args: Vec<IrExpr>,
+        component: u32,
+    },
+    /// `tex.width()` / `tex.height()` → `u32`: the size of mip 0 along `axis`
+    /// (0 or 1) of the `texture` or `image` param `tex` (compute only).
+    TexSize { tex: String, axis: u32 },
     /// A graphics `@location` vertex/fragment input.
     Input(String),
     /// Component access `expr.{x|y|z|w}` → scalar at component `0`/`1`/`2`/`3`.
@@ -88,6 +99,9 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
+    /// `image.store(x, y, r, g, b, a)`: one texel of the `image` param
+    /// `image`; `args` are those six values (compute only).
+    ImageStore { image: String, args: Vec<IrExpr> },
     /// `name[index] = value;` for workgroup-shared memory.
     AssignShared {
         name: String,
@@ -113,6 +127,19 @@ pub enum IrStmt {
     Eval(IrExpr),
     /// `discard`: drops the fragment, writing nothing (fragment only).
     Discard,
+}
+
+/// How an [`IrExpr::Texel`] reads its texel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TexelOp {
+    /// `tex.load(x, y)`: the texel at integer `u32` coordinates in mip 0,
+    /// unfiltered. Works on a `texture` or an `image`.
+    Load,
+    /// `tex.sample(u, v)`: filtered by the texture's sampler at normalized
+    /// `f32` coordinates, in mip 0. `texture` only.
+    Sample,
+    /// `tex.sample_level(u, v, lod)`: as `Sample`, at mip level `lod`.
+    SampleLevel,
 }
 
 /// Built-in math functions (map to GLSL.std.450 / Metal stdlib).
@@ -304,6 +331,7 @@ fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
         | IrStmt::AtomicAdd { index, value, .. } => {
             expr_uses_subgroup_query(index) || expr_uses_subgroup_query(value)
         }
+        IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_subgroup_query),
         IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_subgroup_query(cond)
@@ -341,6 +369,7 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
                 || expr_uses_subgroup_query(uv)
                 || lod.as_deref().is_some_and(expr_uses_subgroup_query)
         }
+        IrExpr::Texel { args, .. } => args.iter().any(expr_uses_subgroup_query),
         IrExpr::Neg(inner) => expr_uses_subgroup_query(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_uses_subgroup_query(lhs) || expr_uses_subgroup_query(rhs)
@@ -352,7 +381,8 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => false,
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => false,
     }
 }
 
@@ -373,6 +403,7 @@ fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
         | IrStmt::AtomicAdd { index, value, .. } => {
             expr_uses_workgroup_reduce(index) || expr_uses_workgroup_reduce(value)
         }
+        IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
         IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_workgroup_reduce(cond)
@@ -412,6 +443,7 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
                 || expr_uses_workgroup_reduce(uv)
                 || lod.as_deref().is_some_and(expr_uses_workgroup_reduce)
         }
+        IrExpr::Texel { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
         IrExpr::Neg(inner) => expr_uses_workgroup_reduce(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_uses_workgroup_reduce(lhs) || expr_uses_workgroup_reduce(rhs)
@@ -423,7 +455,8 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => false,
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => false,
     }
 }
 
@@ -463,6 +496,11 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, boo
             expr_uses_subgroup_collectives(index),
             expr_uses_subgroup_collectives(value),
         ),
+        IrStmt::ImageStore { args, .. } => args
+            .iter()
+            .fold((false, false, false, false, false), |acc, e| {
+                merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(e))
+            }),
         IrStmt::Barrier | IrStmt::Discard => (false, false, false, false, false),
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
@@ -534,7 +572,7 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
         IrExpr::Neg(inner) | IrExpr::Index { index: inner, .. } => {
             expr_uses_subgroup_collectives(inner)
         }
-        IrExpr::ArrayLit(elems) => elems
+        IrExpr::Texel { args: elems, .. } | IrExpr::ArrayLit(elems) => elems
             .iter()
             .fold((false, false, false, false, false), |acc, e| {
                 merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(e))
@@ -562,7 +600,8 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => (false, false, false, false, false),
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => (false, false, false, false, false),
     }
 }
 

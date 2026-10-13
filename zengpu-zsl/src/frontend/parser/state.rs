@@ -34,6 +34,8 @@ pub(super) struct Ctx {
     pub(super) locals_order: Vec<(String, TypeId)>,
     pub(super) shared: HashMap<String, PendingShared>,
     pub(super) shared_order: Vec<String>,
+    /// `texture` and `image` param names → whether it is an `image`.
+    pub(super) textures: HashMap<String, bool>,
 }
 
 impl Ctx {
@@ -77,6 +79,8 @@ pub(super) enum PendingParamKind {
         mutability: Mutability,
     },
     Scalar(TypeId),
+    Texture,
+    Image,
 }
 
 /// A graphics input as accumulated during parsing.

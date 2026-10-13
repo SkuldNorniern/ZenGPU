@@ -51,6 +51,12 @@ pub enum ParamKind {
     /// A push-constant scalar (`u32`/`f32`), interned in the owning
     /// [`Module`]'s `types` arena.
     Scalar(TypeId),
+    /// `texture`: a 2D float texture the kernel samples or loads from, at a
+    /// bindless slot passed in [`Bindings::textures`](https://docs.rs/zengpu-hal).
+    Texture,
+    /// `image`: a 2D float storage texture the kernel loads from and stores
+    /// to, at a slot passed in `Bindings::images`.
+    Image,
 }
 
 /// The kind of entry point, plus stage-specific facts.

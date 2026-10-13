@@ -36,7 +36,10 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
         IrExpr::Construct { args, .. } | IrExpr::Builtin { args, .. } => {
             args.iter().all(|arg| expr_is_uniform(arg, locals))
         }
-        IrExpr::Sample { .. } => false,
+        // A texel read is a memory load, divergent like a buffer load; a
+        // size depends only on the uniform texture.
+        IrExpr::Sample { .. } | IrExpr::Texel { .. } => false,
+        IrExpr::TexSize { .. } => true,
         IrExpr::ArrayLit(elems) => elems.iter().all(|e| expr_is_uniform(e, locals)),
         IrExpr::Index { array, index } => {
             locals.get(array).copied().unwrap_or(false) && expr_is_uniform(index, locals)
@@ -88,6 +91,7 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     .as_deref()
                     .is_some_and(expr_contains_subgroup_collective)
         }
+        IrExpr::Texel { args, .. } => args.iter().any(expr_contains_subgroup_collective),
         IrExpr::Neg(inner) => expr_contains_subgroup_collective(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_contains_subgroup_collective(lhs) || expr_contains_subgroup_collective(rhs)
@@ -99,7 +103,8 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
         | IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::GroupId(_)
-        | IrExpr::Input(_) => false,
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => false,
     }
 }
 
@@ -154,6 +159,9 @@ fn check_stmt(
             reject_if_divergent(index, divergent)?;
             reject_if_divergent(value, divergent)
         }
+        IrStmt::ImageStore { args, .. } => args
+            .iter()
+            .try_for_each(|arg| reject_if_divergent(arg, divergent)),
         IrStmt::Barrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             reject_if_divergent(cond, divergent)?;

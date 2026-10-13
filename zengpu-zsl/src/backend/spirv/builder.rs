@@ -76,6 +76,12 @@ pub(crate) mod op {
     pub const TYPE_SAMPLED_IMAGE: u32 = 27;
     pub const IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
+    pub const IMAGE_FETCH: u32 = 95;
+    pub const IMAGE_READ: u32 = 98;
+    pub const IMAGE_WRITE: u32 = 99;
+    pub const IMAGE: u32 = 100;
+    pub const IMAGE_QUERY_SIZE_LOD: u32 = 103;
+    pub const IMAGE_QUERY_SIZE: u32 = 104;
     pub const SELECT: u32 = 169;
     pub const KILL: u32 = 252;
     pub const COMPOSITE_EXTRACT: u32 = 81;
@@ -167,6 +173,9 @@ mod cap {
     pub const GROUP_NON_UNIFORM_BALLOT: u32 = 64;
     pub const GROUP_NON_UNIFORM_SHUFFLE: u32 = 65;
     pub const GROUP_NON_UNIFORM_SHUFFLE_RELATIVE: u32 = 66;
+    pub const IMAGE_QUERY: u32 = 50;
+    pub const STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
+    pub const STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
@@ -255,6 +264,22 @@ impl SpvBuilder {
         // SPIR-V 1.3 for Vulkan 1.2, so declare the introducing extension.
         let name = encode_string("SPV_EXT_descriptor_indexing");
         emit_raw(&mut self.extensions, op::EXTENSION, &name);
+    }
+
+    /// Size queries on images (`OpImageQuerySize[Lod]`).
+    pub fn capability_image_query(&mut self) {
+        emit(&mut self.capabilities, op::CAPABILITY, &[cap::IMAGE_QUERY]);
+    }
+
+    /// Loads from and stores to storage images declared with an `Unknown`
+    /// format, so one kernel serves every float format.
+    pub fn capability_storage_image_without_format(&mut self) {
+        for c in [
+            cap::STORAGE_IMAGE_READ_WITHOUT_FORMAT,
+            cap::STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
+        ] {
+            emit(&mut self.capabilities, op::CAPABILITY, &[c]);
+        }
     }
 
     pub fn enable_atomic_float32_add_ext(&mut self) {
@@ -700,6 +725,18 @@ impl SpvBuilder {
         id
     }
 
+    /// A 2D storage image (`OpTypeImage` with `Sampled = 2`), format
+    /// `Unknown`.
+    pub fn type_storage_image_2d(&mut self, sampled: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.types,
+            op::TYPE_IMAGE,
+            &[id.0, sampled.0, 1, 0, 0, 0, 2, 0],
+        );
+        id
+    }
+
     pub fn type_sampled_image(&mut self, image: Id) -> Id {
         let id = self.fresh_id();
         emit(&mut self.types, op::TYPE_SAMPLED_IMAGE, &[id.0, image.0]);
@@ -724,6 +761,70 @@ impl SpvBuilder {
             &mut self.functions,
             op::IMAGE_SAMPLE_EXPLICIT_LOD,
             &[ty.0, id.0, image.0, coord.0, 0x2, lod.0],
+        );
+        id
+    }
+
+    /// The image half of a sampled image (`OpImage`).
+    pub fn op_image(&mut self, ty: Id, sampled_image: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE,
+            &[ty.0, id.0, sampled_image.0],
+        );
+        id
+    }
+
+    /// An unfiltered texel of a sampled image at integer `coord`, mip `lod`.
+    pub fn op_image_fetch(&mut self, ty: Id, image: Id, coord: Id, lod: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_FETCH,
+            &[ty.0, id.0, image.0, coord.0, 0x2, lod.0],
+        );
+        id
+    }
+
+    /// A texel of a storage image.
+    pub fn op_image_read(&mut self, ty: Id, image: Id, coord: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_READ,
+            &[ty.0, id.0, image.0, coord.0],
+        );
+        id
+    }
+
+    /// Store `texel` to a storage image.
+    pub fn op_image_write(&mut self, image: Id, coord: Id, texel: Id) {
+        emit(
+            &mut self.functions,
+            op::IMAGE_WRITE,
+            &[image.0, coord.0, texel.0],
+        );
+    }
+
+    /// The size of mip `lod` of a sampled image's image.
+    pub fn op_image_query_size_lod(&mut self, ty: Id, image: Id, lod: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_QUERY_SIZE_LOD,
+            &[ty.0, id.0, image.0, lod.0],
+        );
+        id
+    }
+
+    /// The size of a storage image.
+    pub fn op_image_query_size(&mut self, ty: Id, image: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_QUERY_SIZE,
+            &[ty.0, id.0, image.0],
         );
         id
     }

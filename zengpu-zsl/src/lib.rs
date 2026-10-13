@@ -306,6 +306,18 @@ fn reflection_to_slice_str(reflection: &ModuleReflection, types: &TypeArena) -> 
                     binding.binding,
                 ));
             }
+            (LayoutKind::TextureIndex, Some(binding)) => {
+                s.push_str(&format!(
+                    "::zengpu_spirv::ParamKind::TextureIndex {{ binding: {} }}",
+                    binding.binding,
+                ));
+            }
+            (LayoutKind::ImageIndex, Some(binding)) => {
+                s.push_str(&format!(
+                    "::zengpu_spirv::ParamKind::ImageIndex {{ binding: {} }}",
+                    binding.binding,
+                ));
+            }
             (LayoutKind::Scalar { ty }, None) => {
                 s.push_str(&format!(
                     "::zengpu_spirv::ParamKind::Scalar {{ kind: ::zengpu_spirv::ScalarKind::{} }}",
@@ -2034,6 +2046,87 @@ int main() {{
         if !stdout.contains("SKIP_NO_HIP_GPU") {
             let max_err: f32 = stdout.split_whitespace().last().unwrap().parse().unwrap();
             assert!(max_err < 1.0e-3, "HIP max error {max_err}");
+        }
+    }
+
+    const TEXEL_KERNEL: &str = r#"
+        push P { n: u32 }
+        @workgroup_size(8, 8)
+        kernel k(buf: device buffer<f32>, src: texture, dst: image, p: P, id: global_id) {
+            let x = id.x
+            let y = id.y
+            if x < dst.width() && y < p.n {
+                let u = (x + 0.5) / src.width()
+                dst.store(x, y, src.load(x, y).r + buf[x], src.sample(u, 0.5).a, 0.0, 1.0)
+            }
+        }
+    "#;
+
+    #[test]
+    fn texel_params_sit_after_buffers_in_the_push_block() {
+        use crate::ir::reflection::reflect_compute;
+        let module = parse_compute(TEXEL_KERNEL).expect("parse");
+        let params: Vec<(String, u32, Option<u32>)> = reflect_compute(&module)
+            .params
+            .into_iter()
+            .map(|p| (p.name, p.layout.offset, p.binding.map(|b| b.binding)))
+            .collect();
+        let want = [
+            ("buf", 0, Some(0)),
+            ("src", 4, Some(1)),
+            ("dst", 8, Some(4)),
+            ("n", 12, None),
+        ];
+        for ((name, offset, binding), (w_name, w_offset, w_binding)) in params.iter().zip(want) {
+            assert_eq!(
+                (name.as_str(), *offset, *binding),
+                (w_name, w_offset, w_binding)
+            );
+        }
+        assert_eq!(params.len(), want.len());
+    }
+
+    #[test]
+    fn msl_binds_textures_then_images() {
+        let module = parse_compute(TEXEL_KERNEL).expect("parse");
+        let src = msl::lower_compute(&module).expect("lower to MSL").source;
+        for want in [
+            "texture2d<float> src [[texture(0)]]",
+            "sampler src_smp [[sampler(0)]]",
+            "texture2d<float, access::read_write> dst [[texture(1)]]",
+            "src.read(uint2(x, y)).r",
+            "src.sample(src_smp, float2(",
+            "dst.write(float4(",
+            "dst.get_width()",
+        ] {
+            assert!(src.contains(want), "missing `{want}` in\n{src}");
+        }
+    }
+
+    #[test]
+    fn hip_and_cuda_turn_texel_kernels_down() {
+        let module = parse_compute(TEXEL_KERNEL).expect("parse");
+        assert!(hip::lower_compute(&module).is_err());
+        assert!(cuda::lower_compute(&module).is_err());
+    }
+
+    #[test]
+    fn texel_access_is_checked_when_parsing() {
+        let kernel = |params: &str, body: &str| {
+            format!("@workgroup_size(8)\nkernel k({params}, id: global_id) {{\n{body}\n}}")
+        };
+        for (params, body) in [
+            // Images only load and store; textures only read.
+            ("t: image", "let a = t.sample(0.5, 0.5).r"),
+            ("t: texture", "t.store(id.x, 0, 0.0, 0.0, 0.0, 1.0)"),
+            // A read names its channel, and takes the right coordinates.
+            ("t: texture", "let a = t.load(id.x, 0)"),
+            ("t: texture", "let a = t.load(0.5, 0.5).r"),
+            ("t: texture", "let a = t.sample(id.x, 0).r"),
+            ("t: image", "t.store(id.x, 0, 1.0)"),
+        ] {
+            let src = kernel(params, body);
+            assert!(parse_compute(&src).is_err(), "accepted:\n{src}");
         }
     }
 }
