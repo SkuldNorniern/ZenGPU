@@ -13,13 +13,15 @@ use objc::rc::autoreleasepool;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     Bindings, BufferHandle, LoadOp, PipelineHandle, QueryPoolHandle, RenderCommands,
-    RenderPassDesc, TargetHandle, ViewportScissor,
+    RenderPassDesc, Scalar, TargetHandle, ViewportScissor,
 };
 
 use super::convert;
-use super::device::{Inner, MetalPipeline, RenderPipeline, pack_scalars};
+use super::device::{Inner, MetalPipeline, RenderPipeline};
 use super::table::{PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX};
 
+/// The push block's size limit, as on Vulkan: 64 four-byte words.
+const PUSH_BYTES: usize = 256;
 /// Bytes per tightly packed `MTLDrawPrimitivesIndirectArguments`.
 const DRAW_INDIRECT_STRIDE: u64 = 16;
 /// Bytes per tightly packed `MTLDrawIndexedPrimitivesIndirectArguments`.
@@ -287,17 +289,37 @@ impl RenderCommands for MetalCommandList {
         let Some(enc) = self.encoder("bind") else {
             return;
         };
-        // The texture table is bound for the whole pass; graphics storage
-        // buffers have no MSL lowering yet, so only scalars bind here.
-        if !bindings.buffers.is_empty() {
-            log::warn!("[zengpu-metal] graphics storage buffers are not supported; ignored");
+        // The same push block Vulkan builds: [scalars…, texture indices…,
+        // buffer indices…], 4 bytes each, so a ZSL push struct reads the same
+        // fields on both. The texture table itself stays bound for the pass.
+        let mut pc = [0u8; PUSH_BYTES];
+        let mut len = 0usize;
+        let words = bindings
+            .scalars
+            .iter()
+            .map(|s| match s {
+                Scalar::U32(v) => v.to_le_bytes(),
+                Scalar::I32(v) => v.to_le_bytes(),
+                Scalar::F32(v) => v.to_le_bytes(),
+            })
+            .chain(bindings.textures.iter().map(|i| i.to_le_bytes()))
+            .chain(bindings.buffers.iter().map(|i| i.to_le_bytes()));
+        for w in words {
+            if let Some(dst) = pc.get_mut(len..len + 4) {
+                dst.copy_from_slice(&w);
+                len += 4;
+            }
         }
-        if !bindings.scalars.is_empty() {
-            let packed = pack_scalars(bindings.scalars);
-            let (len, ptr) = (packed.len() as u64, packed.as_ptr() as *const c_void);
-            enc.set_vertex_bytes(PUSH_BUFFER_INDEX, len, ptr);
-            enc.set_fragment_bytes(PUSH_BUFFER_INDEX, len, ptr);
+        if len == 0 {
+            return;
         }
+        // MSL pads a struct to its widest member (up to 16 bytes for a
+        // float4), and Metal checks the bound length covers it; the padding
+        // reads as zero.
+        let len = len.next_multiple_of(16).min(PUSH_BYTES);
+        let ptr = pc.as_ptr() as *const c_void;
+        enc.set_vertex_bytes(PUSH_BUFFER_INDEX, len as u64, ptr);
+        enc.set_fragment_bytes(PUSH_BUFFER_INDEX, len as u64, ptr);
     }
 
     fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle) {
