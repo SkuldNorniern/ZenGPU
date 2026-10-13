@@ -1551,6 +1551,41 @@ mod tests {
     }
 
     #[test]
+    fn invalid_texture_mips_return_errors_without_poisoning_the_device() {
+        use zengpu_hal::TextureWrite;
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 1,
+                height: 1,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        for mip_level in [1, 32, u32::MAX] {
+            let mut region = TextureRegion::rect(0, 0, 1, 1);
+            region.mip_level = mip_level;
+            assert!(
+                dev.write_textures(&[TextureWrite {
+                    texture: tex,
+                    region,
+                    data: &[0; 4],
+                    bytes_per_row: 4,
+                }])
+                .is_err()
+            );
+        }
+        // Validation errors must leave resource locks and subsequent uploads usable.
+        dev.upload_texture_data(tex, &[0; 4]).unwrap();
+        dev.destroy_texture(tex);
+    }
+
+    #[test]
     fn texture_regions_round_trip_without_touching_the_rest() {
         let Some(dev) = try_device() else {
             return;

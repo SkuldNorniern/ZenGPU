@@ -304,8 +304,18 @@ impl VulkanDevice {
                 },
             }));
         }
-        let mip_w = (tex.extent.width >> region.mip_level).max(1);
-        let mip_h = (tex.extent.height >> region.mip_level).max(1);
+        let mip_w = tex
+            .extent
+            .width
+            .checked_shr(region.mip_level)
+            .unwrap_or(0)
+            .max(1);
+        let mip_h = tex
+            .extent
+            .height
+            .checked_shr(region.mip_level)
+            .unwrap_or(0)
+            .max(1);
         let inside = region.mip_level < tex.mip_levels
             && region.layer < tex.array_layers
             && region.width > 0
