@@ -438,6 +438,26 @@ mod tests {
     }
 
     #[test]
+    fn foreign_and_recreated_device_handles_cannot_access_buffers() {
+        let first = CpuDevice::new();
+        let old = first.create_buffer(rw_desc(4)).unwrap();
+        let second = CpuDevice::new();
+        let own = second.create_buffer(rw_desc(4)).unwrap();
+        second.write_buffer(own, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(old.index(), own.index());
+        assert_eq!(old.generation(), own.generation());
+        assert!(second.read_buffer(old, 0, 4).is_err());
+        assert!(second.write_buffer(old, 0, &[9; 4]).is_err());
+        second.destroy_buffer(old);
+        assert_eq!(second.read_buffer(own, 0, 4).unwrap(), [1, 2, 3, 4]);
+        drop(first);
+        let recreated = CpuDevice::new();
+        let new = recreated.create_buffer(rw_desc(4)).unwrap();
+        assert!(recreated.write_buffer(old, 0, &[9; 4]).is_err());
+        assert!(recreated.write_buffer(new, 0, &[5; 4]).is_ok());
+    }
+
+    #[test]
     fn buffer_roundtrip() {
         let dev = CpuDevice::new();
         let h = dev.create_buffer(rw_desc(4)).unwrap();
