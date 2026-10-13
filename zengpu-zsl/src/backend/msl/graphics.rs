@@ -473,6 +473,7 @@ mod tests {
         let _ = remove_file(&air);
         match out {
             Ok(o) if o.status.success() => Some(true),
+            Ok(o) if String::from_utf8_lossy(&o.stderr).contains("missing Metal Toolchain") => None,
             Ok(o) => panic!(
                 "MSL failed:\n--- stderr ---\n{}\n--- stdout ---\n{}\n--- source ---\n{source}",
                 String::from_utf8_lossy(&o.stderr),
