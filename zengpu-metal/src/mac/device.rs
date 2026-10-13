@@ -385,20 +385,42 @@ impl MetalDevice {
         data: &[u8],
         bytes_per_row: u32,
     ) -> Result<()> {
+        if region.mip_level >= desc.mip_levels.max(1)
+            || region.mip_level >= u32::BITS
+            || region.layer >= desc.array_layers.max(1)
+            || region.width == 0
+            || region.height == 0
+        {
+            return Err(GpuError::Backend(
+                "metal: texture subresource out of bounds".into(),
+            ));
+        }
         let bpp = desc.format.bytes_per_texel();
+        let packed_row = region
+            .width
+            .checked_mul(bpp)
+            .ok_or_else(|| GpuError::Backend("metal: texture row size overflow".into()))?;
         let row = if bytes_per_row == 0 {
-            region.width * bpp
+            packed_row
         } else {
             bytes_per_row
         };
         let need = u64::from(row) * u64::from(region.height);
-        if (data.len() as u64) < need || row < region.width * bpp {
+        if (data.len() as u64) < need || row < packed_row {
             return Err(GpuError::Backend(
                 "metal: texture data shorter than its region".into(),
             ));
         }
-        if region.x + region.width > tex.width() as u32 >> region.mip_level
-            || region.y + region.height > (tex.height() as u32 >> region.mip_level).max(1)
+        let mip_w = (tex.width() as u32 >> region.mip_level).max(1);
+        let mip_h = (tex.height() as u32 >> region.mip_level).max(1);
+        if region
+            .x
+            .checked_add(region.width)
+            .is_none_or(|right| right > mip_w)
+            || region
+                .y
+                .checked_add(region.height)
+                .is_none_or(|bottom| bottom > mip_h)
         {
             return Err(GpuError::Backend(
                 "metal: texture region out of bounds".into(),
@@ -843,6 +865,9 @@ impl GpuDevice for MetalDevice {
         data: &[u8],
     ) -> Result<()> {
         let (_, desc) = self.texture(texture)?;
+        if mip_level >= desc.mip_levels.max(1) || mip_level >= u32::BITS {
+            return Err(GpuError::Backend("metal: texture mip out of bounds".into()));
+        }
         let (w, h) = (
             (desc.width >> mip_level).max(1),
             (desc.height >> mip_level).max(1),
