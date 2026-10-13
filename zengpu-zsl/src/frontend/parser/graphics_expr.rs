@@ -167,7 +167,8 @@ impl<'a> Parser<'a> {
                     if !ctx.scalars.contains_key(&field) {
                         return self.err(format!("push struct has no field `{field}`"));
                     }
-                    return Ok(IrExpr::ScalarParam(field));
+                    // `p.v.xy` swizzles a vector field like any value.
+                    return self.parse_g_postfix(ctx, IrExpr::ScalarParam(field));
                 }
                 // table[slot].sample(uv)
                 if ctx.textures.as_deref() == Some(name.as_str()) {
