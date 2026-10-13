@@ -241,13 +241,26 @@ pub enum PresentMode {
     Immediate,
 }
 
-/// Texture / surface pixel formats (subset to start; grows with backends).
+/// Texture and surface pixel formats. Which uses each has on a device is
+/// [`GpuDevice::format_caps`](crate::GpuDevice::format_caps).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
     Bgra8Unorm,
     Bgra8UnormSrgb,
+    /// Half floats: a working compositing format.
+    Rgba16Float,
+    /// Full floats: HDR images and high-precision intermediates.
+    Rgba32Float,
+    /// 16 bits a channel: 16-bit image layers.
+    Rgba16Unorm,
+    /// One 8-bit channel: masks and selections.
+    R8Unorm,
+    /// One half-float channel: high-precision masks.
+    R16Float,
+    /// One 16-bit channel.
+    R16Unorm,
     R32Float,
     Depth32Float,
     Depth24PlusStencil8,
@@ -262,6 +275,8 @@ impl Format {
     /// Bytes one texel takes.
     pub const fn bytes_per_texel(self) -> u32 {
         match self {
+            Format::R8Unorm => 1,
+            Format::R16Float | Format::R16Unorm => 2,
             Format::Rgba8Unorm
             | Format::Rgba8UnormSrgb
             | Format::Bgra8Unorm
@@ -269,8 +284,27 @@ impl Format {
             | Format::R32Float
             | Format::Depth32Float
             | Format::Depth24PlusStencil8 => 4,
+            Format::Rgba16Float | Format::Rgba16Unorm => 8,
+            Format::Rgba32Float => 16,
         }
     }
+
+    /// Every format, for tests and capability tables.
+    pub const ALL: [Format; 13] = [
+        Format::Rgba8Unorm,
+        Format::Rgba8UnormSrgb,
+        Format::Bgra8Unorm,
+        Format::Bgra8UnormSrgb,
+        Format::Rgba16Float,
+        Format::Rgba32Float,
+        Format::Rgba16Unorm,
+        Format::R8Unorm,
+        Format::R16Float,
+        Format::R16Unorm,
+        Format::R32Float,
+        Format::Depth32Float,
+        Format::Depth24PlusStencil8,
+    ];
 }
 
 /// An axis-aligned rectangle in pixels. Used for scissor and damage regions.

@@ -1,5 +1,5 @@
 use super::*;
-use zengpu_hal::{TextureRegion, TextureWrite, TransferCaps};
+use zengpu_hal::{Format, FormatCaps, TextureRegion, TextureWrite, TransferCaps};
 
 impl GpuDevice for VulkanDevice {
     fn as_any(&self) -> &dyn Any {
@@ -22,6 +22,31 @@ impl GpuDevice for VulkanDevice {
 
     fn limits(&self) -> DeviceLimits {
         self.inner.limits
+    }
+
+    fn format_caps(&self, format: Format) -> FormatCaps {
+        let props = unsafe {
+            self.inner
+                .shared
+                .instance
+                .get_physical_device_format_properties(
+                    self.inner.physical,
+                    hal_format_to_vk(format),
+                )
+        };
+        let has = |flag| props.optimal_tiling_features.contains(flag);
+        let attachment = if format.is_depth_stencil() {
+            vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+        } else {
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        };
+        FormatCaps {
+            sampled: has(vk::FormatFeatureFlags::SAMPLED_IMAGE),
+            filterable: has(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+            render_target: has(attachment),
+            blendable: has(vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND),
+            storage: has(vk::FormatFeatureFlags::STORAGE_IMAGE),
+        }
     }
 
     fn is_lost(&self) -> bool {

@@ -45,6 +45,23 @@ pub struct TransferCaps {
     pub async_transfers: bool,
 }
 
+/// What a texture of one format can be used for on a device, from
+/// [`crate::GpuDevice::format_caps`]. A use reported `false` is refused or
+/// undefined there: check before relying on one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatCaps {
+    /// Read by shaders.
+    pub sampled: bool,
+    /// Sampled with linear filtering, not only nearest.
+    pub filterable: bool,
+    /// Drawn into as a colour (or depth) attachment.
+    pub render_target: bool,
+    /// Blended into as a colour attachment.
+    pub blendable: bool,
+    /// Written by compute shaders as a storage texture.
+    pub storage: bool,
+}
+
 /// Which HAL capabilities a backend implements. A backend may provide
 /// graphics, compute, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

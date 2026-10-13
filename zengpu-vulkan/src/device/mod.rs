@@ -1494,7 +1494,9 @@ mod tests {
             return;
         };
         for adapter in inst.vulkan_adapters() {
-            let again = inst.vulkan_adapter_by_uuid(adapter.uuid()).expect("still there");
+            let again = inst
+                .vulkan_adapter_by_uuid(adapter.uuid())
+                .expect("still there");
             assert_eq!(again.info().name, adapter.info().name);
         }
         assert!(inst.vulkan_adapter_by_uuid([0xAB; 16]).is_none());
@@ -1577,6 +1579,108 @@ mod tests {
         for submission in pending {
             submission.wait(Duration::from_secs(5)).unwrap();
         }
+        dev.destroy_texture(tex);
+    }
+
+    /// Every colour format a desktop Vulkan GPU must take: sampled and drawn
+    /// into, as the spec requires of these.
+    #[test]
+    fn colour_formats_report_their_uses() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        for format in zengpu_hal::Format::ALL {
+            let caps = dev.format_caps(format);
+            if format.is_depth_stencil() {
+                assert!(caps.render_target, "{format:?} as depth");
+                continue;
+            }
+            assert!(caps.sampled && caps.render_target, "{format:?}: {caps:?}");
+        }
+        let half = dev.format_caps(zengpu_hal::Format::Rgba16Float);
+        assert!(
+            half.filterable && half.blendable && half.storage,
+            "{half:?}"
+        );
+    }
+
+    /// Upload, a region write and readback keep every byte, for every colour
+    /// format, at its own texel size.
+    #[test]
+    fn colour_formats_round_trip_through_region_writes() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        if !dev.capabilities().transfers.buffer_texture_copy {
+            return;
+        }
+        for format in zengpu_hal::Format::ALL {
+            if format.is_depth_stencil() || !dev.format_caps(format).sampled {
+                continue;
+            }
+            round_trip(&*dev, format);
+        }
+    }
+
+    fn round_trip(dev: &dyn GpuDevice, format: zengpu_hal::Format) {
+        const SIZE: u32 = 8;
+        let texel = format.bytes_per_texel();
+        let row = SIZE * texel;
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: SIZE,
+                height: SIZE,
+                depth: 1,
+                format,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_DST
+                    | TextureUsage::TRANSFER_SRC,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        // Bytes below 0x70 make no float NaN or infinity in any of the formats.
+        let base: Vec<u8> = (0..row * SIZE).map(|i| (i % 0x61) as u8).collect();
+        dev.upload_texture_data(tex, &base).unwrap();
+        let patch = vec![0x3Cu8; (4 * 4 * texel) as usize];
+        let write = zengpu_hal::TextureWrite {
+            texture: tex,
+            region: zengpu_hal::TextureRegion::rect(2, 2, 4, 4),
+            data: &patch,
+            bytes_per_row: 4 * texel,
+        };
+        dev.write_textures(&[write])
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let size = u64::from(row * SIZE);
+        let out = dev.create_buffer(rw_desc(size)).unwrap();
+        dev.copy_texture_region_to_buffer(
+            tex,
+            zengpu_hal::TextureRegion::rect(0, 0, SIZE, SIZE),
+            out,
+            0,
+            row,
+        )
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+        let got = dev.read_buffer(out, 0, size).unwrap();
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let at = ((y * row + x * texel) as usize)..((y * row + (x + 1) * texel) as usize);
+                let inside = (2..6).contains(&x) && (2..6).contains(&y);
+                let want: &[u8] = if inside {
+                    &patch[..texel as usize]
+                } else {
+                    &base[at.clone()]
+                };
+                assert_eq!(&got[at], want, "{format:?} at ({x}, {y})");
+            }
+        }
+        dev.destroy_buffer(out);
         dev.destroy_texture(tex);
     }
 

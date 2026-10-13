@@ -8,7 +8,7 @@ use metal::{
 };
 use zengpu_hal::{
     AddressMode, BlendFactor, BlendOp, BorderColor, CompareFn, CullMode, FilterMode, Format,
-    FrontFace, PrimitiveTopology, StencilOp, StepMode, VertexFormat,
+    FormatCaps, FrontFace, PrimitiveTopology, StencilOp, StepMode, VertexFormat,
 };
 
 pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
@@ -17,10 +17,50 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         Format::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
         Format::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
+        Format::Rgba16Float => MTLPixelFormat::RGBA16Float,
+        Format::Rgba32Float => MTLPixelFormat::RGBA32Float,
+        Format::Rgba16Unorm => MTLPixelFormat::RGBA16Unorm,
+        Format::R8Unorm => MTLPixelFormat::R8Unorm,
+        Format::R16Float => MTLPixelFormat::R16Float,
+        Format::R16Unorm => MTLPixelFormat::R16Unorm,
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::Depth32Float => MTLPixelFormat::Depth32Float,
         // Apple GPUs have no 24-bit depth; the 32-bit float one stands in.
         Format::Depth24PlusStencil8 => MTLPixelFormat::Depth32Float_Stencil8,
+    }
+}
+
+/// What a format can do on the Apple GPUs and Macs Metal runs on, from
+/// Apple's pixel format capability tables. 32-bit floats filter only where
+/// the device says so; sRGB and BGRA textures cannot be written by compute.
+pub(crate) fn format_caps(format: Format, float32_filtering: bool) -> FormatCaps {
+    let all = FormatCaps {
+        sampled: true,
+        filterable: true,
+        render_target: true,
+        blendable: true,
+        storage: true,
+    };
+    match format {
+        Format::Rgba8Unorm
+        | Format::Rgba16Float
+        | Format::Rgba16Unorm
+        | Format::R8Unorm
+        | Format::R16Float
+        | Format::R16Unorm => all,
+        Format::Rgba8UnormSrgb | Format::Bgra8Unorm | Format::Bgra8UnormSrgb => FormatCaps {
+            storage: false,
+            ..all
+        },
+        Format::R32Float | Format::Rgba32Float => FormatCaps {
+            filterable: float32_filtering,
+            ..all
+        },
+        Format::Depth32Float | Format::Depth24PlusStencil8 => FormatCaps {
+            sampled: true,
+            render_target: true,
+            ..FormatCaps::default()
+        },
     }
 }
 

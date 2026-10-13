@@ -14,9 +14,9 @@ use crate::desc::{
 };
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
-use crate::request::{DeviceLimits, HalCapabilities};
+use crate::request::{DeviceLimits, FormatCaps, HalCapabilities};
 use crate::submission::{CompletedSubmission, Submission};
-use crate::types::Features;
+use crate::types::{Features, Format};
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
 /// threads can allocate and upload concurrently.
@@ -31,6 +31,13 @@ pub trait GpuDevice: Send + Sync {
     /// Limits of the created logical device and selected queue path.
     fn limits(&self) -> DeviceLimits {
         DeviceLimits::default()
+    }
+
+    /// What textures of `format` can be used for on this device. The
+    /// default claims nothing; backends report what their hardware does.
+    fn format_caps(&self, format: Format) -> FormatCaps {
+        let _ = format;
+        FormatCaps::default()
     }
 
     /// Create a buffer. The returned handle is generational.
