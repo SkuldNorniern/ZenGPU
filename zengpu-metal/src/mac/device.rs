@@ -13,27 +13,28 @@ use std::time::{Duration, Instant};
 use metal::{
     Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, DepthStencilState,
     Device, Library, MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin,
-    MTLPrimitiveType, MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType,
-    MTLTextureUsage, RenderPipelineState, SamplerDescriptor, SamplerState, Texture,
-    TextureDescriptor,
+    MTLPrimitiveType, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputePipelineDesc, DeviceLimits, Features, Format,
-    FormatCaps, GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle,
-    Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
-    Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
-    TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
+    Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc, DeviceLimits, Features,
+    Format, FormatCaps, GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget,
+    PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
+    ShaderSource, SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc,
+    TextureHandle, TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
 use super::table::{TABLE_CAPACITY, TextureTable};
+use crate::transfer;
 
 pub(crate) struct MetalBuffer {
     pub(crate) buf: Buffer,
     pub(crate) size: u64,
+    pub(crate) usage: BufferUsage,
 }
 
 pub(crate) struct MetalTexture {
@@ -101,9 +102,11 @@ impl Inner {
 
     /// Commit `cmd` and remember it as the newest submission.
     pub(crate) fn commit(&self, cmd: &CommandBufferRef) {
-        cmd.commit();
         if let Ok(mut last) = self.last_submit.lock() {
+            cmd.commit();
             *last = Some(cmd.to_owned());
+        } else {
+            cmd.commit();
         }
     }
 
@@ -411,91 +414,38 @@ impl MetalDevice {
         }
     }
 
-    /// Copy `data` into `region` of a host-visible texture.
-    fn replace(
-        tex: &Texture,
-        desc: &TextureDesc,
-        region: TextureRegion,
-        data: &[u8],
-        bytes_per_row: u32,
-    ) -> Result<()> {
-        if region.mip_level >= desc.mip_levels.max(1)
-            || region.mip_level >= u32::BITS
-            || region.layer >= desc.array_layers.max(1)
-            || region.width == 0
-            || region.height == 0
-        {
-            return Err(GpuError::Backend(
-                "metal: texture subresource out of bounds".into(),
-            ));
-        }
-        let bpp = desc.format.bytes_per_texel();
-        let packed_row = region
-            .width
-            .checked_mul(bpp)
-            .ok_or_else(|| GpuError::Backend("metal: texture row size overflow".into()))?;
-        let row = if bytes_per_row == 0 {
-            packed_row
-        } else {
-            bytes_per_row
-        };
-        let need = u64::from(row) * u64::from(region.height);
-        if (data.len() as u64) < need || row < packed_row {
-            return Err(GpuError::Backend(
-                "metal: texture data shorter than its region".into(),
-            ));
-        }
-        let mip_w = (tex.width() as u32 >> region.mip_level).max(1);
-        let mip_h = (tex.height() as u32 >> region.mip_level).max(1);
-        if region
-            .x
-            .checked_add(region.width)
-            .is_none_or(|right| right > mip_w)
-            || region
-                .y
-                .checked_add(region.height)
-                .is_none_or(|bottom| bottom > mip_h)
-        {
-            return Err(GpuError::Backend(
-                "metal: texture region out of bounds".into(),
-            ));
-        }
-        let mtl_region = MTLRegion::new_2d(
-            u64::from(region.x),
-            u64::from(region.y),
-            u64::from(region.width),
-            u64::from(region.height),
-        );
-        tex.replace_region_in_slice(
-            mtl_region,
-            u64::from(region.mip_level),
-            u64::from(region.layer),
-            data.as_ptr() as *const c_void,
-            u64::from(row),
-            need,
-        );
-        Ok(())
-    }
-
-    /// Copy `data` into a Private texture through a staging buffer.
+    /// Queue a validated upload for any storage mode, after earlier GPU reads.
     fn stage_into(
         &self,
         tex: &Texture,
-        desc: &TextureDesc,
+        layout: &transfer::Layout,
         region: TextureRegion,
         data: &[u8],
-        bytes_per_row: u32,
     ) -> Result<CommandBuffer> {
-        let row = if bytes_per_row == 0 {
-            region.width * desc.format.bytes_per_texel()
-        } else {
-            bytes_per_row
-        };
-        let staging = self.inner.device.new_buffer_with_data(
-            data.as_ptr() as *const c_void,
-            data.len() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+        // Pack CPU rows: their padding need not be a whole number of texels,
+        // while a Metal buffer-to-texture copy requires a texel-aligned pitch.
+        let row = region.width * layout.texel_bytes; // checked by texture_layout
+        let image_bytes = u64::from(row) * u64::from(region.height);
+        if image_bytes > self.inner.device.max_buffer_length() {
+            return Err(GpuError::Backend(
+                "metal: staging upload exceeds buffer limit".into(),
+            ));
+        }
+        let staging = self
+            .inner
+            .device
+            .new_buffer(image_bytes, MTLResourceOptions::StorageModeShared);
+        for y in 0..region.height as usize {
+            // SAFETY: texture_layout/data_len checked every source row; staging
+            // holds all packed destination rows and has no GPU readers yet.
+            unsafe {
+                copy_nonoverlapping(
+                    data.as_ptr().add(y * layout.row_bytes as usize),
+                    (staging.contents() as *mut u8).add(y * row as usize),
+                    row as usize,
+                );
+            }
+        }
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
             let blit = cmd.new_blit_command_encoder();
@@ -503,7 +453,7 @@ impl MetalDevice {
                 &staging,
                 0,
                 u64::from(row),
-                u64::from(row) * u64::from(region.height),
+                image_bytes,
                 MTLSize::new(u64::from(region.width), u64::from(region.height), 1),
                 tex,
                 u64::from(region.layer),
@@ -536,8 +486,8 @@ impl MetalDevice {
         Ok(())
     }
 
-    /// Write `data` into `handle`'s region. A Private texture gets a committed
-    /// copy the GPU may still be running; shared memory is written at once.
+    /// Queue a copy for every storage mode. GPU queue order and tracked resource
+    /// hazards keep this write after earlier readers of the texture.
     fn queue_region(
         &self,
         handle: TextureHandle,
@@ -546,13 +496,15 @@ impl MetalDevice {
         bytes_per_row: u32,
     ) -> Result<Option<CommandBuffer>> {
         let (tex, desc) = self.texture(handle)?;
-        if tex.storage_mode() == MTLStorageMode::Private {
-            self.stage_into(&tex, &desc, region, data, bytes_per_row)
-                .map(Some)
-        } else {
-            Self::replace(&tex, &desc, region, data, bytes_per_row)?;
-            Ok(None)
-        }
+        let layout = transfer::texture_layout(
+            &desc,
+            region,
+            bytes_per_row,
+            TextureUsage::TRANSFER_DST,
+            true,
+        )?;
+        transfer::data_len(&layout, data.len() as u64)?;
+        self.stage_into(&tex, &layout, region, data).map(Some)
     }
 
     /// Encode + submit one compute dispatch, blocking until completion. Buffers
@@ -690,7 +642,7 @@ pub(crate) fn capabilities() -> HalCapabilities {
             texture_region_write: true,
             buffer_texture_copy: true,
             staged_uploads: false,
-            async_transfers: false,
+            async_transfers: true,
         },
     }
 }
@@ -743,6 +695,7 @@ impl GpuDevice for MetalDevice {
         Ok(lock(&self.inner.buffers)?.insert(MetalBuffer {
             buf,
             size: desc.size,
+            usage: desc.usage,
         }))
     }
 
@@ -814,7 +767,14 @@ impl GpuDevice for MetalDevice {
 
     fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
         let (_, desc) = self.texture(texture)?;
-        let row = desc.width * desc.format.bytes_per_texel();
+        let row = desc
+            .width
+            .checked_mul(desc.format.bytes_per_texel())
+            .ok_or_else(|| {
+                GpuError::from(UsageError::BindingMismatch(
+                    "metal: texture row size overflow".into(),
+                ))
+            })?;
         // No deadline: the caller reads the buffer straight after this.
         self.copy_texture_region_to_buffer(
             texture,
@@ -876,22 +836,32 @@ impl GpuDevice for MetalDevice {
 
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
         let (_, desc) = self.texture(texture)?;
-        let layer_bytes = (desc.width * desc.height * desc.format.bytes_per_texel()) as usize;
+        let region = TextureRegion::rect(0, 0, desc.width, desc.height);
+        let layout = transfer::texture_layout(&desc, region, 0, TextureUsage::TRANSFER_DST, true)?;
+        let layer_bytes = usize::try_from(layout.image_bytes).map_err(|_| {
+            GpuError::from(UsageError::BindingMismatch(
+                "metal: texture data size overflow".into(),
+            ))
+        })?;
         let layers = if desc.dimension == TexDim::Cube {
             6
         } else {
             desc.array_layers.max(1)
         };
+        let total = layer_bytes.checked_mul(layers as usize).ok_or_else(|| {
+            GpuError::from(UsageError::BindingMismatch(
+                "metal: texture data size overflow".into(),
+            ))
+        })?;
+        if data.len() < total {
+            return Err(UsageError::BindingMismatch(
+                "metal: texture data shorter than all its layers".into(),
+            )
+            .into());
+        }
         for layer in 0..layers {
             let start = layer as usize * layer_bytes;
-            let Some(chunk) = data.get(start..start + layer_bytes) else {
-                if layer == 0 {
-                    return Err(GpuError::Backend(
-                        "metal: texture data shorter than the texture".into(),
-                    ));
-                }
-                break;
-            };
+            let chunk = &data[start..start + layer_bytes];
             let region = TextureRegion {
                 layer,
                 ..TextureRegion::rect(0, 0, desc.width, desc.height)
@@ -925,6 +895,24 @@ impl GpuDevice for MetalDevice {
     }
 
     fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        if writes.is_empty() {
+            return Err(UsageError::BindingMismatch(
+                "metal: write_textures needs at least one write".into(),
+            )
+            .into());
+        }
+        // Validate the whole batch before allocating staging or submitting a copy.
+        for w in writes {
+            let (_, desc) = self.texture(w.texture)?;
+            let layout = transfer::texture_layout(
+                &desc,
+                w.region,
+                w.bytes_per_row,
+                TextureUsage::TRANSFER_DST,
+                false,
+            )?;
+            transfer::data_len(&layout, w.data.len() as u64)?;
+        }
         let mut cmds = Vec::new();
         for w in writes {
             if let Some(cmd) = self.queue_region(w.texture, w.region, w.data, w.bytes_per_row)? {
@@ -942,16 +930,30 @@ impl GpuDevice for MetalDevice {
         texture: TextureHandle,
         region: TextureRegion,
     ) -> Result<Submission> {
-        let src = self.buffer(buffer)?;
-        let (tex, _) = self.texture(texture)?;
+        let (tex, desc) = self.texture(texture)?;
+        let layout = transfer::texture_layout(
+            &desc,
+            region,
+            bytes_per_row,
+            TextureUsage::TRANSFER_DST,
+            false,
+        )?;
+        let src = {
+            let buffers = lock(&self.inner.buffers)?;
+            let b = buffers
+                .get(buffer)
+                .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))?;
+            transfer::buffer_range(&layout, b.size, b.usage, offset, BufferUsage::TRANSFER_SRC)?;
+            b.buf.clone()
+        };
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
             let blit = cmd.new_blit_command_encoder();
             blit.copy_from_buffer_to_texture(
                 &src,
                 offset,
-                u64::from(bytes_per_row),
-                u64::from(bytes_per_row) * u64::from(region.height),
+                u64::from(layout.row_bytes),
+                layout.image_bytes,
                 MTLSize::new(u64::from(region.width), u64::from(region.height), 1),
                 &tex,
                 u64::from(region.layer),
@@ -978,15 +980,21 @@ impl GpuDevice for MetalDevice {
         bytes_per_row: u32,
     ) -> Result<Submission> {
         let (tex, desc) = self.texture(texture)?;
-        {
+        let layout = transfer::texture_layout(
+            &desc,
+            region,
+            bytes_per_row,
+            TextureUsage::TRANSFER_SRC,
+            false,
+        )?;
+        let dst = {
             let buffers = lock(&self.inner.buffers)?;
             let b = buffers
                 .get(buffer)
                 .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))?;
-            let row = u64::from(bytes_per_row.max(region.width * desc.format.bytes_per_texel()));
-            Self::in_bounds(offset, row * u64::from(region.height), b.size)?;
-        }
-        let dst = self.buffer(buffer)?;
+            transfer::buffer_range(&layout, b.size, b.usage, offset, BufferUsage::TRANSFER_DST)?;
+            b.buf.clone()
+        };
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
             let blit = cmd.new_blit_command_encoder();
@@ -1002,8 +1010,8 @@ impl GpuDevice for MetalDevice {
                 MTLSize::new(u64::from(region.width), u64::from(region.height), 1),
                 &dst,
                 offset,
-                u64::from(bytes_per_row),
-                u64::from(bytes_per_row) * u64::from(region.height),
+                u64::from(layout.row_bytes),
+                layout.image_bytes,
                 MTLBlitOption::empty(),
             );
             blit.end_encoding();
