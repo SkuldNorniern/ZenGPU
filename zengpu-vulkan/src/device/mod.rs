@@ -61,6 +61,9 @@ const SSBO_BINDING_U32: u32 = 2;
 /// Bindless SSBO table for `buffer<i32>`, same slot indices as the f32 table.
 const SSBO_BINDING_I32: u32 = 3;
 
+/// Storage-image table: each `STORAGE` texture's mip 0, in `GENERAL` layout, at its own slot.
+const STORAGE_IMAGE_BINDING: u32 = 4;
+
 /// SSBO tables sharing the storage-buffer budget (`f32`/`u32`/`i32`). Append-only: new tables take
 /// new binding numbers, no renumbering.
 const SSBO_TYPED_TABLE_COUNT: u32 = 3;
@@ -75,6 +78,8 @@ struct BindlessState {
     set: vk::DescriptorSet,
     buffer_capacity: u32,
     texture_capacity: u32,
+    /// Storage-image table slots; 0 if compute cannot store to images.
+    storage_capacity: u32,
     bound_textures: Mutex<Vec<bool>>,
 }
 
@@ -386,6 +391,8 @@ pub(crate) struct VulkanRenderTarget {
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub layout: vk::ImageLayout,
+    /// Layout after `sample_after`: the texture's resting layout.
+    pub resting: vk::ImageLayout,
 }
 
 pub(crate) struct VulkanQueryPool {
@@ -507,12 +514,39 @@ pub(crate) struct VulkanTexture {
     pub array_layers: u32,
     pub usage: vk::ImageUsageFlags,
     pub texel_bytes: u32,
-    /// Per array layer, one bit per mip level that holds texels and is in the sampled layout. A
-    /// partial write to a level that is not ready leaves the rest of that level undefined.
+    /// Per array layer, one bit per mip that holds texels in the resting layout. A partial write to
+    /// a level not ready leaves the rest undefined.
     pub ready: Vec<u32>,
+    /// Resting layout between operations: `SHADER_READ_ONLY_OPTIMAL` if only sampled, else
+    /// `GENERAL` (storage is written while others sample; read-only needs `SAMPLED` usage).
+    pub resting: vk::ImageLayout,
+    /// Mip 0 view for the storage-image table, when `view` has more levels than a storage
+    /// descriptor takes. Else null.
+    pub storage_view: vk::ImageView,
 }
 
 impl VulkanTexture {
+    pub(crate) fn resting_layout(usage: vk::ImageUsageFlags) -> vk::ImageLayout {
+        if usage.contains(vk::ImageUsageFlags::SAMPLED)
+            && !usage.contains(vk::ImageUsageFlags::STORAGE)
+        {
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+        } else {
+            vk::ImageLayout::GENERAL
+        }
+    }
+
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            if self.storage_view != vk::ImageView::null() {
+                device.destroy_image_view(self.storage_view, None);
+            }
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+
     pub(crate) fn is_ready(&self, mip_level: u32, layer: u32) -> bool {
         self.ready
             .get(layer as usize)
@@ -552,11 +586,7 @@ fn destroy_deferred_vulkan(
                 buffers.lock().unwrap().release_retired(index);
             }
             DeferredVulkanResource::Texture(index, texture) => {
-                unsafe {
-                    inner.device.destroy_image_view(texture.view, None);
-                    inner.device.destroy_image(texture.image, None);
-                    inner.device.free_memory(texture.memory, None);
-                }
+                unsafe { texture.destroy(&inner.device) };
                 textures.lock().unwrap().release_retired(index);
             }
             DeferredVulkanResource::Sampler(index, sampler) => {
@@ -764,6 +794,16 @@ impl VulkanDevice {
         }
 
         let supported_features = supported_features2.features;
+        let storage_images = supported_features.shader_storage_image_read_without_format
+            == vk::TRUE
+            && supported_features.shader_storage_image_write_without_format == vk::TRUE
+            && supported_features.shader_storage_image_array_dynamic_indexing == vk::TRUE
+            && supported_desc_idx.descriptor_binding_storage_image_update_after_bind == vk::TRUE;
+        let mut device_limits = device_limits;
+        if !storage_images {
+            device_limits.max_storage_textures = 0;
+        }
+        let on = |enabled: bool| if enabled { vk::TRUE } else { vk::FALSE };
         let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
         let fill_mode_non_solid =
             needs_graphics && supported_features.fill_mode_non_solid == vk::TRUE;
@@ -782,6 +822,7 @@ impl VulkanDevice {
             shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
             descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
             descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
+            descriptor_binding_storage_image_update_after_bind: on(storage_images),
             descriptor_binding_partially_bound: vk::TRUE,
             runtime_descriptor_array: vk::TRUE,
             ..Default::default()
@@ -807,6 +848,9 @@ impl VulkanDevice {
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {
                 shader_sampled_image_array_dynamic_indexing: vk::TRUE,
+                shader_storage_image_array_dynamic_indexing: on(storage_images),
+                shader_storage_image_read_without_format: on(storage_images),
+                shader_storage_image_write_without_format: on(storage_images),
                 dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
                 fill_mode_non_solid: if fill_mode_non_solid {
                     vk::TRUE
@@ -1026,7 +1070,7 @@ impl VulkanDevice {
     }
 }
 
-fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
+fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32, u32)> {
     let total = limits.max_update_after_bind_descriptors;
     let buffer_capacity = MAX_BINDLESS_BUFFERS
         .min(limits.max_storage_buffers / SSBO_TYPED_TABLE_COUNT)
@@ -1040,12 +1084,15 @@ fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32)> {
             limits.max_storage_buffers, limits.max_sampled_textures
         )));
     }
-    Ok((buffer_capacity, texture_capacity))
+    let storage_capacity = MAX_BINDLESS_TEXTURES
+        .min(limits.max_storage_textures)
+        .min(total - buffer_capacity * SSBO_TYPED_TABLE_COUNT - texture_capacity);
+    Ok((buffer_capacity, texture_capacity, storage_capacity))
 }
 
 fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
-    let (buffer_capacity, texture_capacity) = bindless_capacities(limits)?;
-    let bindings = [
+    let (buffer_capacity, texture_capacity, storage_capacity) = bindless_capacities(limits)?;
+    let mut bindings = vec![
         vk::DescriptorSetLayoutBinding {
             binding: SSBO_BINDING_F32,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
@@ -1075,8 +1122,20 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
             ..Default::default()
         },
     ];
-    let binding_flags = [vk::DescriptorBindingFlags::PARTIALLY_BOUND
-        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND; 4];
+    if storage_capacity != 0 {
+        bindings.push(vk::DescriptorSetLayoutBinding {
+            binding: STORAGE_IMAGE_BINDING,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: storage_capacity,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        });
+    }
+    let binding_flags = vec![
+        vk::DescriptorBindingFlags::PARTIALLY_BOUND
+            | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND;
+        bindings.len()
+    ];
     let mut flags_info = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
         binding_count: binding_flags.len() as u32,
         p_binding_flags: binding_flags.as_ptr(),
@@ -1096,7 +1155,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         .map_err(|e| GpuError::Backend(format!("bindless layout: {e}")))?
     };
 
-    let pool_sizes = [
+    let mut pool_sizes = vec![
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: buffer_capacity * SSBO_TYPED_TABLE_COUNT,
@@ -1106,6 +1165,12 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
             descriptor_count: texture_capacity,
         },
     ];
+    if storage_capacity != 0 {
+        pool_sizes.push(vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_IMAGE,
+            descriptor_count: storage_capacity,
+        });
+    }
     let pool = unsafe {
         dev.create_descriptor_pool(
             &vk::DescriptorPoolCreateInfo {
@@ -1143,6 +1208,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         set,
         buffer_capacity,
         texture_capacity,
+        storage_capacity,
         bound_textures: Mutex::new(vec![false; texture_capacity as usize]),
     })
 }
@@ -1298,11 +1364,7 @@ impl Drop for VulkanDevice {
         }
         let mut textures = self.textures.lock().unwrap();
         for tex in textures.drain() {
-            unsafe {
-                self.inner.device.destroy_image_view(tex.view, None);
-                self.inner.device.destroy_image(tex.image, None);
-                self.inner.device.free_memory(tex.memory, None);
-            }
+            unsafe { tex.destroy(&self.inner.device) };
         }
         let mut samplers = self.samplers.lock().unwrap();
         for s in samplers.drain() {
@@ -2342,7 +2404,13 @@ mod tests {
             max_update_after_bind_descriptors: 12,
             ..Default::default()
         };
-        assert_eq!(bindless_capacities(limits).unwrap(), (3, 3));
+        assert_eq!(bindless_capacities(limits).unwrap(), (3, 3, 0));
+        let roomy = DeviceLimits {
+            max_storage_textures: 64,
+            max_update_after_bind_descriptors: 1000,
+            ..limits
+        };
+        assert_eq!(bindless_capacities(roomy).unwrap(), (5, 8, 64));
         assert!(
             bindless_capacities(DeviceLimits {
                 max_storage_buffers: 1,
@@ -3000,6 +3068,137 @@ mod tests {
         dev.destroy_buffer(readback);
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
+    }
+
+    #[test]
+    fn compute_chains_texture_passes_in_one_submission() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const INVERT: ZslShader = zsl!(
+            push P { w: u32, h: u32 }
+            @workgroup_size(8, 8)
+            kernel invert(src: texture, dst: image, p: P, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < p.w && y < p.h {
+                    dst.store(x, y, 1.0 - src.load(x, y).r, 1.0 - src.load(x, y).g, 1.0 - src.load(x, y).b, src.load(x, y).a)
+                }
+            }
+        );
+        const COMBINE: ZslShader = zsl!(
+            @workgroup_size(8, 8)
+            kernel combine(inv: image, smooth: texture, out: image, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < out.width() && y < out.height() {
+                    let u = (x + 0.5) / out.width()
+                    let v = (y + 0.5) / out.height()
+                    let r = (inv.load(x, y).r + smooth.sample(u, v).r) * 0.5
+                    out.store(x, y, r, inv.load(x, y).g, smooth.sample_level(u, v, 0.0).b, 1.0)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        if vk_dev.limits().max_storage_textures == 0 {
+            return;
+        }
+        let pipeline = |shader: &ZslShader| {
+            let shader = dev.create_shader(shader.spirv_desc()).unwrap();
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [8, 8, 1],
+            })
+            .unwrap()
+        };
+        let (invert, combine) = (pipeline(&INVERT), pipeline(&COMBINE));
+        let (w, h) = (5u32, 3u32);
+        let texture = |format: Format, usage: TextureUsage| {
+            dev.create_texture(TextureDesc {
+                width: w,
+                height: h,
+                depth: 1,
+                format,
+                usage,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+        };
+        let src = texture(
+            Format::Rgba8Unorm,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        )
+        .unwrap();
+        let mid = texture(
+            Format::Rgba16Float,
+            TextureUsage::STORAGE | TextureUsage::SAMPLED,
+        )
+        .unwrap();
+        let out = texture(
+            Format::Rgba32Float,
+            TextureUsage::STORAGE | TextureUsage::TRANSFER_SRC,
+        )
+        .unwrap();
+        let texels: Vec<u8> = (0..w * h * 4).map(|i| (i * 13 % 256) as u8).collect();
+        dev.upload_texture_data(src, &texels).unwrap();
+        let nearest = dev.create_sampler(SamplerDesc::default()).unwrap();
+        let src_slot = vk_dev.bind_texture(src, nearest).unwrap();
+        let mid_slot = vk_dev.bind_texture(mid, nearest).unwrap();
+
+        let ops = [
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline: invert,
+                bindings: Bindings {
+                    buffers: &[],
+                    textures: &[src_slot],
+                    images: &[mid.index()],
+                    scalars: &[Scalar::U32(w), Scalar::U32(h)],
+                },
+                grid: [1, 1, 1],
+            }),
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline: combine,
+                bindings: Bindings {
+                    buffers: &[],
+                    textures: &[mid_slot],
+                    images: &[mid.index(), out.index()],
+                    scalars: &[],
+                },
+                grid: [1, 1, 1],
+            }),
+        ];
+        dev.submit_compute_ops(1, &ops)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+
+        let got = read_texels(vk_dev, out, Format::Rgba32Float, w, h);
+        for (i, (texel, src)) in got.iter().zip(texels.chunks_exact(4)).enumerate() {
+            let inv = |c: u8| 1.0 - f32::from(c) / 255.0;
+            let want = [inv(src[0]), inv(src[1]), inv(src[2]), 1.0];
+            for (g, w) in texel.iter().zip(want) {
+                assert!((g - w).abs() < 2e-3, "texel {i}: {texel:?} != {want:?}");
+            }
+        }
+
+        let not_storage = Bindings {
+            buffers: &[],
+            textures: &[src_slot],
+            images: &[src.index()],
+            scalars: &[Scalar::U32(w), Scalar::U32(h)],
+        };
+        assert!(dev.dispatch(invert, not_storage, [1, 1, 1]).is_err());
+        assert!(
+            texture(
+                Format::Rgba8Unorm,
+                TextureUsage::STORAGE | TextureUsage::RENDER_TARGET
+            )
+            .is_err()
+        );
     }
 
     #[test]

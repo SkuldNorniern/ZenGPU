@@ -401,6 +401,32 @@ impl GpuDevice for VulkanDevice {
                 format!("TexDim::Cube requires array_layers == 6, got {array_layers}"),
             )));
         }
+        let storage = desc.usage.contains(TextureUsage::STORAGE);
+        if storage {
+            if desc.dimension != TexDim::D2 || array_layers != 1 {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "a STORAGE texture must be 2D with one layer".into(),
+                )));
+            }
+            if desc.usage.contains(TextureUsage::RENDER_TARGET)
+                || desc.usage.contains(TextureUsage::DEPTH_STENCIL)
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    "a STORAGE texture cannot also be drawn into".into(),
+                )));
+            }
+            if self.bindless.storage_capacity == 0 {
+                return Err(GpuError::Unsupported(
+                    "this device cannot store to textures from compute".into(),
+                ));
+            }
+            if !self.format_caps(desc.format).storage {
+                return Err(GpuError::Unsupported(format!(
+                    "{:?} cannot be a storage texture on this device",
+                    desc.format
+                )));
+            }
+        }
 
         let format = hal_format_to_vk(desc.format);
         let mut usage = vk::ImageUsageFlags::empty();
@@ -523,7 +549,37 @@ impl GpuDevice for VulkanDevice {
                 }
             }
         };
-        Ok(self.textures.lock().unwrap().insert(VulkanTexture {
+        let storage_view = if storage && mip_levels > 1 {
+            unsafe {
+                match self.inner.device.create_image_view(
+                    &vk::ImageViewCreateInfo {
+                        image,
+                        view_type: vk::ImageViewType::TYPE_2D,
+                        format,
+                        subresource_range: vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        ..Default::default()
+                    },
+                    None,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.inner.device.destroy_image_view(view, None);
+                        self.inner.device.destroy_image(image, None);
+                        self.inner.device.free_memory(memory, None);
+                        return Err(GpuError::Backend(format!("vkCreateImageView: {e}")));
+                    }
+                }
+            }
+        } else {
+            vk::ImageView::null()
+        };
+        let handle = self.textures.lock().unwrap().insert(VulkanTexture {
             image,
             view,
             memory,
@@ -538,7 +594,14 @@ impl GpuDevice for VulkanDevice {
             usage,
             texel_bytes: desc.format.bytes_per_texel(),
             ready: vec![0; array_layers as usize],
-        }))
+            resting: VulkanTexture::resting_layout(usage),
+            storage_view,
+        });
+        if storage && let Err(e) = self.init_storage_texture(handle) {
+            self.destroy_texture(handle);
+            return Err(e);
+        }
+        Ok(handle)
     }
 
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
@@ -626,11 +689,7 @@ impl GpuDevice for VulkanDevice {
             bound_textures[texture.index() as usize] = false;
         }
         if let Some(tex) = tex {
-            unsafe {
-                self.inner.device.destroy_image_view(tex.view, None);
-                self.inner.device.destroy_image(tex.image, None);
-                self.inner.device.free_memory(tex.memory, None);
-            }
+            unsafe { tex.destroy(&self.inner.device) };
         }
     }
 
@@ -918,21 +977,7 @@ impl GpuDevice for VulkanDevice {
                         }));
                     }
                 }
-                for &idx in op.bindings.textures {
-                    if idx >= self.bindless.texture_capacity {
-                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                            format!(
-                                "texture binding index {idx} exceeds bindless capacity {}",
-                                self.bindless.texture_capacity
-                            ),
-                        )));
-                    }
-                    if textures.get_by_slot_index(idx).is_none() || !bound_textures[idx as usize] {
-                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                            format!("texture binding index {idx} is not live and bound"),
-                        )));
-                    }
-                }
+                self.check_texel_bindings(&op.bindings, &textures, &bound_textures)?;
                 let p = pipelines
                     .get(op.pipeline)
                     .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
@@ -945,29 +990,7 @@ impl GpuDevice for VulkanDevice {
                     }
                 };
 
-                let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
-                let mut pc_len = 0usize;
-                let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
-                    if pc_len + 4 > pc.len() {
-                        return Err(GpuError::Dispatch(format!(
-                            "push constants exceed {} bytes",
-                            pc.len()
-                        )));
-                    }
-                    pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
-                    pc_len += 4;
-                    Ok(())
-                };
-                for &idx in op.bindings.buffers {
-                    push_pc(idx.to_ne_bytes())?;
-                }
-                for scalar in op.bindings.scalars {
-                    push_pc(match scalar {
-                        Scalar::U32(v) => v.to_ne_bytes(),
-                        Scalar::I32(v) => v.to_ne_bytes(),
-                        Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-                    })?;
-                }
+                let (pc, pc_len) = dispatch::push_constants(&op.bindings)?;
 
                 out.push((vk_pipeline, vk_layout, pc, pc_len, op.grid));
             }

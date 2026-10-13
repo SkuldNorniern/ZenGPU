@@ -86,6 +86,7 @@ const PENDING: u64 = u64::MAX;
 
 struct Placed {
     image: vk::Image,
+    resting: vk::ImageLayout,
     region: TextureRegion,
     was_ready: bool,
     offset: u64,
@@ -129,8 +130,10 @@ impl VulkanDevice {
         let mut at = base;
         for (write, size) in writes.iter().zip(sizes) {
             self.copy_rows_into(staging, at, write)?;
+            let (image, resting) = self.image_of(write.texture)?;
             placed.push(Placed {
-                image: self.image_of(write.texture)?,
+                image,
+                resting,
                 region: write.region,
                 was_ready: self.is_ready(write.texture, write.region),
                 offset: at,
@@ -158,8 +161,10 @@ impl VulkanDevice {
         let row_texels = rows_in_texels(bytes_per_row, region.width, texel)?;
         let span = span_bytes(region, bytes_per_row, texel);
         self.check_buffer(buffer, offset, span, BufferUsage::TRANSFER_SRC)?;
+        let (image, resting) = self.image_of(texture)?;
         let placed = [Placed {
-            image: self.image_of(texture)?,
+            image,
+            resting,
             region,
             was_ready: self.is_ready(texture, region),
             offset,
@@ -195,12 +200,12 @@ impl VulkanDevice {
         let row_texels = rows_in_texels(bytes_per_row, region.width, texel)?;
         let span = span_bytes(region, bytes_per_row, texel);
         self.check_buffer(buffer, offset, span, BufferUsage::TRANSFER_DST)?;
-        let image = self.image_of(texture)?;
+        let (image, resting) = self.image_of(texture)?;
         let was_ready = self.is_ready(texture, region);
         let vk_buffer = self.vk_buffer(buffer)?;
         let (submission, _) = self.one_shot_submit_tracked(0, &[buffer.index()], |dev, cmd| {
             let from = if was_ready {
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                resting
             } else {
                 vk::ImageLayout::UNDEFINED
             };
@@ -220,10 +225,7 @@ impl VulkanDevice {
                     &[buffer_image_copy(region, offset, row_texels)],
                 );
             }
-            let back = (
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
+            let back = (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, resting);
             image_barrier(dev, cmd, image, region, back);
             memory_barrier(
                 dev,
@@ -344,11 +346,11 @@ impl VulkanDevice {
             .ok_or_else(stale_texture)
     }
 
-    fn image_of(&self, texture: TextureHandle) -> Result<vk::Image> {
+    fn image_of(&self, texture: TextureHandle) -> Result<(vk::Image, vk::ImageLayout)> {
         let textures = self.textures.lock().unwrap();
         textures
             .get(texture)
-            .map(|tex| tex.image)
+            .map(|tex| (tex.image, tex.resting))
             .ok_or_else(stale_texture)
     }
 
@@ -559,7 +561,7 @@ fn record_buffer_to_images(
 ) {
     for p in placed {
         let from = if p.was_ready {
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            p.resting
         } else {
             vk::ImageLayout::UNDEFINED
         };
@@ -579,10 +581,7 @@ fn record_buffer_to_images(
                 &[buffer_image_copy(p.region, p.offset, p.row_texels)],
             );
         }
-        let back = (
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        );
+        let back = (vk::ImageLayout::TRANSFER_DST_OPTIMAL, p.resting);
         image_barrier(dev, cmd, p.image, p.region, back);
     }
 }

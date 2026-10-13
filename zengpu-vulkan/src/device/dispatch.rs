@@ -341,16 +341,7 @@ impl VulkanDevice {
                             }));
                         }
                     }
-                    for &idx in op.bindings.textures {
-                        if idx >= self.bindless.texture_capacity
-                            || textures.get_by_slot_index(idx).is_none()
-                            || !bound_textures[idx as usize]
-                        {
-                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                format!("texture binding index {idx} is not live and bound"),
-                            )));
-                        }
-                    }
+                    self.check_texel_bindings(&op.bindings, &textures, &bound_textures)?;
                     let (pipeline, layout) = match pipelines
                         .get(op.pipeline)
                         .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?
@@ -362,24 +353,7 @@ impl VulkanDevice {
                             ));
                         }
                     };
-                    let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
-                    let mut pc_len = 0usize;
-                    for bytes in op.bindings.buffers.iter().map(|v| v.to_ne_bytes()).chain(
-                        op.bindings.scalars.iter().map(|scalar| match scalar {
-                            Scalar::U32(v) => v.to_ne_bytes(),
-                            Scalar::I32(v) => v.to_ne_bytes(),
-                            Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-                        }),
-                    ) {
-                        if pc_len + 4 > pc.len() {
-                            return Err(GpuError::Dispatch(format!(
-                                "push constants exceed {} bytes",
-                                pc.len()
-                            )));
-                        }
-                        pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
-                        pc_len += 4;
-                    }
+                    let (pc, pc_len) = push_constants(&op.bindings)?;
                     resolved.push(ResolvedOp::Dispatch {
                         pipeline,
                         layout,
@@ -538,21 +512,7 @@ impl VulkanDevice {
                         }));
                     }
                 }
-                for &idx in op.bindings.textures {
-                    if idx >= self.bindless.texture_capacity {
-                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                            format!(
-                                "texture binding index {idx} exceeds bindless capacity {}",
-                                self.bindless.texture_capacity
-                            ),
-                        )));
-                    }
-                    if textures.get_by_slot_index(idx).is_none() || !bound_textures[idx as usize] {
-                        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                            format!("texture binding index {idx} is not live and bound"),
-                        )));
-                    }
-                }
+                self.check_texel_bindings(&op.bindings, &textures, &bound_textures)?;
                 let p = pipelines
                     .get(op.pipeline)
                     .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
@@ -565,29 +525,7 @@ impl VulkanDevice {
                     }
                 };
 
-                let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
-                let mut pc_len = 0usize;
-                let mut push_pc = |bytes: [u8; 4]| -> Result<()> {
-                    if pc_len + 4 > pc.len() {
-                        return Err(GpuError::Dispatch(format!(
-                            "push constants exceed {} bytes",
-                            pc.len()
-                        )));
-                    }
-                    pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
-                    pc_len += 4;
-                    Ok(())
-                };
-                for &idx in op.bindings.buffers {
-                    push_pc(idx.to_ne_bytes())?;
-                }
-                for scalar in op.bindings.scalars {
-                    push_pc(match scalar {
-                        Scalar::U32(v) => v.to_ne_bytes(),
-                        Scalar::I32(v) => v.to_ne_bytes(),
-                        Scalar::F32(v) => v.to_bits().to_ne_bytes(),
-                    })?;
-                }
+                let (pc, pc_len) = push_constants(&op.bindings)?;
                 out.push((vk_pipeline, vk_layout, pc, pc_len, op.grid));
             }
             out
@@ -660,6 +598,74 @@ impl VulkanDevice {
             self.bindless.set,
         ))
     }
+}
+
+impl VulkanDevice {
+    pub(super) fn check_texel_bindings(
+        &self,
+        bindings: &Bindings<'_>,
+        textures: &SlotMap<marker::Texture, VulkanTexture>,
+        bound_textures: &[bool],
+    ) -> Result<()> {
+        for &idx in bindings.textures {
+            if idx >= self.bindless.texture_capacity
+                || textures.get_by_slot_index(idx).is_none()
+                || !bound_textures[idx as usize]
+            {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!("texture binding index {idx} is not live and bound"),
+                )));
+            }
+        }
+        for &idx in bindings.images {
+            let texture = textures
+                .get_by_slot_index(idx)
+                .filter(|_| idx < self.bindless.storage_capacity)
+                .ok_or_else(|| {
+                    GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                        "image binding index {idx} is not a live texture"
+                    )))
+                })?;
+            if !texture.usage.contains(vk::ImageUsageFlags::STORAGE) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "bound image",
+                    needed: "STORAGE",
+                }));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Push-constant layout that ZSL kernels expect: buffers, textures, images, then scalars, 4
+/// bytes each.
+pub(super) fn push_constants(
+    bindings: &Bindings<'_>,
+) -> Result<([u8; COMPUTE_PUSH_CONSTANT_BYTES], usize)> {
+    let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];
+    let mut pc_len = 0usize;
+    let slots = bindings
+        .buffers
+        .iter()
+        .chain(bindings.textures)
+        .chain(bindings.images)
+        .map(|v| v.to_ne_bytes());
+    let scalars = bindings.scalars.iter().map(|scalar| match scalar {
+        Scalar::U32(v) => v.to_ne_bytes(),
+        Scalar::I32(v) => v.to_ne_bytes(),
+        Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+    });
+    for bytes in slots.chain(scalars) {
+        if pc_len + 4 > pc.len() {
+            return Err(GpuError::Dispatch(format!(
+                "push constants exceed {} bytes",
+                pc.len()
+            )));
+        }
+        pc[pc_len..pc_len + 4].copy_from_slice(&bytes);
+        pc_len += 4;
+    }
+    Ok((pc, pc_len))
 }
 
 /// Buffers a mixed batch reads or writes, by bindless index: dispatch bindings and both ends of

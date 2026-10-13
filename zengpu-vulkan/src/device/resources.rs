@@ -1,28 +1,27 @@
 use super::*;
 
 impl VulkanDevice {
-    /// Register `texture` (sampled with `sampler`) in the bindless combined-image-sampler table, at
-    /// its own slot index, for use as a [`Bindings::textures`] index in
-    /// [`RenderCommands::bind`](zengpu_hal::RenderCommands::bind). The descriptor declares
-    /// `SHADER_READ_ONLY_OPTIMAL`, so the image must be in that layout when sampled. That holds
-    /// after [`GpuDevice::upload_texture_data`], or after a pass with
-    /// [`zengpu_hal::ColorAttachment::sample_after`] for a render target.
+    /// Registers `texture` in the combined-image-sampler table at its own slot,
+    /// for `Bindings::textures`.
     ///
-    /// The guarantee covers same-device, same-queue ordering only. There is no cross-submission
-    /// semaphore or fence here. External queues, other devices and out-of-order submission need
-    /// caller-managed sync.
+    /// The image must be in the layout the descriptor declares (`SHADER_READ_ONLY_OPTIMAL`,
+    /// or `GENERAL` for `STORAGE`) when sampled: after `upload_texture_data`, or a render
+    /// pass with `sample_after`.
+    ///
+    /// Readiness covers same-device, same-queue ordering only. There is no cross-submission
+    /// semaphore: external queues and other devices need caller sync.
     pub fn bind_texture(&self, texture: TextureHandle, sampler: SamplerHandle) -> Option<u32> {
         if texture.index() >= self.bindless.texture_capacity {
             return None;
         }
         let textures = self.textures.lock().unwrap();
-        let view = textures.get(texture)?.view;
+        let (view, layout) = textures.get(texture).map(|t| (t.view, t.resting))?;
         let samplers = self.samplers.lock().unwrap();
         let vk_sampler = *samplers.get(sampler)?;
         let info = vk::DescriptorImageInfo {
             sampler: vk_sampler,
             image_view: view,
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            image_layout: layout,
         };
         let write = vk::WriteDescriptorSet {
             dst_set: self.bindless.set,
@@ -38,6 +37,92 @@ impl VulkanDevice {
         }
         self.bindless.bound_textures.lock().unwrap()[texture.index() as usize] = true;
         Some(texture.index())
+    }
+
+    /// Shader stages an upload hands its texels to: compute, plus fragment when the queue draws.
+    fn shader_stages(&self) -> vk::PipelineStageFlags {
+        if self.inner.graphics {
+            vk::PipelineStageFlags::FRAGMENT_SHADER | vk::PipelineStageFlags::COMPUTE_SHADER
+        } else {
+            vk::PipelineStageFlags::COMPUTE_SHADER
+        }
+    }
+
+    /// Moves a new `STORAGE` texture to `GENERAL` (where it stays) and registers its mip 0 in the
+    /// storage-image table. Contents start undefined.
+    pub(super) fn init_storage_texture(&self, texture: TextureHandle) -> Result<()> {
+        if texture.index() >= self.bindless.storage_capacity {
+            return Err(GpuError::Unsupported(format!(
+                "the storage-image table holds {} textures",
+                self.bindless.storage_capacity
+            )));
+        }
+        let (image, view, levels) = {
+            let textures = self.textures.lock().unwrap();
+            let tex = textures.get(texture).ok_or_else(|| {
+                GpuError::Backend("init_storage_texture: stale texture handle".to_string())
+            })?;
+            let view = if tex.storage_view == vk::ImageView::null() {
+                tex.view
+            } else {
+                tex.storage_view
+            };
+            (tex.image, view, tex.mip_levels)
+        };
+        self.one_shot_submit(|dev, cmd| {
+            let to_general = vk::ImageMemoryBarrier {
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::GENERAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: levels,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                ..Default::default()
+            };
+            unsafe {
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_general],
+                );
+            }
+            Ok(())
+        })?;
+        let info = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::GENERAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: STORAGE_IMAGE_BINDING,
+            dst_array_element: texture.index(),
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        if let Some(tex) = self.textures.lock().unwrap().get_mut(texture) {
+            for mip in 0..levels {
+                tex.mark_ready(mip, 0);
+            }
+        }
+        Ok(())
     }
 
     /// Register a `STORAGE` buffer in every SSBO table, at its slot index. Called
@@ -184,7 +269,7 @@ impl VulkanDevice {
             let tex = textures.get(texture).ok_or_else(|| {
                 GpuError::Backend("upload_texture_data: stale texture handle".to_string())
             })?;
-            (tex.image, tex.extent, tex.depth)
+            ((tex.image, tex.resting), tex.extent, tex.depth)
         };
         let mip_width = (extent.width >> mip_level).max(1);
         let mip_height = (extent.height >> mip_level).max(1);
@@ -215,7 +300,7 @@ impl VulkanDevice {
     fn upload_through(
         &self,
         staging: BufferHandle,
-        image: vk::Image,
+        (image, resting): (vk::Image, vk::ImageLayout),
         mip_level: u32,
         layer: u32,
         data: &[u8],
@@ -230,6 +315,7 @@ impl VulkanDevice {
             })?
         };
 
+        let shader_stages = self.shader_stages();
         self.one_shot_submit(|dev, cmd| {
             let to_transfer = vk::ImageMemoryBarrier {
                 old_layout: vk::ImageLayout::UNDEFINED,
@@ -284,7 +370,7 @@ impl VulkanDevice {
             }
             let to_shader = vk::ImageMemoryBarrier {
                 old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                new_layout: resting,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 image,
@@ -303,7 +389,7 @@ impl VulkanDevice {
                 dev.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    shader_stages,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
@@ -316,7 +402,7 @@ impl VulkanDevice {
 
     /// Mip chain from the base level by sequential blits, each level half the last.
     pub(crate) fn generate_mipmaps_impl(&self, texture: TextureHandle) -> Result<()> {
-        let (image, extent, depth, mip_levels, array_layers) = {
+        let (image, extent, depth, mip_levels, array_layers, resting) = {
             let textures = self.textures.lock().unwrap();
             let tex = textures.get(texture).ok_or_else(|| {
                 GpuError::Backend("generate_mipmaps: stale texture handle".to_string())
@@ -327,12 +413,14 @@ impl VulkanDevice {
                 tex.depth,
                 tex.mip_levels,
                 tex.array_layers,
+                tex.resting,
             )
         };
         if mip_levels < 2 {
             return Ok(());
         }
 
+        let shader_stages = self.shader_stages();
         self.one_shot_submit(|dev, cmd| {
             let mut mip_width = extent.width as i32;
             let mut mip_height = extent.height as i32;
@@ -428,7 +516,7 @@ impl VulkanDevice {
                 }
                 let src_to_shader = vk::ImageMemoryBarrier {
                     old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    new_layout: resting,
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     image,
@@ -447,7 +535,7 @@ impl VulkanDevice {
                     dev.cmd_pipeline_barrier(
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        shader_stages,
                         vk::DependencyFlags::empty(),
                         &[],
                         &[],
@@ -462,7 +550,7 @@ impl VulkanDevice {
 
             let last_to_shader = vk::ImageMemoryBarrier {
                 old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                new_layout: resting,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 image,
@@ -481,7 +569,7 @@ impl VulkanDevice {
                 dev.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    shader_stages,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
