@@ -301,6 +301,57 @@ mod tests {
         let result: &[f32] = unsafe { from_raw_parts(out.as_ptr() as *const f32, n) };
         assert_eq!(result, &[11.0, 22.0, 33.0, 44.0]);
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn texture_readback_completes_when_waited_on() {
+        use std::time::Duration;
+        use zengpu_hal::{
+            BufferUsage, Format, MemoryUsage, SubmissionStatus, TexDim, TextureDesc, TextureRegion,
+            TextureUsage, TextureWrite,
+        };
+        let Some(dev) = open_metal() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let texels = [7u8; 16];
+        let region = TextureRegion::rect(0, 0, 2, 2);
+        let write = TextureWrite {
+            texture: tex,
+            region,
+            data: &texels,
+            bytes_per_row: 8,
+        };
+        dev.write_textures(&[write])
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        let copy = dev
+            .copy_texture_region_to_buffer(tex, region, buf, 0, 8)
+            .unwrap();
+        copy.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(copy.poll().unwrap(), SubmissionStatus::Complete);
+        let mut out = [0u8; 16];
+        dev.read_buffer_into(buf, 0, &mut out).unwrap();
+        assert_eq!(out, texels);
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -142,20 +142,23 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::Unsupported("buffer-to-texture copy".into()))
     }
 
-    /// Copies `region` of `texture` into `buffer` at `offset`, rows `bytes_per_row` apart, on the
-    /// device. `buffer` needs [`crate::BufferUsage::TRANSFER_DST`], and
-    /// [`crate::BufferUsage::READBACK`] to read it on the host once the submission completes.
+    /// Copies `region` of `texture` into `buffer`, starting `offset` bytes
+    /// in, rows `bytes_per_row` apart, on the device. `buffer` needs
+    /// [`crate::BufferUsage::TRANSFER_DST`], and
+    /// [`crate::BufferUsage::READBACK`] to be read on the host once the
+    /// submission completes.
     ///
     /// Reading back without stalling a frame:
     ///
     /// 1. Create the buffer once, with `READBACK | TRANSFER_DST`, and reuse it.
     /// 2. Call this and keep the returned [`Submission`]. Do not wait on it.
     /// 3. Each frame, `poll` it. Polling never blocks.
-    /// 4. On `Complete`, `read_buffer_into` a caller-owned slice. Reading early fails rather than
-    ///    waits.
+    /// 4. When it reports `Complete`, `read_buffer_into` a caller-owned slice.
+    ///    Reading before completion fails rather than waiting.
     ///
-    /// Drop a submission only after it completes. On Vulkan, dropping a pending one waits for the
-    /// GPU. Metal's copy waits inside this call, so the pattern does not hide latency on Metal.
+    /// Drop the submission only after it completes: on Vulkan, dropping a
+    /// pending one waits for the GPU. Metal does not wait on drop; it keeps the
+    /// command buffer alive until the GPU finishes.
     ///
     /// ```rust,no_run
     /// # use zengpu_hal::{BufferDesc, BufferHandle, BufferUsage, GpuDevice, MemoryUsage};
@@ -181,7 +184,8 @@ pub trait GpuDevice: Send + Sync {
     /// # }
     /// ```
     ///
-    /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default refuses.
+    /// Check [`crate::TransferCaps::buffer_texture_copy`]: the default
+    /// refuses.
     fn copy_texture_region_to_buffer(
         &self,
         _texture: TextureHandle,
