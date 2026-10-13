@@ -9,6 +9,8 @@ pub mod depth_target;
 pub mod device;
 pub mod frame_graph;
 pub mod instance;
+#[cfg(target_os = "macos")]
+mod metal_layer;
 pub mod offscreen;
 pub(crate) mod surface;
 pub mod swapchain;

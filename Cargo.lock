@@ -1943,6 +1943,7 @@ version = "0.0.1"
 dependencies = [
  "ash",
  "log",
+ "objc",
  "zen-window-handle",
  "zengpu-hal",
  "zengpu-spirv",

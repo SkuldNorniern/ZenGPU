@@ -8,6 +8,10 @@ use std::{
 };
 
 use ash::{Entry, Instance, ext, khr, vk};
+#[cfg(target_os = "macos")]
+use std::env::current_exe;
+#[cfg(target_os = "macos")]
+use std::path::{Path, PathBuf};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, DeviceType, GpuAdapter, GpuError, GpuInstance,
     PowerPreference,
@@ -65,10 +69,38 @@ pub struct VulkanInstance {
     pub(crate) shared: Arc<VulkanShared>,
 }
 
+/// Load the Vulkan loader. On macOS a binary run outside `cargo run` does not
+/// search Homebrew's or `/usr/local`'s lib directories, nor an app bundle's
+/// Frameworks, so those are tried by full path after the default lookup.
+fn load_entry() -> zengpu_hal::Result<Entry> {
+    // SAFETY: loading the Vulkan loader library runs no Vulkan calls.
+    let first = unsafe { Entry::load() };
+    #[cfg(target_os = "macos")]
+    let first = first.or_else(|e| {
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        {
+            paths.push(dir.join("../Frameworks/libvulkan.1.dylib"));
+            paths.push(dir.join("libvulkan.1.dylib"));
+        }
+        for dir in ["/opt/homebrew/lib", "/usr/local/lib"] {
+            paths.push(Path::new(dir).join("libvulkan.1.dylib"));
+        }
+        paths
+            .iter()
+            .filter(|p| p.exists())
+            // SAFETY: as above, for the same library found by path.
+            .find_map(|p| unsafe { Entry::load_from(p) }.ok())
+            .ok_or(e)
+    });
+    first.map_err(|e| GpuError::Backend(format!("Vulkan loader: {e}")))
+}
+
 impl VulkanInstance {
     fn create(surface_extensions: bool) -> zengpu_hal::Result<Self> {
-        let entry = unsafe { Entry::load() }
-            .map_err(|e| GpuError::Backend(format!("Vulkan loader: {e}")))?;
+        let entry = load_entry()?;
 
         let app_info = vk::ApplicationInfo {
             api_version: vk::make_api_version(0, 1, 2, 0),
@@ -138,13 +170,15 @@ impl VulkanInstance {
                 }
             }
             #[cfg(target_os = "macos")]
-            {
-                ext_names.push(require(ash::mvk::macos_surface::NAME)?);
-                if has_ext(khr::portability_enumeration::NAME) {
-                    ext_names.push(khr::portability_enumeration::NAME.as_ptr());
-                    flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
-                }
-            }
+            ext_names.push(require(ext::metal_surface::NAME)?);
+        }
+
+        // MoltenVK is a portability driver, which the loader hides from any
+        // instance that does not ask for them, surface or not.
+        #[cfg(target_os = "macos")]
+        if has_ext(khr::portability_enumeration::NAME) {
+            ext_names.push(khr::portability_enumeration::NAME.as_ptr());
+            flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         }
 
         let create_info = vk::InstanceCreateInfo {
@@ -212,7 +246,7 @@ impl VulkanInstance {
     pub fn is_available() -> bool {
         // SAFETY: Entry::load only loads a shared library; it does not allocate
         // Vulkan objects and is safe to call without a prior Vulkan setup.
-        unsafe { ash::Entry::load() }.is_ok()
+        load_entry().is_ok()
     }
 
     /// Compute-only instance (no surface/display extensions).
