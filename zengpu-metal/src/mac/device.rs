@@ -25,7 +25,7 @@ use zengpu_hal::{
     FormatCaps, GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle,
     Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
     Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
-    TextureUsage, TextureWrite, TransferCaps, marker,
+    TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
@@ -535,8 +535,11 @@ impl MetalDevice {
 
     /// Encode + submit one compute dispatch, blocking until completion. Buffers
     /// in `bindings.buffers` (slot indices) bind to `[[buffer(0..n)]]`; scalars
-    /// pack into a `Push` struct at `[[buffer(n)]]`; `grid` is the threadgroup
-    /// count and the pipeline's `block` is threads-per-threadgroup.
+    /// pack into a `Push` struct at `[[buffer(n)]]`; textures in
+    /// `bindings.textures` (table slots) bind to `[[texture(0..t)]]` with
+    /// their samplers at `[[sampler(0..t)]]`, and storage textures in
+    /// `bindings.images` to the texture slots after them; `grid` is the
+    /// threadgroup count and the pipeline's `block` is threads-per-threadgroup.
     fn dispatch_one(
         &self,
         pipeline: PipelineHandle,
@@ -574,12 +577,48 @@ impl MetalDevice {
                 })
                 .collect::<Result<_>>()?
         };
+        let sampled: Vec<(Texture, SamplerState)> = {
+            let table = lock(&self.inner.table)?;
+            bindings
+                .textures
+                .iter()
+                .map(|&slot| {
+                    table.get(slot).ok_or_else(|| {
+                        GpuError::Backend("metal: texture slot in bindings is not bound".into())
+                    })
+                })
+                .collect::<Result<_>>()?
+        };
+        let images: Vec<Texture> = {
+            let textures = lock(&self.inner.textures)?;
+            bindings
+                .images
+                .iter()
+                .map(|&slot| match textures.get_by_slot_index(slot) {
+                    Some(t) if t.desc.usage.contains(TextureUsage::STORAGE) => Ok(t.tex.clone()),
+                    Some(_) => Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                        resource: "bound image",
+                        needed: "STORAGE",
+                    })),
+                    None => Err(GpuError::Backend(
+                        "metal: invalid image slot in bindings".into(),
+                    )),
+                })
+                .collect::<Result<_>>()?
+        };
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&state);
             for (i, b) in buffers.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(b), 0);
+            }
+            for (i, (tex, smp)) in sampled.iter().enumerate() {
+                enc.set_texture(i as u64, Some(tex));
+                enc.set_sampler_state(i as u64, Some(smp));
+            }
+            for (i, tex) in images.iter().enumerate() {
+                enc.set_texture((sampled.len() + i) as u64, Some(tex));
             }
             if !bindings.scalars.is_empty() {
                 let packed = pack_scalars(bindings.scalars);

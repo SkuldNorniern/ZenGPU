@@ -879,4 +879,109 @@ mod graphics_tests {
             assert_eq!(first.info().device_type, DeviceType::Integrated);
         }
     }
+
+    /// What zengpu-vulkan's `compute_chains_texture_passes_in_one_submission`
+    /// checks, on Metal: a sampled texture inverted into an image, then that
+    /// image loaded and sampled into another.
+    #[test]
+    fn compute_chains_texture_passes() {
+        use zengpu_hal::{ComputeOp, ComputePipelineDesc, DispatchOp};
+
+        const INVERT: ZslShader = zsl!(
+            push P { w: u32, h: u32 }
+            @workgroup_size(8, 8)
+            kernel invert(src: texture, dst: image, p: P, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < p.w && y < p.h {
+                    dst.store(x, y, 1.0 - src.load(x, y).r, 1.0 - src.load(x, y).g, 1.0 - src.load(x, y).b, src.load(x, y).a)
+                }
+            }
+        );
+        const COMBINE: ZslShader = zsl!(
+            @workgroup_size(8, 8)
+            kernel combine(inv: image, smooth: texture, out: image, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < out.width() && y < out.height() {
+                    let u = (x + 0.5) / out.width()
+                    let v = (y + 0.5) / out.height()
+                    let r = (inv.load(x, y).r + smooth.sample(u, v).r) * 0.5
+                    out.store(x, y, r, inv.load(x, y).g, smooth.sample_level(u, v, 0.0).b, 1.0)
+                }
+            }
+        );
+
+        let Some(dev) = open() else { return };
+        let pipeline = |shader: &ZslShader| {
+            let shader = dev.create_shader(ShaderDesc::msl(shader.msl)).unwrap();
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [8, 8, 1],
+            })
+            .unwrap()
+        };
+        let (invert, combine) = (pipeline(&INVERT), pipeline(&COMBINE));
+        let (w, h) = (5, 3);
+        let src = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            w,
+            h,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        );
+        let mid = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            w,
+            h,
+            TextureUsage::STORAGE | TextureUsage::SAMPLED,
+        );
+        let out = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            w,
+            h,
+            TextureUsage::STORAGE | TextureUsage::TRANSFER_SRC,
+        );
+        let texels: Vec<u8> = (0..w * h * 4).map(|i| (i * 13 % 256) as u8).collect();
+        dev.upload_texture_data(src, &texels).unwrap();
+        let nearest = dev.create_sampler(SamplerDesc::default()).unwrap();
+        let src_slot = dev.bind_texture(src, nearest).unwrap();
+        let mid_slot = dev.bind_texture(mid, nearest).unwrap();
+        let ops = [
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline: invert,
+                bindings: Bindings {
+                    buffers: &[],
+                    textures: &[src_slot],
+                    images: &[mid.index()],
+                    scalars: &[Scalar::U32(w), Scalar::U32(h)],
+                },
+                grid: [1, 1, 1],
+            }),
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline: combine,
+                bindings: Bindings {
+                    buffers: &[],
+                    textures: &[mid_slot],
+                    images: &[mid.index(), out.index()],
+                    scalars: &[],
+                },
+                grid: [1, 1, 1],
+            }),
+        ];
+        dev.submit_compute_ops(1, &ops).unwrap();
+        for (i, (got, src)) in pixels(&dev, out, w, h)
+            .iter()
+            .zip(texels.chunks_exact(4))
+            .enumerate()
+        {
+            let want = [255 - src[0], 255 - src[1], 255 - src[2], 255];
+            for (g, w) in got.iter().zip(want) {
+                assert!(g.abs_diff(w) <= 1, "texel {i}: {got:?} != {want:?}");
+            }
+        }
+    }
 }

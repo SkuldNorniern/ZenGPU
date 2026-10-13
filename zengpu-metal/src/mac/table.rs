@@ -39,8 +39,9 @@ pub(crate) struct TextureTable {
     encoder: ArgumentEncoder,
     buffer: Buffer,
     stride: u64,
-    /// What each slot holds, kept so passes can make them resident.
-    bound: Vec<Option<Texture>>,
+    /// What each slot holds, kept so passes can make them resident and
+    /// compute can bind them directly.
+    bound: Vec<Option<(Texture, SamplerState)>>,
 }
 
 impl TextureTable {
@@ -76,7 +77,7 @@ impl TextureTable {
             .set_argument_buffer(&self.buffer, u64::from(slot) * self.stride);
         self.encoder.set_texture(0, texture);
         self.encoder.set_sampler_state(1, sampler);
-        *entry = Some(texture.clone());
+        *entry = Some((texture.clone(), sampler.clone()));
         true
     }
 
@@ -85,7 +86,7 @@ impl TextureTable {
         if let Some(entry) = self.bound.get_mut(slot as usize)
             && entry
                 .as_ref()
-                .is_some_and(|t| t.as_ptr() == texture.as_ptr())
+                .is_some_and(|(t, _)| t.as_ptr() == texture.as_ptr())
         {
             *entry = None;
         }
@@ -98,7 +99,16 @@ impl TextureTable {
     /// Every bound texture, which a pass must declare resident before its
     /// shaders can reach them through the table.
     pub(crate) fn resident(&self) -> Vec<Texture> {
-        self.bound.iter().flatten().cloned().collect()
+        self.bound
+            .iter()
+            .flatten()
+            .map(|(t, _)| t.clone())
+            .collect()
+    }
+
+    /// The texture and sampler in `slot`, if it holds one.
+    pub(crate) fn get(&self, slot: u32) -> Option<(Texture, SamplerState)> {
+        self.bound.get(slot as usize)?.clone()
     }
 
     pub(crate) fn used(&self) -> u32 {
