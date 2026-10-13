@@ -21,6 +21,27 @@ impl MetalInstance {
         Self
     }
 
+    /// The same as [`new`](Self::new): Metal needs nothing extra to present.
+    /// Named like the Vulkan constructor so the two are interchangeable.
+    pub fn new_with_surface() -> Result<Self> {
+        Ok(Self)
+    }
+
+    /// Every adapter, under the name every graphics backend shares.
+    pub fn graphics_adapters(&self) -> Vec<MetalAdapter> {
+        self.metal_adapters()
+    }
+
+    /// The preferred adapter, under the shared graphics-backend name.
+    pub fn request_graphics_adapter(&self) -> Option<MetalAdapter> {
+        self.request_metal_adapter()
+    }
+
+    /// The adapter with this UUID, under the shared graphics-backend name.
+    pub fn graphics_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<MetalAdapter> {
+        self.metal_adapter_by_uuid(uuid)
+    }
+
     /// Every Metal device, as concrete adapters.
     pub fn metal_adapters(&self) -> Vec<MetalAdapter> {
         Device::all().into_iter().map(MetalAdapter::new).collect()
@@ -111,6 +132,12 @@ impl MetalAdapter {
     /// Open this adapter as a concrete [`MetalDevice`], for the graphics API.
     pub fn open_metal(&self, _req: DeviceRequest) -> Result<MetalDevice> {
         MetalDevice::new(self.device.clone())
+    }
+
+    /// Open a device that can present, under the shared graphics-backend
+    /// name.
+    pub fn open_graphics(&self, req: DeviceRequest) -> Result<MetalDevice> {
+        self.open_metal(req)
     }
 }
 

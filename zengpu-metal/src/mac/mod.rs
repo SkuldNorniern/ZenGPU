@@ -9,6 +9,6 @@ mod surface;
 mod table;
 
 pub use command::MetalCommandList;
-pub use device::MetalDevice;
+pub use device::{DepthTarget, MetalDevice};
 pub use instance::{MetalAdapter, MetalInstance};
 pub use surface::{MetalFrame, MetalSurface};
