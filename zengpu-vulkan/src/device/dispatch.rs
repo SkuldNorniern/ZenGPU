@@ -156,6 +156,7 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
+        self.reap_orphans();
         let cmd = self.cmd_list_pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
@@ -206,6 +207,7 @@ impl VulkanDevice {
             samplers: Arc::clone(&self.samplers),
             pipelines: Arc::clone(&self.pipelines),
             lifetime: Arc::clone(&self.lifetime),
+            orphans: Arc::clone(&self.orphans),
             state: Mutex::new(VulkanSubmissionState {
                 fence: Some(fence),
                 cmd: Some(cmd),
