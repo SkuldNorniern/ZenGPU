@@ -20,10 +20,10 @@ use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, CompletedSubmission, ComputePipelineDesc, DeviceLimits,
-    Features, Format, FormatCaps, GpuDevice, GpuError, HalCapabilities, PipelineHandle, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
-    Submission, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion, TextureUsage,
-    TextureWrite, TransferCaps, marker,
+    Features, Format, FormatCaps, GpuDevice, GpuError, HalCapabilities, MemoryBudget,
+    PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
+    ShaderSource, SlotMap, Submission, TargetHandle, TexDim, TextureDesc, TextureHandle,
+    TextureRegion, TextureUsage, TextureWrite, TransferCaps, marker,
 };
 
 use super::convert;
@@ -914,6 +914,18 @@ impl GpuDevice for MetalDevice {
 
     fn supports_anisotropic_filtering(&self) -> bool {
         true
+    }
+
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        // Unified memory: the recommended working set is both the total and
+        // the budget, and the current allocation is the usage.
+        let device = &self.inner.device;
+        let budget = device.recommended_max_working_set_size();
+        Some(MemoryBudget {
+            device_local: budget,
+            budget,
+            usage: device.current_allocated_size(),
+        })
     }
 
     // ── Compute ─────────────────────────────────────────────────────────────

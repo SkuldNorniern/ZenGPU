@@ -62,6 +62,27 @@ pub struct FormatCaps {
     pub storage: bool,
 }
 
+/// Device-local memory and this process's share of it, from
+/// [`crate::GpuDevice::memory_budget`]. Drivers move `budget` and `usage`
+/// over time, so read it again rather than caching it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudget {
+    /// Device-local memory in total (all device-local heaps).
+    pub device_local: u64,
+    /// What this process may use of it before the driver starts evicting or
+    /// failing: the budget.
+    pub budget: u64,
+    /// What this process uses now.
+    pub usage: u64,
+}
+
+impl MemoryBudget {
+    /// Bytes this process can still allocate before reaching its budget.
+    pub fn headroom(&self) -> u64 {
+        self.budget.saturating_sub(self.usage)
+    }
+}
+
 /// Which HAL capabilities a backend implements. A backend may provide
 /// graphics, compute, or both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

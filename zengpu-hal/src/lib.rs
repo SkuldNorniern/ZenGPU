@@ -35,7 +35,8 @@ pub use graphics::{
 };
 pub use pool::TexturePool;
 pub use request::{
-    AdapterRequest, DeviceLimits, DeviceRequest, FormatCaps, HalCapabilities, TransferCaps,
+    AdapterRequest, DeviceLimits, DeviceRequest, FormatCaps, HalCapabilities, MemoryBudget,
+    TransferCaps,
 };
 pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
 pub use surface::WindowHandles;

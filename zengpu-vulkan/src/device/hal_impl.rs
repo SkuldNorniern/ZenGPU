@@ -53,6 +53,10 @@ impl GpuDevice for VulkanDevice {
         self.inner.is_lost()
     }
 
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        self.inner.memory_budget()
+    }
+
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         self.collect_garbage();
         if desc.usage.contains(BufferUsage::STORAGE)
