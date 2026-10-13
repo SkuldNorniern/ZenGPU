@@ -21,6 +21,10 @@ ash = "0.38"
 zen-window-handle.workspace = true
 log.workspace = true
 
+# Finding or attaching the CAMetalLayer MoltenVK presents to.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
 # Native ZSL shaders for the in-crate tests and the pipeline_repro example.
 [dev-dependencies]
 zengpu-spirv.workspace = true

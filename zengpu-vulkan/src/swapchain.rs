@@ -16,6 +16,10 @@ use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
 
 use crate::device::{VulkanDevice, VulkanDeviceInner};
 use crate::instance::VulkanShared;
+#[cfg(target_os = "macos")]
+use crate::metal_layer::metal_layer_for;
+#[cfg(target_os = "macos")]
+use ash::ext;
 
 /// Per-image state, rebuilt on resize or surface loss.
 struct SwapchainResources {
@@ -928,15 +932,17 @@ pub(crate) fn create_platform_surface(
             "expected AppKit window handle on macOS".to_string(),
         ));
     };
-    let loader = ash::mvk::macos_surface::Instance::new(&shared.entry, &shared.instance);
-    let create_info = vk::MacOSSurfaceCreateInfoMVK {
-        p_view: appkit.ns_view.as_ptr(),
+    // SAFETY: the NSView must be live, used on the main thread.
+    let layer = unsafe { metal_layer_for(appkit.ns_view.as_ptr().cast())? };
+    let loader = ext::metal_surface::Instance::new(&shared.entry, &shared.instance);
+    let create_info = vk::MetalSurfaceCreateInfoEXT {
+        p_layer: layer.cast(),
         ..Default::default()
     };
     unsafe {
         loader
-            .create_mac_os_surface(&create_info, None)
-            .map_err(|e| GpuError::Backend(format!("vkCreateMacOSSurfaceMVK: {e}")))
+            .create_metal_surface(&create_info, None)
+            .map_err(|e| GpuError::Backend(format!("vkCreateMetalSurfaceEXT: {e}")))
     }
 }
 
