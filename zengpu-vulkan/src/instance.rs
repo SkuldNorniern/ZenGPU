@@ -262,7 +262,19 @@ impl VulkanInstance {
             .collect()
     }
 
-    /// The adapter with this [`VulkanAdapter::uuid`], if it is still present.
+    /// Adapter with this `VulkanAdapter::uuid`, if still present.
+    pub fn graphics_adapters(&self) -> Vec<VulkanAdapter> {
+        self.vulkan_adapters()
+    }
+
+    pub fn request_graphics_adapter(&self) -> Option<VulkanAdapter> {
+        self.request_vulkan_adapter()
+    }
+
+    pub fn graphics_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<VulkanAdapter> {
+        self.vulkan_adapter_by_uuid(uuid)
+    }
+
     pub fn vulkan_adapter_by_uuid(&self, uuid: [u8; 16]) -> Option<VulkanAdapter> {
         self.vulkan_adapters()
             .into_iter()

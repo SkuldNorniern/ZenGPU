@@ -248,6 +248,11 @@ impl VulkanDevice {
         }
     }
 
+    /// Depth buffer of `width`×`height`. Same name on every backend (see `zengpu::native`).
+    pub fn create_depth_target(&self, width: u32, height: u32) -> Result<DepthTarget> {
+        DepthTarget::new(&self.context(), width, height)
+    }
+
     /// Register `depth` as a render target. After a resize, register the recreated target and
     /// `unregister_render_target` the stale handle.
     pub fn register_depth_target(&self, depth: &DepthTarget) -> TargetHandle {
