@@ -467,22 +467,18 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
 /// uses_shuffle_relative, uses_arithmetic)`, allowing SPIR-V lowering to declare the five
 /// independently-required capabilities in one walk.
 pub fn stmts_use_subgroup_collectives(stmts: &[IrStmt]) -> (bool, bool, bool, bool, bool) {
-    stmts.iter().fold((false, false, false, false, false), |acc, stmt| {
-        merge_subgroup_collective_uses(acc, stmt_uses_subgroup_collectives(stmt))
-    })
+    stmts
+        .iter()
+        .fold((false, false, false, false, false), |acc, stmt| {
+            merge_subgroup_collective_uses(acc, stmt_uses_subgroup_collectives(stmt))
+        })
 }
 
 fn merge_subgroup_collective_uses(
     a: (bool, bool, bool, bool, bool),
     b: (bool, bool, bool, bool, bool),
 ) -> (bool, bool, bool, bool, bool) {
-    (
-        a.0 || b.0,
-        a.1 || b.1,
-        a.2 || b.2,
-        a.3 || b.3,
-        a.4 || b.4,
-    )
+    (a.0 || b.0, a.1 || b.1, a.2 || b.2, a.3 || b.3, a.4 || b.4)
 }
 
 fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, bool) {
@@ -563,12 +559,11 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => {
             expr_uses_subgroup_collectives(base)
         }
-        IrExpr::Construct { args, .. } => {
-            args.iter()
-                .fold((false, false, false, false, false), |acc, arg| {
-                    merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
-                })
-        }
+        IrExpr::Construct { args, .. } => args
+            .iter()
+            .fold((false, false, false, false, false), |acc, arg| {
+                merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(arg))
+            }),
         IrExpr::Neg(inner) | IrExpr::Index { index: inner, .. } => {
             expr_uses_subgroup_collectives(inner)
         }

@@ -73,7 +73,7 @@ backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-cpu`),
 
 ## Building
 
-Rust 1.85+. Vulkan needs a driver with descriptor indexing.
+Rust 1.88+. Vulkan needs a driver with descriptor indexing.
 
 Metal needs nothing extra. For Vulkan on macOS:
 

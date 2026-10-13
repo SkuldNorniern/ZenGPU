@@ -30,7 +30,10 @@ pub struct ModuleReflection {
     pub params: Vec<ParamReflection>,
 }
 
-fn merge(layouts: Vec<(String, LayoutInfo)>, bindings: Vec<(String, BindingInfo)>) -> ModuleReflection {
+fn merge(
+    layouts: Vec<(String, LayoutInfo)>,
+    bindings: Vec<(String, BindingInfo)>,
+) -> ModuleReflection {
     let mut bindings: HashMap<String, BindingInfo> = bindings.into_iter().collect();
     let params = layouts
         .into_iter()
@@ -48,12 +51,18 @@ fn merge(layouts: Vec<(String, LayoutInfo)>, bindings: Vec<(String, BindingInfo)
 
 /// Reflect a compute [`Module`]'s entry point.
 pub fn reflect_compute(module: &Module) -> ModuleReflection {
-    merge(layout::compute_layout(module), binding::compute_bindings(module))
+    merge(
+        layout::compute_layout(module),
+        binding::compute_bindings(module),
+    )
 }
 
 /// Reflect a graphics [`GraphicsModule`]'s entry point.
 pub fn reflect_graphics(module: &GraphicsModule) -> ModuleReflection {
-    merge(layout::graphics_layout(module), binding::graphics_bindings(module))
+    merge(
+        layout::graphics_layout(module),
+        binding::graphics_bindings(module),
+    )
 }
 
 #[cfg(test)]

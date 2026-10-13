@@ -68,7 +68,9 @@ mod tests {
     fn read_f32(device: &dyn GpuDevice, buf: BufferHandle, n: usize) -> Vec<f32> {
         let bytes = device.read_buffer(buf, 0, (n * 4) as u64).unwrap();
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -456,7 +458,9 @@ mod graphics_tests {
             .expect("readback buffer");
         dev.copy_texture_to_buffer(tex, buf).expect("copy");
         let raw = dev.read_buffer(buf, 0, len).expect("read");
-        raw.chunks_exact(4)
+        raw.as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2], c[3]])
             .collect()
     }
@@ -950,14 +954,19 @@ mod graphics_tests {
         let nearest = dev.create_sampler(SamplerDesc::default()).unwrap();
         let src_slot = dev.bind_texture(src, nearest).unwrap();
         let mid_slot = dev.bind_texture(mid, nearest).unwrap();
+        let src_textures = [src_slot];
+        let mid_images = [mid.index()];
+        let dimensions = [Scalar::U32(w), Scalar::U32(h)];
+        let mid_textures = [mid_slot];
+        let out_images = [mid.index(), out.index()];
         let ops = [
             ComputeOp::Dispatch(DispatchOp {
                 pipeline: invert,
                 bindings: Bindings {
                     buffers: &[],
-                    textures: &[src_slot],
-                    images: &[mid.index()],
-                    scalars: &[Scalar::U32(w), Scalar::U32(h)],
+                    textures: &src_textures,
+                    images: &mid_images,
+                    scalars: &dimensions,
                 },
                 grid: [1, 1, 1],
             }),
@@ -965,8 +974,8 @@ mod graphics_tests {
                 pipeline: combine,
                 bindings: Bindings {
                     buffers: &[],
-                    textures: &[mid_slot],
-                    images: &[mid.index(), out.index()],
+                    textures: &mid_textures,
+                    images: &out_images,
                     scalars: &[],
                 },
                 grid: [1, 1, 1],
@@ -975,7 +984,7 @@ mod graphics_tests {
         dev.submit_compute_ops(1, &ops).unwrap();
         for (i, (got, src)) in pixels(&dev, out, w, h)
             .iter()
-            .zip(texels.chunks_exact(4))
+            .zip(texels.as_chunks::<4>().0.iter())
             .enumerate()
         {
             let want = [255 - src[0], 255 - src[1], 255 - src[2], 255];

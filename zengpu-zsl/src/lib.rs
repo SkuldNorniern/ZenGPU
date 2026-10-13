@@ -50,22 +50,22 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
     let mut name: Option<String> = None;
     let mut fields: Option<proc_macro::Group> = None;
     while let Some(tt) = it.next() {
-        if let TokenTree::Ident(id) = &tt {
-            if id.to_string() == "struct" {
-                match it.next() {
-                    Some(TokenTree::Ident(n)) => name = Some(n.to_string()),
-                    _ => return Err("ZslPushConst: expected a struct name".into()),
-                }
-                for tt2 in it.by_ref() {
-                    if let TokenTree::Group(g) = tt2 {
-                        if g.delimiter() == Delimiter::Brace {
-                            fields = Some(g);
-                        }
-                        break;
-                    }
-                }
-                break;
+        if let TokenTree::Ident(id) = &tt
+            && id.to_string() == "struct"
+        {
+            match it.next() {
+                Some(TokenTree::Ident(n)) => name = Some(n.to_string()),
+                _ => return Err("ZslPushConst: expected a struct name".into()),
             }
+            for tt2 in it.by_ref() {
+                if let TokenTree::Group(g) = tt2 {
+                    if g.delimiter() == Delimiter::Brace {
+                        fields = Some(g);
+                    }
+                    break;
+                }
+            }
+            break;
         }
     }
     let name = name.ok_or("ZslPushConst only supports structs")?;
@@ -91,10 +91,10 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
                 break;
             }
             let tt = toks.next().unwrap();
-            if type_name.is_empty() {
-                if let TokenTree::Ident(id) = &tt {
-                    type_name = id.to_string();
-                }
+            if type_name.is_empty()
+                && let TokenTree::Ident(id) = &tt
+            {
+                type_name = id.to_string();
             }
         }
         match type_name.as_str() {
@@ -135,13 +135,13 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
 
 // ── Native ZSL macro (no syn/quote) ────────────────────────────────────────────
 
-/// Compile **native ZSL** source to a [`ZslShader`] containing all backend
+/// Compile **native ZSL** source to a `ZslShader` containing all backend
 /// compiled forms built at compile time.
 ///
-/// The returned [`::zengpu_spirv::ZslShader`] carries SPIR-V (Vulkan), HIP C++
+/// The returned `zengpu_spirv::ZslShader` carries SPIR-V (Vulkan), HIP C++
 /// (ROCm), MSL (Metal), and CUDA C++ (NVIDIA) — all compiled from the same ZSL
 /// source. At runtime, pick the right form with
-/// [`ZslShader::for_backend`](::zengpu_spirv::ZslShader::for_backend).
+/// `ZslShader::for_backend`.
 ///
 /// ```ignore
 /// const SHADER: ZslShader = zengpu_spirv::zsl!(

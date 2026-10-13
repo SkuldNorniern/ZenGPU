@@ -28,7 +28,7 @@ pub trait GpuSubmission: Send + Sync {
 
     /// Wait for completion for no longer than `timeout`.
     ///
-    /// Returns [`GpuError::Timeout`] if the deadline expires. A timeout does
+    /// Returns [`GpuError::Timeout`](crate::GpuError::Timeout) if the deadline expires. A timeout does
     /// not cancel the GPU work; the handle remains valid and may be polled or
     /// waited again.
     fn wait(&self, timeout: Duration) -> Result<()>;

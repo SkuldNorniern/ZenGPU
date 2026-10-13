@@ -196,7 +196,8 @@ mod tests {
         "#;
         let module = compile(src);
         let layout = compute_layout(&module);
-        let offsets: Vec<(String, u32)> = layout.iter().map(|(n, l)| (n.clone(), l.offset)).collect();
+        let offsets: Vec<(String, u32)> =
+            layout.iter().map(|(n, l)| (n.clone(), l.offset)).collect();
         assert_eq!(
             offsets,
             vec![
@@ -226,7 +227,8 @@ mod tests {
         "#;
         let module = compile(src);
         let layout = compute_layout(&module);
-        let offsets: Vec<(String, u32)> = layout.iter().map(|(n, l)| (n.clone(), l.offset)).collect();
+        let offsets: Vec<(String, u32)> =
+            layout.iter().map(|(n, l)| (n.clone(), l.offset)).collect();
         // Buffers (x, y) get the first two u32 slots; push-struct scalars
         // (n, alpha) follow, in declaration order.
         assert_eq!(
@@ -260,10 +262,7 @@ mod tests {
             .collect();
         assert_eq!(
             offsets,
-            vec![
-                ("flag".to_string(), 0, 4),
-                ("mvp".to_string(), 16, 64),
-            ]
+            vec![("flag".to_string(), 0, 4), ("mvp".to_string(), 16, 64),]
         );
     }
 }

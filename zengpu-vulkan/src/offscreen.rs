@@ -274,9 +274,7 @@ mod zsl_parity_tests {
             .expect("readback buffer");
         dev.copy_offscreen_to_buffer(target, buf).expect("copy");
         let raw = dev.read_buffer(buf, 0, len).expect("read");
-        raw.chunks_exact(4)
-            .map(|c| [c[0], c[1], c[2], c[3]])
-            .collect()
+        raw.as_chunks::<4>().0.to_vec()
     }
 
     const RED_FS: ZslShader = zsl!(

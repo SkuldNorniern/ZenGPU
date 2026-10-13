@@ -248,8 +248,10 @@ pub fn as_bytes_f32(s: &[f32]) -> &[u8] {
 }
 
 pub fn from_bytes_f32(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -394,12 +396,16 @@ mod cpu_vs_vulkan_tests {
             pipeline,
             Box::new(|ctx| {
                 let a: Vec<f32> = ctx.buffers[0]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let b: Vec<f32> = ctx.buffers[1]
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 let out: Vec<u8> = a
                     .iter()
@@ -638,12 +644,16 @@ mod cpu_vs_vulkan_tests {
             [n.div_ceil(64), 1, 1],
         );
         let out_hi: Vec<u32> = outputs[0]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         let out_lo: Vec<u32> = outputs[1]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
 
         for (i, &value) in inputs.iter().enumerate() {

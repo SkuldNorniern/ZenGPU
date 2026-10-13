@@ -776,8 +776,10 @@ impl GpuDevice for VulkanDevice {
             aligned_words
         } else {
             copied_words = spirv
-                .chunks_exact(4)
-                .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_ne_bytes(*c))
                 .collect::<Vec<_>>();
             &copied_words
         };

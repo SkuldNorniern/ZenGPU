@@ -707,7 +707,7 @@ impl VulkanDevice {
 
     /// Marks the device lost, as a driver reset would: [`is_lost`] says so,
     /// and a surface's acquire and present fail with
-    /// [`GpuError::DeviceLost`](zengpu_hal::GpuError::DeviceLost). For
+    /// [`GpuError::DeviceLost`]. For
     /// testing recovery without hanging a real GPU; there is no way back.
     ///
     /// [`is_lost`]: zengpu_hal::GpuDevice::is_lost
@@ -1085,13 +1085,13 @@ impl VulkanDevice {
         )
     }
     /// Total texture slots available to consumers sharing this device's
-    /// bindless budget, capped by [`MAX_BINDLESS_TEXTURES`].
+    /// bindless budget, capped by `MAX_BINDLESS_TEXTURES`.
     pub fn bindless_texture_capacity(&self) -> u32 {
         self.bindless.texture_capacity
     }
 
     /// Texture slots currently used by consumers sharing this device's
-    /// bindless budget; compare with [`MAX_BINDLESS_TEXTURES`].
+    /// bindless budget; compare with `MAX_BINDLESS_TEXTURES`.
     pub fn bindless_texture_used(&self) -> u32 {
         self.bindless
             .bound_textures
@@ -1103,13 +1103,13 @@ impl VulkanDevice {
     }
 
     /// Total storage-buffer slots available to consumers sharing this device's
-    /// bindless budget, capped by [`MAX_BINDLESS_BUFFERS`].
+    /// bindless budget, capped by `MAX_BINDLESS_BUFFERS`.
     pub fn bindless_buffer_capacity(&self) -> u32 {
         self.bindless.buffer_capacity
     }
 
     /// Live storage-buffer slots used by consumers sharing this device's
-    /// bindless budget; compare with [`MAX_BINDLESS_BUFFERS`].
+    /// bindless budget; compare with `MAX_BINDLESS_BUFFERS`.
     pub fn bindless_buffer_used(&self) -> u32 {
         let buffers = self.buffers.lock().unwrap();
         (0..self.bindless.buffer_capacity)
@@ -3175,11 +3175,8 @@ mod tests {
         assert_eq!(submission.cycle_id(), 0x4d_49_58_45_44);
         submission.wait(Duration::from_secs(5)).unwrap();
         let actual = dev.read_buffer(readback, 0, size).unwrap();
-        for (index, bytes) in actual.chunks_exact(4).enumerate() {
-            assert_eq!(
-                f32::from_ne_bytes(bytes.try_into().unwrap()),
-                values[index] * 2.0
-            );
+        for (index, bytes) in actual.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(f32::from_ne_bytes(*bytes), values[index] * 2.0);
         }
         dev.destroy_buffer(upload);
         dev.destroy_buffer(input);
@@ -3271,14 +3268,19 @@ mod tests {
         let src_slot = vk_dev.bind_texture(src, nearest).unwrap();
         let mid_slot = vk_dev.bind_texture(mid, nearest).unwrap();
 
+        let src_textures = [src_slot];
+        let mid_images = [mid.index()];
+        let dimensions = [Scalar::U32(w), Scalar::U32(h)];
+        let mid_textures = [mid_slot];
+        let out_images = [mid.index(), out.index()];
         let ops = [
             ComputeOp::Dispatch(DispatchOp {
                 pipeline: invert,
                 bindings: Bindings {
                     buffers: &[],
-                    textures: &[src_slot],
-                    images: &[mid.index()],
-                    scalars: &[Scalar::U32(w), Scalar::U32(h)],
+                    textures: &src_textures,
+                    images: &mid_images,
+                    scalars: &dimensions,
                 },
                 grid: [1, 1, 1],
             }),
@@ -3286,8 +3288,8 @@ mod tests {
                 pipeline: combine,
                 bindings: Bindings {
                     buffers: &[],
-                    textures: &[mid_slot],
-                    images: &[mid.index(), out.index()],
+                    textures: &mid_textures,
+                    images: &out_images,
                     scalars: &[],
                 },
                 grid: [1, 1, 1],
@@ -3299,7 +3301,7 @@ mod tests {
             .unwrap();
 
         let got = read_texels(vk_dev, out, Format::Rgba32Float, w, h);
-        for (i, (texel, src)) in got.iter().zip(texels.chunks_exact(4)).enumerate() {
+        for (i, (texel, src)) in got.iter().zip(texels.as_chunks::<4>().0.iter()).enumerate() {
             let inv = |c: u8| 1.0 - f32::from(c) / 255.0;
             let want = [inv(src[0]), inv(src[1]), inv(src[2]), 1.0];
             for (g, w) in texel.iter().zip(want) {
@@ -3704,8 +3706,8 @@ mod tests {
         for (worker, output) in outputs.iter().copied().enumerate() {
             let bytes = dev.read_buffer(output, 0, LEN * 4).unwrap();
             let expected = worker as f32 + 0.5;
-            for value in bytes.chunks_exact(4) {
-                assert_eq!(f32::from_ne_bytes(value.try_into().unwrap()), expected);
+            for value in bytes.as_chunks::<4>().0.iter() {
+                assert_eq!(f32::from_ne_bytes(*value), expected);
             }
             dev.destroy_buffer(output);
         }
@@ -3914,8 +3916,10 @@ mod tests {
 
         let raw = dev.read_buffer(out, 0, size).unwrap();
         let actual: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|bytes| u32::from_ne_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_ne_bytes(*bytes))
             .collect();
         assert_eq!(actual, expected);
         dev.destroy_pipeline(pipeline);

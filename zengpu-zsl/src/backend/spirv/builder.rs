@@ -1253,12 +1253,7 @@ impl SpvBuilder {
         id
     }
 
-    pub fn op_group_non_uniform_ballot(
-        &mut self,
-        uvec4_ty: Id,
-        scope: Id,
-        predicate: Id,
-    ) -> Id {
+    pub fn op_group_non_uniform_ballot(&mut self, uvec4_ty: Id, scope: Id, predicate: Id) -> Id {
         let id = self.fresh_id();
         emit(
             &mut self.functions,

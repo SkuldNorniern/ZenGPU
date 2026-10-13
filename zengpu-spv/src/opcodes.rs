@@ -110,8 +110,18 @@ pub fn lookup(opcode: u16) -> OpInfo {
         81 => OpInfo::new("OpCompositeExtract", true, true, IdsAt { idx: &[0] }),
         79 => OpInfo::new("OpVectorShuffle", true, true, IdsAt { idx: &[0, 1] }),
         // ── Images ──────────────────────────────────────────────────────────
-        87 => OpInfo::new("OpImageSampleImplicitLod", true, true, IdsAt { idx: &[0, 1] }),
-        88 => OpInfo::new("OpImageSampleExplicitLod", true, true, IdsAt { idx: &[0, 1, 3] }),
+        87 => OpInfo::new(
+            "OpImageSampleImplicitLod",
+            true,
+            true,
+            IdsAt { idx: &[0, 1] },
+        ),
+        88 => OpInfo::new(
+            "OpImageSampleExplicitLod",
+            true,
+            true,
+            IdsAt { idx: &[0, 1, 3] },
+        ),
         // ── Conversion / unary ──────────────────────────────────────────────
         109 => OpInfo::new("OpConvertFToU", true, true, AllIds),
         110 => OpInfo::new("OpConvertFToS", true, true, AllIds),
