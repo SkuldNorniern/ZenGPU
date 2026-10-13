@@ -188,6 +188,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         }
         s.push_str("    VsOut out;\n");
         let _ = writeln!(s, "    out.position = {};", emit_expr(&ctx, &e.ret[0])?);
+        s.push_str("    out.position.y = -out.position.y;\n");
         for i in 0..e.varyings.len() {
             let _ = writeln!(s, "    out.vary{i} = {};", emit_expr(&ctx, &e.ret[i + 1])?);
         }
@@ -505,6 +506,16 @@ mod tests {
         );
         assert!(m.source.contains("out.vary0 = in.col;"));
         let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn vertex_position_uses_vulkan_clip_space() {
+        let m = graphics(
+            r#"
+            vertex vs(@location(0) p: f32x4) -> f32x4 { p }
+            "#,
+        );
+        assert!(m.source.contains("out.position.y = -out.position.y;"));
     }
 
     #[test]
