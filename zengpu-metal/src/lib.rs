@@ -533,6 +533,47 @@ mod graphics_tests {
                 wrote.wait(Duration::MAX).unwrap();
                 assert_eq!(dev.read_buffer(readback, 0, 64).unwrap(), data);
             }
+            let packed = [42; 64];
+            let padded = [77; 76];
+            dev.write_textures(&[
+                TextureWrite {
+                    texture: tex,
+                    region: valid,
+                    data: &packed,
+                    bytes_per_row: 16,
+                },
+                TextureWrite {
+                    texture: tex,
+                    region: valid,
+                    data: &padded,
+                    bytes_per_row: 20,
+                },
+            ])
+            .unwrap()
+            .wait(Duration::MAX)
+            .unwrap();
+            assert!(
+                dev.write_textures(&[
+                    TextureWrite {
+                        texture: tex,
+                        region: valid,
+                        data: &packed,
+                        bytes_per_row: 16
+                    },
+                    TextureWrite {
+                        texture: tex,
+                        region: valid,
+                        data: &[0; 63],
+                        bytes_per_row: 16
+                    },
+                ])
+                .is_err()
+            );
+            dev.copy_texture_region_to_buffer(tex, valid, readback, 0, 16)
+                .unwrap()
+                .wait(Duration::MAX)
+                .unwrap();
+            assert_eq!(dev.read_buffer(readback, 0, 64).unwrap(), [77; 64]);
         }
     }
 

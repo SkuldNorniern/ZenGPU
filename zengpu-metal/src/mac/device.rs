@@ -10,10 +10,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use metal::{
-    Buffer, CommandBuffer, CommandBufferRef, CommandQueue, ComputePipelineState, DepthStencilState,
-    Device, Library, MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin,
-    MTLPrimitiveType, MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage,
-    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
+    BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
+    ComputePipelineState, DepthStencilState, Device, Library, MTLBlitOption,
+    MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType, MTLResourceOptions, MTLSize,
+    MTLStorageMode, MTLTextureType, MTLTextureUsage, RenderPipelineState, SamplerDescriptor,
+    SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
@@ -389,6 +390,23 @@ impl MetalDevice {
         region: TextureRegion,
         data: &[u8],
     ) -> Result<CommandBuffer> {
+        let staging = self.stage_rows(layout, region, data)?;
+        let cmd = self.inner.command_buffer();
+        autoreleasepool(|| {
+            let blit = cmd.new_blit_command_encoder();
+            Self::encode_upload(blit, &staging, tex, layout, region);
+            blit.end_encoding();
+        });
+        self.inner.commit(&cmd);
+        Ok(cmd)
+    }
+
+    fn stage_rows(
+        &self,
+        layout: &transfer::Layout,
+        region: TextureRegion,
+        data: &[u8],
+    ) -> Result<Buffer> {
         let row = region.width * layout.texel_bytes;
         let image_bytes = u64::from(row) * u64::from(region.height);
         if image_bytes > self.inner.device.max_buffer_length() {
@@ -400,39 +418,55 @@ impl MetalDevice {
             .inner
             .device
             .new_buffer(image_bytes, MTLResourceOptions::StorageModeShared);
-        for y in 0..region.height as usize {
-            // SAFETY: texture_layout/data_len are checked for every source row. Staging holds all
+        if layout.row_bytes == row {
+            // SAFETY: validated source span equals the packed allocation size.
             unsafe {
                 copy_nonoverlapping(
-                    data.as_ptr().add(y * layout.row_bytes as usize),
-                    (staging.contents() as *mut u8).add(y * row as usize),
-                    row as usize,
+                    data.as_ptr(),
+                    staging.contents().cast(),
+                    image_bytes as usize,
                 );
             }
+        } else {
+            for y in 0..region.height as usize {
+                // SAFETY: layout checked per row. Staging has no GPU readers yet.
+                unsafe {
+                    copy_nonoverlapping(
+                        data.as_ptr().add(y * layout.row_bytes as usize),
+                        (staging.contents() as *mut u8).add(y * row as usize),
+                        row as usize,
+                    );
+                }
+            }
         }
-        let cmd = self.inner.command_buffer();
-        autoreleasepool(|| {
-            let blit = cmd.new_blit_command_encoder();
-            blit.copy_from_buffer_to_texture(
-                &staging,
-                0,
-                u64::from(row),
-                image_bytes,
-                MTLSize::new(u64::from(region.width), u64::from(region.height), 1),
-                tex,
-                u64::from(region.layer),
-                u64::from(region.mip_level),
-                MTLOrigin {
-                    x: u64::from(region.x),
-                    y: u64::from(region.y),
-                    z: 0,
-                },
-                MTLBlitOption::empty(),
-            );
-            blit.end_encoding();
-        });
-        self.inner.commit(&cmd);
-        Ok(cmd)
+        Ok(staging)
+    }
+
+    fn encode_upload(
+        blit: &BlitCommandEncoderRef,
+        staging: &Buffer,
+        tex: &Texture,
+        layout: &transfer::Layout,
+        region: TextureRegion,
+    ) {
+        let row = region.width * layout.texel_bytes;
+        let image_bytes = u64::from(row) * u64::from(region.height);
+        blit.copy_from_buffer_to_texture(
+            staging,
+            0,
+            u64::from(row),
+            image_bytes,
+            MTLSize::new(u64::from(region.width), u64::from(region.height), 1),
+            tex,
+            u64::from(region.layer),
+            u64::from(region.mip_level),
+            MTLOrigin {
+                x: u64::from(region.x),
+                y: u64::from(region.y),
+                z: 0,
+            },
+            MTLBlitOption::empty(),
+        );
     }
 
     /// Write `data` into `handle`'s region and wait until it has landed.
@@ -443,10 +477,8 @@ impl MetalDevice {
         data: &[u8],
         bytes_per_row: u32,
     ) -> Result<()> {
-        if let Some(cmd) = self.queue_region(handle, region, data, bytes_per_row)? {
-            self.inner.wait_for(&cmd)?;
-        }
-        Ok(())
+        let cmd = self.queue_region(handle, region, data, bytes_per_row)?;
+        self.inner.wait_for(&cmd)
     }
 
     /// Queues a copy for any storage mode. Queue order and tracked hazards keep it after
@@ -457,7 +489,7 @@ impl MetalDevice {
         region: TextureRegion,
         data: &[u8],
         bytes_per_row: u32,
-    ) -> Result<Option<CommandBuffer>> {
+    ) -> Result<CommandBuffer> {
         let (tex, desc) = self.texture(handle)?;
         let layout = transfer::texture_layout(
             &desc,
@@ -467,7 +499,7 @@ impl MetalDevice {
             true,
         )?;
         transfer::data_len(&layout, data.len() as u64)?;
-        self.stage_into(&tex, &layout, region, data).map(Some)
+        self.stage_into(&tex, &layout, region, data)
     }
 
     /// Encode and submit one compute dispatch, blocking until completion. `bindings.buffers` bind
@@ -855,8 +887,9 @@ impl GpuDevice for MetalDevice {
             )
             .into());
         }
+        let mut uploads = Vec::with_capacity(writes.len());
         for w in writes {
-            let (_, desc) = self.texture(w.texture)?;
+            let (tex, desc) = self.texture(w.texture)?;
             let layout = transfer::texture_layout(
                 &desc,
                 w.region,
@@ -865,14 +898,22 @@ impl GpuDevice for MetalDevice {
                 false,
             )?;
             transfer::data_len(&layout, w.data.len() as u64)?;
+            uploads.push((tex, layout, w));
         }
-        let mut cmds = Vec::new();
-        for w in writes {
-            if let Some(cmd) = self.queue_region(w.texture, w.region, w.data, w.bytes_per_row)? {
-                cmds.push(cmd);
+        let staging = uploads
+            .iter()
+            .map(|(_, layout, w)| self.stage_rows(layout, w.region, w.data))
+            .collect::<Result<Vec<_>>>()?;
+        let cmd = self.inner.command_buffer();
+        autoreleasepool(|| {
+            let blit = cmd.new_blit_command_encoder();
+            for ((tex, layout, w), buffer) in uploads.iter().zip(&staging) {
+                Self::encode_upload(blit, buffer, tex, layout, w.region);
             }
-        }
-        Ok(MetalSubmission::boxed(&self.inner, cmds))
+            blit.end_encoding();
+        });
+        self.inner.commit(&cmd);
+        Ok(MetalSubmission::boxed(&self.inner, vec![cmd]))
     }
 
     fn copy_buffer_to_texture(
