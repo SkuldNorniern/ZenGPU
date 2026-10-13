@@ -137,10 +137,14 @@ pub trait GpuDevice: Send + Sync {
     /// asynchronous path may be added later.
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()>;
 
-    /// Upload `data` to one mip level of one array layer (or cube face) of
-    /// the texture. Use this for texture arrays, cubemaps, and pre-baked mip
-    /// chains; [`Self::upload_texture_data`] only ever targets mip `0`, layer
-    /// `0`. Default implementation reports
+    /// Replaces one whole mip level of one array layer (or cube face) of the
+    /// texture with `data`. It does not update a sub-rectangle: to update a
+    /// rectangle, use [`Self::write_textures`] (check
+    /// [`crate::TransferCaps::texture_region_write`] first).
+    ///
+    /// Use this for texture arrays, cubemaps, and pre-baked mip chains;
+    /// [`Self::upload_texture_data`] only ever targets mip `0`, layer `0`.
+    /// Default implementation reports
     /// [`GpuError::UnsupportedFeatures`] on backends that have not
     /// implemented it.
     fn upload_texture_data_region(
