@@ -234,6 +234,103 @@ impl VulkanDevice {
         })
     }
 
+    /// Write `data` into `dst` at `offset` through a temporary host-visible
+    /// buffer, for buffers the host cannot map (device-local VRAM).
+    pub(super) fn staged_write(&self, dst: vk::Buffer, offset: u64, data: &[u8]) -> Result<()> {
+        let staging = StagingBuffer::new(self, data.len() as u64, false)?;
+        for (i, chunk) in data.chunks(staging.size as usize).enumerate() {
+            unsafe { copy_nonoverlapping(chunk.as_ptr(), staging.mapped, chunk.len()) };
+            let dst_offset = offset + (i as u64) * staging.size;
+            self.one_shot_submit(|dev, cmd| {
+                unsafe {
+                    dev.cmd_copy_buffer(
+                        cmd,
+                        staging.buffer,
+                        dst,
+                        &[vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset,
+                            size: chunk.len() as u64,
+                        }],
+                    );
+                    // Later submissions read what the copy wrote.
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access_mask: vk::AccessFlags::MEMORY_READ
+                                | vk::AccessFlags::MEMORY_WRITE,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Read `src` from `offset` into `out` through a temporary host-visible
+    /// buffer.
+    pub(super) fn staged_read(&self, src: vk::Buffer, offset: u64, out: &mut [u8]) -> Result<()> {
+        let staging = StagingBuffer::new(self, out.len() as u64, true)?;
+        let size = staging.size as usize;
+        for (i, chunk) in out.chunks_mut(size).enumerate() {
+            let src_offset = offset + (i * size) as u64;
+            let len = chunk.len() as u64;
+            self.one_shot_submit(|dev, cmd| {
+                unsafe {
+                    // Earlier submissions' shader writes become visible to the
+                    // copy, and the copy's writes to the host.
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::MEMORY_WRITE,
+                            dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                    dev.cmd_copy_buffer(
+                        cmd,
+                        src,
+                        staging.buffer,
+                        &[vk::BufferCopy {
+                            src_offset,
+                            dst_offset: 0,
+                            size: len,
+                        }],
+                    );
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::HOST,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access_mask: vk::AccessFlags::HOST_READ,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                }
+                Ok(())
+            })?;
+            unsafe { copy_nonoverlapping(staging.mapped, chunk.as_mut_ptr(), chunk.len()) };
+        }
+        Ok(())
+    }
+
     /// Memory types to try for a buffer of `size` bytes, best first.
     ///
     /// Without Resizable BAR, the only device-local host-visible heap is the
@@ -761,5 +858,98 @@ pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
             &[],
             &[],
         );
+    }
+}
+
+/// Bytes moved per staging round trip.
+const STAGING_CHUNK: u64 = 16 << 20;
+
+/// A temporary host-visible, mapped transfer buffer, freed on drop.
+struct StagingBuffer<'a> {
+    device: &'a VulkanDevice,
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    size: u64,
+}
+
+impl<'a> StagingBuffer<'a> {
+    /// At most [`STAGING_CHUNK`] bytes, and at least one. `readback` prefers
+    /// host-cached memory, which the CPU reads far faster.
+    fn new(device: &'a VulkanDevice, len: u64, readback: bool) -> Result<Self> {
+        let size = len.clamp(1, STAGING_CHUNK);
+        let dev = &device.inner.device;
+        let buffer = unsafe {
+            dev.create_buffer(
+                &vk::BufferCreateInfo {
+                    size,
+                    usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
+                    sharing_mode: vk::SharingMode::EXCLUSIVE,
+                    ..Default::default()
+                },
+                None,
+            )
+        }
+        .map_err(|e| GpuError::Backend(format!("vkCreateBuffer (staging): {e}")))?;
+        let reqs = unsafe { dev.get_buffer_memory_requirements(buffer) };
+        let coherent =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let type_index = readback
+            .then(|| {
+                device.find_memory_type(
+                    reqs.memory_type_bits,
+                    coherent | vk::MemoryPropertyFlags::HOST_CACHED,
+                )
+            })
+            .flatten()
+            .or_else(|| device.find_memory_type(reqs.memory_type_bits, coherent));
+        let memory = type_index.and_then(|memory_type_index| {
+            unsafe {
+                dev.allocate_memory(
+                    &vk::MemoryAllocateInfo {
+                        allocation_size: reqs.size,
+                        memory_type_index,
+                        ..Default::default()
+                    },
+                    None,
+                )
+            }
+            .ok()
+        });
+        let Some(memory) = memory else {
+            unsafe { dev.destroy_buffer(buffer, None) };
+            return Err(GpuError::OutOfMemory(MemoryUsage::Upload));
+        };
+        let mapped = unsafe {
+            dev.bind_buffer_memory(buffer, memory, 0)
+                .and_then(|()| dev.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()))
+        };
+        match mapped {
+            Ok(mapped) => Ok(Self {
+                device,
+                buffer,
+                memory,
+                mapped: mapped as *mut u8,
+                size,
+            }),
+            Err(e) => {
+                unsafe {
+                    dev.destroy_buffer(buffer, None);
+                    dev.free_memory(memory, None);
+                }
+                Err(GpuError::Backend(format!("staging buffer: {e}")))
+            }
+        }
+    }
+}
+
+impl Drop for StagingBuffer<'_> {
+    fn drop(&mut self) {
+        let dev = &self.device.inner.device;
+        unsafe {
+            dev.unmap_memory(self.memory);
+            dev.destroy_buffer(self.buffer, None);
+            dev.free_memory(self.memory, None);
+        }
     }
 }

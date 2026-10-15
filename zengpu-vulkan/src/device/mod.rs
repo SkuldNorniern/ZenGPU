@@ -2043,6 +2043,32 @@ mod tests {
         dev.destroy_texture(tex);
     }
 
+    /// Device-local buffers the host cannot map are written and read
+    /// through staging, across chunk boundaries and at odd offsets.
+    #[test]
+    fn gpu_only_buffer_round_trips_through_staging() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let size = (40u64 << 20) + 12; // spans three 16 MiB staging chunks
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
+        dev.write_buffer(buf, 0, &data).unwrap();
+        assert_eq!(dev.read_buffer(buf, 0, size).unwrap(), data);
+        dev.write_buffer(buf, 7, &[1, 2, 3]).unwrap();
+        let mut window = [0u8; 5];
+        dev.read_buffer_into(buf, 6, &mut window).unwrap();
+        assert_eq!(window, [data[6], 1, 2, 3, data[10]]);
+        assert!(dev.read_buffer(buf, size - 2, 4).is_err(), "past the end");
+        dev.destroy_buffer(buf);
+    }
+
     /// Without Resizable BAR the device-local host-visible heap is a 256 MiB
     /// aperture with a few MiB to spare; a large `CpuToGpu` buffer must still
     /// be made (in host memory) rather than fail.
@@ -2899,17 +2925,9 @@ mod tests {
             .map(|i| (i as u32).wrapping_mul(31).wrapping_add(7) as u8)
             .collect();
         dev.write_buffer(upload, 0, &data).unwrap();
-        // Device-local memory may also be host-visible on UMA/software devices.
-        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
-        let host_visible = !vk_dev
-            .buffers
-            .lock()
-            .unwrap()
-            .get(gpu)
-            .unwrap()
-            .mapped
-            .is_null();
-        assert_eq!(dev.write_buffer(gpu, 0, &[1]).is_ok(), host_visible);
+        // Host writes reach device-local memory whether or not it is mapped
+        // (staged when it is not); the copy below overwrites this byte.
+        dev.write_buffer(gpu, 0, &[1]).unwrap();
         dev.copy_buffer(upload, 0, gpu, 0, SIZE as u64).unwrap();
         dev.copy_buffer(gpu, 0, readback, 0, SIZE as u64).unwrap();
         assert_eq!(dev.read_buffer(readback, 0, SIZE as u64).unwrap(), data);

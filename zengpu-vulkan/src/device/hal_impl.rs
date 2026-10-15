@@ -184,11 +184,6 @@ impl GpuDevice for VulkanDevice {
             )));
         }
 
-        if buf.mapped.is_null() {
-            return Err(GpuError::Backend(
-                "write_buffer on non-host-visible buffer".to_string(),
-            ));
-        }
         let start = offset as usize;
         let end = start.checked_add(data.len()).ok_or_else(|| {
             GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
@@ -200,6 +195,13 @@ impl GpuDevice for VulkanDevice {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
                 format!("range {start}..{end} exceeds buffer size {}", buf.size),
             )));
+        }
+        if data.is_empty() {
+            return Ok(());
+        }
+        if buf.mapped.is_null() {
+            let target = buf.buffer;
+            return self.staged_write(target, offset, data);
         }
         unsafe {
             copy_nonoverlapping(data.as_ptr(), buf.mapped.add(start), data.len());
@@ -222,11 +224,6 @@ impl GpuDevice for VulkanDevice {
                 needed: "READBACK",
             }));
         }
-        if buf.mapped.is_null() {
-            return Err(GpuError::Backend(
-                "read_buffer on non-host-visible buffer".to_string(),
-            ));
-        }
         let start = offset as usize;
         let end = start.checked_add(len as usize).ok_or_else(|| {
             GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
@@ -240,6 +237,13 @@ impl GpuDevice for VulkanDevice {
             )));
         }
         let mut out = vec![0u8; len as usize];
+        if buf.mapped.is_null() {
+            if len != 0 {
+                let source = buf.buffer;
+                self.staged_read(source, offset, &mut out)?;
+            }
+            return Ok(out);
+        }
         unsafe {
             copy_nonoverlapping(buf.mapped.add(start), out.as_mut_ptr(), len as usize);
         }
@@ -260,11 +264,6 @@ impl GpuDevice for VulkanDevice {
                 needed: "READBACK",
             }));
         }
-        if buf.mapped.is_null() {
-            return Err(GpuError::Backend(
-                "read_buffer_into on non-host-visible buffer".to_string(),
-            ));
-        }
         let start = offset as usize;
         let end = start.checked_add(dst.len()).ok_or_else(|| {
             GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
@@ -276,6 +275,13 @@ impl GpuDevice for VulkanDevice {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
                 format!("range {start}..{end} exceeds buffer size {}", buf.size),
             )));
+        }
+        if buf.mapped.is_null() {
+            if !dst.is_empty() {
+                let source = buf.buffer;
+                self.staged_read(source, offset, dst)?;
+            }
+            return Ok(());
         }
         unsafe {
             copy_nonoverlapping(buf.mapped.add(start), dst.as_mut_ptr(), dst.len());

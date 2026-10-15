@@ -66,16 +66,10 @@ pub(crate) fn buffer_usage_to_vk(usage: BufferUsage) -> vk::BufferUsageFlags {
     if usage.contains(BufferUsage::INDIRECT) {
         flags |= vk::BufferUsageFlags::INDIRECT_BUFFER;
     }
-    if usage.contains(BufferUsage::TRANSFER_SRC) {
-        flags |= vk::BufferUsageFlags::TRANSFER_SRC;
-    }
-    if usage.contains(BufferUsage::TRANSFER_DST) || usage.contains(BufferUsage::READBACK) {
-        flags |= vk::BufferUsageFlags::TRANSFER_DST;
-    }
-    if flags.is_empty() {
-        flags = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
-    }
-    flags
+    // Always transferable: buffers the host cannot map are written and read
+    // through a staging copy in either direction. The HAL usage flags still
+    // gate copy_buffer itself.
+    flags | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST
 }
 
 pub(crate) fn memory_usage_to_vk(usage: MemoryUsage) -> vk::MemoryPropertyFlags {
