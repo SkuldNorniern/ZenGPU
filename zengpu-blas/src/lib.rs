@@ -29,6 +29,7 @@
 //! Optional extension: add `zengpu-blas` to `Cargo.toml`. It depends only on `zengpu-hal` and
 //! `zengpu-compute`, so it works with any HAL backend.
 
+mod gemm_tiled;
 pub mod level1;
 pub mod level3;
 
