@@ -494,6 +494,8 @@ struct HipBuffer {
     usage: BufferUsage,
     /// Pinned host allocation backing this buffer (APU fallback), else null.
     host: *mut c_void,
+    /// Allocated from the stream-ordered pool; freed with `hipFreeAsync`.
+    pooled: bool,
 }
 
 impl HipBuffer {
@@ -555,6 +557,9 @@ struct HipCore {
     peer_access: Mutex<HashMap<i32, bool>>,
     /// Persistent code-object cache, from `DeviceRequest::pipeline_cache_path`.
     cache_dir: Option<PathBuf>,
+    /// Whether buffers of [`POOL_MIN_BYTES`] and up come from the
+    /// stream-ordered pool.
+    pooled_alloc: bool,
     allocated: AtomicU64,
     lost: AtomicBool,
 }
@@ -651,6 +656,9 @@ impl HipCore {
         unsafe {
             if !buffer.host.is_null() {
                 hipHostFree(buffer.host);
+            } else if buffer.pooled {
+                // Stream-ordered: returns at once, never waits on the GPU.
+                hipFreeAsync(buffer.ptr, self.stream);
             } else if !buffer.ptr.is_null() {
                 hipSetDevice(self.info.ordinal);
                 hipFree(buffer.ptr);
@@ -875,7 +883,11 @@ impl Drop for HipCore {
         if let Ok(shaders) = self.shaders.get_mut() {
             drop(shaders.drain().collect::<Vec<_>>());
         }
-        unsafe { hipStreamDestroy(self.stream) };
+        unsafe {
+            // Pooled frees are queued on the stream; let them run first.
+            hipStreamSynchronize(self.stream);
+            hipStreamDestroy(self.stream);
+        }
     }
 }
 
@@ -1094,6 +1106,52 @@ impl GpuInstance for HipInstance {
     }
 }
 
+// ── Stream-ordered allocation ─────────────────────────────────────────────────
+
+/// Smallest buffer taken from the stream-ordered pool. Below 2 MiB HIP
+/// sub-allocates `hipMalloc` itself (~1 µs); from 2 MiB on, `hipMalloc` +
+/// `hipFree` cost 160–2300 µs on an RX 9060 XT against ~20 µs from the pool.
+const POOL_MIN_BYTES: usize = 2 << 20;
+
+/// Opt-out for the stream-ordered allocator.
+pub const NO_MEMPOOL_ENV: &str = "ZENGPU_HIP_NO_MEMPOOL";
+
+/// `hipMemPoolAttrReleaseThreshold` (CUDA-compatible enum value).
+const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
+
+/// Use the device's default memory pool for large buffers, when the runtime
+/// has one (ROCm 6.0+; the 5.x implementation is skipped as less proven).
+///
+/// Large allocations matter twice over: `hipFree` synchronizes the whole
+/// device, so destroying a buffer while any kernel runs blocks until that
+/// kernel ends, whereas `hipFreeAsync` returns at once. The default release
+/// threshold of 0 hands memory back to the driver at every synchronization,
+/// which makes the pool as slow as `hipMalloc`; keeping up to an eighth of
+/// VRAM (at most 512 MiB) cached avoids that.
+fn setup_mem_pool(info: &HipDeviceInfo) -> bool {
+    if env::var_os(NO_MEMPOOL_ENV).is_some()
+        || !ffi::pools_loaded()
+        || !info.capabilities.runtime_rocm.at_least(6, 0)
+    {
+        return false;
+    }
+    let mut pool: HipMemPool = ptr::null_mut();
+    if unsafe { hipDeviceGetDefaultMemPool(&mut pool, info.ordinal) } != HIP_SUCCESS
+        || pool.is_null()
+    {
+        return false;
+    }
+    let mut threshold: u64 = (info.total_mem as u64 / 8).min(512 << 20);
+    let rc = unsafe {
+        hipMemPoolSetAttribute(
+            pool,
+            HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD,
+            (&mut threshold as *mut u64).cast(),
+        )
+    };
+    rc == HIP_SUCCESS
+}
+
 // ── HipAdapter ────────────────────────────────────────────────────────────────
 
 pub struct HipAdapter {
@@ -1128,6 +1186,7 @@ impl GpuAdapter for HipAdapter {
                 lifetime: Mutex::new(LifetimeState::default()),
                 peer_access: Mutex::new(HashMap::new()),
                 cache_dir: req.pipeline_cache_path.as_deref().map(cache::dir_for),
+                pooled_alloc: setup_mem_pool(&self.dev_info),
                 allocated: AtomicU64::new(0),
                 lost: AtomicBool::new(false),
             }),
@@ -1286,7 +1345,16 @@ impl GpuDevice for HipDevice {
         // hipMalloc(0) succeeds with a null pointer; such a buffer binds as
         // null and every non-empty range on it is rejected.
         let mut host: *mut c_void = ptr::null_mut();
-        if size != 0 {
+        let mut pooled = false;
+        if size >= POOL_MIN_BYTES && self.core.pooled_alloc {
+            // Stream-ordered: the memory is valid for everything later on
+            // this device's stream, which is where every use of it goes.
+            pooled = unsafe { hipMallocAsync(&mut ptr, size, self.core.stream) } == HIP_SUCCESS;
+            if !pooled {
+                ptr = ptr::null_mut();
+            }
+        }
+        if size != 0 && !pooled {
             let rc = unsafe { hipMalloc(&mut ptr, size) };
             if rc == HIP_ERROR_OUT_OF_MEMORY && self.core.info.integrated {
                 // APUs expose only a small VRAM carve-out to hipMalloc; the
@@ -1317,6 +1385,7 @@ impl GpuDevice for HipDevice {
             size,
             usage: desc.usage,
             host,
+            pooled,
         }))
     }
 
@@ -1460,9 +1529,11 @@ impl GpuDevice for HipDevice {
             return self.core.synchronize();
         }
 
-        // Both device streams are idle (ensure_idle above, and every
-        // synchronous op waits for its stream), so the legacy-stream copies
-        // below cannot race this crate's own work.
+        // The legacy-stream copies below do not order against either device
+        // stream, so drain both: that also makes pooled allocations, which are
+        // stream-ordered, valid before they are touched.
+        self.core.synchronize()?;
+        src_device.core.synchronize()?;
         if self.can_peer(src_ordinal) {
             self.core.activate()?;
             unsafe {
@@ -1735,7 +1806,7 @@ mod tests {
     use std::process;
     use std::slice::from_raw_parts;
     use std::sync::Arc;
-    use std::thread::spawn;
+    use std::thread::{sleep, spawn};
     use std::time::Instant;
 
     use zengpu_hal::{BufferUsage, GpuInstance, MemoryUsage};
@@ -3814,5 +3885,70 @@ extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
         build("after corruption");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `hipFree` waits for every kernel on the GPU; large buffers come from
+    /// the stream-ordered pool so destroying one never does.
+    #[test]
+    fn destroying_large_buffer_does_not_wait_for_busy_gpu() {
+        const SPIN: &str = r#"
+extern "C" __global__ void spin(unsigned int ticks) {
+    unsigned long long start = wall_clock64();
+    while (wall_clock64() - start < ticks) {}
+}
+"#;
+        let Some(inst) = try_instance() else { return };
+        let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
+        let busy = adapter.open(DeviceRequest::default()).unwrap();
+        let other = adapter.open(DeviceRequest::default()).unwrap();
+        let hip = other.as_any().downcast_ref::<HipDevice>().unwrap();
+        if !hip.core.pooled_alloc {
+            println!("hip: stream-ordered pool unavailable; skipped");
+            return;
+        }
+
+        let shader = busy.create_shader(ShaderDesc::hip(SPIN)).unwrap();
+        let pipeline = busy
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "spin",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        let big = buffer(other.as_ref(), 64 << 20, BufferUsage::STORAGE);
+        // Warm the pool so the timed destroy measures only the free.
+        other.write_buffer(big, 0, &[0u8; 16]).unwrap();
+
+        // 0.5 s at the 100 MHz wall clock AMD GPUs use.
+        let ticks = zengpu_hal::Scalar::U32(50_000_000);
+        let submission = busy
+            .submit(
+                1,
+                pipeline,
+                Bindings {
+                    buffers: &[],
+                    textures: &[],
+                    images: &[],
+                    scalars: &[ticks],
+                },
+                [1, 1, 1],
+            )
+            .unwrap();
+        // Let the kernel start.
+        sleep(Duration::from_millis(50));
+        let t = Instant::now();
+        other.destroy_buffer(big);
+        let took = t.elapsed();
+        let pending = submission.poll().unwrap() == SubmissionStatus::Pending;
+        submission.wait(Duration::from_secs(30)).unwrap();
+        println!("hip: destroy 64 MiB while GPU busy: {took:?} (kernel still running: {pending})");
+        assert!(
+            pending,
+            "spin kernel ended too early for the test to mean anything"
+        );
+        assert!(took < Duration::from_millis(100), "destroy waited {took:?}");
+
+        busy.destroy_pipeline(pipeline);
+        busy.destroy_shader(shader);
     }
 }
