@@ -51,7 +51,9 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 Other features: `compute` (default) for device arrays, pooling and
 elementwise kernels, `blas` for GEMM.
 
-HIP needs ROCm 5.0 or newer and compiles kernels with hipRTC for the exact
+HIP loads ROCm at run time, so building needs no ROCm and an app built with
+`hip` still starts where ROCm is missing (the backend then has no adapters).
+It needs ROCm 5.0 or newer at run time and compiles kernels with hipRTC for the exact
 gfx target, so RDNA 1 (RX 5000), RDNA 2 laptop parts and other GPUs missing
 from AMD's support list run without `HSA_OVERRIDE_GFX_VERSION`. On RDNA 1/2 it
 sets `HSA_ENABLE_SDMA=0` before `hipInit` unless you set it yourself or set
