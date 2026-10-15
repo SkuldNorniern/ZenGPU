@@ -184,14 +184,20 @@ fn memory_bound_kernel_bandwidth() {
         let out = kernels.add(&*device, &pool, &a, &b).unwrap();
         pool.free(out);
     }
-    println!("hip: elementwise add  {:.0} GB/s", gb(3.0, t.elapsed().as_secs_f64() / 5.0));
+    println!(
+        "hip: elementwise add  {:.0} GB/s",
+        gb(3.0, t.elapsed().as_secs_f64() / 5.0)
+    );
 
     blas.saxpy(&*device, &pool, 2.0, &a, &b).unwrap();
     let t = Instant::now();
     for _ in 0..5 {
         blas.saxpy(&*device, &pool, 2.0, &a, &b).unwrap();
     }
-    println!("hip: saxpy            {:.0} GB/s", gb(3.0, t.elapsed().as_secs_f64() / 5.0));
+    println!(
+        "hip: saxpy            {:.0} GB/s",
+        gb(3.0, t.elapsed().as_secs_f64() / 5.0)
+    );
 
     pool.free(a);
     pool.free(b);
