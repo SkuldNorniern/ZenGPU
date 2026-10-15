@@ -655,6 +655,7 @@ pub struct VulkanDevice {
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
     /// Reused for host-visible uploads.
     staging: Mutex<transfer::StagingRing>,
+    transfer_slots: Mutex<Option<dispatch::TransferSlots>>,
     orphans: Orphans,
 }
 
@@ -1011,6 +1012,7 @@ impl VulkanDevice {
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
             staging: Mutex::new(transfer::StagingRing::default()),
+            transfer_slots: Mutex::new(None),
             orphans: Arc::default(),
         })
     }
@@ -1329,6 +1331,9 @@ impl Drop for VulkanDevice {
             let _ = self.inner.device.device_wait_idle();
         }
         self.reap_orphans();
+        if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {
+            slots.destroy(&self.inner.device);
+        }
         #[cfg(debug_assertions)]
         {
             let mut outstanding = Vec::new();

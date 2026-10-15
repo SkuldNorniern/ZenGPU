@@ -80,8 +80,19 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
-        let cmd = self.cmd_list_pool.acquire()?;
+        let pending = self.submit_raw(record)?;
+        self.finish_raw(pending)
+    }
 
+    /// Submits a one-shot command buffer without waiting.
+    ///
+    /// Completion never destroys deferred resources, so it is safe while resource
+    /// tables are locked.
+    pub(crate) fn submit_raw<F>(&self, record: F) -> Result<RawSubmit>
+    where
+        F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
+    {
+        let cmd = self.cmd_list_pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
             self.inner
@@ -93,47 +104,58 @@ impl VulkanDevice {
             self.cmd_list_pool.release(cmd);
             return Err(e);
         }
-
-        let fence = self.fence_pool.acquire()?;
+        let fence = match self.fence_pool.acquire() {
+            Ok(fence) => fence,
+            Err(e) => {
+                self.cmd_list_pool.release(cmd);
+                return Err(e);
+            }
+        };
         let submit_info = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        let mut submitted = false;
-        let (submit_result, serial) = {
+        let submitted = {
             let _queue = self.inner.queue_lock.lock().unwrap();
-            let result = unsafe {
+            unsafe {
                 self.inner
                     .device
                     .queue_submit(self.inner.queue, &[submit_info], fence)
                     .map_err(|e| map_vk_err("vkQueueSubmit", e))
-            };
-            let serial = result.is_ok().then(|| self.inner.serials.next());
-            (result, serial)
+            }
+            .map(|()| self.inner.serials.next())
         };
-        if submit_result.is_ok() {
-            submitted = true;
+        match submitted {
+            Ok(serial) => Ok(RawSubmit { cmd, fence, serial }),
+            Err(e) => {
+                self.fence_pool.release(fence);
+                self.cmd_list_pool.release(cmd);
+                Err(e)
+            }
         }
-        let wait_result = submit_result.and_then(|()| unsafe {
+    }
+
+    pub(crate) fn finish_raw(&self, pending: RawSubmit) -> Result<()> {
+        let RawSubmit { cmd, fence, serial } = pending;
+        let waited = unsafe {
             self.inner
                 .device
                 .wait_for_fences(&[fence], true, u64::MAX)
                 .map_err(|e| map_vk_err("vkWaitForFences", e))
-        });
-        if let (Some(serial), Ok(())) = (serial, &wait_result) {
-            self.inner.serials.complete(serial);
-        }
-        if !submitted || wait_result.is_ok() {
-            self.fence_pool.release(fence);
-            self.cmd_list_pool.release(cmd);
-        } else {
-            unsafe {
-                self.inner.device.destroy_fence(fence, None);
+        };
+        match waited {
+            Ok(()) => {
+                self.inner.serials.complete(serial);
+                self.fence_pool.release(fence);
+                self.cmd_list_pool.release(cmd);
+                Ok(())
+            }
+            Err(e) => {
+                unsafe { self.inner.device.destroy_fence(fence, None) };
+                Err(e)
             }
         }
-
-        wait_result
     }
 
     /// The submission owns the fence and command buffer until it completes.
@@ -256,50 +278,68 @@ impl VulkanDevice {
                 Ok(())
             });
         }
-        let staging = StagingBuffer::new(self, data.len() as u64, false)?;
-        for (i, chunk) in data.chunks(staging.size as usize).enumerate() {
-            unsafe { copy_nonoverlapping(chunk.as_ptr(), staging.mapped, chunk.len()) };
-            let dst_offset = offset + (i as u64) * staging.size;
-            self.one_shot_submit(|dev, cmd| {
-                unsafe {
-                    dev.cmd_copy_buffer(
-                        cmd,
-                        staging.buffer,
-                        dst,
-                        &[vk::BufferCopy {
-                            src_offset: 0,
-                            dst_offset,
-                            size: chunk.len() as u64,
-                        }],
-                    );
-                    dev.cmd_pipeline_barrier(
-                        cmd,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                            dst_access_mask: vk::AccessFlags::MEMORY_READ
-                                | vk::AccessFlags::MEMORY_WRITE,
-                            ..Default::default()
-                        }],
-                        &[],
-                        &[],
-                    );
+        let mut slots = self.transfer_slots.lock().unwrap();
+        let slots = transfer_slots(self, &mut slots)?;
+        let mut in_flight: [Option<RawSubmit>; 2] = [None, None];
+        let result = (|| {
+            for (i, chunk) in data.chunks(STAGING_CHUNK as usize).enumerate() {
+                let slot = &slots.upload[i % 2];
+                if let Some(pending) = in_flight[i % 2].take() {
+                    self.finish_raw(pending)?;
                 }
-                Ok(())
-            })?;
-        }
-        Ok(())
+                unsafe { copy_nonoverlapping(chunk.as_ptr(), slot.mapped, chunk.len()) };
+                let dst_offset = offset + (i as u64) * STAGING_CHUNK;
+                let len = chunk.len() as u64;
+                in_flight[i % 2] = Some(self.submit_raw(|dev, cmd| {
+                    unsafe {
+                        dev.cmd_copy_buffer(
+                            cmd,
+                            slot.buffer,
+                            dst,
+                            &[vk::BufferCopy {
+                                src_offset: 0,
+                                dst_offset,
+                                size: len,
+                            }],
+                        );
+                        dev.cmd_pipeline_barrier(
+                            cmd,
+                            vk::PipelineStageFlags::TRANSFER,
+                            vk::PipelineStageFlags::ALL_COMMANDS,
+                            vk::DependencyFlags::empty(),
+                            &[vk::MemoryBarrier {
+                                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                                dst_access_mask: vk::AccessFlags::MEMORY_READ
+                                    | vk::AccessFlags::MEMORY_WRITE,
+                                ..Default::default()
+                            }],
+                            &[],
+                            &[],
+                        );
+                    }
+                    Ok(())
+                })?);
+            }
+            Ok(())
+        })();
+        let drained = in_flight
+            .into_iter()
+            .flatten()
+            .map(|pending| self.finish_raw(pending))
+            .fold(Ok(()), Result::and);
+        result.and(drained)
     }
 
     pub(super) fn staged_read(&self, src: vk::Buffer, offset: u64, out: &mut [u8]) -> Result<()> {
-        let staging = StagingBuffer::new(self, out.len() as u64, true)?;
-        let size = staging.size as usize;
-        for (i, chunk) in out.chunks_mut(size).enumerate() {
-            let src_offset = offset + (i * size) as u64;
-            let len = chunk.len() as u64;
-            self.one_shot_submit(|dev, cmd| {
+        let mut slots = self.transfer_slots.lock().unwrap();
+        let slots = transfer_slots(self, &mut slots)?;
+        let total = out.len() as u64;
+        let chunks = total.div_ceil(STAGING_CHUNK) as usize;
+        let enqueue = |i: usize| -> Result<RawSubmit> {
+            let slot = &slots.readback[i % 2];
+            let src_offset = offset + i as u64 * STAGING_CHUNK;
+            let len = STAGING_CHUNK.min(total - i as u64 * STAGING_CHUNK);
+            self.submit_raw(|dev, cmd| {
                 unsafe {
                     dev.cmd_pipeline_barrier(
                         cmd,
@@ -317,7 +357,7 @@ impl VulkanDevice {
                     dev.cmd_copy_buffer(
                         cmd,
                         src,
-                        staging.buffer,
+                        slot.buffer,
                         &[vk::BufferCopy {
                             src_offset,
                             dst_offset: 0,
@@ -339,10 +379,29 @@ impl VulkanDevice {
                     );
                 }
                 Ok(())
-            })?;
-            unsafe { copy_nonoverlapping(staging.mapped, chunk.as_mut_ptr(), chunk.len()) };
-        }
-        Ok(())
+            })
+        };
+        let mut in_flight: [Option<RawSubmit>; 2] = [None, None];
+        let result = (|| {
+            in_flight[0] = Some(enqueue(0)?);
+            for (i, chunk) in out.chunks_mut(STAGING_CHUNK as usize).enumerate() {
+                if i + 1 < chunks {
+                    in_flight[(i + 1) % 2] = Some(enqueue(i + 1)?);
+                }
+                if let Some(pending) = in_flight[i % 2].take() {
+                    self.finish_raw(pending)?;
+                }
+                let slot = &slots.readback[i % 2];
+                unsafe { copy_nonoverlapping(slot.mapped, chunk.as_mut_ptr(), chunk.len()) };
+            }
+            Ok(())
+        })();
+        let drained = in_flight
+            .into_iter()
+            .flatten()
+            .map(|pending| self.finish_raw(pending))
+            .fold(Ok(()), Result::and);
+        result.and(drained)
     }
 
     /// Memory types for a buffer of `size` bytes, best first.
@@ -864,31 +923,88 @@ pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
     }
 }
 
+pub(crate) struct RawSubmit {
+    cmd: vk::CommandBuffer,
+    fence: vk::Fence,
+    serial: u64,
+}
+
 /// Largest write sent inline with vkCmdUpdateBuffer (the Vulkan limit).
 const INLINE_UPDATE_MAX: u64 = 65536;
 
-/// Bytes moved per staging round trip.
-const STAGING_CHUNK: u64 = 16 << 20;
+const STAGING_CHUNK: u64 = 8 << 20;
 
-/// A temporary host-visible, mapped transfer buffer, freed on drop.
-struct StagingBuffer<'a> {
-    device: &'a VulkanDevice,
+/// A persistently mapped host-visible transfer buffer.
+pub(crate) struct HostSlot {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
     mapped: *mut u8,
-    size: u64,
 }
 
-impl<'a> StagingBuffer<'a> {
-    /// At most [`STAGING_CHUNK`] bytes, and at least one. `readback` prefers host-cached memory,
-    /// which the CPU reads far faster.
-    fn new(device: &'a VulkanDevice, len: u64, readback: bool) -> Result<Self> {
-        let size = len.clamp(1, STAGING_CHUNK);
+/// Staging for buffers the host cannot map: two write-combined upload slots, two host-cached
+/// readback slots. Kept after first use: allocating and zeroing 8 MiB per transfer costs more than
+/// the transfer.
+pub(crate) struct TransferSlots {
+    upload: [HostSlot; 2],
+    readback: [HostSlot; 2],
+}
+
+// SAFETY: raw handles and mapped pointers, used only under the device's
+unsafe impl Send for TransferSlots {}
+
+impl TransferSlots {
+    fn new(device: &VulkanDevice) -> Result<Self> {
+        let mut made: Vec<HostSlot> = Vec::with_capacity(4);
+        for readback in [false, false, true, true] {
+            match HostSlot::new(device, readback) {
+                Ok(slot) => made.push(slot),
+                Err(e) => {
+                    for slot in made {
+                        slot.destroy(&device.inner.device);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let mut made = made.into_iter();
+        let mut next = || {
+            made.next()
+                .ok_or(GpuError::OutOfMemory(MemoryUsage::Upload))
+        };
+        Ok(Self {
+            upload: [next()?, next()?],
+            readback: [next()?, next()?],
+        })
+    }
+
+    /// Free every slot; the device must be idle.
+    pub(crate) fn destroy(self, dev: &Device) {
+        for slot in self.upload.into_iter().chain(self.readback) {
+            slot.destroy(dev);
+        }
+    }
+}
+
+fn transfer_slots<'a>(
+    device: &VulkanDevice,
+    slots: &'a mut Option<TransferSlots>,
+) -> Result<&'a TransferSlots> {
+    if slots.is_none() {
+        *slots = Some(TransferSlots::new(device)?);
+    }
+    slots
+        .as_ref()
+        .ok_or(GpuError::OutOfMemory(MemoryUsage::Upload))
+}
+
+impl HostSlot {
+    /// `readback` prefers host-cached memory, which the CPU reads far faster.
+    fn new(device: &VulkanDevice, readback: bool) -> Result<Self> {
         let dev = &device.inner.device;
         let buffer = unsafe {
             dev.create_buffer(
                 &vk::BufferCreateInfo {
-                    size,
+                    size: STAGING_CHUNK,
                     usage: vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
                     sharing_mode: vk::SharingMode::EXCLUSIVE,
                     ..Default::default()
@@ -927,16 +1043,15 @@ impl<'a> StagingBuffer<'a> {
             return Err(GpuError::OutOfMemory(MemoryUsage::Upload));
         };
         let mapped = unsafe {
-            dev.bind_buffer_memory(buffer, memory, 0)
-                .and_then(|()| dev.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()))
+            dev.bind_buffer_memory(buffer, memory, 0).and_then(|()| {
+                dev.map_memory(memory, 0, STAGING_CHUNK, vk::MemoryMapFlags::empty())
+            })
         };
         match mapped {
             Ok(mapped) => Ok(Self {
-                device,
                 buffer,
                 memory,
                 mapped: mapped as *mut u8,
-                size,
             }),
             Err(e) => {
                 unsafe {
@@ -947,11 +1062,8 @@ impl<'a> StagingBuffer<'a> {
             }
         }
     }
-}
 
-impl Drop for StagingBuffer<'_> {
-    fn drop(&mut self) {
-        let dev = &self.device.inner.device;
+    fn destroy(self, dev: &Device) {
         unsafe {
             dev.unmap_memory(self.memory);
             dev.destroy_buffer(self.buffer, None);
