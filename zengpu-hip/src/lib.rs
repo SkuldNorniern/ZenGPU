@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::thread::yield_now;
+use std::thread::{sleep, yield_now};
 use std::time::{Duration, Instant};
 
 use zengpu_hal::{
@@ -74,6 +74,14 @@ const HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 0;
 
 const HIP_STREAM_NON_BLOCKING: u32 = 1;
 const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+
+const SPIN_BEFORE_SLEEP: Duration = Duration::from_micros(200);
+const POLL_SLEEP: Duration = Duration::from_micros(100);
+
+/// `hipDeviceScheduleBlockingSync`: waiting threads sleep in the OS instead of spinning.
+const HIP_DEVICE_SCHEDULE_BLOCKING_SYNC: u32 = 4;
+
+pub const SPIN_WAIT_ENV: &str = "ZENGPU_HIP_SPIN_WAIT";
 
 /// Parameter slots per launch, 8 bytes each. A 4-byte scalar uses the low half;
 /// `hipModuleLaunchKernel` reads exactly the declared size.
@@ -895,15 +903,22 @@ impl GpuSubmission for HipSubmission {
                 }
             }
         }
-        let deadline = Instant::now().checked_add(timeout);
+        let start = Instant::now();
+        let deadline = start.checked_add(timeout);
         loop {
             if self.query()? == SubmissionStatus::Complete {
                 return Ok(());
             }
-            if timeout == Duration::ZERO || deadline.is_some_and(|d| Instant::now() >= d) {
+            let now = Instant::now();
+            if timeout == Duration::ZERO || deadline.is_some_and(|d| now >= d) {
                 return Err(GpuError::Timeout);
             }
-            yield_now();
+            if now - start < SPIN_BEFORE_SLEEP {
+                yield_now();
+            } else {
+                let left = deadline.map_or(POLL_SLEEP, |d| d - now);
+                sleep(POLL_SLEEP.min(left));
+            }
         }
     }
 }
@@ -958,6 +973,16 @@ impl HipInstance {
             "hipGetDeviceCount",
         )
         .map_err(with_hint)?;
+
+        if env::var_os(SPIN_WAIT_ENV).is_none() {
+            for ordinal in 0..count {
+                unsafe {
+                    if hipSetDevice(ordinal) == HIP_SUCCESS {
+                        let _ = hipSetDeviceFlags(HIP_DEVICE_SCHEDULE_BLOCKING_SYNC);
+                    }
+                }
+            }
+        }
 
         let devices: Vec<HipDeviceInfo> = (0..count).filter_map(HipDeviceInfo::query).collect();
 
