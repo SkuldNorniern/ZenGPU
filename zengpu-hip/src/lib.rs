@@ -21,6 +21,7 @@ use std::env;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::hash::{Hash, Hasher};
 use std::mem::take;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -52,6 +53,8 @@ pub mod workarounds;
 // ── Raw HIP FFI (loaded at run time) ──────────────────────────────────────────
 mod ffi;
 use ffi::*;
+
+mod cache;
 
 const HIP_SUCCESS: HipError = 0;
 const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
@@ -321,37 +324,92 @@ impl HipDeviceInfo {
 
 // ── hipRTC ────────────────────────────────────────────────────────────────────
 
-/// Compiled code objects, keyed by source and options. Opening several
-/// devices of one architecture, or recreating a shader, compiles once.
-type CodeCache = Mutex<HashMap<u64, Vec<(Vec<u8>, Vec<String>, Arc<Vec<u8>>)>>>;
+/// Compiled code objects, keyed by target, options and source. Opening
+/// several devices of one architecture, or recreating a shader, compiles once.
+type CodeCache = Mutex<HashMap<u64, Vec<(String, Vec<u8>, Vec<String>, Arc<Vec<u8>>)>>>;
 
 fn code_cache() -> &'static CodeCache {
     static CACHE: OnceLock<CodeCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn compile_hip_src(src: &[u8], opts: &[String]) -> Result<Arc<Vec<u8>>> {
+/// Where a compiled code object came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodeOrigin {
+    Memory,
+    Disk,
+    Compiled,
+}
+
+/// Compile `src` for `target` (the gfx name, or a device identity when the
+/// name is unknown and hipRTC picks the current device), consulting the
+/// in-process cache and then `disk`.
+fn compile_hip_src(
+    src: &[u8],
+    opts: &[String],
+    target: &str,
+    disk: Option<&Path>,
+) -> Result<(Arc<Vec<u8>>, CodeOrigin)> {
     // hipRTC/comgr were not thread-safe in older ROCm releases; serializing
     // also stops two threads compiling the same source twice.
     static COMPILE: Mutex<()> = Mutex::new(());
     let _serial = lock(&COMPILE)?;
     let mut hasher = DefaultHasher::new();
+    target.hash(&mut hasher);
     src.hash(&mut hasher);
     opts.hash(&mut hasher);
     let key = hasher.finish();
     if let Some(bucket) = lock(code_cache())?.get(&key)
-        && let Some((_, _, code)) = bucket.iter().find(|(s, o, _)| s == src && o == opts)
+        && let Some((_, _, _, code)) = bucket
+            .iter()
+            .find(|(t, s, o, _)| t == target && s == src && o == opts)
     {
-        return Ok(Arc::clone(code));
+        return Ok((Arc::clone(code), CodeOrigin::Memory));
     }
 
-    let code = Arc::new(hiprtc_compile(src, opts)?);
+    let disk_key = disk.map(|_| cache::CacheKey::new(src, opts, target, runtime_version_raw()));
+    let from_disk = disk
+        .zip(disk_key.as_ref())
+        .and_then(|(dir, key)| cache::load(dir, key));
+    let (code, origin) = match from_disk {
+        Some(code) => (code, CodeOrigin::Disk),
+        None => {
+            let code = hiprtc_compile(src, opts)?;
+            if let (Some(dir), Some(key)) = (disk, disk_key.as_ref()) {
+                cache::store(dir, key, &code);
+            }
+            (code, CodeOrigin::Compiled)
+        }
+    };
+    let code = Arc::new(code);
     lock(code_cache())?.entry(key).or_default().push((
+        target.to_string(),
         src.to_vec(),
         opts.to_vec(),
         Arc::clone(&code),
     ));
-    Ok(code)
+    Ok((code, origin))
+}
+
+/// Forget a cached code object the runtime refused to load.
+fn evict_code(src: &[u8], opts: &[String], target: &str, disk: Option<&Path>) {
+    if let Ok(mut cache) = code_cache().lock() {
+        for bucket in cache.values_mut() {
+            bucket.retain(|(t, s, o, _)| !(t == target && s == src && o == opts));
+        }
+    }
+    if let Some(dir) = disk {
+        cache::evict(
+            dir,
+            &cache::CacheKey::new(src, opts, target, runtime_version_raw()),
+        );
+    }
+}
+
+fn runtime_version_raw() -> i32 {
+    let mut version = 0;
+    unsafe { hipRuntimeGetVersion(&mut version) };
+    version
 }
 
 fn hiprtc_compile(src: &[u8], opts: &[String]) -> Result<Vec<u8>> {
@@ -495,6 +553,8 @@ struct HipCore {
     pipelines: Mutex<SlotMap<marker::Pipeline, HipPipeline>>,
     lifetime: Mutex<LifetimeState>,
     peer_access: Mutex<HashMap<i32, bool>>,
+    /// Persistent code-object cache, from `DeviceRequest::pipeline_cache_path`.
+    cache_dir: Option<PathBuf>,
     allocated: AtomicU64,
     lost: AtomicBool,
 }
@@ -1050,7 +1110,7 @@ impl GpuAdapter for HipAdapter {
         HalCapabilities::compute_only()
     }
 
-    fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
+    fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
         let ordinal = self.dev_info.ordinal;
         check(unsafe { hipSetDevice(ordinal) }, "hipSetDevice")?;
         let mut stream: HipStream = ptr::null_mut();
@@ -1067,6 +1127,7 @@ impl GpuAdapter for HipAdapter {
                 pipelines: Mutex::new(SlotMap::new()),
                 lifetime: Mutex::new(LifetimeState::default()),
                 peer_access: Mutex::new(HashMap::new()),
+                cache_dir: req.pipeline_cache_path.as_deref().map(cache::dir_for),
                 allocated: AtomicU64::new(0),
                 lost: AtomicBool::new(false),
             }),
@@ -1088,12 +1149,29 @@ impl HipDevice {
         &self.core.info
     }
 
-    fn compile(&self, src: &[u8]) -> Result<Arc<Vec<u8>>> {
+    /// Cache identity of this device's code: the gfx target, or the device
+    /// itself when hipRTC has to detect the target.
+    fn code_target(&self) -> String {
+        let info = &self.core.info;
+        if info.gfx_target.is_empty() {
+            format!("device{}:{}", info.ordinal, info.name)
+        } else {
+            info.gfx_target.clone()
+        }
+    }
+
+    fn compile(&self, src: &[u8]) -> Result<(Arc<Vec<u8>>, CodeOrigin)> {
         let info = &self.core.info;
         let opts = info.capabilities.rtc_options(&info.gfx_target);
         // With no explicit target hipRTC compiles for the current device.
         self.core.activate()?;
-        compile_hip_src(src, &opts).map_err(|e| match e {
+        compile_hip_src(
+            src,
+            &opts,
+            &self.code_target(),
+            self.core.cache_dir.as_deref(),
+        )
+        .map_err(|e| match e {
             GpuError::ShaderCompile(log) if !info.capabilities.target_supported() => {
                 GpuError::ShaderCompile(format!(
                     "{log}\nhint: {} ({}) needs a newer ROCm than {}",
@@ -1470,8 +1548,8 @@ impl GpuDevice for HipDevice {
     // ── Compute ───────────────────────────────────────────────────────────────
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        let code = match desc.source {
-            ShaderSource::Hip(src) => self.compile(src)?,
+        let src = match desc.source {
+            ShaderSource::Hip(src) => src,
             _ => {
                 return Err(GpuError::ShaderCompile(
                     "hip backend: only HIP C++ source is accepted; use ShaderDesc::hip() \
@@ -1481,14 +1559,30 @@ impl GpuDevice for HipDevice {
             }
         };
 
+        let (mut code, mut origin) = self.compile(src)?;
         self.core.activate()?;
         let mut module: HipModuleRaw = ptr::null_mut();
-        unsafe {
-            self.core.check(
-                hipModuleLoadData(&mut module, code.as_ptr() as *const c_void),
-                "hipModuleLoadData",
-            )?
-        };
+        let mut rc = unsafe { hipModuleLoadData(&mut module, code.as_ptr() as *const c_void) };
+        if rc != HIP_SUCCESS && origin != CodeOrigin::Compiled && !is_fatal(rc) {
+            // A cached object the runtime rejects (e.g. a damaged file) is
+            // dropped and rebuilt rather than failing the shader.
+            log::warn!(
+                "hip: cached code object rejected ({}); recompiling",
+                error_name(rc)
+            );
+            let info = &self.core.info;
+            let opts = info.capabilities.rtc_options(&info.gfx_target);
+            evict_code(
+                src,
+                &opts,
+                &self.code_target(),
+                self.core.cache_dir.as_deref(),
+            );
+            (code, origin) = self.compile(src)?;
+            debug_assert_eq!(origin, CodeOrigin::Compiled);
+            rc = unsafe { hipModuleLoadData(&mut module, code.as_ptr() as *const c_void) };
+        }
+        self.core.check(rc, "hipModuleLoadData")?;
         Ok(lock(&self.core.shaders)?.insert(Arc::new(HipModule { raw: module })))
     }
 
@@ -1636,6 +1730,9 @@ mod tests {
     #![allow(clippy::manual_div_ceil, clippy::unnecessary_cast)]
 
     use super::*;
+    use std::env::temp_dir;
+    use std::fs;
+    use std::process;
     use std::slice::from_raw_parts;
     use std::sync::Arc;
     use std::thread::spawn;
@@ -3595,8 +3692,9 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
             let caps = HipCapabilities::for_family(rocm, rocm, family);
             let opts = caps.rtc_options(gfx);
             for src in [VEC_ADD_SRC, SGEMM_OPT_SRC, REDUCE_SRC, WAVE_REDUCE_SRC] {
-                let code =
-                    compile_hip_src(src.as_bytes(), &opts).unwrap_or_else(|e| panic!("{gfx}: {e}"));
+                let code = compile_hip_src(src.as_bytes(), &opts, gfx, None)
+                    .unwrap_or_else(|e| panic!("{gfx}: {e}"))
+                    .0;
                 assert!(!code.is_empty(), "{gfx}: empty code object");
             }
         }
@@ -3651,5 +3749,70 @@ extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
             .unwrap();
         device.destroy_pipeline(ok);
         device.destroy_shader(shader);
+    }
+
+    #[test]
+    fn disk_code_cache_survives_process_cache_and_corruption() {
+        let Some(inst) = try_instance() else { return };
+        let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
+        let root = temp_dir().join(format!("zengpu-hip-e2e-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let request = DeviceRequest {
+            pipeline_cache_path: Some(root.join("pipelines.bin")),
+            ..DeviceRequest::default()
+        };
+        // Unique per run so earlier runs cannot pre-populate anything.
+        let src = format!("{FILL_SRC}\n// {:?}\n", Instant::now());
+
+        let build = |label: &str| {
+            let device = adapter.open(request.clone()).unwrap();
+            let t = Instant::now();
+            let shader = device.create_shader(ShaderDesc::hip(&src)).unwrap();
+            println!("hip: {label}: {:?}", t.elapsed());
+            let pipeline = device
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry: "fill",
+                    block: [64, 1, 1],
+                })
+                .unwrap();
+            let out = buffer(
+                device.as_ref(),
+                256,
+                BufferUsage::STORAGE | BufferUsage::READBACK,
+            );
+            let scalars = [zengpu_hal::Scalar::U32(3), zengpu_hal::Scalar::U32(64)];
+            let bindings = Bindings {
+                buffers: &[out.index()],
+                textures: &[],
+                images: &[],
+                scalars: &scalars,
+            };
+            device.dispatch(pipeline, bindings, [1, 1, 1]).unwrap();
+            let raw = device.read_buffer(out, 0, 8).unwrap();
+            assert_eq!(raw, [3, 0, 0, 0, 4, 0, 0, 0], "{label}");
+        };
+
+        build("cold compile");
+        let dir = root.join("pipelines.bin.hip");
+        let entries: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(entries.len(), 1, "one cached code object");
+
+        // Forget the in-process copy: the next device must load from disk.
+        code_cache().lock().unwrap().clear();
+        build("warm from disk");
+
+        // Damage the code (key intact): the runtime rejects it, the entry is
+        // evicted and rebuilt, and the shader still works.
+        let path = entries[0].path();
+        let mut data = fs::read(&path).unwrap();
+        let len = data.len();
+        data[len - 2048..].fill(0xAB);
+        fs::write(&path, &data).unwrap();
+        code_cache().lock().unwrap().clear();
+        build("after corruption");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
