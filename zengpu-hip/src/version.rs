@@ -8,6 +8,7 @@
 //! | wave-level builtins (DPP/swizzle)   | 4.0      |
 //! | hipDeviceProp_t.gcnArchName         | 4.0      |
 //! | gfx10xx (RDNA 1/2) targets          | 4.0      |
+//! | gfx10-1/10-3/11/12-generic targets  | 6.2      |
 //! | cooperative groups                  | 4.5      |
 //! | MFMA matrix instructions (CDNA)     | 4.0      |
 //! | hipGraph API                        | 5.0      |
@@ -17,7 +18,7 @@
 //! | gfx942 (CDNA 3 / MI300) target      | 6.0      |
 //! | hipStreamGetCaptureInfo_v2          | 6.0      |
 //! | gfx1150 (RDNA 3.5) targets          | 6.3      |
-//! | gfx1200 (RDNA 4) targets            | 7.0      |
+//! | gfx1200 (RDNA 4) targets            | 6.4      |
 //! | WMMAv2 matrix instructions (RDNA 3) | 5.4      |
 
 use std::fmt;
@@ -136,16 +137,25 @@ pub struct HipCapabilities {
     pub target_rdna3: bool,
     /// gfx115x (RDNA 3.5) compile target supported (ROCm ≥ 6.3).
     pub target_rdna3p5: bool,
-    /// gfx12xx (RDNA 4) compile target supported (ROCm ≥ 7.0).
+    /// gfx12xx (RDNA 4) compile target supported (ROCm ≥ 6.4).
     pub target_rdna4: bool,
     /// gfx942 (CDNA 3 / MI300) compile target supported (ROCm ≥ 6.0).
     pub target_cdna3: bool,
 }
 
 impl HipCapabilities {
+    /// Capabilities for `gfx` given the ROCm headers the crate was built
+    /// against. A feature is reported only when both the build headers and the
+    /// loaded runtime are new enough, since an older `libamdhip64` at run time
+    /// lacks what newer headers advertise.
     pub fn from_device(rocm: RocmVersion, gfx: &str) -> Self {
         let family = GfxFamily::from_gfx(gfx);
-        let rt = RocmVersion::runtime();
+        Self::for_family(rocm, RocmVersion::runtime(), family)
+    }
+
+    pub fn for_family(compile: RocmVersion, runtime: RocmVersion, family: GfxFamily) -> Self {
+        let rocm = compile.min(runtime);
+        let rt = runtime;
         Self {
             rocm,
             runtime_rocm: rt,
@@ -171,22 +181,43 @@ impl HipCapabilities {
             target_rdna12: rocm.at_least(4, 0),
             target_rdna3: rocm.at_least(5, 3),
             target_rdna3p5: rocm.at_least(6, 3),
-            target_rdna4: rocm.at_least(7, 0),
+            target_rdna4: rocm.at_least(6, 4),
             target_cdna3: rocm.at_least(6, 0),
         }
     }
 
     /// hipRTC compile options appropriate for this device + ROCm version.
+    ///
+    /// No `-ffast-math`: it lets the compiler fold `isnan`/`isinf` to false
+    /// and reassociate reductions, so results would differ from the CUDA and
+    /// Vulkan backends, which compile with IEEE semantics.
+    ///
+    /// An empty `gfx_target` leaves the architecture to hipRTC, which then
+    /// compiles for the current device.
     pub fn rtc_options(&self, gfx_target: &str) -> Vec<String> {
         let mut opts = Vec::new();
         if !gfx_target.is_empty() {
             opts.push(format!("--gpu-architecture={gfx_target}"));
         }
-        opts.push("-ffast-math".into());
         if self.hiprtc_opt3 {
             opts.push("-O3".into());
         }
         opts
+    }
+
+    /// Whether the ROCm in use can compile for this device's family. `false`
+    /// means hipRTC will most likely reject the target; callers use it to
+    /// explain the failure rather than to refuse up front.
+    pub fn target_supported(&self) -> bool {
+        match self.gfx_family {
+            GfxFamily::Rdna1 | GfxFamily::Rdna2 => self.target_rdna12,
+            GfxFamily::Rdna3 => self.target_rdna3,
+            GfxFamily::Rdna3p5 => self.target_rdna3p5,
+            GfxFamily::Rdna4 => self.target_rdna4,
+            GfxFamily::Cdna3 => self.target_cdna3,
+            GfxFamily::Cdna4 => self.rocm.at_least(7, 0),
+            _ => true,
+        }
     }
 
     /// hipRTC options for wave-level reduction kernels.
@@ -196,10 +227,13 @@ impl HipCapabilities {
         if self.wave_reduction {
             // DPP is enabled by default; no extra flag needed.
             // Some versions need explicit wave size.
-            if self.wave_size == 32 {
-                opts.push("-mwavefrontsize32".into());
-            } else {
-                opts.push("-mwavefrontsize64".into());
+            // Only RDNA can run either width; GCN/CDNA reject the flag.
+            if self.gfx_family.is_rdna() {
+                if self.wave_size == 32 {
+                    opts.push("-mwavefrontsize32".into());
+                } else {
+                    opts.push("-mwavefrontsize64".into());
+                }
             }
         }
         opts
@@ -246,10 +280,19 @@ impl HipCapabilities {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GfxFamily {
+    /// Polaris / Fiji (gfx803). Dropped from official ROCm support after
+    /// 4.x; hipRTC can still target it where the kernel driver runs it.
+    Gcn4,
     Gcn5,
     Cdna1,
     Cdna2,
     Cdna3,
+    /// MI350 / MI355 (gfx950).
+    Cdna4,
+    /// Navi 1x (RX 5000 series). Never officially supported by ROCm, but
+    /// hipRTC compiles gfx101x natively, so no `HSA_OVERRIDE_GFX_VERSION`
+    /// is needed (and overriding to 10.3.0 runs RDNA 2 code on RDNA 1
+    /// hardware, which can hang).
     Rdna1,
     Rdna2,
     Rdna3,
@@ -259,41 +302,84 @@ pub enum GfxFamily {
 }
 
 impl GfxFamily {
+    /// Classify a gfx target such as `gfx1010`, `gfx90a:xnack-` or
+    /// `gfx10-1-generic`. Unlisted steppings fall back to their generation, so
+    /// a new part in a known family is not treated as unknown.
     pub fn from_gfx(gfx: &str) -> Self {
         let base = gfx.split(':').next().unwrap_or(gfx).trim();
         match base {
-            "gfx900" | "gfx901" => Self::Gcn5,
-            "gfx906" | "gfx907" => Self::Gcn5,
-            "gfx908" => Self::Cdna1,
-            "gfx90a" | "gfx90c" => Self::Cdna2,
-            "gfx940" | "gfx941" | "gfx942" => Self::Cdna3,
-            "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" => Self::Rdna1,
-            "gfx1030" | "gfx1031" | "gfx1032" | "gfx1033" | "gfx1034" | "gfx1035" | "gfx1036" => {
-                Self::Rdna2
-            }
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" => Self::Rdna3,
-            "gfx1150" | "gfx1151" | "gfx1152" | "gfx1153" => Self::Rdna3p5,
-            "gfx1200" | "gfx1201" => Self::Rdna4,
+            "gfx801" | "gfx802" | "gfx803" | "gfx805" | "gfx810" => return Self::Gcn4,
+            "gfx900" | "gfx902" | "gfx904" | "gfx906" | "gfx909" | "gfx90c" => return Self::Gcn5,
+            "gfx9-generic" => return Self::Gcn5,
+            "gfx908" => return Self::Cdna1,
+            "gfx90a" => return Self::Cdna2,
+            "gfx940" | "gfx941" | "gfx942" | "gfx9-4-generic" => return Self::Cdna3,
+            "gfx950" => return Self::Cdna4,
+            "gfx10-1-generic" => return Self::Rdna1,
+            "gfx10-3-generic" => return Self::Rdna2,
+            "gfx11-generic" => return Self::Rdna3,
+            "gfx12-generic" => return Self::Rdna4,
+            _ => {}
+        }
+        let Some(digits) = base.strip_prefix("gfx") else {
+            return Self::Unknown;
+        };
+        if digits.starts_with("115") {
+            Self::Rdna3p5
+        } else if digits.starts_with("12") {
+            Self::Rdna4
+        } else if digits.starts_with("11") {
+            Self::Rdna3
+        } else if digits.starts_with("103") {
+            Self::Rdna2
+        } else if digits.starts_with("101") {
+            Self::Rdna1
+        } else {
+            Self::Unknown
+        }
+    }
+
+    /// Family from the compute-capability pair HIP reports for AMD devices
+    /// (`major` = gfx major, `minor` = gfx minor). Used when the gfx name is
+    /// unavailable; it cannot tell gfx906 from gfx90a, so CDNA 1/2 read as
+    /// GCN 5.
+    pub const fn from_compute_capability(major: i32, minor: i32) -> Self {
+        match (major, minor) {
+            (8, _) => Self::Gcn4,
+            (9, 4) => Self::Cdna3,
+            (9, 5) => Self::Cdna4,
+            (9, _) => Self::Gcn5,
+            (10, 1) => Self::Rdna1,
+            (10, 3) => Self::Rdna2,
+            (11, 5) => Self::Rdna3p5,
+            (11, _) => Self::Rdna3,
+            (12, _) => Self::Rdna4,
             _ => Self::Unknown,
         }
     }
 
-    /// RDNA 2+ uses WGP mode by default (two CUs share one WGP).
-    pub const fn wgp_default(self) -> bool {
+    /// RDNA family (any generation).
+    pub const fn is_rdna(self) -> bool {
         matches!(
             self,
-            Self::Rdna2 | Self::Rdna3 | Self::Rdna3p5 | Self::Rdna4
+            Self::Rdna1 | Self::Rdna2 | Self::Rdna3 | Self::Rdna3p5 | Self::Rdna4
         )
+    }
+
+    /// RDNA compiles in WGP mode by default (two CUs share one WGP); LLVM's
+    /// `cumode` is off for every gfx10+ target, RDNA 1 included.
+    pub const fn wgp_default(self) -> bool {
+        self.is_rdna()
     }
 
     /// CDNA has full-rate FP64; RDNA consumer is 1/64.
     pub const fn full_fp64(self) -> bool {
-        matches!(self, Self::Cdna1 | Self::Cdna2 | Self::Cdna3)
+        matches!(self, Self::Cdna1 | Self::Cdna2 | Self::Cdna3 | Self::Cdna4)
     }
 
     /// MFMA (matrix fused multiply-add) — CDNA only.
     pub const fn has_mfma(self) -> bool {
-        matches!(self, Self::Cdna1 | Self::Cdna2 | Self::Cdna3)
+        matches!(self, Self::Cdna1 | Self::Cdna2 | Self::Cdna3 | Self::Cdna4)
     }
 
     /// WMMA (wave matrix multiply-accumulate) — RDNA 3+ (hardware WMMA).
@@ -302,30 +388,26 @@ impl GfxFamily {
     }
 
     /// Wave width (warp size) for this family.
+    /// HIP's default `warpSize` for this family. The device's own
+    /// `hipDeviceAttributeWarpSize` overrides it when available.
     pub const fn wave_size(self) -> u32 {
-        match self {
-            Self::Rdna1 | Self::Rdna2 | Self::Rdna3 | Self::Rdna3p5 | Self::Rdna4 => 32,
-            _ => 64,
-        }
+        if self.is_rdna() { 32 } else { 64 }
     }
 
-    /// Recommended block size for generic compute kernels.
+    /// Recommended block size for generic compute kernels: four 64-wide
+    /// waves on GCN/CDNA, eight 32-wide waves on RDNA.
     pub const fn default_block_size(self) -> u32 {
-        match self {
-            // CDNA: 64-wide waves, typical 4 waves/CU → 256.
-            Self::Cdna1 | Self::Cdna2 | Self::Cdna3 => 256,
-            // RDNA: 32-wide waves, 256 fills one CU (8 waves × 32).
-            Self::Rdna2 | Self::Rdna3 | Self::Rdna3p5 | Self::Rdna4 => 256,
-            _ => 256,
-        }
+        256
     }
 
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Gcn4 => "GCN4",
             Self::Gcn5 => "GCN5",
             Self::Cdna1 => "CDNA1",
             Self::Cdna2 => "CDNA2",
             Self::Cdna3 => "CDNA3",
+            Self::Cdna4 => "CDNA4",
             Self::Rdna1 => "RDNA1",
             Self::Rdna2 => "RDNA2",
             Self::Rdna3 => "RDNA3",
@@ -361,7 +443,65 @@ mod tests {
         assert_eq!(GfxFamily::from_gfx("gfx90a"), GfxFamily::Cdna2);
         assert_eq!(GfxFamily::from_gfx("gfx908"), GfxFamily::Cdna1);
         assert_eq!(GfxFamily::from_gfx("gfx906"), GfxFamily::Gcn5);
+        assert_eq!(GfxFamily::from_gfx("gfx950"), GfxFamily::Cdna4);
+        assert_eq!(GfxFamily::from_gfx("gfx803"), GfxFamily::Gcn4);
         assert_eq!(GfxFamily::from_gfx("gfx9999"), GfxFamily::Unknown);
+        assert_eq!(GfxFamily::from_gfx("navi10"), GfxFamily::Unknown);
+        assert_eq!(GfxFamily::from_gfx(""), GfxFamily::Unknown);
+    }
+
+    #[test]
+    fn rdna1_targets_classify() {
+        for gfx in ["gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1010:xnack-"] {
+            assert_eq!(GfxFamily::from_gfx(gfx), GfxFamily::Rdna1, "{gfx}");
+        }
+        assert_eq!(GfxFamily::from_gfx("gfx10-1-generic"), GfxFamily::Rdna1);
+        assert_eq!(GfxFamily::from_gfx("gfx10-3-generic"), GfxFamily::Rdna2);
+        assert_eq!(GfxFamily::from_gfx("gfx11-generic"), GfxFamily::Rdna3);
+        assert_eq!(GfxFamily::from_gfx("gfx12-generic"), GfxFamily::Rdna4);
+        // Unlisted steppings fall back to their generation.
+        assert_eq!(GfxFamily::from_gfx("gfx1037"), GfxFamily::Rdna2);
+        assert_eq!(GfxFamily::from_gfx("gfx1103"), GfxFamily::Rdna3);
+        assert_eq!(GfxFamily::from_gfx("gfx1153"), GfxFamily::Rdna3p5);
+        assert_eq!(GfxFamily::from_gfx("gfx1250"), GfxFamily::Rdna4);
+    }
+
+    #[test]
+    fn compute_capability_fallback() {
+        assert_eq!(GfxFamily::from_compute_capability(10, 1), GfxFamily::Rdna1);
+        assert_eq!(GfxFamily::from_compute_capability(10, 3), GfxFamily::Rdna2);
+        assert_eq!(GfxFamily::from_compute_capability(11, 0), GfxFamily::Rdna3);
+        assert_eq!(
+            GfxFamily::from_compute_capability(11, 5),
+            GfxFamily::Rdna3p5
+        );
+        assert_eq!(GfxFamily::from_compute_capability(12, 0), GfxFamily::Rdna4);
+        assert_eq!(GfxFamily::from_compute_capability(9, 4), GfxFamily::Cdna3);
+        assert_eq!(GfxFamily::from_compute_capability(0, 0), GfxFamily::Unknown);
+    }
+
+    #[test]
+    fn rdna1_capabilities_on_old_and_new_rocm() {
+        for rocm in [RocmVersion::new(5, 7), RocmVersion::new(7, 2)] {
+            let caps = HipCapabilities::for_family(rocm, rocm, GfxFamily::Rdna1);
+            assert_eq!(caps.wave_size, 32);
+            assert!(caps.target_supported(), "gfx101x compiles on ROCm {rocm}");
+            assert!(!caps.wmma, "RDNA 1 has no WMMA");
+            assert!(!caps.mfma);
+            let opts = caps.rtc_options("gfx1010");
+            assert!(opts.iter().any(|o| o == "--gpu-architecture=gfx1010"));
+        }
+    }
+
+    #[test]
+    fn runtime_older_than_headers_limits_features() {
+        let caps = HipCapabilities::for_family(
+            RocmVersion::new(7, 2),
+            RocmVersion::new(6, 1),
+            GfxFamily::Rdna4,
+        );
+        assert!(!caps.target_rdna4, "ROCm 6.1 runtime cannot target gfx12");
+        assert!(!caps.target_supported());
     }
 
     #[test]
@@ -369,7 +509,7 @@ mod tests {
         assert!(GfxFamily::Rdna4.wgp_default());
         assert!(GfxFamily::Rdna3.wgp_default());
         assert!(GfxFamily::Rdna2.wgp_default());
-        assert!(!GfxFamily::Rdna1.wgp_default());
+        assert!(GfxFamily::Rdna1.wgp_default());
         assert!(!GfxFamily::Cdna2.wgp_default());
 
         assert_eq!(GfxFamily::Rdna4.wave_size(), 32);
@@ -414,7 +554,7 @@ mod tests {
     #[test]
     fn rdna4_capabilities_on_rocm72() {
         let rocm = RocmVersion::new(7, 2);
-        let caps = HipCapabilities::from_device(rocm, "gfx1200");
+        let caps = HipCapabilities::for_family(rocm, rocm, GfxFamily::Rdna4);
 
         // All modern features should be present.
         assert!(caps.hiprtc, "hipRTC");
@@ -441,7 +581,7 @@ mod tests {
     #[test]
     fn old_rocm_feature_gating() {
         let rocm40 = RocmVersion::new(4, 0);
-        let caps = HipCapabilities::from_device(rocm40, "gfx1030");
+        let caps = HipCapabilities::for_family(rocm40, rocm40, GfxFamily::Rdna2);
 
         assert!(caps.hiprtc);
         assert!(!caps.hiprtc_opt3, "no -O3 on ROCm 4.0");
@@ -455,8 +595,10 @@ mod tests {
 
     #[test]
     fn rtc_options_version_gated() {
-        let old = HipCapabilities::from_device(RocmVersion::new(4, 2), "gfx1030");
-        let new = HipCapabilities::from_device(RocmVersion::new(7, 2), "gfx1200");
+        let v42 = RocmVersion::new(4, 2);
+        let v72 = RocmVersion::new(7, 2);
+        let old = HipCapabilities::for_family(v42, v42, GfxFamily::Rdna2);
+        let new = HipCapabilities::for_family(v72, v72, GfxFamily::Rdna4);
 
         let opts_old = old.rtc_options("gfx1030");
         let opts_new = new.rtc_options("gfx1200");
@@ -464,6 +606,15 @@ mod tests {
         assert!(!opts_old.iter().any(|o| o == "-O3"), "no -O3 on ROCm 4");
         assert!(opts_new.iter().any(|o| o == "-O3"), "-O3 on ROCm 7");
         assert!(opts_new.iter().any(|o| o.contains("gfx1200")));
+        assert!(
+            !opts_new.iter().any(|o| o.contains("fast-math")),
+            "fast-math changes NaN/Inf semantics vs the other backends"
+        );
+        assert!(
+            !new.rtc_options("")
+                .iter()
+                .any(|o| o.contains("gpu-architecture"))
+        );
     }
 
     #[test]
@@ -478,7 +629,8 @@ mod tests {
 
     #[test]
     fn capability_report_format() {
-        let caps = HipCapabilities::from_device(RocmVersion::new(7, 2), "gfx1200");
+        let v72 = RocmVersion::new(7, 2);
+        let caps = HipCapabilities::for_family(v72, v72, GfxFamily::Rdna4);
         let report = caps.report("AMD Radeon RX 9060 XT", "gfx1200");
         // Spot-check a few required lines.
         assert!(report.contains("gfx1200"));
