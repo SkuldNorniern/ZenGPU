@@ -959,4 +959,42 @@ mod devarray_matmul_tests {
         cpu_gemm.destroy(&*cpu);
         vk_gemm.destroy(&*vk);
     }
+
+    /// Covers several 128×128 tiles, with every dimension off the tile and K off the 8-deep slice.
+    #[test]
+    fn devarray_matmul_vulkan_multi_tile() {
+        let Some(vk) = vulkan_device() else { return };
+        let gemm = GemmKernel::new(&*vk).unwrap();
+        let pool = BufferPool::new(vk.clone());
+        const M: u32 = 301;
+        const K: u32 = 133;
+        const N: u32 = 259;
+        let a_data: Vec<f32> = (0..M * K).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+        let b_data: Vec<f32> = (0..K * N)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let a = pool.alloc(vec![M, K], DType::F32).unwrap();
+        let b = pool.alloc(vec![K, N], DType::F32).unwrap();
+        vk.write_buffer(a.buffer, 0, as_bytes_f32(&a_data)).unwrap();
+        vk.write_buffer(b.buffer, 0, as_bytes_f32(&b_data)).unwrap();
+        let c = gemm.sgemm(&*vk, &pool, -2.0, &a, &b).unwrap();
+        let out = from_bytes_f32(&vk.read_buffer(c.buffer, 0, c.size_bytes()).unwrap());
+        for row in 0..M as usize {
+            for col in 0..N as usize {
+                let want: f32 = -2.0
+                    * (0..K as usize)
+                        .map(|i| a_data[row * K as usize + i] * b_data[i * N as usize + col])
+                        .sum::<f32>();
+                let got = out[row * N as usize + col];
+                assert!(
+                    (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                    "C[{row}][{col}] = {got}, want {want}"
+                );
+            }
+        }
+        pool.free(a);
+        pool.free(b);
+        pool.free(c);
+        gemm.destroy(&*vk);
+    }
 }
