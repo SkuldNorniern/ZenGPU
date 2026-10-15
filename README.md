@@ -62,6 +62,10 @@ for consumer RDNA; `ZENGPU_HIP_P2P=1` or `0` overrides that.
 Set `DeviceRequest::pipeline_cache_path` to keep compiled HIP kernels in
 `<path>.hip/`: a kernel then loads in under a millisecond instead of the
 ~250 ms hipRTC takes.
+Waiting threads block rather than spin (`ZENGPU_HIP_SPIN_WAIT=1` restores
+HIP's spinning), and on ROCm 6+ buffers of 2 MiB and up come from HIP's
+stream-ordered pool, so freeing one never waits for running kernels
+(`ZENGPU_HIP_NO_MEMPOOL=1` turns that off).
 
 ZSL covers compute, vertex and fragment shaders: bindless buffers
 (`u32`/`i32`/`f32`/`bf16`/`f16`), push constants, vectors and matrices,
