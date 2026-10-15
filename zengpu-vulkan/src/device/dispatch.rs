@@ -89,12 +89,13 @@ impl VulkanDevice {
         let cmd = self.cmd_list_pool.acquire()?;
 
         let record_result = record(&self.inner.device, cmd);
-
-        unsafe {
-            let _ = self.inner.device.end_command_buffer(cmd);
-        }
-
-        if let Err(e) = record_result {
+        let end_result = unsafe {
+            self.inner
+                .device
+                .end_command_buffer(cmd)
+                .map_err(|e| GpuError::Backend(format!("vkEndCommandBuffer: {e}")))
+        };
+        if let Err(e) = record_result.and(end_result) {
             self.cmd_list_pool.release(cmd);
             return Err(e);
         }
@@ -106,17 +107,21 @@ impl VulkanDevice {
             ..Default::default()
         };
         let mut submitted = false;
-        let _queue = self.inner.queue_lock.lock().unwrap();
-        let submit_result = unsafe {
-            self.inner
-                .device
-                .queue_submit(self.inner.queue, &[submit_info], fence)
-                .map_err(|e| map_vk_err("vkQueueSubmit", e))
+        // Hold the queue only to submit: waiting under it would stall every
+        // other thread's submissions until this work finished on the GPU.
+        let (submit_result, serial) = {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            let result = unsafe {
+                self.inner
+                    .device
+                    .queue_submit(self.inner.queue, &[submit_info], fence)
+                    .map_err(|e| map_vk_err("vkQueueSubmit", e))
+            };
+            let serial = result.is_ok().then(|| self.inner.serials.next());
+            (result, serial)
         };
-        let mut serial = None;
         if submit_result.is_ok() {
             submitted = true;
-            serial = Some(self.inner.serials.next());
         }
         let wait_result = submit_result.and_then(|()| unsafe {
             self.inner
