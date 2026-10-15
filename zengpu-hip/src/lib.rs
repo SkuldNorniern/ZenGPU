@@ -29,6 +29,9 @@ use hip_layout::*;
 
 // ── ROCm version detection and feature capability gating ──────────────────────
 pub mod version;
+
+// ── Per-GPU / per-ROCm workarounds ────────────────────────────────────────────
+pub mod workarounds;
 use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 // ── Raw HIP FFI ───────────────────────────────────────────────────────────────
