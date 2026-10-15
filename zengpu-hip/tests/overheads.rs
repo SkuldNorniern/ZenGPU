@@ -119,6 +119,20 @@ fn overheads() {
     }
     println!("hip: 256 B write                {:?}", per_iter(t, N));
 
+    for mib in [1usize, 64] {
+        let desc = BufferDesc {
+            size: (mib << 20) as u64,
+            usage: BufferUsage::STORAGE,
+            memory: MemoryUsage::GpuOnly,
+        };
+        let t = Instant::now();
+        for _ in 0..100 {
+            let b = dev.create_buffer(desc).unwrap();
+            dev.destroy_buffer(b);
+        }
+        println!("hip: create+destroy {mib:>2} MiB       {:?}", per_iter(t, 100));
+    }
+
     let first = dev.read_buffer(out, 0, 4).unwrap();
     assert_eq!(first, [1, 1, 1, 1]);
 
