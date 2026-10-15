@@ -22,6 +22,7 @@
 
 use std::fmt;
 
+use crate::ffi::hipRuntimeGetVersion;
 use crate::hip_layout::{ROCM_VERSION_MAJOR, ROCM_VERSION_MINOR};
 
 pub use crate::hip_layout::{
@@ -70,11 +71,6 @@ impl fmt::Display for RocmVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.major, self.minor)
     }
-}
-
-#[link(name = "amdhip64")]
-unsafe extern "C" {
-    fn hipRuntimeGetVersion(ver: *mut i32) -> i32;
 }
 
 /// Feature set for one device, built at enumeration from the gfx target and ROCm version.

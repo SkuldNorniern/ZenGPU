@@ -42,7 +42,9 @@ use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 pub mod workarounds;
 
-type HipError = i32;
+mod ffi;
+use ffi::*;
+
 const HIP_SUCCESS: HipError = 0;
 const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
 const HIP_ERROR_INVALID_IMAGE: HipError = 200;
@@ -55,7 +57,6 @@ const HIP_ERROR_LAUNCH_OUT_OF_RESOURCES: HipError = 701;
 const HIP_ERROR_LAUNCH_TIMEOUT: HipError = 702;
 const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipError = 704;
 const HIP_ERROR_LAUNCH_FAILURE: HipError = 719;
-const HIP_ERROR_NOT_SUPPORTED: HipError = 801;
 
 const HIP_MEMCPY_H2D: i32 = 1;
 const HIP_MEMCPY_D2H: i32 = 2;
@@ -72,95 +73,6 @@ const HIP_EVENT_DISABLE_TIMING: u32 = 2;
 /// Parameter slots per launch, 8 bytes each. A 4-byte scalar uses the low half;
 /// `hipModuleLaunchKernel` reads exactly the declared size.
 const MAX_PARAMS: usize = 32;
-
-type HipModuleRaw = *mut c_void;
-type HipFunction = *mut c_void;
-type HipStream = *mut c_void;
-type HipEvent = *mut c_void;
-type HiprtcProg = *mut c_void;
-
-#[link(name = "amdhip64")]
-unsafe extern "C" {
-    fn hipInit(flags: u32) -> HipError;
-    fn hipGetDeviceCount(count: *mut i32) -> HipError;
-    fn hipDeviceGetName(name: *mut c_char, len: i32, device: i32) -> HipError;
-    fn hipDeviceTotalMem(bytes: *mut usize, device: i32) -> HipError;
-    #[cfg_attr(hip_props_r0600, link_name = "hipGetDevicePropertiesR0600")]
-    fn hipGetDeviceProperties(props: *mut u8, device: i32) -> HipError;
-    fn hipDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> HipError;
-    fn hipDeviceComputeCapability(major: *mut i32, minor: *mut i32, device: i32) -> HipError;
-    fn hipGetErrorName(code: HipError) -> *const c_char;
-    fn hipSetDevice(device: i32) -> HipError;
-    fn hipDeviceCanAccessPeer(canAccess: *mut i32, device: i32, peerDevice: i32) -> HipError;
-    fn hipDeviceEnablePeerAccess(peerDevice: i32, flags: u32) -> HipError;
-    fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError;
-    fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> HipError;
-    fn hipFree(ptr: *mut c_void) -> HipError;
-    fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> HipError;
-    fn hipHostFree(ptr: *mut c_void) -> HipError;
-    fn hipHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> HipError;
-    fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> HipError;
-    fn hipMemcpyAsync(
-        dst: *mut c_void,
-        src: *const c_void,
-        bytes: usize,
-        kind: i32,
-        stream: HipStream,
-    ) -> HipError;
-    fn hipMemcpyPeer(
-        dst: *mut c_void,
-        dstDevice: i32,
-        src: *const c_void,
-        srcDevice: i32,
-        bytes: usize,
-    ) -> HipError;
-    fn hipStreamCreateWithFlags(stream: *mut HipStream, flags: u32) -> HipError;
-    fn hipStreamDestroy(stream: HipStream) -> HipError;
-    fn hipStreamSynchronize(stream: HipStream) -> HipError;
-    fn hipEventCreateWithFlags(event: *mut HipEvent, flags: u32) -> HipError;
-    fn hipEventRecord(event: HipEvent, stream: HipStream) -> HipError;
-    fn hipEventQuery(event: HipEvent) -> HipError;
-    fn hipEventSynchronize(event: HipEvent) -> HipError;
-    fn hipEventDestroy(event: HipEvent) -> HipError;
-    fn hipModuleLoadData(module: *mut HipModuleRaw, image: *const c_void) -> HipError;
-    fn hipModuleGetFunction(
-        func: *mut HipFunction,
-        module: HipModuleRaw,
-        name: *const c_char,
-    ) -> HipError;
-    fn hipModuleUnload(module: HipModuleRaw) -> HipError;
-    fn hipModuleLaunchKernel(
-        f: HipFunction,
-        gx: u32,
-        gy: u32,
-        gz: u32,
-        bx: u32,
-        by: u32,
-        bz: u32,
-        shared_bytes: u32,
-        stream: HipStream,
-        kernel_params: *mut *mut c_void,
-        extra: *mut *mut c_void,
-    ) -> HipError;
-}
-
-#[link(name = "hiprtc")]
-unsafe extern "C" {
-    fn hiprtcCreateProgram(
-        prog: *mut HiprtcProg,
-        src: *const c_char,
-        name: *const c_char,
-        num_headers: i32,
-        headers: *const *const c_char,
-        include_names: *const *const c_char,
-    ) -> i32;
-    fn hiprtcCompileProgram(prog: HiprtcProg, num_opts: i32, opts: *const *const c_char) -> i32;
-    fn hiprtcGetCodeSize(prog: HiprtcProg, sz: *mut usize) -> i32;
-    fn hiprtcGetCode(prog: HiprtcProg, code: *mut c_char) -> i32;
-    fn hiprtcDestroyProgram(prog: *mut HiprtcProg) -> i32;
-    fn hiprtcGetProgramLogSize(prog: HiprtcProg, sz: *mut usize) -> i32;
-    fn hiprtcGetProgramLog(prog: HiprtcProg, log: *mut c_char) -> i32;
-}
 
 fn error_name(code: HipError) -> String {
     // SAFETY: hipGetErrorName returns a static NUL-terminated string (or null
@@ -232,25 +144,38 @@ const PROP_BLOB_SIZE: usize = if HIP_PROP_SIZE > 8192 {
     8192
 };
 
-/// Read `gcnArchName` from an opaque `hipDeviceProp_t` blob. "" when the bytes at the probed offset
-/// are not a gfx name.
-fn gcn_arch_from_prop(blob: &[u8]) -> String {
-    let start = HIP_PROP_GCN_ARCH_OFF;
-    let end = start + HIP_PROP_GCN_ARCH_LEN;
-    if blob.len() < end {
-        return String::new();
-    }
-    let slice = &blob[start..end];
-    let len = slice
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(HIP_PROP_GCN_ARCH_LEN);
-    let name = String::from_utf8_lossy(&slice[..len]).into_owned();
-    if name.starts_with("gfx") {
-        name
+/// Reads `gcnArchName` from an opaque `hipDeviceProp_t` blob.
+///
+/// Uses the build-time offset when the runtime's layout matches the build headers. Otherwise scans
+/// for the NUL-delimited `gfx…` string. A gfx-named marketing name is the same target.
+fn gcn_arch_from_prop(blob: &[u8], abi: Option<PropsAbi>) -> String {
+    let headers_abi = if ROCM_VERSION_MAJOR >= 6 {
+        PropsAbi::R0600
     } else {
-        String::new()
+        PropsAbi::R0000
+    };
+    if abi == Some(headers_abi)
+        && let Some(name) = gfx_string_at(blob, HIP_PROP_GCN_ARCH_OFF)
+    {
+        return name;
     }
+    (0..blob.len().saturating_sub(3))
+        .filter(|&i| (i == 0 || blob[i - 1] == 0) && blob[i..].starts_with(b"gfx"))
+        .find_map(|i| gfx_string_at(blob, i))
+        .unwrap_or_default()
+}
+
+fn gfx_string_at(blob: &[u8], start: usize) -> Option<String> {
+    let field = blob.get(start..(start + HIP_PROP_GCN_ARCH_LEN).min(blob.len()))?;
+    let len = field.iter().position(|&b| b == 0)?;
+    let name = str::from_utf8(&field[..len]).ok()?;
+    let target = name.split(':').next()?;
+    let valid = target.len() > 3
+        && target.starts_with("gfx")
+        && target[3..]
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-');
+    valid.then(|| name.to_string())
 }
 
 fn device_attribute(attr: i32, ordinal: i32) -> Option<i32> {
@@ -303,7 +228,7 @@ impl HipDeviceInfo {
         let mut blob = vec![0u8; PROP_BLOB_SIZE];
         let prop_ok = unsafe { hipGetDeviceProperties(blob.as_mut_ptr(), ordinal) } == HIP_SUCCESS;
         let raw_arch = if prop_ok {
-            gcn_arch_from_prop(&blob)
+            gcn_arch_from_prop(&blob, props_abi())
         } else {
             String::new()
         };
@@ -326,8 +251,8 @@ impl HipDeviceInfo {
             .map(|w| w as u32)
             .unwrap_or_else(|| family.wave_size());
 
-        let mut caps =
-            HipCapabilities::for_family(RocmVersion::COMPILE_TIME, RocmVersion::runtime(), family);
+        let runtime = RocmVersion::runtime();
+        let mut caps = HipCapabilities::for_family(runtime, runtime, family);
         caps.wave_size = wave_size;
 
         let max_threads_per_block =
@@ -393,6 +318,11 @@ fn compile_hip_src(src: &[u8], opts: &[String]) -> Result<Arc<Vec<u8>>> {
 }
 
 fn hiprtc_compile(src: &[u8], opts: &[String]) -> Result<Vec<u8>> {
+    if !ffi::hiprtc_loaded() {
+        return Err(GpuError::ShaderCompile(
+            "hip: hipRTC (libhiprtc) not found; install the ROCm hiprtc package".into(),
+        ));
+    }
     let src_c = CString::new(src)
         .map_err(|_| GpuError::ShaderCompile("HIP source contains null byte".into()))?;
     let name_c = CString::new("zen_kernel.hip").unwrap();
@@ -944,12 +874,12 @@ pub struct HipInstance {
 impl HipInstance {
     pub fn new() -> Result<Self> {
         workarounds::apply_process_env();
-        let rc = unsafe { hipInit(0) };
-        if rc == HIP_ERROR_NOT_SUPPORTED {
+        if !ffi::runtime_loaded() {
             return Err(GpuError::Unsupported(
-                "hip: ROCm runtime not found (built against the link stub)".into(),
+                "hip: ROCm runtime (libamdhip64) not found; install ROCm or set ROCM_PATH".into(),
             ));
         }
+        let rc = unsafe { hipInit(0) };
         let with_hint = |e: GpuError| match (e, workarounds::kfd_diagnostic()) {
             (GpuError::Backend(msg), Some(hint)) => GpuError::Backend(format!("{msg}; {hint}")),
             (e, _) => e,
@@ -3457,5 +3387,25 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
                 assert!(!code.is_empty(), "{gfx}: empty code object");
             }
         }
+    }
+
+    #[test]
+    fn gcn_arch_found_in_any_props_layout() {
+        let mut blob = vec![0u8; PROP_BLOB_SIZE];
+        blob[..18].copy_from_slice(b"AMD Radeon RX 5700");
+        blob[1003..1003 + 14].copy_from_slice(b"gfx1010:xnack-");
+        let other_abi = if ROCM_VERSION_MAJOR >= 6 {
+            PropsAbi::R0000
+        } else {
+            PropsAbi::R0600
+        };
+        assert_eq!(gcn_arch_from_prop(&blob, Some(other_abi)), "gfx1010:xnack-");
+        assert_eq!(gcn_arch_from_prop(&blob, None), "gfx1010:xnack-");
+
+        let mut junk = vec![0u8; 64];
+        junk[..12].copy_from_slice(b"xxgfx1030 ok");
+        assert_eq!(gcn_arch_from_prop(&junk, None), "");
+        assert!(gfx_string_at(b"gfx\0", 0).is_none());
+        assert!(gfx_string_at(b"gfx12-generic\0", 0).is_some());
     }
 }

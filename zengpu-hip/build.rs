@@ -1,58 +1,23 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-/// Build script for zengpu-hip.
+/// Links nothing: HIP and hipRTC load at run time (see `src/ffi.rs`), so ROCm is optional on the
+/// build host and the target.
 ///
-/// 1. Finds ROCm (`ROCM_PATH`, else a /opt/rocm scan). Without libamdhip64 and libhiprtc, it links
-///    stubs so the crate still builds.
-/// 2. Probes `hip_version.h` and emits `cfg(rocm_major="N")` and `cfg(rocm_minor="N")`.
-/// 3. Compiles a C probe for the `hipDeviceProp_t` size, the `gcnArchName` offset and the
-///    `hipDeviceAttribute_t` values, which shift between ROCm majors. Without an AMD compiler, or
-///    when cross-compiling, it falls back to ROCm 6/7 x86-64 defaults.
-use cc::Build;
+/// Probes ROCm (`ROCM_PATH`, then `/opt/rocm`) and emits `cfg(rocm_major)` and `cfg(rocm_minor)`. A
+/// small C probe measures the `hipDeviceProp_t` size, the `gcnArchName` offset, and the
+/// `hipDeviceAttribute_t` values, which change between ROCm majors. Without a compiler, it falls
+/// back to ROCm 6/7 x86-64 defaults.
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
 
-    let lib_dirs = [
-        PathBuf::from(format!("{rocm_path}/lib")),
-        PathBuf::from(format!("{rocm_path}/lib/x64")),
-        PathBuf::from(format!("{rocm_path}/lib64")),
-    ];
-    for dir in &lib_dirs {
-        if dir.exists() {
-            println!("cargo:rustc-link-search=native={}", dir.display());
-        }
-    }
-
-    let has_hip = lib_dirs.iter().any(|dir| {
-        has_library(
-            dir,
-            &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"],
-        )
-    });
-    if !has_hip {
-        Build::new().file("src/hip_stub.c").compile("amdhip64");
-    }
-
-    let has_hiprtc = lib_dirs
-        .iter()
-        .any(|dir| has_library(dir, &["libhiprtc.so", "libhiprtc.dylib", "hiprtc.lib"]));
-    if !has_hiprtc {
-        Build::new().file("src/hiprtc_stub.c").compile("hiprtc");
-    }
-
-    println!("cargo:rustc-link-lib=amdhip64");
-    println!("cargo:rustc-link-lib=hiprtc");
-
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed={rocm_path}/include/hip/hip_version.h");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/hip_stub.c");
-    println!("cargo:rerun-if-changed=src/hiprtc_stub.c");
 
     let (major, minor) = detect_rocm_version(&rocm_path);
     if major < 5 {
@@ -148,12 +113,8 @@ fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let layout_rs = out_dir.join("hip_layout.rs");
 
-    println!("cargo:rustc-check-cfg=cfg(hip_props_r0600)");
     println!("cargo:rustc-check-cfg=cfg(rocm_major, values(any()))");
     println!("cargo:rustc-check-cfg=cfg(rocm_minor, values(any()))");
-    if rocm_major >= 6 {
-        println!("cargo:rustc-cfg=hip_props_r0600");
-    }
 
     let (def_size, def_gcn) = match rocm_major {
         ..=4 => (1184, 944),
@@ -267,8 +228,4 @@ fn probe_layout(rocm_path: &str) -> Result<HipLayout, String> {
         }
     }
     Err("no suitable compiler found".into())
-}
-
-fn has_library(dir: &Path, names: &[&str]) -> bool {
-    names.iter().any(|name| dir.join(name).exists())
 }
