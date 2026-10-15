@@ -452,7 +452,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     "({0} + ({2}) * ({1} - {0}))",
                     args_s[0], args_s[1], args_s[2]
                 ),
-                BuiltinFn::Normalize => format!("__hip_normalize_stub({})", args_s[0]),
+                BuiltinFn::Normalize => {
+                    format!(
+                        "(({0} > 0.0f) ? 1.0f : ({0} < 0.0f) ? -1.0f : 0.0f)",
+                        args_s[0]
+                    )
+                }
                 BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
