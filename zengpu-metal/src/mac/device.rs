@@ -21,11 +21,12 @@ use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc, DeviceLimits, Features,
-    Format, FormatCaps, GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget,
-    PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
-    ShaderSource, SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc,
-    TextureHandle, TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
+    BackendPreference, Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
+    DeviceLimits, Features, Format, FormatCaps, GpuDevice, GpuError, GpuSubmission,
+    HalCapabilities, MemoryBudget, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, TargetHandle,
+    TexDim, TextureDesc, TextureHandle, TextureRegion, TextureUsage, TextureWrite, TransferCaps,
+    UsageError, marker,
 };
 
 use super::convert;
