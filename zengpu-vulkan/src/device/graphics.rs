@@ -132,7 +132,7 @@ impl VulkanDevice {
         let color_formats: Vec<vk::Format> = desc
             .color_targets
             .iter()
-            .map(|target| hal_format_to_vk(target.format))
+            .map(|target| self.inner.vk_format(target.format))
             .collect();
         let blend_attachments: Vec<vk::PipelineColorBlendAttachmentState> = desc
             .color_targets
@@ -174,7 +174,7 @@ impl VulkanDevice {
 
         let depth_format = desc
             .depth_format
-            .map(hal_format_to_vk)
+            .map(|format| self.inner.vk_format(format))
             .unwrap_or(vk::Format::UNDEFINED);
         let rendering_info = vk::PipelineRenderingCreateInfo {
             color_attachment_count: color_formats.len() as u32,

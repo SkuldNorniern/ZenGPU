@@ -425,6 +425,9 @@ pub(crate) struct VulkanDeviceInner {
     pub fill_mode_non_solid: bool,
     pub sampler_anisotropy: bool,
     pub max_sampler_anisotropy: f32,
+    /// `Depth24PlusStencil8` here: `D24_UNORM_S8_UINT` if present, else `D32_SFLOAT_S8_UINT`. AMD
+    /// exposes no D24S8. "24 plus" allows the wider depth.
+    pub depth24_stencil8: vk::Format,
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
@@ -435,7 +438,31 @@ pub(crate) struct VulkanDeviceInner {
 unsafe impl Send for VulkanDeviceInner {}
 unsafe impl Sync for VulkanDeviceInner {}
 
+/// Depth-stencil format for `Format::Depth24PlusStencil8`: first of D24S8, D32S8 usable as an
+/// optimal-tiling depth attachment.
+fn pick_depth24_stencil8(instance: &ash::Instance, physical: vk::PhysicalDevice) -> vk::Format {
+    [
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ]
+    .into_iter()
+    .find(|&format| {
+        let props = unsafe { instance.get_physical_device_format_properties(physical, format) };
+        props
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    })
+    .unwrap_or(vk::Format::D24_UNORM_S8_UINT)
+}
+
 impl VulkanDeviceInner {
+    pub(crate) fn vk_format(&self, format: zengpu_hal::Format) -> vk::Format {
+        match format {
+            zengpu_hal::Format::Depth24PlusStencil8 => self.depth24_stencil8,
+            other => hal_format_to_vk(other),
+        }
+    }
+
     /// Device-local heap sizes with the driver's budget and usage. `None` without
     /// `VK_EXT_memory_budget`.
     pub(crate) fn memory_budget(&self) -> Option<MemoryBudget> {
@@ -900,6 +927,7 @@ impl VulkanDevice {
             .then(|| ext::debug_utils::Device::new(&shared.instance, &device));
         let probe = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
             .map_err(|e| map_vk_err("vkCreateFence", e))?;
+        let depth24_stencil8 = pick_depth24_stencil8(&shared.instance, physical);
         let inner = Arc::new(VulkanDeviceInner {
             shared,
             device,
@@ -922,6 +950,7 @@ impl VulkanDevice {
             fill_mode_non_solid,
             sampler_anisotropy,
             max_sampler_anisotropy,
+            depth24_stencil8,
             dynamic_rendering,
             debug_utils,
         });
@@ -1902,6 +1931,42 @@ mod tests {
             submission.wait(Duration::from_secs(5)).unwrap();
         }
         dev.destroy_texture(tex);
+    }
+
+    /// AMD has no D24S8: `Depth24PlusStencil8` must still be creatable, backed by D32S8.
+    #[test]
+    fn depth24_plus_stencil8_is_creatable_everywhere() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let backing = dev
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .unwrap()
+            .inner
+            .depth24_stencil8;
+        assert!(
+            backing == vk::Format::D24_UNORM_S8_UINT || backing == vk::Format::D32_SFLOAT_S8_UINT,
+            "{backing:?}"
+        );
+        let tex = dev
+            .create_texture(zengpu_hal::TextureDesc {
+                width: 64,
+                height: 64,
+                depth: 1,
+                format: zengpu_hal::Format::Depth24PlusStencil8,
+                usage: zengpu_hal::TextureUsage::RENDER_TARGET,
+                samples: 1,
+                dimension: zengpu_hal::TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        dev.destroy_texture(tex);
+        assert_eq!(
+            crate::from_vk_format(backing),
+            Some(zengpu_hal::Format::Depth24PlusStencil8)
+        );
     }
 
     /// Mandatory color formats: sampled and drawn into.

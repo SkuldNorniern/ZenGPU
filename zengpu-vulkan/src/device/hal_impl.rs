@@ -37,7 +37,7 @@ impl GpuDevice for VulkanDevice {
                 .instance
                 .get_physical_device_format_properties(
                     self.inner.physical,
-                    hal_format_to_vk(format),
+                    self.inner.vk_format(format),
                 )
         };
         let has = |flag| props.optimal_tiling_features.contains(flag);
@@ -434,7 +434,7 @@ impl GpuDevice for VulkanDevice {
             }
         }
 
-        let format = hal_format_to_vk(desc.format);
+        let format = self.inner.vk_format(desc.format);
         let mut usage = vk::ImageUsageFlags::empty();
         if desc.usage.contains(TextureUsage::SAMPLED) {
             usage |= vk::ImageUsageFlags::SAMPLED;
