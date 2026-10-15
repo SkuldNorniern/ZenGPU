@@ -1908,6 +1908,8 @@ version = "0.0.1"
 dependencies = [
  "cc",
  "log",
+ "zengpu-blas",
+ "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",
 ]
