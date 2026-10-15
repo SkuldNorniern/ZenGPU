@@ -1147,6 +1147,10 @@ impl HipDevice {
 }
 
 impl GpuDevice for HipDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Hip
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

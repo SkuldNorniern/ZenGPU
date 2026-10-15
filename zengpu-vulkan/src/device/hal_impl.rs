@@ -1,7 +1,13 @@
 use super::*;
-use zengpu_hal::{Format, FormatCaps, TextureRegion, TextureWrite, TransferCaps};
+use zengpu_hal::{
+    BackendPreference, Format, FormatCaps, TextureRegion, TextureWrite, TransferCaps,
+};
 
 impl GpuDevice for VulkanDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Vulkan
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

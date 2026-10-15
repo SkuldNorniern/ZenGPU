@@ -638,6 +638,10 @@ pub(crate) fn capabilities() -> HalCapabilities {
 }
 
 impl GpuDevice for MetalDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Metal
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

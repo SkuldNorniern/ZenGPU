@@ -3,8 +3,8 @@
 use std::any::Any;
 
 use zengpu_hal::{
-    AdapterRequest, BufferDesc, BufferHandle, GpuAdapter, GpuDevice, GpuError, GpuInstance,
-    HalCapabilities, Result, SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
+    AdapterRequest, BackendPreference, BufferDesc, BufferHandle, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, HalCapabilities, Result, SamplerDesc, SamplerHandle, TextureDesc, TextureHandle,
 };
 
 #[derive(Default)]
@@ -36,6 +36,10 @@ fn unavailable<T>() -> Result<T> {
 }
 
 impl GpuDevice for MetalDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Metal
+    }
+
     fn as_any(&self) -> &dyn Any {
         match *self {}
     }

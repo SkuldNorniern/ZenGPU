@@ -2,10 +2,10 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
-    Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget, PipelineHandle, Result,
-    SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission, TextureDesc, TextureHandle,
-    TextureRegion, TextureWrite,
+    BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
+    DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget,
+    PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission,
+    TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -216,6 +216,10 @@ impl Device {
 /// Inherent methods with the same name win for direct calls. The trait methods apply only when the
 /// trait is in scope.
 impl GpuDevice for Device {
+    fn backend(&self) -> BackendPreference {
+        self.inner.backend()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
     }

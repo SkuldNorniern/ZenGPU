@@ -12,7 +12,7 @@ use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
 use crate::submission::{CompletedSubmission, Submission};
-use crate::types::{Features, Format};
+use crate::types::{BackendPreference, Features, Format};
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
 pub trait GpuDevice: Send + Sync {
@@ -21,6 +21,11 @@ pub trait GpuDevice: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn capabilities(&self) -> HalCapabilities;
+
+    /// `Auto` means the backend did not say, so callers fall back to SPIR-V.
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Auto
+    }
 
     fn limits(&self) -> DeviceLimits {
         DeviceLimits::default()
