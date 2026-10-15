@@ -66,6 +66,8 @@ const HIP_MEMCPY_D2D: i32 = 3;
 const HIP_MEMCPY_DEFAULT: i32 = 4;
 
 const HIP_HOST_MALLOC_MAPPED: u32 = 2;
+/// First `hipFunction_attribute` member, the same in every ROCm release.
+const HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 0;
 
 const HIP_STREAM_NON_BLOCKING: u32 = 1;
 const HIP_EVENT_DISABLE_TIMING: u32 = 2;
@@ -1456,6 +1458,22 @@ impl GpuDevice for HipDevice {
             )));
         }
         self.core.check(rc, "hipModuleGetFunction")?;
+
+        let mut kernel_max = 0;
+        let rc = unsafe {
+            hipFuncGetAttribute(
+                &mut kernel_max,
+                HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                func,
+            )
+        };
+        if rc == HIP_SUCCESS && kernel_max > 0 && threads > kernel_max as u64 {
+            return Err(GpuError::PipelineCreation(format!(
+                "hip: block {block:?} has {threads} threads but kernel `{}` allows at most \
+                 {kernel_max} (check its __launch_bounds__ / @workgroup_size)",
+                desc.entry
+            )));
+        }
 
         Ok(lock(&self.core.pipelines)?.insert(HipPipeline {
             function: func,
@@ -3407,5 +3425,33 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
         assert_eq!(gcn_arch_from_prop(&junk, None), "");
         assert!(gfx_string_at(b"gfx\0", 0).is_none());
         assert!(gfx_string_at(b"gfx12-generic\0", 0).is_some());
+    }
+
+    #[test]
+    fn block_beyond_kernel_launch_bounds_is_rejected() {
+        const SRC: &str = r#"
+extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
+    out[threadIdx.x] = threadIdx.x;
+}
+"#;
+        let Some(device) = first_device() else { return };
+        let shader = device.create_shader(ShaderDesc::hip(SRC)).unwrap();
+        let err = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "small",
+                block: [256, 1, 1],
+            })
+            .expect_err("256 threads exceed __launch_bounds__(64)");
+        assert!(format!("{err:?}").contains("at most"), "{err:?}");
+        let ok = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "small",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        device.destroy_pipeline(ok);
+        device.destroy_shader(shader);
     }
 }

@@ -205,6 +205,7 @@ entry_points! {
     fn hipModuleLoadData(module: *mut HipModuleRaw, image: *const c_void) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleGetFunction(func: *mut HipFunction, module: HipModuleRaw, name: *const c_char) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleUnload(module: HipModuleRaw) -> HipError = HIP_ERROR_NOT_SUPPORTED;
+    fn hipFuncGetAttribute(value: *mut i32, attr: i32, func: HipFunction) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleLaunchKernel(
         f: HipFunction, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32,
         shared_bytes: u32, stream: HipStream, params: *mut *mut c_void, extra: *mut *mut c_void,
