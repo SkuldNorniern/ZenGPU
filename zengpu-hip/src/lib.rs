@@ -26,6 +26,8 @@ mod hip_layout {
 use hip_layout::*;
 
 pub mod version;
+
+pub mod workarounds;
 use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 type HipError = i32;
