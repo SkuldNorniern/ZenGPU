@@ -51,6 +51,13 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 Other features: `compute` (default) for device arrays, pooling and
 elementwise kernels, `blas` for GEMM.
 
+HIP needs ROCm 5.0 or newer and compiles kernels with hipRTC for the exact
+gfx target, so RDNA 1 (RX 5000), RDNA 2 laptop parts and other GPUs missing
+from AMD's support list run without `HSA_OVERRIDE_GFX_VERSION`. On RDNA 1/2 it
+sets `HSA_ENABLE_SDMA=0` before `hipInit` unless you set it yourself or set
+`ZENGPU_HIP_NO_ENV_WORKAROUNDS=1`. Peer-to-peer copies are on for CDNA and off
+for consumer RDNA; `ZENGPU_HIP_P2P=1` or `0` overrides that.
+
 ZSL covers compute, vertex and fragment shaders: bindless buffers
 (`u32`/`i32`/`f32`/`bf16`/`f16`), push constants, vectors and matrices,
 `if`/`for`, shared memory, atomics, subgroup and workgroup reductions.
