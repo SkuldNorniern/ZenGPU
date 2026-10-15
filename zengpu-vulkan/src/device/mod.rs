@@ -1933,6 +1933,29 @@ mod tests {
         dev.destroy_texture(tex);
     }
 
+    /// Without ReBAR a large `CpuToGpu` buffer must still be made in host memory, not fail on the
+    /// small aperture.
+    #[test]
+    fn large_cpu_to_gpu_buffer_survives_small_bar() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let size = 64u64 << 20;
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::CpuToGpu,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        dev.write_buffer(buf, 0, &data).unwrap();
+        let mut back = vec![0u8; 4096];
+        dev.read_buffer_into(buf, size - 4096, &mut back).unwrap();
+        assert_eq!(&back[..], &data[data.len() - 4096..]);
+        dev.destroy_buffer(buf);
+    }
+
     /// AMD has no D24S8: `Depth24PlusStencil8` must still be creatable, backed by D32S8.
     #[test]
     fn depth24_plus_stencil8_is_creatable_everywhere() {

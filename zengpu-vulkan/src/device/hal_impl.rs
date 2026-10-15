@@ -92,36 +92,22 @@ impl GpuDevice for VulkanDevice {
 
         let mem_reqs = unsafe { self.inner.device.get_buffer_memory_requirements(buffer) };
 
-        let preferred_flags = memory_usage_to_vk(desc.memory);
-        let type_index = self
-            .find_memory_type(mem_reqs.memory_type_bits, preferred_flags)
-            .or_else(|| {
-                memory_usage_fallback(desc.memory)
-                    .and_then(|props| self.find_memory_type(mem_reqs.memory_type_bits, props))
+        let allocated = self
+            .memory_type_candidates(mem_reqs.memory_type_bits, desc.memory, mem_reqs.size)
+            .into_iter()
+            .find_map(|type_index| {
+                let alloc_info = vk::MemoryAllocateInfo {
+                    allocation_size: mem_reqs.size,
+                    memory_type_index: type_index,
+                    ..Default::default()
+                };
+                unsafe { self.inner.device.allocate_memory(&alloc_info, None) }
+                    .ok()
+                    .map(|memory| (type_index, memory))
             });
-
-        let type_index = match type_index {
-            Some(i) => i,
-            None => {
-                unsafe { self.inner.device.destroy_buffer(buffer, None) };
-                return Err(GpuError::OutOfMemory(desc.memory));
-            }
-        };
-
-        let alloc_info = vk::MemoryAllocateInfo {
-            allocation_size: mem_reqs.size,
-            memory_type_index: type_index,
-            ..Default::default()
-        };
-
-        let memory = unsafe {
-            match self.inner.device.allocate_memory(&alloc_info, None) {
-                Ok(m) => m,
-                Err(_) => {
-                    self.inner.device.destroy_buffer(buffer, None);
-                    return Err(GpuError::OutOfMemory(desc.memory));
-                }
-            }
+        let Some((type_index, memory)) = allocated else {
+            unsafe { self.inner.device.destroy_buffer(buffer, None) };
+            return Err(GpuError::OutOfMemory(desc.memory));
         };
 
         if let Err(e) = unsafe { self.inner.device.bind_buffer_memory(buffer, memory, 0) } {

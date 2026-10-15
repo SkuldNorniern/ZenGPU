@@ -1,5 +1,9 @@
 use super::*;
 
+/// Largest device-local host-visible heap treated as the legacy BAR aperture, not Resizable BAR
+/// (which spans VRAM).
+const SMALL_BAR_HEAP: u64 = 512 << 20;
+
 impl VulkanDevice {
     pub fn context(&self) -> DeviceContext {
         DeviceContext::from_inner(Arc::clone(&self.inner))
@@ -219,6 +223,39 @@ impl VulkanDevice {
                     .property_flags
                     .contains(props)
         })
+    }
+
+    /// Memory types for a buffer of `size` bytes, best first.
+    ///
+    /// Without ReBAR the only device-local host-visible heap is the 256 MiB legacy aperture, often
+    /// with a few MiB free (4.6 MiB on an RX 9060 XT under RADV). Large `CpuToGpu` buffers skip it.
+    /// With ReBAR the heap spans VRAM.
+    pub(super) fn memory_type_candidates(
+        &self,
+        type_bits: u32,
+        usage: MemoryUsage,
+        size: u64,
+    ) -> Vec<u32> {
+        let mem_props = &self.inner.memory_properties;
+        let mut candidates = Vec::with_capacity(2);
+        if let Some(preferred) = self.find_memory_type(type_bits, memory_usage_to_vk(usage)) {
+            let heap = mem_props.memory_heaps
+                [mem_props.memory_types[preferred as usize].heap_index as usize];
+            let flags = mem_props.memory_types[preferred as usize].property_flags;
+            let small_bar = flags.contains(
+                vk::MemoryPropertyFlags::DEVICE_LOCAL | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            ) && heap.size <= SMALL_BAR_HEAP;
+            if !(small_bar && size > heap.size / 16) {
+                candidates.push(preferred);
+            }
+        }
+        if let Some(fallback) =
+            memory_usage_fallback(usage).and_then(|props| self.find_memory_type(type_bits, props))
+            && !candidates.contains(&fallback)
+        {
+            candidates.push(fallback);
+        }
+        candidates
     }
 
     pub(super) fn memory_type_flags(&self, type_index: u32) -> vk::MemoryPropertyFlags {
