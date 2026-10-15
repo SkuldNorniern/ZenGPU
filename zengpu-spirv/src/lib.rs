@@ -32,7 +32,9 @@ use std::error::Error;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::slice;
 
-use zengpu_hal::{BackendPreference, ShaderDesc};
+use zengpu_hal::{
+    BackendPreference, GpuDevice, GpuError, Result as HalResult, ShaderDesc, ShaderHandle,
+};
 
 #[cfg(test)]
 extern crate self as zengpu_spirv;
@@ -103,6 +105,30 @@ impl ZslShader {
             BackendPreference::Cuda => (ShaderDesc::cuda_src(self.cuda), "zsl_kernel"),
             _ => (self.spirv_desc(), "main"),
         }
+    }
+
+    /// Creates the shader on `device` from the artifact its backend consumes (see
+    /// [`GpuDevice::backend`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `zengpu-spirv` was built without that backend's feature.
+    pub fn create(&self, device: &dyn GpuDevice) -> HalResult<(ShaderHandle, &'static str)> {
+        let backend = device.backend();
+        let (missing, feature) = match backend {
+            BackendPreference::Hip => (self.hip.is_empty(), "hip"),
+            BackendPreference::Cuda => (self.cuda.is_empty(), "cuda"),
+            BackendPreference::Metal => (self.msl.is_empty(), "metal"),
+            _ => (self.spv.is_empty(), "spirv"),
+        };
+        if missing {
+            return Err(GpuError::ShaderCompile(format!(
+                "zsl: no {feature} artifact for the {backend:?} backend; enable the \
+                 `{feature}` feature of zengpu-spirv"
+            )));
+        }
+        let (desc, entry) = self.for_backend(backend);
+        Ok((device.create_shader(desc)?, entry))
     }
 
     /// Convenience: SPIR-V [`ShaderDesc`] for Vulkan-only callers.
