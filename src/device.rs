@@ -3,8 +3,9 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
-    GpuDevice, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc,
-    ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
+    Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget, PipelineHandle, Result,
+    SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission, TextureDesc, TextureHandle,
+    TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -347,5 +348,90 @@ impl GpuDevice for Device {
 
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
         self.inner.submit_compute_ops(cycle_id, ops)
+    }
+
+    fn dispatch_batch(&self, ops: &[DispatchOp<'_>]) -> Result<()> {
+        self.inner.dispatch_batch(ops)
+    }
+
+    fn format_caps(&self, format: Format) -> FormatCaps {
+        self.inner.format_caps(format)
+    }
+
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        self.inner.memory_budget()
+    }
+
+    fn is_lost(&self) -> bool {
+        self.inner.is_lost()
+    }
+
+    fn device_ordinal(&self) -> i32 {
+        self.inner.device_ordinal()
+    }
+
+    fn can_peer(&self, peer_ordinal: i32) -> bool {
+        self.inner.can_peer(peer_ordinal)
+    }
+
+    fn copy_from_peer(
+        &self,
+        dst: BufferHandle,
+        src_device: &dyn GpuDevice,
+        src: BufferHandle,
+        bytes: u64,
+    ) -> Result<()> {
+        self.inner.copy_from_peer(dst, src_device, src, bytes)
+    }
+
+    fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
+        self.inner.copy_texture_to_buffer(texture, buffer)
+    }
+
+    fn upload_texture_data_region(
+        &self,
+        texture: TextureHandle,
+        mip_level: u32,
+        layer: u32,
+        data: &[u8],
+    ) -> Result<()> {
+        self.inner
+            .upload_texture_data_region(texture, mip_level, layer, data)
+    }
+
+    fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
+        self.inner.write_textures(writes)
+    }
+
+    fn copy_buffer_to_texture(
+        &self,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+        texture: TextureHandle,
+        region: TextureRegion,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_buffer_to_texture(buffer, offset, bytes_per_row, texture, region)
+    }
+
+    fn copy_texture_region_to_buffer(
+        &self,
+        texture: TextureHandle,
+        region: TextureRegion,
+        buffer: BufferHandle,
+        offset: u64,
+        bytes_per_row: u32,
+    ) -> Result<Submission> {
+        self.inner
+            .copy_texture_region_to_buffer(texture, region, buffer, offset, bytes_per_row)
+    }
+
+    fn generate_mipmaps(&self, texture: TextureHandle) -> Result<()> {
+        self.inner.generate_mipmaps(texture)
+    }
+
+    fn supports_anisotropic_filtering(&self) -> bool {
+        self.inner.supports_anisotropic_filtering()
     }
 }
