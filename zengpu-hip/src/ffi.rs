@@ -196,6 +196,7 @@ entry_points! {
     fn hipDeviceComputeCapability(major: *mut i32, minor: *mut i32, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipGetErrorName(code: HipError) -> *const c_char = null();
     fn hipSetDevice(device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
+    fn hipSetDeviceFlags(flags: u32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceCanAccessPeer(can_access: *mut i32, device: i32, peer: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceEnablePeerAccess(peer: i32, flags: u32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError = HIP_ERROR_NOT_SUPPORTED;

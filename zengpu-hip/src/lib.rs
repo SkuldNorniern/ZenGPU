@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::thread::yield_now;
+use std::thread::{sleep, yield_now};
 use std::time::{Duration, Instant};
 
 use zengpu_hal::{
@@ -83,6 +83,18 @@ const HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 0;
 
 const HIP_STREAM_NON_BLOCKING: u32 = 1;
 const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+
+/// How long a bounded wait yields before it starts sleeping between polls.
+const SPIN_BEFORE_SLEEP: Duration = Duration::from_micros(200);
+/// Sleep between polls of a bounded wait once it stops yielding.
+const POLL_SLEEP: Duration = Duration::from_micros(100);
+
+/// `hipDeviceScheduleBlockingSync`: host threads block on an OS primitive
+/// while they wait for the GPU instead of spinning.
+const HIP_DEVICE_SCHEDULE_BLOCKING_SYNC: u32 = 4;
+
+/// Set to keep HIP's default spin-waiting.
+pub const SPIN_WAIT_ENV: &str = "ZENGPU_HIP_SPIN_WAIT";
 
 /// Kernel-parameter slots per launch. Every slot is 8 bytes; 4-byte scalars
 /// use the low half (`hipModuleLaunchKernel` reads exactly the declared size).
@@ -960,15 +972,24 @@ impl GpuSubmission for HipSubmission {
                 }
             }
         }
-        let deadline = Instant::now().checked_add(timeout);
+        let start = Instant::now();
+        let deadline = start.checked_add(timeout);
         loop {
             if self.query()? == SubmissionStatus::Complete {
                 return Ok(());
             }
-            if timeout == Duration::ZERO || deadline.is_some_and(|d| Instant::now() >= d) {
+            let now = Instant::now();
+            if timeout == Duration::ZERO || deadline.is_some_and(|d| now >= d) {
                 return Err(GpuError::Timeout);
             }
-            yield_now();
+            // Yield briefly for latency, then sleep so a long bounded wait
+            // does not hold a core at 100%.
+            if now - start < SPIN_BEFORE_SLEEP {
+                yield_now();
+            } else {
+                let left = deadline.map_or(POLL_SLEEP, |d| d - now);
+                sleep(POLL_SLEEP.min(left));
+            }
         }
     }
 }
@@ -1030,6 +1051,22 @@ impl HipInstance {
             "hipGetDeviceCount",
         )
         .map_err(with_hint)?;
+
+        // HIP's default spin-waits: a thread waiting on a 1 s kernel burns a
+        // full core for the whole second. Blocking sync costs no measurable
+        // latency (29 us launch+sync either way on an RX 9060 XT) and brings
+        // that to ~0.04 s of CPU. It must be set before a device is first
+        // used; when the application already did, HIP refuses and its
+        // choice stands.
+        if env::var_os(SPIN_WAIT_ENV).is_none() {
+            for ordinal in 0..count {
+                unsafe {
+                    if hipSetDevice(ordinal) == HIP_SUCCESS {
+                        let _ = hipSetDeviceFlags(HIP_DEVICE_SCHEDULE_BLOCKING_SYNC);
+                    }
+                }
+            }
+        }
 
         let devices: Vec<HipDeviceInfo> = (0..count).filter_map(HipDeviceInfo::query).collect();
 

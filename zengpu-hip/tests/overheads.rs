@@ -133,7 +133,10 @@ fn overheads() {
             let b = dev.create_buffer(desc).unwrap();
             dev.destroy_buffer(b);
         }
-        println!("hip: create+destroy {mib:>2} MiB       {:?}", per_iter(t, 100));
+        println!(
+            "hip: create+destroy {mib:>2} MiB       {:?}",
+            per_iter(t, 100)
+        );
     }
 
     let first = dev.read_buffer(out, 0, 4).unwrap();
