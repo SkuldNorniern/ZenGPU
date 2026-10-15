@@ -74,11 +74,11 @@ compute = ["zengpu-compute"]
 # GEMM compute kernel, on top of `compute`.
 blas = ["zengpu-blas", "compute"]
 # CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
-cuda = ["zengpu-cuda"]
+cuda = ["zengpu-cuda", "zengpu-spirv/cuda"]
 # Apple Metal backend (macOS, graphics + compute). Turns on ZSL's MSL output.
 metal = ["zengpu-metal", "zengpu-spirv/metal"]
 # AMD ROCm/HIP compute backend (compute HAL only).
-hip = ["zengpu-hip"]
+hip = ["zengpu-hip", "zengpu-spirv/hip"]
 # DirectX 12 backend (Windows, graphics + compute).
 dx12 = ["zengpu-dx12"]
 
