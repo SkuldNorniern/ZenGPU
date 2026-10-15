@@ -2043,6 +2043,30 @@ mod tests {
         dev.destroy_texture(tex);
     }
 
+    /// Without Resizable BAR the device-local host-visible heap is a 256 MiB
+    /// aperture with a few MiB to spare; a large `CpuToGpu` buffer must still
+    /// be made (in host memory) rather than fail.
+    #[test]
+    fn large_cpu_to_gpu_buffer_survives_small_bar() {
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let size = 64u64 << 20;
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::CpuToGpu,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        dev.write_buffer(buf, 0, &data).unwrap();
+        let mut back = vec![0u8; 4096];
+        dev.read_buffer_into(buf, size - 4096, &mut back).unwrap();
+        assert_eq!(&back[..], &data[data.len() - 4096..]);
+        dev.destroy_buffer(buf);
+    }
+
     /// AMD drivers have no D24S8; the format must still be creatable as a
     /// depth target, backed by D32S8 there.
     #[test]
