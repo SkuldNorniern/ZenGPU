@@ -7,6 +7,8 @@ use zengpu_hal::{
 };
 use zengpu_spirv::{ZslShader, zsl};
 
+use crate::gemm_tiled::{GEMM_TILED_ZSL, TILE as TILED_GEMM_TILE};
+
 /// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
 /// Naive (untiled) f32 GEMM. 16×16 local workgroup.
@@ -32,8 +34,8 @@ const GEMM_ZSL: ZslShader = zsl!(
 pub struct GemmKernel {
     shader: ShaderHandle,
     pub pipeline: PipelineHandle,
-    /// Output tile per workgroup: 16 for the portable kernel, 128 for the
-    /// register-blocked HIP kernel.
+    /// Output tile per workgroup: 16 for the naive kernel, 128 for the
+    /// register-blocked ones.
     tile: u32,
 }
 
@@ -112,9 +114,29 @@ void sgemm_tiled(const float* __restrict__ A, const float* __restrict__ B,
 "#;
 
 impl GemmKernel {
-    /// Compile the GEMM pipeline on `device`: the tuned kernel on HIP, the
-    /// portable ZSL kernel elsewhere.
+    /// Compile the GEMM pipeline on `device`: the hand-written kernel on
+    /// HIP, the register-blocked ZSL kernel on Vulkan, and the naive ZSL
+    /// kernel on backends the blocked one has not been measured on.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
+        if device.backend() == BackendPreference::Vulkan {
+            let (shader, entry) = GEMM_TILED_ZSL.create(device)?;
+            let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [16, 16, 1],
+            });
+            return match pipeline {
+                Ok(pipeline) => Ok(Self {
+                    shader,
+                    pipeline,
+                    tile: TILED_GEMM_TILE,
+                }),
+                Err(e) => {
+                    device.destroy_shader(shader);
+                    Err(e)
+                }
+            };
+        }
         if device.backend() == BackendPreference::Hip {
             let shader = device.create_shader(ShaderDesc::hip(GEMM_HIP_TILED))?;
             let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
