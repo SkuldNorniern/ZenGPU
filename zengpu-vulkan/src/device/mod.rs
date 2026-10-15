@@ -2065,6 +2065,10 @@ mod tests {
         let mut window = [0u8; 5];
         dev.read_buffer_into(buf, 6, &mut window).unwrap();
         assert_eq!(window, [data[6], 1, 2, 3, data[10]]);
+        // Aligned and small: sent inline with vkCmdUpdateBuffer.
+        let inline: Vec<u8> = (0..64).map(|i| 200 - i).collect();
+        dev.write_buffer(buf, 4096, &inline).unwrap();
+        assert_eq!(dev.read_buffer(buf, 4092, 72).unwrap()[4..68], inline[..]);
         assert!(dev.read_buffer(buf, size - 2, 4).is_err(), "past the end");
         dev.destroy_buffer(buf);
     }

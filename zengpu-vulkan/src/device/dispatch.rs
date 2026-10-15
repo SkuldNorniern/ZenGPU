@@ -237,6 +237,34 @@ impl VulkanDevice {
     /// Write `data` into `dst` at `offset` through a temporary host-visible
     /// buffer, for buffers the host cannot map (device-local VRAM).
     pub(super) fn staged_write(&self, dst: vk::Buffer, offset: u64, data: &[u8]) -> Result<()> {
+        // Small aligned writes ride in the command buffer itself
+        // (vkCmdUpdateBuffer), skipping a staging allocation that costs more
+        // than the submission.
+        if data.len() as u64 <= INLINE_UPDATE_MAX
+            && offset.is_multiple_of(4)
+            && data.len().is_multiple_of(4)
+        {
+            return self.one_shot_submit(|dev, cmd| {
+                unsafe {
+                    dev.cmd_update_buffer(cmd, dst, offset, data);
+                    dev.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access_mask: vk::AccessFlags::MEMORY_READ
+                                | vk::AccessFlags::MEMORY_WRITE,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                }
+                Ok(())
+            });
+        }
         let staging = StagingBuffer::new(self, data.len() as u64, false)?;
         for (i, chunk) in data.chunks(staging.size as usize).enumerate() {
             unsafe { copy_nonoverlapping(chunk.as_ptr(), staging.mapped, chunk.len()) };
@@ -860,6 +888,9 @@ pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
         );
     }
 }
+
+/// Largest write sent inline with vkCmdUpdateBuffer (the Vulkan limit).
+const INLINE_UPDATE_MAX: u64 = 65536;
 
 /// Bytes moved per staging round trip.
 const STAGING_CHUNK: u64 = 16 << 20;
