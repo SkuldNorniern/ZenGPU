@@ -168,3 +168,36 @@ fn blas_sgemm_throughput() {
     }
     blas.destroy(&*device);
 }
+
+#[test]
+fn memory_bound_kernel_bandwidth() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let kernels = ElementwiseKernels::new(&*device).unwrap();
+    let blas = Blas::new(&*device).unwrap();
+    let n = 64u32 << 20; // 64 Mi floats = 256 MiB per array
+    let a = pool.alloc(vec![n], DType::F32).unwrap();
+    let b = pool.alloc(vec![n], DType::F32).unwrap();
+    let gb = |arrays: f64, secs: f64| arrays * f64::from(n) * 4.0 / secs / 1e9;
+
+    let out = kernels.add(&*device, &pool, &a, &b).unwrap();
+    pool.free(out);
+    let t = Instant::now();
+    for _ in 0..5 {
+        let out = kernels.add(&*device, &pool, &a, &b).unwrap();
+        pool.free(out);
+    }
+    println!("hip: elementwise add  {:.0} GB/s", gb(3.0, t.elapsed().as_secs_f64() / 5.0));
+
+    blas.saxpy(&*device, &pool, 2.0, &a, &b).unwrap();
+    let t = Instant::now();
+    for _ in 0..5 {
+        blas.saxpy(&*device, &pool, 2.0, &a, &b).unwrap();
+    }
+    println!("hip: saxpy            {:.0} GB/s", gb(3.0, t.elapsed().as_secs_f64() / 5.0));
+
+    pool.free(a);
+    pool.free(b);
+    kernels.destroy(&*device);
+    blas.destroy(&*device);
+}
