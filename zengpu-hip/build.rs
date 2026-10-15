@@ -3,64 +3,28 @@
 
 /// Build script for zengpu-hip.
 ///
-/// 1. Locates the ROCm installation (ROCM_PATH env → /opt/rocm scan).
-/// 2. Emits link flags for libamdhip64 and libhiprtc, or — when neither is
-///    found on the search path — compiles link-only stubs so the crate still
-///    links on machines without ROCm installed (mirrors zengpu-cuda's
-///    cuda_stub.c/nvrtc_stub.c fallback).
-/// 3. Probes `hip_version.h` → emits `cfg(rocm_major="N")` / `cfg(rocm_minor="N")`
+/// Nothing is linked: the HIP runtime and hipRTC are loaded at run time
+/// (see `src/ffi.rs`), so ROCm is optional both here and on the target.
+///
+/// 1. Locates the ROCm headers (ROCM_PATH env → /opt/rocm scan).
+/// 2. Probes `hip_version.h` → emits `cfg(rocm_major="N")` / `cfg(rocm_minor="N")`
 ///    so the crate can gate features on ROCm version at compile time.
-/// 4. Compiles a tiny C probe to measure the `hipDeviceProp_t` size, the
+/// 3. Compiles a tiny C probe to measure the `hipDeviceProp_t` size, the
 ///    `gcnArchName` offset, and the `hipDeviceAttribute_t` values the crate
 ///    queries, all of which shifted between major ROCm releases. Falls back to
 ///    ROCm 6/7 x86-64 defaults when cross-compiling or when no AMD compiler is
 ///    present.
-use cc::Build;
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
     let rocm_path = env::var("ROCM_PATH").unwrap_or_else(|_| find_rocm());
 
-    // ── Link flags ────────────────────────────────────────────────────────────
-    let lib_dirs = [
-        PathBuf::from(format!("{rocm_path}/lib")),
-        PathBuf::from(format!("{rocm_path}/lib/x64")),
-        PathBuf::from(format!("{rocm_path}/lib64")),
-    ];
-    for dir in &lib_dirs {
-        if dir.exists() {
-            println!("cargo:rustc-link-search=native={}", dir.display());
-        }
-    }
-
-    let has_hip = lib_dirs.iter().any(|dir| {
-        has_library(
-            dir,
-            &["libamdhip64.so", "libamdhip64.dylib", "amdhip64.lib"],
-        )
-    });
-    if !has_hip {
-        Build::new().file("src/hip_stub.c").compile("amdhip64");
-    }
-
-    let has_hiprtc = lib_dirs
-        .iter()
-        .any(|dir| has_library(dir, &["libhiprtc.so", "libhiprtc.dylib", "hiprtc.lib"]));
-    if !has_hiprtc {
-        Build::new().file("src/hiprtc_stub.c").compile("hiprtc");
-    }
-
-    println!("cargo:rustc-link-lib=amdhip64");
-    println!("cargo:rustc-link-lib=hiprtc");
-
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-changed={rocm_path}/include/hip/hip_version.h");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/hip_stub.c");
-    println!("cargo:rerun-if-changed=src/hiprtc_stub.c");
 
     // ── ROCm version detection ────────────────────────────────────────────────
     let (major, minor) = detect_rocm_version(&rocm_path);
@@ -171,16 +135,8 @@ fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let layout_rs = out_dir.join("hip_layout.rs");
 
-    // ROCm 6 renamed the exported symbol: `hipGetDeviceProperties` still
-    // exists for old binaries but fills the ROCm 5 (R0000) layout, while the
-    // header macro points new code at `hipGetDevicePropertiesR0600`. Link the
-    // one whose layout the probe measures.
-    println!("cargo:rustc-check-cfg=cfg(hip_props_r0600)");
     println!("cargo:rustc-check-cfg=cfg(rocm_major, values(any()))");
     println!("cargo:rustc-check-cfg=cfg(rocm_minor, values(any()))");
-    if rocm_major >= 6 {
-        println!("cargo:rustc-cfg=hip_props_r0600");
-    }
 
     // Fall-back offsets by ROCm major version (x86-64 measurements).
     let (def_size, def_gcn) = match rocm_major {
@@ -295,8 +251,4 @@ fn probe_layout(rocm_path: &str) -> Result<HipLayout, String> {
         }
     }
     Err("no suitable compiler found".into())
-}
-
-fn has_library(dir: &Path, names: &[&str]) -> bool {
-    names.iter().any(|name| dir.join(name).exists())
 }
