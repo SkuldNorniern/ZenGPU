@@ -1,23 +1,35 @@
 //! ZenGPU AMD ROCm/HIP compute backend.
 //!
-//! Supports ROCm 5.x-7.x on gfx9xx (CDNA), gfx10xx (RDNA 1/2), gfx11xx (RDNA 3) and gfx12xx (RDNA
-//! 4). Multiple GPUs: open one `HipDevice` per adapter. They are `Send + Sync` and can be driven
-//! from separate threads.
+//! Supports ROCm 5.x - 7.x on gfx9xx (GCN 5 / CDNA), gfx10xx (RDNA 1/2), gfx11xx (RDNA 3), gfx12xx
+//! (RDNA 4). Kernels compile at run time with hipRTC for the exact gfx target the device reports,
+//! so parts outside AMD's official support list run without `HSA_OVERRIDE_GFX_VERSION`.
+//!
+//! Each [`HipDevice`] owns one non-blocking stream. A dispatch sees every earlier write, copy
+//! and dispatch on the same device. Multi-GPU: open one `HipDevice` per adapter. They are
+//! `Send + Sync`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::ffi::{CStr, CString, c_void};
+use std::collections::hash_map::DefaultHasher;
+use std::env;
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::hash::{Hash, Hasher};
+use std::mem::take;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::thread::yield_now;
+use std::time::{Duration, Instant};
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, ComputePipelineDesc, DeviceRequest, DeviceType, DispatchOp, GpuAdapter, GpuDevice,
-    GpuError, GpuInstance, HalCapabilities, PipelineHandle, Result, SamplerDesc, SamplerHandle,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, TextureDesc, TextureHandle, UsageError,
-    marker,
+    BufferUsage, CompletedSubmission, ComputeOp, ComputePipelineDesc, DeviceLimits, DeviceRequest,
+    DeviceType, DispatchOp, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
+    HalCapabilities, MemoryBudget, MemoryUsage, PipelineHandle, PowerPreference, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 mod hip_layout {
@@ -26,35 +38,75 @@ mod hip_layout {
 use hip_layout::*;
 
 pub mod version;
+use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 pub mod workarounds;
-use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 type HipError = i32;
 const HIP_SUCCESS: HipError = 0;
+const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
+const HIP_ERROR_INVALID_IMAGE: HipError = 200;
+const HIP_ERROR_NO_BINARY_FOR_GPU: HipError = 209;
+const HIP_ERROR_INVALID_KERNEL_FILE: HipError = 218;
+const HIP_ERROR_NOT_FOUND: HipError = 500;
+const HIP_ERROR_NOT_READY: HipError = 600;
+const HIP_ERROR_ILLEGAL_ADDRESS: HipError = 700;
+const HIP_ERROR_LAUNCH_OUT_OF_RESOURCES: HipError = 701;
+const HIP_ERROR_LAUNCH_TIMEOUT: HipError = 702;
 const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipError = 704;
+const HIP_ERROR_LAUNCH_FAILURE: HipError = 719;
+const HIP_ERROR_NOT_SUPPORTED: HipError = 801;
 
 const HIP_MEMCPY_H2D: i32 = 1;
 const HIP_MEMCPY_D2H: i32 = 2;
+const HIP_MEMCPY_D2D: i32 = 3;
+/// Inferred from unified addresses. Used for pinned host buffers (APU fallback), where the explicit
+/// kinds would mislead.
+const HIP_MEMCPY_DEFAULT: i32 = 4;
 
-type HipModule = *mut c_void;
+const HIP_HOST_MALLOC_MAPPED: u32 = 2;
+
+const HIP_STREAM_NON_BLOCKING: u32 = 1;
+const HIP_EVENT_DISABLE_TIMING: u32 = 2;
+
+/// Parameter slots per launch, 8 bytes each. A 4-byte scalar uses the low half;
+/// `hipModuleLaunchKernel` reads exactly the declared size.
+const MAX_PARAMS: usize = 32;
+
+type HipModuleRaw = *mut c_void;
 type HipFunction = *mut c_void;
 type HipStream = *mut c_void;
+type HipEvent = *mut c_void;
 type HiprtcProg = *mut c_void;
 
 #[link(name = "amdhip64")]
 unsafe extern "C" {
     fn hipInit(flags: u32) -> HipError;
     fn hipGetDeviceCount(count: *mut i32) -> HipError;
-    fn hipDeviceGetName(name: *mut i8, len: i32, device: i32) -> HipError;
+    fn hipDeviceGetName(name: *mut c_char, len: i32, device: i32) -> HipError;
     fn hipDeviceTotalMem(bytes: *mut usize, device: i32) -> HipError;
+    #[cfg_attr(hip_props_r0600, link_name = "hipGetDevicePropertiesR0600")]
     fn hipGetDeviceProperties(props: *mut u8, device: i32) -> HipError;
+    fn hipDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> HipError;
+    fn hipDeviceComputeCapability(major: *mut i32, minor: *mut i32, device: i32) -> HipError;
+    fn hipGetErrorName(code: HipError) -> *const c_char;
     fn hipSetDevice(device: i32) -> HipError;
     fn hipDeviceCanAccessPeer(canAccess: *mut i32, device: i32, peerDevice: i32) -> HipError;
     fn hipDeviceEnablePeerAccess(peerDevice: i32, flags: u32) -> HipError;
+    fn hipMemGetInfo(free: *mut usize, total: *mut usize) -> HipError;
     fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> HipError;
     fn hipFree(ptr: *mut c_void) -> HipError;
+    fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: u32) -> HipError;
+    fn hipHostFree(ptr: *mut c_void) -> HipError;
+    fn hipHostGetDevicePointer(dev: *mut *mut c_void, host: *mut c_void, flags: u32) -> HipError;
     fn hipMemcpy(dst: *mut c_void, src: *const c_void, bytes: usize, kind: i32) -> HipError;
+    fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+        kind: i32,
+        stream: HipStream,
+    ) -> HipError;
     fn hipMemcpyPeer(
         dst: *mut c_void,
         dstDevice: i32,
@@ -62,10 +114,21 @@ unsafe extern "C" {
         srcDevice: i32,
         bytes: usize,
     ) -> HipError;
-    fn hipModuleLoadData(module: *mut HipModule, image: *const c_void) -> HipError;
-    fn hipModuleGetFunction(func: *mut HipFunction, module: HipModule, name: *const i8)
-    -> HipError;
-    fn hipModuleUnload(module: HipModule) -> HipError;
+    fn hipStreamCreateWithFlags(stream: *mut HipStream, flags: u32) -> HipError;
+    fn hipStreamDestroy(stream: HipStream) -> HipError;
+    fn hipStreamSynchronize(stream: HipStream) -> HipError;
+    fn hipEventCreateWithFlags(event: *mut HipEvent, flags: u32) -> HipError;
+    fn hipEventRecord(event: HipEvent, stream: HipStream) -> HipError;
+    fn hipEventQuery(event: HipEvent) -> HipError;
+    fn hipEventSynchronize(event: HipEvent) -> HipError;
+    fn hipEventDestroy(event: HipEvent) -> HipError;
+    fn hipModuleLoadData(module: *mut HipModuleRaw, image: *const c_void) -> HipError;
+    fn hipModuleGetFunction(
+        func: *mut HipFunction,
+        module: HipModuleRaw,
+        name: *const c_char,
+    ) -> HipError;
+    fn hipModuleUnload(module: HipModuleRaw) -> HipError;
     fn hipModuleLaunchKernel(
         f: HipFunction,
         gx: u32,
@@ -79,25 +142,57 @@ unsafe extern "C" {
         kernel_params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> HipError;
-    fn hipStreamSynchronize(stream: HipStream) -> HipError;
 }
 
 #[link(name = "hiprtc")]
 unsafe extern "C" {
     fn hiprtcCreateProgram(
         prog: *mut HiprtcProg,
-        src: *const i8,
-        name: *const i8,
+        src: *const c_char,
+        name: *const c_char,
         num_headers: i32,
-        headers: *const *const i8,
-        include_names: *const *const i8,
+        headers: *const *const c_char,
+        include_names: *const *const c_char,
     ) -> i32;
-    fn hiprtcCompileProgram(prog: HiprtcProg, num_opts: i32, opts: *const *const i8) -> i32;
+    fn hiprtcCompileProgram(prog: HiprtcProg, num_opts: i32, opts: *const *const c_char) -> i32;
     fn hiprtcGetCodeSize(prog: HiprtcProg, sz: *mut usize) -> i32;
-    fn hiprtcGetCode(prog: HiprtcProg, code: *mut i8) -> i32;
+    fn hiprtcGetCode(prog: HiprtcProg, code: *mut c_char) -> i32;
     fn hiprtcDestroyProgram(prog: *mut HiprtcProg) -> i32;
     fn hiprtcGetProgramLogSize(prog: HiprtcProg, sz: *mut usize) -> i32;
-    fn hiprtcGetProgramLog(prog: HiprtcProg, log: *mut i8) -> i32;
+    fn hiprtcGetProgramLog(prog: HiprtcProg, log: *mut c_char) -> i32;
+}
+
+fn error_name(code: HipError) -> String {
+    // SAFETY: hipGetErrorName returns a static NUL-terminated string (or null
+    let name = unsafe { hipGetErrorName(code) };
+    if name.is_null() {
+        return format!("HIP error {code}");
+    }
+    unsafe { CStr::from_ptr(name) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Whether `code` leaves the HIP context corrupt, so every later call on the device fails.
+fn is_fatal(code: HipError) -> bool {
+    matches!(
+        code,
+        HIP_ERROR_ILLEGAL_ADDRESS | HIP_ERROR_LAUNCH_FAILURE | HIP_ERROR_LAUNCH_TIMEOUT
+    )
+}
+
+fn hip_error(code: HipError, ctx: &str) -> GpuError {
+    match code {
+        HIP_ERROR_OUT_OF_MEMORY => GpuError::OutOfMemory(MemoryUsage::GpuOnly),
+        HIP_ERROR_INVALID_IMAGE | HIP_ERROR_NO_BINARY_FOR_GPU | HIP_ERROR_INVALID_KERNEL_FILE => {
+            GpuError::ShaderCompile(format!("{ctx}: {} ({code})", error_name(code)))
+        }
+        HIP_ERROR_LAUNCH_OUT_OF_RESOURCES => {
+            GpuError::Dispatch(format!("{ctx}: {} ({code})", error_name(code)))
+        }
+        code if is_fatal(code) => GpuError::DeviceLost,
+        _ => GpuError::Backend(format!("{ctx}: {} ({code})", error_name(code))),
+    }
 }
 
 #[inline]
@@ -105,11 +200,40 @@ fn check(code: HipError, ctx: &str) -> Result<()> {
     if code == HIP_SUCCESS {
         Ok(())
     } else {
-        Err(GpuError::Backend(format!("{ctx}: HIP error {code}")))
+        Err(hip_error(code, ctx))
     }
 }
 
-/// Read `gcnArchName` from an opaque `hipDeviceProp_t` blob. "" on layout mismatch (older ROCm).
+fn binding_error(msg: impl Into<String>) -> GpuError {
+    GpuError::InvalidUsage(UsageError::BindingMismatch(msg.into()))
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>> {
+    mutex.lock().map_err(|_| GpuError::DeviceLost)
+}
+
+fn checked_range(offset: u64, len: u64, size: usize, what: &str) -> Result<usize> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| binding_error(format!("hip: {what} range overflows u64")))?;
+    if end > size as u64 {
+        return Err(binding_error(format!(
+            "hip: {what} range {offset}..{end} exceeds buffer of {size} bytes"
+        )));
+    }
+    Ok(offset as usize)
+}
+
+/// Larger than any ROCm `hipDeviceProp_t`, so a wrong probe size cannot make the runtime write past
+/// the buffer.
+const PROP_BLOB_SIZE: usize = if HIP_PROP_SIZE > 8192 {
+    HIP_PROP_SIZE
+} else {
+    8192
+};
+
+/// Read `gcnArchName` from an opaque `hipDeviceProp_t` blob. "" when the bytes at the probed offset
+/// are not a gfx name.
 fn gcn_arch_from_prop(blob: &[u8]) -> String {
     let start = HIP_PROP_GCN_ARCH_OFF;
     let end = start + HIP_PROP_GCN_ARCH_LEN;
@@ -121,46 +245,47 @@ fn gcn_arch_from_prop(blob: &[u8]) -> String {
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(HIP_PROP_GCN_ARCH_LEN);
-    String::from_utf8_lossy(&slice[..len]).into_owned()
+    let name = String::from_utf8_lossy(&slice[..len]).into_owned();
+    if name.starts_with("gfx") {
+        name
+    } else {
+        String::new()
+    }
 }
 
-/// Read multiProcessorCount (i32 at fixed offset).
-fn cu_count_from_prop(blob: &[u8]) -> u32 {
-    let off = HIP_PROP_CU_COUNT_OFF;
-    if blob.len() < off + 4 {
-        return 0;
-    }
-    let bytes: [u8; 4] = blob[off..off + 4].try_into().unwrap_or([0; 4]);
-    i32::from_ne_bytes(bytes) as u32
+fn device_attribute(attr: i32, ordinal: i32) -> Option<i32> {
+    let mut value = 0;
+    let rc = unsafe { hipDeviceGetAttribute(&mut value, attr, ordinal) };
+    (rc == HIP_SUCCESS).then_some(value)
 }
 
-/// Read clockRate (kHz, i32 at fixed offset), converted to MHz.
-fn clock_mhz_from_prop(blob: &[u8]) -> u32 {
-    let off = HIP_PROP_CLOCK_OFF;
-    if blob.len() < off + 4 {
-        return 0;
-    }
-    let bytes: [u8; 4] = blob[off..off + 4].try_into().unwrap_or([0; 4]);
-    let khz = i32::from_ne_bytes(bytes);
-    (khz / 1000) as u32
+fn positive_attribute(attr: i32, ordinal: i32) -> Option<u32> {
+    device_attribute(attr, ordinal)
+        .filter(|&v| v > 0)
+        .map(|v| v as u32)
 }
 
 #[derive(Debug, Clone)]
 pub struct HipDeviceInfo {
     pub ordinal: i32,
     pub name: String,
-    /// Bare gfx target, e.g. "gfx1200". Empty if undetectable.
+    /// Bare gfx target, e.g. "gfx1200". Empty: hipRTC picks the target.
     pub gfx_target: String,
     pub gfx_family: GfxFamily,
     pub total_mem: usize,
     pub cu_count: u32,
     pub clock_mhz: u32,
+    pub wave_size: u32,
+    pub integrated: bool,
+    pub max_threads_per_block: u32,
+    pub max_block_dim: [u32; 3],
+    pub max_grid_dim: [u32; 3],
     pub capabilities: HipCapabilities,
 }
 
 impl HipDeviceInfo {
     fn query(ordinal: i32) -> Option<Self> {
-        let mut name_buf = [0i8; 256];
+        let mut name_buf = [0 as c_char; 256];
         unsafe {
             if hipDeviceGetName(name_buf.as_mut_ptr(), 256, ordinal) != HIP_SUCCESS {
                 return None;
@@ -171,35 +296,52 @@ impl HipDeviceInfo {
             .into_owned();
 
         let mut total_mem: usize = 0;
-        unsafe {
-            hipDeviceTotalMem(&mut total_mem, ordinal);
+        if unsafe { hipDeviceTotalMem(&mut total_mem, ordinal) } != HIP_SUCCESS {
+            total_mem = 0;
         }
 
-        let mut blob = vec![0u8; HIP_PROP_SIZE];
+        let mut blob = vec![0u8; PROP_BLOB_SIZE];
         let prop_ok = unsafe { hipGetDeviceProperties(blob.as_mut_ptr(), ordinal) } == HIP_SUCCESS;
-
-        let (gfx_target, cu_count, clock_mhz) = if prop_ok {
-            (
-                gcn_arch_from_prop(&blob),
-                cu_count_from_prop(&blob),
-                clock_mhz_from_prop(&blob),
-            )
+        let raw_arch = if prop_ok {
+            gcn_arch_from_prop(&blob)
         } else {
-            (String::new(), 0, 0)
+            String::new()
         };
+        let gfx_target = raw_arch
+            .split_once(':')
+            .map(|(g, _)| g.to_string())
+            .unwrap_or(raw_arch);
 
-        let gfx_target = if gfx_target.is_empty() {
-            gfx_from_name_heuristic(&name)
-        } else {
-            gfx_target
-                .split_once(':')
-                .map(|(g, _)| g.to_string())
-                .unwrap_or(gfx_target)
-        };
+        let mut family = GfxFamily::from_gfx(&gfx_target);
+        if family == GfxFamily::Unknown {
+            let (mut major, mut minor) = (0, 0);
+            if unsafe { hipDeviceComputeCapability(&mut major, &mut minor, ordinal) } == HIP_SUCCESS
+            {
+                family = GfxFamily::from_compute_capability(major, minor);
+            }
+        }
 
-        let rocm = RocmVersion::COMPILE_TIME;
-        let caps = HipCapabilities::from_device(rocm, &gfx_target);
-        let family = GfxFamily::from_gfx(&gfx_target);
+        let wave_size = device_attribute(HIP_ATTR_WARP_SIZE, ordinal)
+            .filter(|&w| w == 32 || w == 64)
+            .map(|w| w as u32)
+            .unwrap_or_else(|| family.wave_size());
+
+        let mut caps =
+            HipCapabilities::for_family(RocmVersion::COMPILE_TIME, RocmVersion::runtime(), family);
+        caps.wave_size = wave_size;
+
+        let max_threads_per_block =
+            positive_attribute(HIP_ATTR_MAX_THREADS_PER_BLOCK, ordinal).unwrap_or(1024);
+        let max_block_dim = [
+            positive_attribute(HIP_ATTR_MAX_BLOCK_DIM_X, ordinal).unwrap_or(1024),
+            positive_attribute(HIP_ATTR_MAX_BLOCK_DIM_Y, ordinal).unwrap_or(1024),
+            positive_attribute(HIP_ATTR_MAX_BLOCK_DIM_Z, ordinal).unwrap_or(1024),
+        ];
+        let max_grid_dim = [
+            positive_attribute(HIP_ATTR_MAX_GRID_DIM_X, ordinal).unwrap_or(i32::MAX as u32),
+            positive_attribute(HIP_ATTR_MAX_GRID_DIM_Y, ordinal).unwrap_or(65535),
+            positive_attribute(HIP_ATTR_MAX_GRID_DIM_Z, ordinal).unwrap_or(65535),
+        ];
 
         Some(Self {
             ordinal,
@@ -207,101 +349,582 @@ impl HipDeviceInfo {
             gfx_target,
             gfx_family: family,
             total_mem,
-            cu_count,
-            clock_mhz,
+            cu_count: positive_attribute(HIP_ATTR_MULTIPROCESSOR_COUNT, ordinal).unwrap_or(0),
+            clock_mhz: positive_attribute(HIP_ATTR_CLOCK_RATE, ordinal).unwrap_or(0) / 1000,
+            wave_size,
+            integrated: device_attribute(HIP_ATTR_INTEGRATED, ordinal).is_some_and(|v| v != 0),
+            max_threads_per_block,
+            max_block_dim,
+            max_grid_dim,
             capabilities: caps,
         })
     }
 }
 
-/// Name-based gfx guess, last resort for old ROCm (< 5.x) or cross-compiling.
-fn gfx_from_name_heuristic(name: &str) -> String {
-    if name.contains("9070") {
-        return "gfx1201".into();
-    }
-    if name.contains("9060") {
-        return "gfx1200".into();
-    }
-    if name.contains("890M") || name.contains("880M") {
-        return "gfx1150".into();
-    }
-    if name.contains("7900") || name.contains("7800") || name.contains("7700") {
-        return "gfx1100".into();
-    }
-    if name.contains("7600") {
-        return "gfx1102".into();
-    }
-    if name.contains("6950") || name.contains("6900") || name.contains("6800") {
-        return "gfx1030".into();
-    }
-    if name.contains("6700") {
-        return "gfx1031".into();
-    }
-    if name.contains("6600") {
-        return "gfx1032".into();
-    }
-    if name.contains("5700") {
-        return "gfx1010".into();
-    }
-    if name.contains("MI300") {
-        return "gfx942".into();
-    }
-    if name.contains("MI250") || name.contains("MI210") {
-        return "gfx90a".into();
-    }
-    if name.contains("MI100") {
-        return "gfx908".into();
-    }
-    if name.contains("Vega20") || name.contains("MI50") || name.contains("MI60") {
-        return "gfx906".into();
-    }
-    if name.contains("Vega10") || name.contains("Vega 64") || name.contains("Vega 56") {
-        return "gfx900".into();
-    }
-    String::new()
+/// Compiled code objects keyed by source and options. Several devices of one arch, or a recreated
+/// shader, compile once.
+type CodeCache = Mutex<HashMap<u64, Vec<(Vec<u8>, Vec<String>, Arc<Vec<u8>>)>>>;
+
+fn code_cache() -> &'static CodeCache {
+    static CACHE: OnceLock<CodeCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[allow(dead_code)]
+fn compile_hip_src(src: &[u8], opts: &[String]) -> Result<Arc<Vec<u8>>> {
+    static COMPILE: Mutex<()> = Mutex::new(());
+    let _serial = lock(&COMPILE)?;
+    let mut hasher = DefaultHasher::new();
+    src.hash(&mut hasher);
+    opts.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(bucket) = lock(code_cache())?.get(&key)
+        && let Some((_, _, code)) = bucket.iter().find(|(s, o, _)| s == src && o == opts)
+    {
+        return Ok(Arc::clone(code));
+    }
+
+    let code = Arc::new(hiprtc_compile(src, opts)?);
+    lock(code_cache())?.entry(key).or_default().push((
+        src.to_vec(),
+        opts.to_vec(),
+        Arc::clone(&code),
+    ));
+    Ok(code)
+}
+
+fn hiprtc_compile(src: &[u8], opts: &[String]) -> Result<Vec<u8>> {
+    let src_c = CString::new(src)
+        .map_err(|_| GpuError::ShaderCompile("HIP source contains null byte".into()))?;
+    let name_c = CString::new("zen_kernel.hip").unwrap();
+    let opts_owned: Vec<CString> = opts
+        .iter()
+        .map(|s| CString::new(s.as_str()).unwrap())
+        .collect();
+    let opt_ptrs: Vec<*const c_char> = opts_owned.iter().map(|s| s.as_ptr()).collect();
+
+    let mut prog: HiprtcProg = ptr::null_mut();
+    unsafe {
+        let rc = hiprtcCreateProgram(
+            &mut prog,
+            src_c.as_ptr(),
+            name_c.as_ptr(),
+            0,
+            ptr::null(),
+            ptr::null(),
+        );
+        if rc != 0 {
+            return Err(GpuError::ShaderCompile(format!(
+                "hiprtcCreateProgram failed ({rc})"
+            )));
+        }
+
+        let rc = hiprtcCompileProgram(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr());
+        if rc != 0 {
+            let log = fetch_rtc_log(prog);
+            hiprtcDestroyProgram(&mut prog);
+            return Err(GpuError::ShaderCompile(format!(
+                "hiprtcCompileProgram failed ({rc}) with {opts:?}:\n{log}"
+            )));
+        }
+
+        let mut code_sz: usize = 0;
+        let rc = hiprtcGetCodeSize(prog, &mut code_sz);
+        if rc != 0 || code_sz == 0 {
+            hiprtcDestroyProgram(&mut prog);
+            return Err(GpuError::ShaderCompile(format!(
+                "hiprtcGetCodeSize failed ({rc}) or returned an empty code object"
+            )));
+        }
+        let mut code = vec![0u8; code_sz];
+        let rc = hiprtcGetCode(prog, code.as_mut_ptr() as *mut c_char);
+        hiprtcDestroyProgram(&mut prog);
+        if rc != 0 {
+            return Err(GpuError::ShaderCompile(format!(
+                "hiprtcGetCode failed ({rc})"
+            )));
+        }
+        Ok(code)
+    }
+}
+
+unsafe fn fetch_rtc_log(prog: HiprtcProg) -> String {
+    let mut sz: usize = 0;
+    unsafe { hiprtcGetProgramLogSize(prog, &mut sz) };
+    if sz <= 1 {
+        return "(no log)".into();
+    }
+    let mut buf = vec![0u8; sz];
+    unsafe { hiprtcGetProgramLog(prog, buf.as_mut_ptr() as *mut c_char) };
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
+}
+
+#[derive(Clone, Copy)]
 struct HipBuffer {
     ptr: *mut c_void,
     size: usize,
     usage: BufferUsage,
+    /// Pinned host allocation backing this buffer (APU fallback), else null.
+    host: *mut c_void,
+}
+
+impl HipBuffer {
+    fn copy_kind(&self, device_kind: i32) -> i32 {
+        if self.host.is_null() {
+            device_kind
+        } else {
+            HIP_MEMCPY_DEFAULT
+        }
+    }
 }
 unsafe impl Send for HipBuffer {}
 unsafe impl Sync for HipBuffer {}
 
-struct HipShader {
-    module: HipModule,
+/// Shared with pipelines, so destroying a shader does not unload code a pipeline still launches.
+struct HipModule {
+    raw: HipModuleRaw,
 }
-unsafe impl Send for HipShader {}
-unsafe impl Sync for HipShader {}
+unsafe impl Send for HipModule {}
+unsafe impl Sync for HipModule {}
 
+impl Drop for HipModule {
+    fn drop(&mut self) {
+        unsafe { hipModuleUnload(self.raw) };
+    }
+}
+
+#[derive(Clone)]
 struct HipPipeline {
     function: HipFunction,
     block: [u32; 3],
+    _module: Arc<HipModule>,
 }
 unsafe impl Send for HipPipeline {}
 unsafe impl Sync for HipPipeline {}
 
-struct HipDeviceInner {
-    ordinal: i32,
-    buffers: SlotMap<marker::Buffer, HipBuffer>,
-    shaders: SlotMap<marker::Shader, HipShader>,
-    pipelines: SlotMap<marker::Pipeline, HipPipeline>,
+enum Deferred {
+    Buffer(u32, HipBuffer),
+    Shader(u32, Arc<HipModule>),
+    Pipeline(u32, HipPipeline),
 }
 
-impl HipDeviceInner {
-    fn new(ordinal: i32) -> Self {
-        Self {
-            ordinal,
-            buffers: SlotMap::new(),
-            shaders: SlotMap::new(),
-            pipelines: SlotMap::new(),
+#[derive(Default)]
+struct LifetimeState {
+    in_flight: usize,
+    deferred: Vec<Deferred>,
+}
+
+struct HipCore {
+    info: HipDeviceInfo,
+    stream: HipStream,
+    buffers: Mutex<SlotMap<marker::Buffer, HipBuffer>>,
+    shaders: Mutex<SlotMap<marker::Shader, Arc<HipModule>>>,
+    pipelines: Mutex<SlotMap<marker::Pipeline, HipPipeline>>,
+    lifetime: Mutex<LifetimeState>,
+    peer_access: Mutex<HashMap<i32, bool>>,
+    allocated: AtomicU64,
+    lost: AtomicBool,
+}
+
+// SAFETY: the raw stream is only used through HIP calls, which are
+unsafe impl Send for HipCore {}
+unsafe impl Sync for HipCore {}
+
+impl HipCore {
+    /// Makes this device current on the thread (HIP tracks it per thread). Fails once lost.
+    fn activate(&self) -> Result<()> {
+        if self.lost.load(Ordering::Acquire) {
+            return Err(GpuError::DeviceLost);
+        }
+        unsafe { self.check(hipSetDevice(self.info.ordinal), "hipSetDevice") }
+    }
+
+    /// Converts `code` to a `Result`, marking the device lost when the error is fatal.
+    fn check(&self, code: HipError, ctx: &str) -> Result<()> {
+        if is_fatal(code) {
+            log::error!(
+                "hip: device {} lost: {ctx}: {}",
+                self.info.ordinal,
+                error_name(code)
+            );
+            self.lost.store(true, Ordering::Release);
+        }
+        check(code, ctx)
+    }
+
+    fn synchronize(&self) -> Result<()> {
+        self.activate()?;
+        unsafe { self.check(hipStreamSynchronize(self.stream), "hipStreamSynchronize") }
+    }
+
+    fn ensure_idle(&self, op: &str) -> Result<()> {
+        if lock(&self.lifetime)?.in_flight != 0 {
+            return Err(binding_error(format!(
+                "{op} cannot run while an asynchronous submission is pending"
+            )));
+        }
+        Ok(())
+    }
+
+    fn buffer(&self, handle: BufferHandle) -> Result<HipBuffer> {
+        lock(&self.buffers)?
+            .get(handle)
+            .copied()
+            .ok_or_else(|| stale(handle))
+    }
+
+    fn release_in_flight(&self) {
+        let deferred = {
+            let Ok(mut lifetime) = self.lifetime.lock() else {
+                return;
+            };
+            debug_assert!(lifetime.in_flight > 0);
+            lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
+            if lifetime.in_flight == 0 {
+                take(&mut lifetime.deferred)
+            } else {
+                Vec::new()
+            }
+        };
+        for resource in deferred {
+            match resource {
+                Deferred::Buffer(index, buffer) => {
+                    self.free(buffer);
+                    if let Ok(mut buffers) = self.buffers.lock() {
+                        buffers.release_retired(index);
+                    }
+                }
+                Deferred::Shader(index, module) => {
+                    drop(module);
+                    if let Ok(mut shaders) = self.shaders.lock() {
+                        shaders.release_retired(index);
+                    }
+                }
+                Deferred::Pipeline(index, pipeline) => {
+                    drop(pipeline);
+                    if let Ok(mut pipelines) = self.pipelines.lock() {
+                        pipelines.release_retired(index);
+                    }
+                }
+            }
         }
     }
 
-    fn activate(&self) -> Result<()> {
-        unsafe { check(hipSetDevice(self.ordinal), "hipSetDevice") }
+    fn free(&self, buffer: HipBuffer) {
+        self.allocated
+            .fetch_sub(buffer.size as u64, Ordering::Relaxed);
+        unsafe {
+            if !buffer.host.is_null() {
+                hipHostFree(buffer.host);
+            } else if !buffer.ptr.is_null() {
+                hipSetDevice(self.info.ordinal);
+                hipFree(buffer.ptr);
+            }
+        }
+    }
+
+    fn launch(&self, op: &DispatchOp<'_>) -> Result<()> {
+        let pipe = lock(&self.pipelines)?
+            .get(op.pipeline)
+            .cloned()
+            .ok_or_else(|| stale(op.pipeline))?;
+        if !op.bindings.textures.is_empty() || !op.bindings.images.is_empty() {
+            return Err(GpuError::Unsupported(
+                "hip: compute-only backend has no texture or image bindings".into(),
+            ));
+        }
+        let n_params = op.bindings.buffers.len() + op.bindings.scalars.len();
+        if n_params > MAX_PARAMS {
+            return Err(GpuError::Dispatch(format!(
+                "hip: {n_params} kernel parameters exceed the limit of {MAX_PARAMS}"
+            )));
+        }
+        if op.grid.contains(&0) {
+            return Ok(());
+        }
+        for axis in 0..3 {
+            if op.grid[axis] > self.info.max_grid_dim[axis] {
+                return Err(GpuError::Dispatch(format!(
+                    "hip: grid {:?} exceeds the device limit {:?}",
+                    op.grid, self.info.max_grid_dim
+                )));
+            }
+            if u64::from(op.grid[axis]) * u64::from(pipe.block[axis]) > u64::from(u32::MAX) {
+                return Err(GpuError::Dispatch(format!(
+                    "hip: grid {:?} × block {:?} exceeds 2^32 threads on one axis",
+                    op.grid, pipe.block
+                )));
+            }
+        }
+
+        let mut storage = [[0u8; 8]; MAX_PARAMS];
+        let mut n = 0usize;
+        {
+            let buffers = lock(&self.buffers)?;
+            for &slot in op.bindings.buffers {
+                let buffer = buffers.get_by_slot_index(slot).ok_or_else(|| {
+                    binding_error(format!("hip: binding refers to unknown buffer slot {slot}"))
+                })?;
+                storage[n] = (buffer.ptr as u64).to_ne_bytes();
+                n += 1;
+            }
+        }
+        for scalar in op.bindings.scalars {
+            let bytes = match scalar {
+                Scalar::U32(v) => v.to_ne_bytes(),
+                Scalar::I32(v) => v.to_ne_bytes(),
+                Scalar::F32(v) => v.to_bits().to_ne_bytes(),
+            };
+            storage[n][..4].copy_from_slice(&bytes);
+            n += 1;
+        }
+        let mut params = [ptr::null_mut::<c_void>(); MAX_PARAMS];
+        for (param, slot) in params.iter_mut().zip(storage.iter_mut()).take(n) {
+            *param = slot.as_mut_ptr() as *mut c_void;
+        }
+
+        unsafe {
+            self.check(
+                hipModuleLaunchKernel(
+                    pipe.function,
+                    op.grid[0],
+                    op.grid[1],
+                    op.grid[2],
+                    pipe.block[0],
+                    pipe.block[1],
+                    pipe.block[2],
+                    0,
+                    self.stream,
+                    params.as_mut_ptr(),
+                    ptr::null_mut(),
+                ),
+                "hipModuleLaunchKernel",
+            )
+        }
+    }
+
+    fn enqueue_copy(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        if src == dst {
+            return Err(binding_error(
+                "copy_buffer requires distinct source and destination buffers",
+            ));
+        }
+        let src_buf = self.buffer(src)?;
+        let dst_buf = self.buffer(dst)?;
+        if !src_buf.usage.contains(BufferUsage::TRANSFER_SRC) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "source buffer",
+                needed: "TRANSFER_SRC",
+            }));
+        }
+        if !dst_buf.usage.contains(BufferUsage::TRANSFER_DST) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "destination buffer",
+                needed: "TRANSFER_DST",
+            }));
+        }
+        let src_off = checked_range(src_offset, len, src_buf.size, "source copy")?;
+        let dst_off = checked_range(dst_offset, len, dst_buf.size, "destination copy")?;
+        if len == 0 {
+            return Ok(());
+        }
+        let kind = if src_buf.host.is_null() {
+            dst_buf.copy_kind(HIP_MEMCPY_D2D)
+        } else {
+            HIP_MEMCPY_DEFAULT
+        };
+        unsafe {
+            self.check(
+                hipMemcpyAsync(
+                    (dst_buf.ptr as *mut u8).add(dst_off) as *mut c_void,
+                    (src_buf.ptr as *const u8).add(src_off) as *const c_void,
+                    len as usize,
+                    kind,
+                    self.stream,
+                ),
+                "hipMemcpyAsync D→D",
+            )
+        }
+    }
+
+    /// Resources destroyed while the batch is in flight stay alive until it completes.
+    fn submit<T>(
+        self: &Arc<Self>,
+        cycle_id: u64,
+        ops: &[T],
+        enqueue: impl Fn(&Self, &T) -> Result<()>,
+    ) -> Result<Submission> {
+        if ops.is_empty() {
+            return Ok(Box::new(CompletedSubmission::new(cycle_id)));
+        }
+        self.activate()?;
+        lock(&self.lifetime)?.in_flight += 1;
+
+        let recorded = (|| {
+            for op in ops {
+                enqueue(self, op)?;
+            }
+            let mut event: HipEvent = ptr::null_mut();
+            unsafe {
+                self.check(
+                    hipEventCreateWithFlags(&mut event, HIP_EVENT_DISABLE_TIMING),
+                    "hipEventCreateWithFlags",
+                )?;
+                if let Err(e) = self.check(hipEventRecord(event, self.stream), "hipEventRecord") {
+                    hipEventDestroy(event);
+                    return Err(e);
+                }
+            }
+            Ok(event)
+        })();
+
+        match recorded {
+            Ok(event) => Ok(Box::new(HipSubmission {
+                cycle_id,
+                core: Arc::clone(self),
+                event: Mutex::new(Some(event)),
+            })),
+            Err(error) => {
+                unsafe { hipStreamSynchronize(self.stream) };
+                self.release_in_flight();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for HipCore {
+    fn drop(&mut self) {
+        unsafe {
+            hipSetDevice(self.info.ordinal);
+            hipStreamSynchronize(self.stream);
+        }
+        let buffers: Vec<HipBuffer> = self
+            .buffers
+            .get_mut()
+            .map(|b| b.drain().collect())
+            .unwrap_or_default();
+        for buffer in buffers {
+            self.free(buffer);
+        }
+        let deferred = self
+            .lifetime
+            .get_mut()
+            .map(|l| take(&mut l.deferred))
+            .unwrap_or_default();
+        for resource in deferred {
+            if let Deferred::Buffer(_, buffer) = resource {
+                self.free(buffer);
+            }
+        }
+        if let Ok(pipelines) = self.pipelines.get_mut() {
+            drop(pipelines.drain().collect::<Vec<_>>());
+        }
+        if let Ok(shaders) = self.shaders.get_mut() {
+            drop(shaders.drain().collect::<Vec<_>>());
+        }
+        unsafe { hipStreamDestroy(self.stream) };
+    }
+}
+
+fn stale<K>(handle: zengpu_hal::Handle<K>) -> GpuError {
+    GpuError::InvalidUsage(UsageError::StaleHandle {
+        index: handle.index(),
+        expected_gen: handle.generation(),
+        actual_gen: 0,
+    })
+}
+
+struct HipSubmission {
+    cycle_id: u64,
+    core: Arc<HipCore>,
+    event: Mutex<Option<HipEvent>>,
+}
+
+// SAFETY: hipEvent_t is an opaque handle; HIP event calls are thread-safe and the slot is behind
+unsafe impl Send for HipSubmission {}
+unsafe impl Sync for HipSubmission {}
+
+impl HipSubmission {
+    fn query(&self) -> Result<SubmissionStatus> {
+        let mut event = lock(&self.event)?;
+        let Some(raw) = *event else {
+            return Ok(SubmissionStatus::Complete);
+        };
+        match unsafe { hipEventQuery(raw) } {
+            HIP_SUCCESS => {
+                unsafe { hipEventDestroy(raw) };
+                *event = None;
+                self.core.release_in_flight();
+                Ok(SubmissionStatus::Complete)
+            }
+            HIP_ERROR_NOT_READY => Ok(SubmissionStatus::Pending),
+            code => {
+                unsafe { hipEventDestroy(raw) };
+                *event = None;
+                self.core.release_in_flight();
+                Err(self
+                    .core
+                    .check(code, "hipEventQuery")
+                    .err()
+                    .unwrap_or(GpuError::DeviceLost))
+            }
+        }
+    }
+}
+
+impl GpuSubmission for HipSubmission {
+    fn cycle_id(&self) -> u64 {
+        self.cycle_id
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        self.query()
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        if timeout == Duration::MAX {
+            let raw = *lock(&self.event)?;
+            if let Some(raw) = raw {
+                let code = unsafe { hipEventSynchronize(raw) };
+                if code != HIP_SUCCESS && code != HIP_ERROR_NOT_READY {
+                    self.core.check(code, "hipEventSynchronize")?;
+                }
+            }
+        }
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            if self.query()? == SubmissionStatus::Complete {
+                return Ok(());
+            }
+            if timeout == Duration::ZERO || deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(GpuError::Timeout);
+            }
+            yield_now();
+        }
+    }
+}
+
+impl Drop for HipSubmission {
+    fn drop(&mut self) {
+        let Ok(event) = self.event.get_mut() else {
+            return;
+        };
+        let Some(raw) = event.take() else {
+            return;
+        };
+        unsafe {
+            hipEventSynchronize(raw);
+            hipEventDestroy(raw);
+        }
+        self.core.release_in_flight();
     }
 }
 
@@ -320,16 +943,31 @@ pub struct HipInstance {
 
 impl HipInstance {
     pub fn new() -> Result<Self> {
-        unsafe { check(hipInit(0), "hipInit")? };
+        workarounds::apply_process_env();
+        let rc = unsafe { hipInit(0) };
+        if rc == HIP_ERROR_NOT_SUPPORTED {
+            return Err(GpuError::Unsupported(
+                "hip: ROCm runtime not found (built against the link stub)".into(),
+            ));
+        }
+        let with_hint = |e: GpuError| match (e, workarounds::kfd_diagnostic()) {
+            (GpuError::Backend(msg), Some(hint)) => GpuError::Backend(format!("{msg}; {hint}")),
+            (e, _) => e,
+        };
+        check(rc, "hipInit").map_err(with_hint)?;
 
         let mut count: i32 = 0;
-        unsafe { hipGetDeviceCount(&mut count) };
+        check(
+            unsafe { hipGetDeviceCount(&mut count) },
+            "hipGetDeviceCount",
+        )
+        .map_err(with_hint)?;
 
         let devices: Vec<HipDeviceInfo> = (0..count).filter_map(HipDeviceInfo::query).collect();
 
         for d in &devices {
             log::debug!(
-                "hip: [{ordinal}] {name} ({gfx}/{family}): {mem} MiB, {cu} CUs @ {clk} MHz, ROCm {rocm}",
+                "hip: [{ordinal}] {name} ({gfx}/{family}): {mem} MiB, {cu} CUs @ {clk} MHz, wave{wave}, ROCm {rocm}",
                 ordinal = d.ordinal,
                 name = d.name,
                 gfx = if d.gfx_target.is_empty() {
@@ -341,8 +979,17 @@ impl HipInstance {
                 mem = d.total_mem / (1024 * 1024),
                 cu = d.cu_count,
                 clk = d.clock_mhz,
+                wave = d.wave_size,
                 rocm = d.capabilities.rocm,
             );
+            if !d.capabilities.target_supported() {
+                log::warn!(
+                    "hip: {} ({}) needs a newer ROCm than {}; hipRTC may reject it",
+                    d.name,
+                    d.gfx_target,
+                    d.capabilities.rocm
+                );
+            }
         }
 
         Ok(Self { devices })
@@ -351,29 +998,40 @@ impl HipInstance {
     pub fn device_infos(&self) -> &[HipDeviceInfo] {
         &self.devices
     }
+
+    fn adapter(d: &HipDeviceInfo) -> HipAdapter {
+        HipAdapter {
+            info: AdapterInfo {
+                name: d.name.clone(),
+                vendor: 0x1002,
+                device: 0,
+                device_type: if d.integrated {
+                    DeviceType::Integrated
+                } else {
+                    DeviceType::Discrete
+                },
+                backend: BackendPreference::Hip,
+            },
+            dev_info: d.clone(),
+        }
+    }
 }
 
 impl GpuInstance for HipInstance {
     fn enumerate_adapters(&self) -> Vec<Box<dyn GpuAdapter>> {
         self.devices
             .iter()
-            .map(|d| {
-                Box::new(HipAdapter {
-                    info: AdapterInfo {
-                        name: d.name.clone(),
-                        vendor: 0x1002,
-                        device: 0,
-                        device_type: DeviceType::Discrete,
-                        backend: BackendPreference::Hip,
-                    },
-                    dev_info: d.clone(),
-                }) as Box<dyn GpuAdapter>
-            })
+            .map(|d| Box::new(Self::adapter(d)) as Box<dyn GpuAdapter>)
             .collect()
     }
 
-    fn request_adapter(&self, _req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
-        self.enumerate_adapters().into_iter().next()
+    fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
+        let want_integrated = req.power == PowerPreference::LowPower;
+        self.devices
+            .iter()
+            .find(|d| d.integrated == want_integrated)
+            .or_else(|| self.devices.first())
+            .map(|d| Box::new(Self::adapter(d)) as Box<dyn GpuAdapter>)
     }
 }
 
@@ -392,99 +1050,100 @@ impl GpuAdapter for HipAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
+        let ordinal = self.dev_info.ordinal;
+        check(unsafe { hipSetDevice(ordinal) }, "hipSetDevice")?;
+        let mut stream: HipStream = ptr::null_mut();
+        check(
+            unsafe { hipStreamCreateWithFlags(&mut stream, HIP_STREAM_NON_BLOCKING) },
+            "hipStreamCreateWithFlags",
+        )?;
         Ok(Box::new(HipDevice {
-            dev_info: Arc::new(self.dev_info.clone()),
-            inner: Mutex::new(HipDeviceInner::new(self.dev_info.ordinal)),
-            peer_access: Mutex::new(HashMap::new()),
+            core: Arc::new(HipCore {
+                info: self.dev_info.clone(),
+                stream,
+                buffers: Mutex::new(SlotMap::new()),
+                shaders: Mutex::new(SlotMap::new()),
+                pipelines: Mutex::new(SlotMap::new()),
+                lifetime: Mutex::new(LifetimeState::default()),
+                peer_access: Mutex::new(HashMap::new()),
+                allocated: AtomicU64::new(0),
+                lost: AtomicBool::new(false),
+            }),
         }))
     }
 }
 
+/// Compute-only buffers, hipRTC shaders and kernel dispatch on one ordered stream.
 pub struct HipDevice {
-    dev_info: Arc<HipDeviceInfo>,
-    inner: Mutex<HipDeviceInner>,
-    peer_access: Mutex<HashMap<i32, bool>>,
+    core: Arc<HipCore>,
 }
 
 impl HipDevice {
-    /// Access device properties outside of the locked inner.
     pub fn device_info(&self) -> &HipDeviceInfo {
-        &self.dev_info
+        &self.core.info
     }
 
-    fn compile_hip_src(&self, src: &[u8]) -> Result<Vec<u8>> {
-        let src_c = CString::new(src)
-            .map_err(|_| GpuError::ShaderCompile("HIP source contains null byte".into()))?;
-        let name_c = CString::new("zen_kernel").unwrap();
-
-        let caps = &self.dev_info.capabilities;
-        let flags = caps.rtc_options(&self.dev_info.gfx_target);
-        let opts_owned: Vec<CString> = flags
-            .iter()
-            .map(|s| CString::new(s.as_str()).unwrap())
-            .collect();
-
-        let opt_ptrs: Vec<*const i8> = opts_owned.iter().map(|s| s.as_ptr()).collect();
-
-        let mut prog: HiprtcProg = ptr::null_mut();
-        unsafe {
-            self.inner.lock().unwrap().activate()?;
-
-            let rc = hiprtcCreateProgram(
-                &mut prog,
-                src_c.as_ptr(),
-                name_c.as_ptr(),
-                0,
-                ptr::null(),
-                ptr::null(),
-            );
-            if rc != 0 {
-                return Err(GpuError::ShaderCompile(format!(
-                    "hiprtcCreateProgram: {rc}"
-                )));
+    fn compile(&self, src: &[u8]) -> Result<Arc<Vec<u8>>> {
+        let info = &self.core.info;
+        let opts = info.capabilities.rtc_options(&info.gfx_target);
+        self.core.activate()?;
+        compile_hip_src(src, &opts).map_err(|e| match e {
+            GpuError::ShaderCompile(log) if !info.capabilities.target_supported() => {
+                GpuError::ShaderCompile(format!(
+                    "{log}\nhint: {} ({}) needs a newer ROCm than {}",
+                    info.name, info.gfx_target, info.capabilities.rocm
+                ))
             }
-
-            let rc = hiprtcCompileProgram(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr());
-            if rc != 0 {
-                let log = fetch_rtc_log(prog);
-                let mut p = prog;
-                hiprtcDestroyProgram(&mut p);
-                return Err(GpuError::ShaderCompile(log));
-            }
-
-            let mut code_sz: usize = 0;
-            hiprtcGetCodeSize(prog, &mut code_sz);
-            let mut code = vec![0i8; code_sz];
-            hiprtcGetCode(prog, code.as_mut_ptr());
-            let mut p = prog;
-            hiprtcDestroyProgram(&mut p);
-
-            Ok(code.into_iter().map(|b| b as u8).collect())
-        }
-    }
-
-    fn stale<K>(handle: zengpu_hal::Handle<K>) -> GpuError {
-        GpuError::InvalidUsage(UsageError::StaleHandle {
-            index: handle.index(),
-            expected_gen: handle.generation(),
-            actual_gen: 0,
+            other => other,
         })
     }
-}
 
-unsafe fn fetch_rtc_log(prog: HiprtcProg) -> String {
-    let mut sz: usize = 0;
-    unsafe { hiprtcGetProgramLogSize(prog, &mut sz) };
-    if sz <= 1 {
-        return "hiprtcCompileProgram failed (no log)".into();
+    fn copy_host_to_device(&self, buf: HipBuffer, offset: usize, data: &[u8]) -> Result<()> {
+        let core = &self.core;
+        unsafe {
+            core.check(
+                hipMemcpyAsync(
+                    (buf.ptr as *mut u8).add(offset) as *mut c_void,
+                    data.as_ptr() as *const c_void,
+                    data.len(),
+                    buf.copy_kind(HIP_MEMCPY_H2D),
+                    core.stream,
+                ),
+                "hipMemcpyAsync H→D",
+            )?;
+        }
+        core.synchronize()
     }
-    let mut buf = vec![0i8; sz];
-    unsafe { hiprtcGetProgramLog(prog, buf.as_mut_ptr()) };
-    let bytes: Vec<u8> = buf[..sz.saturating_sub(1)]
-        .iter()
-        .map(|&b| b as u8)
-        .collect();
-    String::from_utf8_lossy(&bytes).into_owned()
+
+    fn copy_device_to_host(&self, buf: HipBuffer, offset: usize, dst: &mut [u8]) -> Result<()> {
+        let core = &self.core;
+        unsafe {
+            core.check(
+                hipMemcpyAsync(
+                    dst.as_mut_ptr() as *mut c_void,
+                    (buf.ptr as *const u8).add(offset) as *const c_void,
+                    dst.len(),
+                    buf.copy_kind(HIP_MEMCPY_D2H),
+                    core.stream,
+                ),
+                "hipMemcpyAsync D→H",
+            )?;
+        }
+        core.synchronize()
+    }
+
+    fn readable(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<(HipBuffer, usize)> {
+        let buf = self.core.buffer(buffer)?;
+        if !buf.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
+        self.core.ensure_idle("read_buffer")?;
+        let offset = checked_range(offset, len, buf.size, "read")?;
+        Ok((buf, offset))
+    }
 }
 
 impl GpuDevice for HipDevice {
@@ -496,85 +1155,160 @@ impl GpuDevice for HipDevice {
         HalCapabilities::compute_only()
     }
 
+    fn limits(&self) -> DeviceLimits {
+        let info = &self.core.info;
+        DeviceLimits {
+            max_workgroup_size: info.max_block_dim,
+            max_workgroup_invocations: info.max_threads_per_block,
+            max_dispatch_size: info.max_grid_dim,
+            max_storage_buffer_range: info.total_mem as u64,
+            max_push_constant_size: (MAX_PARAMS * 4) as u32,
+            max_storage_buffers: MAX_PARAMS as u32,
+            ..DeviceLimits::default()
+        }
+    }
+
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        self.core.activate().ok()?;
+        let (mut free, mut total) = (0usize, 0usize);
+        if unsafe { hipMemGetInfo(&mut free, &mut total) } != HIP_SUCCESS {
+            return None;
+        }
+        let usage = self.core.allocated.load(Ordering::Relaxed);
+        Some(MemoryBudget {
+            device_local: total as u64,
+            budget: (free as u64).saturating_add(usage).min(total as u64),
+            usage,
+        })
+    }
+
+    fn is_lost(&self) -> bool {
+        self.core.lost.load(Ordering::Acquire)
+    }
+
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.activate()?;
-
-        let size = desc.size as usize;
+        let size =
+            usize::try_from(desc.size).map_err(|_| GpuError::OutOfMemory(MemoryUsage::GpuOnly))?;
+        self.core.activate()?;
         let mut ptr: *mut c_void = ptr::null_mut();
-        unsafe { check(hipMalloc(&mut ptr, size), "hipMalloc")? };
-
-        Ok(inner.buffers.insert(HipBuffer {
+        let mut host: *mut c_void = ptr::null_mut();
+        if size != 0 {
+            let rc = unsafe { hipMalloc(&mut ptr, size) };
+            if rc == HIP_ERROR_OUT_OF_MEMORY && self.core.info.integrated {
+                unsafe {
+                    self.core.check(
+                        hipHostMalloc(&mut host, size, HIP_HOST_MALLOC_MAPPED),
+                        "hipHostMalloc (APU fallback)",
+                    )?;
+                    if let Err(e) = self.core.check(
+                        hipHostGetDevicePointer(&mut ptr, host, 0),
+                        "hipHostGetDevicePointer",
+                    ) {
+                        hipHostFree(host);
+                        return Err(e);
+                    }
+                }
+                log::debug!("hip: {size} B buffer placed in pinned host memory (APU)");
+            } else {
+                self.core.check(rc, "hipMalloc")?;
+            }
+        }
+        self.core
+            .allocated
+            .fetch_add(size as u64, Ordering::Relaxed);
+        Ok(lock(&self.core.buffers)?.insert(HipBuffer {
             ptr,
             size,
             usage: desc.usage,
+            host,
         }))
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        inner.activate()?;
-        let buf = inner
-            .buffers
-            .get(buffer)
-            .ok_or_else(|| Self::stale(buffer))?;
-        let dst = unsafe { (buf.ptr as *mut u8).add(offset as usize) as *mut c_void };
-        unsafe {
-            check(
-                hipMemcpy(
-                    dst,
-                    data.as_ptr() as *const c_void,
-                    data.len(),
-                    HIP_MEMCPY_H2D,
-                ),
-                "hipMemcpy H→D",
-            )
+        let buf = self.core.buffer(buffer)?;
+        self.core.ensure_idle("write_buffer")?;
+        let offset = checked_range(offset, data.len() as u64, buf.size, "write")?;
+        if data.is_empty() {
+            return Ok(());
         }
+        self.core.activate()?;
+        self.copy_host_to_device(buf, offset, data)
     }
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
-        inner.activate()?;
-        let buf = inner
-            .buffers
-            .get(buffer)
-            .ok_or_else(|| Self::stale(buffer))?;
-        let src = unsafe { (buf.ptr as *const u8).add(offset as usize) as *const c_void };
+        let (buf, offset) = self.readable(buffer, offset, len)?;
         let mut out = vec![0u8; len as usize];
-        unsafe {
-            check(
-                hipMemcpy(
-                    out.as_mut_ptr() as *mut c_void,
-                    src,
-                    len as usize,
-                    HIP_MEMCPY_D2H,
-                ),
-                "hipMemcpy D→H",
-            )?;
-            check(
-                hipStreamSynchronize(ptr::null_mut()),
-                "hipStreamSynchronize",
-            )?;
+        if len != 0 {
+            self.core.activate()?;
+            self.copy_device_to_host(buf, offset, &mut out)?;
         }
         Ok(out)
     }
 
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        let (buf, offset) = self.readable(buffer, offset, dst.len() as u64)?;
+        if dst.is_empty() {
+            return Ok(());
+        }
+        self.core.activate()?;
+        self.copy_device_to_host(buf, offset, dst)
+    }
+
+    fn copy_buffer(
+        &self,
+        src: BufferHandle,
+        src_offset: u64,
+        dst: BufferHandle,
+        dst_offset: u64,
+        len: u64,
+    ) -> Result<()> {
+        self.core.ensure_idle("copy_buffer")?;
+        self.core.activate()?;
+        self.core
+            .enqueue_copy(src, src_offset, dst, dst_offset, len)?;
+        self.core.synchronize()
+    }
+
     fn device_ordinal(&self) -> i32 {
-        self.dev_info.ordinal
+        self.core.info.ordinal
     }
 
     fn can_peer(&self, peer_ordinal: i32) -> bool {
-        let mut cache = self.peer_access.lock().unwrap();
-        if let Some(&can_access) = cache.get(&peer_ordinal) {
-            return can_access;
+        let ordinal = self.core.info.ordinal;
+        if peer_ordinal == ordinal || peer_ordinal < 0 {
+            return false;
+        }
+        let Ok(mut cache) = self.core.peer_access.lock() else {
+            return false;
+        };
+        if let Some(&usable) = cache.get(&peer_ordinal) {
+            return usable;
+        }
+
+        let (mut major, mut minor) = (0, 0);
+        let peer_family =
+            if unsafe { hipDeviceComputeCapability(&mut major, &mut minor, peer_ordinal) }
+                == HIP_SUCCESS
+            {
+                GfxFamily::from_compute_capability(major, minor)
+            } else {
+                GfxFamily::Unknown
+            };
+        let policy = env::var(workarounds::P2P_ENV).ok();
+        if !workarounds::peer_copy_allowed(
+            self.core.info.gfx_family,
+            peer_family,
+            policy.as_deref(),
+        ) {
+            cache.insert(peer_ordinal, false);
+            return false;
         }
 
         let mut can_access = 0;
         let usable = unsafe {
-            hipDeviceCanAccessPeer(&mut can_access, self.dev_info.ordinal, peer_ordinal)
-                == HIP_SUCCESS
+            hipDeviceCanAccessPeer(&mut can_access, ordinal, peer_ordinal) == HIP_SUCCESS
                 && can_access != 0
-                && hipSetDevice(self.dev_info.ordinal) == HIP_SUCCESS
+                && hipSetDevice(ordinal) == HIP_SUCCESS
                 && matches!(
                     hipDeviceEnablePeerAccess(peer_ordinal, 0),
                     HIP_SUCCESS | HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED
@@ -595,67 +1329,73 @@ impl GpuDevice for HipDevice {
             .as_any()
             .downcast_ref::<HipDevice>()
             .ok_or_else(|| GpuError::Unsupported("hip: peer source is not a HIP device".into()))?;
-        let bytes = usize::try_from(bytes)
-            .map_err(|_| GpuError::Backend("hip: peer copy size exceeds usize".into()))?;
+        let dst_buf = self.core.buffer(dst)?;
+        let src_buf = src_device.core.buffer(src)?;
+        checked_range(0, bytes, dst_buf.size, "peer copy destination")?;
+        checked_range(0, bytes, src_buf.size, "peer copy source")?;
+        self.core.ensure_idle("copy_from_peer")?;
+        src_device.core.ensure_idle("copy_from_peer")?;
+        if bytes == 0 {
+            return Ok(());
+        }
+        let bytes = bytes as usize;
 
-        let (dst_ptr, dst_size) = {
-            let inner = self.inner.lock().unwrap();
-            let buffer = inner.buffers.get(dst).ok_or_else(|| Self::stale(dst))?;
-            (buffer.ptr, buffer.size)
-        };
-        let (src_ptr, src_size) = {
-            let inner = src_device.inner.lock().unwrap();
-            let buffer = inner.buffers.get(src).ok_or_else(|| Self::stale(src))?;
-            (buffer.ptr, buffer.size)
-        };
-        if bytes > dst_size || bytes > src_size {
-            return Err(GpuError::Backend(format!(
-                "hip: peer copy of {bytes} bytes exceeds source ({src_size}) or destination ({dst_size}) buffer"
-            )));
+        let dst_ordinal = self.core.info.ordinal;
+        let src_ordinal = src_device.core.info.ordinal;
+        if Arc::ptr_eq(&self.core, &src_device.core) {
+            if src == dst {
+                return Err(binding_error(
+                    "copy_from_peer requires distinct source and destination buffers",
+                ));
+            }
+            self.core.activate()?;
+            unsafe {
+                self.core.check(
+                    hipMemcpyAsync(
+                        dst_buf.ptr,
+                        src_buf.ptr,
+                        bytes,
+                        HIP_MEMCPY_DEFAULT,
+                        self.core.stream,
+                    ),
+                    "hipMemcpyAsync D→D",
+                )?;
+            }
+            return self.core.synchronize();
         }
 
-        let dst_ordinal = self.dev_info.ordinal;
-        let src_ordinal = src_device.dev_info.ordinal;
-        unsafe {
-            if self.can_peer(src_ordinal) {
-                check(
-                    hipMemcpyPeer(dst_ptr, dst_ordinal, src_ptr, src_ordinal, bytes),
+        if self.can_peer(src_ordinal) {
+            self.core.activate()?;
+            unsafe {
+                self.core.check(
+                    hipMemcpyPeer(dst_buf.ptr, dst_ordinal, src_buf.ptr, src_ordinal, bytes),
                     "hipMemcpyPeer",
                 )?;
-                check(hipSetDevice(dst_ordinal), "hipSetDevice destination")?;
-                check(
-                    hipStreamSynchronize(ptr::null_mut()),
-                    "hipStreamSynchronize peer copy",
-                )?;
-            } else {
-                let mut staging = vec![0u8; bytes];
-                check(hipSetDevice(src_ordinal), "hipSetDevice peer source")?;
-                check(
+            }
+        } else {
+            let mut staging = vec![0u8; bytes];
+            src_device.core.activate()?;
+            unsafe {
+                src_device.core.check(
                     hipMemcpy(
                         staging.as_mut_ptr() as *mut c_void,
-                        src_ptr,
+                        src_buf.ptr,
                         bytes,
-                        HIP_MEMCPY_D2H,
+                        src_buf.copy_kind(HIP_MEMCPY_D2H),
                     ),
                     "hipMemcpy peer fallback D→H",
                 )?;
-                check(
-                    hipStreamSynchronize(ptr::null_mut()),
-                    "hipStreamSynchronize peer fallback D→H",
-                )?;
-                check(hipSetDevice(dst_ordinal), "hipSetDevice peer destination")?;
-                check(
+            }
+            self.core.activate()?;
+            unsafe {
+                self.core.check(
                     hipMemcpy(
-                        dst_ptr,
+                        dst_buf.ptr,
                         staging.as_ptr() as *const c_void,
                         bytes,
-                        HIP_MEMCPY_H2D,
+                        dst_buf.copy_kind(HIP_MEMCPY_H2D),
                     ),
                     "hipMemcpy peer fallback H→D",
-                )?;
-                check(
-                    hipStreamSynchronize(ptr::null_mut()),
-                    "hipStreamSynchronize peer fallback H→D",
                 )?;
             }
         }
@@ -663,94 +1403,148 @@ impl GpuDevice for HipDevice {
     }
 
     fn destroy_buffer(&self, buffer: BufferHandle) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(b) = inner.buffers.remove(buffer) {
-            unsafe { hipFree(b.ptr) };
+        let removed = {
+            let (Ok(mut buffers), Ok(mut lifetime)) =
+                (self.core.buffers.lock(), self.core.lifetime.lock())
+            else {
+                return;
+            };
+            if lifetime.in_flight != 0 {
+                if let Some(buf) = buffers.retire(buffer) {
+                    lifetime
+                        .deferred
+                        .push(Deferred::Buffer(buffer.index(), buf));
+                }
+                None
+            } else {
+                buffers.remove(buffer)
+            }
+        };
+        if let Some(buf) = removed {
+            self.core.free(buf);
         }
     }
 
     fn create_texture(&self, _: TextureDesc) -> Result<TextureHandle> {
-        Err(GpuError::Backend("hip: compute-only: no textures".into()))
+        Err(GpuError::Unsupported(
+            "hip: compute-only backend has no textures".into(),
+        ))
     }
     fn upload_texture_data(&self, _: TextureHandle, _: &[u8]) -> Result<()> {
-        Err(GpuError::Backend("hip: compute-only: no textures".into()))
+        Err(GpuError::Unsupported(
+            "hip: compute-only backend has no textures".into(),
+        ))
     }
     fn destroy_texture(&self, _: TextureHandle) {}
 
     fn create_sampler(&self, _: SamplerDesc) -> Result<SamplerHandle> {
-        Err(GpuError::Backend("hip: compute-only: no samplers".into()))
+        Err(GpuError::Unsupported(
+            "hip: compute-only backend has no samplers".into(),
+        ))
     }
     fn destroy_sampler(&self, _: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
         let code = match desc.source {
-            ShaderSource::Hip(src) => self.compile_hip_src(src)?,
-            ShaderSource::Spirv(_) => {
-                return Err(GpuError::ShaderCompile(
-                    "hip backend: SPIR-V not yet supported; use ShaderDesc::hip()".into(),
-                ));
-            }
+            ShaderSource::Hip(src) => self.compile(src)?,
             _ => {
                 return Err(GpuError::ShaderCompile(
-                    "hip backend: only Hip source accepted".into(),
+                    "hip backend: only HIP C++ source is accepted; use ShaderDesc::hip() \
+                     or a zsl! shader built with the `hip` feature"
+                        .into(),
                 ));
             }
         };
 
-        let mut inner = self.inner.lock().unwrap();
-        inner.activate()?;
-
-        let mut module: HipModule = ptr::null_mut();
+        self.core.activate()?;
+        let mut module: HipModuleRaw = ptr::null_mut();
         unsafe {
-            check(
+            self.core.check(
                 hipModuleLoadData(&mut module, code.as_ptr() as *const c_void),
                 "hipModuleLoadData",
             )?
         };
-
-        Ok(inner.shaders.insert(HipShader { module }))
+        Ok(lock(&self.core.shaders)?.insert(Arc::new(HipModule { raw: module })))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(s) = inner.shaders.remove(shader) {
-            unsafe { hipModuleUnload(s.module) };
+        let (Ok(mut shaders), Ok(mut lifetime)) =
+            (self.core.shaders.lock(), self.core.lifetime.lock())
+        else {
+            return;
+        };
+        if lifetime.in_flight != 0 {
+            if let Some(module) = shaders.retire(shader) {
+                lifetime
+                    .deferred
+                    .push(Deferred::Shader(shader.index(), module));
+            }
+        } else {
+            shaders.remove(shader);
         }
     }
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
         let entry = CString::new(desc.entry)
             .map_err(|_| GpuError::PipelineCreation("entry point contains null byte".into()))?;
-
-        let mut inner = self.inner.lock().unwrap();
-        let module = inner
-            .shaders
+        let module = lock(&self.core.shaders)?
             .get(desc.shader)
-            .ok_or_else(|| GpuError::PipelineCreation("stale shader handle".into()))?
-            .module;
-
-        let mut func: HipFunction = ptr::null_mut();
-        unsafe {
-            check(
-                hipModuleGetFunction(&mut func, module, entry.as_ptr()),
-                "hipModuleGetFunction",
-            )?
-        };
+            .cloned()
+            .ok_or_else(|| GpuError::PipelineCreation("stale shader handle".into()))?;
 
         let block = if desc.block == [0, 0, 0] {
             [256, 1, 1]
         } else {
             desc.block
         };
-        Ok(inner.pipelines.insert(HipPipeline {
+        let info = &self.core.info;
+        let threads = block.iter().map(|&b| u64::from(b)).product::<u64>();
+        if block.contains(&0)
+            || threads > u64::from(info.max_threads_per_block)
+            || block
+                .iter()
+                .zip(info.max_block_dim)
+                .any(|(&b, max)| b > max)
+        {
+            return Err(GpuError::PipelineCreation(format!(
+                "hip: block {block:?} is outside the device limits ({} threads, {:?} per axis)",
+                info.max_threads_per_block, info.max_block_dim
+            )));
+        }
+
+        self.core.activate()?;
+        let mut func: HipFunction = ptr::null_mut();
+        let rc = unsafe { hipModuleGetFunction(&mut func, module.raw, entry.as_ptr()) };
+        if rc == HIP_ERROR_NOT_FOUND {
+            return Err(GpuError::PipelineCreation(format!(
+                "hip: kernel `{}` not found in module (declare it extern \"C\" __global__)",
+                desc.entry
+            )));
+        }
+        self.core.check(rc, "hipModuleGetFunction")?;
+
+        Ok(lock(&self.core.pipelines)?.insert(HipPipeline {
             function: func,
             block,
+            _module: module,
         }))
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.pipelines.remove(pipeline);
+        let (Ok(mut pipelines), Ok(mut lifetime)) =
+            (self.core.pipelines.lock(), self.core.lifetime.lock())
+        else {
+            return;
+        };
+        if lifetime.in_flight != 0 {
+            if let Some(pipe) = pipelines.retire(pipeline) {
+                lifetime
+                    .deferred
+                    .push(Deferred::Pipeline(pipeline.index(), pipe));
+            }
+        } else {
+            pipelines.remove(pipeline);
+        }
     }
 
     fn dispatch(
@@ -759,68 +1553,32 @@ impl GpuDevice for HipDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
-        let inner = self.inner.lock().unwrap();
-        inner.activate()?;
-
-        let pipe = inner
-            .pipelines
-            .get(pipeline)
-            .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".into()))?;
-
-        let mut raw_ptrs: Vec<*mut c_void> = bindings
-            .buffers
-            .iter()
-            .map(|&idx| {
-                inner
-                    .buffers
-                    .get_by_slot_index(idx)
-                    .map(|b| b.ptr)
-                    .unwrap_or(ptr::null_mut())
-            })
-            .collect();
-
-        let mut scalar_words: Vec<u32> = bindings
-            .scalars
-            .iter()
-            .map(|s| match s {
-                zengpu_hal::Scalar::U32(v) => *v,
-                zengpu_hal::Scalar::I32(v) => *v as u32,
-                zengpu_hal::Scalar::F32(v) => v.to_bits(),
-            })
-            .collect();
-
-        let mut params: Vec<*mut c_void> = raw_ptrs
-            .iter_mut()
-            .map(|p| p as *mut _ as *mut c_void)
-            .chain(scalar_words.iter_mut().map(|w| w as *mut _ as *mut c_void))
-            .collect();
-
-        unsafe {
-            check(
-                hipModuleLaunchKernel(
-                    pipe.function,
-                    grid[0],
-                    grid[1],
-                    grid[2],
-                    pipe.block[0],
-                    pipe.block[1],
-                    pipe.block[2],
-                    0,
-                    ptr::null_mut(),
-                    params.as_mut_ptr(),
-                    ptr::null_mut(),
-                ),
-                "hipModuleLaunchKernel",
-            )?;
-        }
-        Ok(())
+        self.dispatch_batch(&[DispatchOp {
+            pipeline,
+            bindings,
+            grid,
+        }])
     }
 
     fn dispatch_batch(&self, ops: &[DispatchOp<'_>]) -> Result<()> {
-        for op in ops {
-            self.dispatch(op.pipeline, op.bindings, op.grid)?;
-        }
-        Ok(())
+        self.submit_batch(0, ops)?.wait(Duration::MAX)
+    }
+
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        self.core.submit(cycle_id, ops, HipCore::launch)
+    }
+
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        self.core.submit(cycle_id, ops, |core, op| match op {
+            ComputeOp::CopyBuffer(copy) => core.enqueue_copy(
+                copy.src,
+                copy.src_offset,
+                copy.dst,
+                copy.dst_offset,
+                copy.len,
+            ),
+            ComputeOp::Dispatch(dispatch) => core.launch(dispatch),
+        })
     }
 }
 
@@ -2367,18 +3125,333 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
                     info.gfx_target
                 );
             }
-            let expect_wgp = matches!(
-                info.gfx_family,
-                version::GfxFamily::Rdna2
-                    | version::GfxFamily::Rdna3
-                    | version::GfxFamily::Rdna3p5
-                    | version::GfxFamily::Rdna4,
-            );
+            let expect_wgp = info.gfx_family.is_rdna();
             assert_eq!(
                 caps.wgp_default, expect_wgp,
                 "WGP mode mismatch for {} ({:?})",
                 info.gfx_target, info.gfx_family,
             );
+        }
+    }
+
+    fn first_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = try_instance()?;
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        Some(adapter.open(DeviceRequest::default()).unwrap())
+    }
+
+    fn buffer(device: &dyn GpuDevice, size: u64, usage: BufferUsage) -> BufferHandle {
+        device
+            .create_buffer(BufferDesc {
+                size,
+                usage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+    }
+
+    const FILL_SRC: &str = r#"
+extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = value + i;
+}
+"#;
+
+    #[test]
+    fn device_query_reports_real_properties() {
+        let Some(inst) = try_instance() else { return };
+        for info in inst.device_infos() {
+            assert!(info.gfx_target.starts_with("gfx"), "{info:?}");
+            assert_ne!(info.gfx_family, GfxFamily::Unknown, "{}", info.gfx_target);
+            assert!(info.cu_count > 0, "CU count from attributes");
+            assert!(info.clock_mhz > 0, "clock from attributes");
+            assert!(info.wave_size == 32 || info.wave_size == 64);
+            assert!(info.max_threads_per_block >= 256);
+            if info.gfx_family.is_rdna() {
+                assert_eq!(info.wave_size, 32, "HIP runs RDNA in wave32");
+            }
+        }
+    }
+
+    #[test]
+    fn out_of_bounds_and_usage_are_rejected() {
+        let Some(device) = first_device() else { return };
+        let rb = buffer(
+            device.as_ref(),
+            16,
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        let storage_only = buffer(device.as_ref(), 16, BufferUsage::STORAGE);
+
+        assert!(
+            device.write_buffer(rb, 8, &[0u8; 16]).is_err(),
+            "write past end"
+        );
+        assert!(
+            device.write_buffer(rb, u64::MAX, &[1]).is_err(),
+            "offset overflow"
+        );
+        assert!(device.read_buffer(rb, 0, 17).is_err(), "read past end");
+        assert!(
+            device.read_buffer(storage_only, 0, 4).is_err(),
+            "needs READBACK"
+        );
+        assert!(
+            device.write_buffer(rb, 16, &[]).is_ok(),
+            "empty write at end"
+        );
+        assert!(device.read_buffer(rb, 16, 0).unwrap().is_empty());
+
+        device.destroy_buffer(rb);
+        assert!(device.read_buffer(rb, 0, 4).is_err(), "stale handle");
+        device.destroy_buffer(rb);
+        device.destroy_buffer(storage_only);
+    }
+
+    #[test]
+    fn dispatch_validates_bindings_and_launch_shape() {
+        let Some(device) = first_device() else { return };
+        let shader = device.create_shader(ShaderDesc::hip(FILL_SRC)).unwrap();
+        assert!(
+            device
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry: "fill",
+                    block: [2048, 1, 1],
+                })
+                .is_err(),
+            "block over the device limit"
+        );
+        assert!(
+            device
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry: "missing",
+                    block: [64, 1, 1],
+                })
+                .is_err(),
+            "unknown entry point"
+        );
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "fill",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        device.destroy_shader(shader);
+
+        let out = buffer(
+            device.as_ref(),
+            256 * 4,
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        let bad = Bindings {
+            buffers: &[9999],
+            textures: &[],
+            images: &[],
+            scalars: &[zengpu_hal::Scalar::U32(0), zengpu_hal::Scalar::U32(256)],
+        };
+        assert!(
+            device.dispatch(pipeline, bad, [4, 1, 1]).is_err(),
+            "unknown slot"
+        );
+
+        let good = Bindings {
+            buffers: &[out.index()],
+            textures: &[],
+            images: &[],
+            scalars: &[zengpu_hal::Scalar::U32(7), zengpu_hal::Scalar::U32(256)],
+        };
+        device.dispatch(pipeline, good, [0, 1, 1]).unwrap();
+        device.dispatch(pipeline, good, [4, 1, 1]).unwrap();
+        let raw = device.read_buffer(out, 0, 256 * 4).unwrap();
+        for (i, chunk) in raw.chunks_exact(4).enumerate() {
+            let v = u32::from_ne_bytes(chunk.try_into().unwrap());
+            assert_eq!(v, 7 + i as u32);
+        }
+        assert!(!device.is_lost());
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn async_submission_defers_destruction_and_orders_copies() {
+        let Some(device) = first_device() else { return };
+        const N: u32 = 1 << 16;
+        let shader = device.create_shader(ShaderDesc::hip(FILL_SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "fill",
+                block: [256, 1, 1],
+            })
+            .unwrap();
+        let src = buffer(
+            device.as_ref(),
+            u64::from(N) * 4,
+            BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+        );
+        let dst = buffer(
+            device.as_ref(),
+            u64::from(N) * 4,
+            BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+        );
+        let bindings = Bindings {
+            buffers: &[src.index()],
+            textures: &[],
+            images: &[],
+            scalars: &[zengpu_hal::Scalar::U32(100), zengpu_hal::Scalar::U32(N)],
+        };
+        let ops = [
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline,
+                bindings,
+                grid: [N / 256, 1, 1],
+            }),
+            ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                src,
+                src_offset: 0,
+                dst,
+                dst_offset: 0,
+                len: u64::from(N) * 4,
+            }),
+        ];
+        let submission = device.submit_compute_ops(42, &ops).unwrap();
+        assert_eq!(submission.cycle_id(), 42);
+        assert!(device.read_buffer(dst, 0, 4).is_err());
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(src);
+        submission.wait(Duration::from_secs(30)).unwrap();
+        assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
+
+        let raw = device.read_buffer(dst, 0, u64::from(N) * 4).unwrap();
+        assert_eq!(u32::from_ne_bytes(raw[0..4].try_into().unwrap()), 100);
+        let last = (N as usize - 1) * 4;
+        assert_eq!(
+            u32::from_ne_bytes(raw[last..last + 4].try_into().unwrap()),
+            100 + N - 1
+        );
+        device.destroy_buffer(dst);
+    }
+
+    #[test]
+    fn copy_buffer_validates_and_copies() {
+        let Some(device) = first_device() else { return };
+        let src = buffer(
+            device.as_ref(),
+            64,
+            BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+        );
+        let dst = buffer(
+            device.as_ref(),
+            64,
+            BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+        );
+        let data: Vec<u8> = (0..64).collect();
+        device.write_buffer(src, 0, &data).unwrap();
+        assert!(
+            device.copy_buffer(src, 0, src, 32, 16).is_err(),
+            "same buffer"
+        );
+        assert!(
+            device.copy_buffer(dst, 0, src, 0, 16).is_err(),
+            "missing usage"
+        );
+        assert!(device.copy_buffer(src, 60, dst, 0, 8).is_err(), "past end");
+        device.copy_buffer(src, 16, dst, 0, 32).unwrap();
+        let mut out = [0u8; 32];
+        device.read_buffer_into(dst, 0, &mut out).unwrap();
+        assert_eq!(&out[..], &data[16..48]);
+        device.destroy_buffer(src);
+        device.destroy_buffer(dst);
+    }
+
+    #[test]
+    fn limits_and_budget_are_reported() {
+        let Some(device) = first_device() else { return };
+        let limits = device.limits();
+        assert!(limits.max_workgroup_invocations >= 256);
+        assert!(limits.max_dispatch_size[0] > 0);
+        let before = device.memory_budget().expect("hipMemGetInfo");
+        assert!(before.device_local > 0 && before.budget <= before.device_local);
+        let b = buffer(device.as_ref(), 1 << 20, BufferUsage::STORAGE);
+        let after = device.memory_budget().unwrap();
+        assert_eq!(after.usage, before.usage + (1 << 20));
+        device.destroy_buffer(b);
+        assert_eq!(device.memory_budget().unwrap().usage, before.usage);
+    }
+
+    #[test]
+    fn ieee_semantics_survive_compilation() {
+        const SRC: &str = r#"
+extern "C" __global__ void classify(const float* in, unsigned int* out) {
+    unsigned int i = threadIdx.x;
+    out[i] = (isnan(in[i]) ? 1u : 0u) | (isinf(in[i]) ? 2u : 0u);
+}
+"#;
+        let Some(device) = first_device() else { return };
+        let input = [0.0f32, f32::NAN, f32::INFINITY, -1.5];
+        let inb = buffer(device.as_ref(), 16, BufferUsage::STORAGE);
+        let outb = buffer(
+            device.as_ref(),
+            16,
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        device.write_buffer(inb, 0, bytemuck_cast(&input)).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(SRC)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "classify",
+                block: [4, 1, 1],
+            })
+            .unwrap();
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[inb.index(), outb.index()],
+                    textures: &[],
+                    images: &[],
+                    scalars: &[],
+                },
+                [1, 1, 1],
+            )
+            .unwrap();
+        let raw = device.read_buffer(outb, 0, 16).unwrap();
+        let flags: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(flags, [0, 1, 2, 0]);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(inb);
+        device.destroy_buffer(outb);
+    }
+
+    /// Shipped kernels must compile for older parts (RDNA 1/2, GCN 5, CDNA) without a device:
+    /// compile only, no load.
+    #[test]
+    fn kernels_compile_for_legacy_targets() {
+        if try_instance().is_none() {
+            return;
+        }
+        let rocm = RocmVersion::runtime().min(RocmVersion::COMPILE_TIME);
+        for gfx in [
+            "gfx1010", "gfx1012", "gfx1030", "gfx1100", "gfx906", "gfx90a",
+        ] {
+            let family = GfxFamily::from_gfx(gfx);
+            let caps = HipCapabilities::for_family(rocm, rocm, family);
+            let opts = caps.rtc_options(gfx);
+            for src in [VEC_ADD_SRC, SGEMM_OPT_SRC, REDUCE_SRC, WAVE_REDUCE_SRC] {
+                let code =
+                    compile_hip_src(src.as_bytes(), &opts).unwrap_or_else(|e| panic!("{gfx}: {e}"));
+                assert!(!code.is_empty(), "{gfx}: empty code object");
+            }
         }
     }
 }
