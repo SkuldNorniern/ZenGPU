@@ -58,16 +58,16 @@ pub struct Level1Kernels {
 impl Level1Kernels {
     /// Compile SAXPY and SSCAL pipelines on `device`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let axpy_shader = device.create_shader(AXPY_ZSL.spirv_desc())?;
+        let (axpy_shader, axpy_entry) = AXPY_ZSL.create(device)?;
         let axpy_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: axpy_shader,
-            entry: "main",
+            entry: axpy_entry,
             block: [256, 1, 1],
         })?;
-        let scal_shader = device.create_shader(SCAL_ZSL.spirv_desc())?;
+        let (scal_shader, scal_entry) = SCAL_ZSL.create(device)?;
         let scal_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: scal_shader,
-            entry: "main",
+            entry: scal_entry,
             block: [256, 1, 1],
         })?;
         Ok(Self {

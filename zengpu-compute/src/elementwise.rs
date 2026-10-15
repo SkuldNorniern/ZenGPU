@@ -61,16 +61,16 @@ impl ElementwiseKernels {
     /// matching kernels for [`Self::add_pipeline`]/[`Self::relu_pipeline`]
     /// via `CpuDevice::register_kernel`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        let add_shader = device.create_shader(ADD_ZSL.spirv_desc())?;
+        let (add_shader, add_entry) = ADD_ZSL.create(device)?;
         let add_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: add_shader,
-            entry: "main",
+            entry: add_entry,
             block: [256, 1, 1],
         })?;
-        let relu_shader = device.create_shader(RELU_ZSL.spirv_desc())?;
+        let (relu_shader, relu_entry) = RELU_ZSL.create(device)?;
         let relu_pipeline = device.create_compute_pipeline(ComputePipelineDesc {
             shader: relu_shader,
-            entry: "main",
+            entry: relu_entry,
             block: [256, 1, 1],
         })?;
         Ok(Self {
