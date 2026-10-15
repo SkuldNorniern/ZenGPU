@@ -75,6 +75,10 @@ impl GpuAdapter for Dx12Adapter {
 pub struct Dx12Device;
 
 impl GpuDevice for Dx12Device {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Dx12
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

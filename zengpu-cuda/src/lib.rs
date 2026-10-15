@@ -475,6 +475,10 @@ impl Drop for CudaDevice {
 }
 
 impl GpuDevice for CudaDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Cuda
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

@@ -120,6 +120,10 @@ fn out_of_bounds(start: usize, end: usize, len: usize) -> GpuError {
 // ── GpuDevice ─────────────────────────────────────────────────────────────────
 
 impl GpuDevice for CpuDevice {
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Cpu
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }

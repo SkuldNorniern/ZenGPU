@@ -2,10 +2,10 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc, DeviceLimits, DispatchOp,
-    Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget, PipelineHandle, Result,
-    SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission, TextureDesc, TextureHandle,
-    TextureRegion, TextureWrite,
+    BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
+    DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget,
+    PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission,
+    TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -242,6 +242,10 @@ impl Device {
 /// calls; this impl only activates when the trait is in scope and a trait
 /// object / bound is required.
 impl GpuDevice for Device {
+    fn backend(&self) -> BackendPreference {
+        self.inner.backend()
+    }
+
     fn as_any(&self) -> &dyn Any {
         // Delegate into the concrete backend so `downcast_ref::<VulkanDevice>()` works.
         self.inner.as_any()

@@ -16,7 +16,7 @@ use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
 use crate::submission::{CompletedSubmission, Submission};
-use crate::types::{Features, Format};
+use crate::types::{BackendPreference, Features, Format};
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
 /// threads can allocate and upload concurrently.
@@ -27,6 +27,13 @@ pub trait GpuDevice: Send + Sync {
 
     /// Which HAL capabilities this backend implements.
     fn capabilities(&self) -> HalCapabilities;
+
+    /// The backend running this device, so backend-neutral code (such as a
+    /// ZSL kernel) can hand it the matching shader source. `Auto` means the
+    /// backend did not say; callers then fall back to SPIR-V.
+    fn backend(&self) -> BackendPreference {
+        BackendPreference::Auto
+    }
 
     /// Limits of the created logical device and selected queue path.
     fn limits(&self) -> DeviceLimits {
