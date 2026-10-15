@@ -46,6 +46,9 @@ pub mod workarounds;
 mod ffi;
 use ffi::*;
 
+mod alloc;
+use alloc::BlockCache;
+
 mod cache;
 
 mod peer;
@@ -463,8 +466,8 @@ struct HipBuffer {
     usage: BufferUsage,
     /// Pinned host allocation backing this buffer (APU fallback), else null.
     host: *mut c_void,
-    /// Allocated from the stream-ordered pool; freed with `hipFreeAsync`.
-    pooled: bool,
+    /// Allocated bytes at `ptr`: `size`, or more for a cached block.
+    block: usize,
 }
 
 impl HipBuffer {
@@ -524,8 +527,8 @@ struct HipCore {
     cache_dir: Option<PathBuf>,
     /// Pinned staging for cross-GPU copies, made on first use. `Some(None)`: no pinned memory.
     peer_staging: Mutex<Option<Option<PeerStaging>>>,
-    /// Buffers of [`POOL_MIN_BYTES`] and up come from the stream-ordered pool.
-    pooled_alloc: bool,
+    /// Freed blocks, reused on this device's stream.
+    block_cache: Mutex<BlockCache>,
     allocated: AtomicU64,
     lost: AtomicBool,
 }
@@ -617,16 +620,36 @@ impl HipCore {
     fn free(&self, buffer: HipBuffer) {
         self.allocated
             .fetch_sub(buffer.size as u64, Ordering::Relaxed);
-        unsafe {
-            if !buffer.host.is_null() {
-                hipHostFree(buffer.host);
-            } else if buffer.pooled {
-                hipFreeAsync(buffer.ptr, self.stream);
-            } else if !buffer.ptr.is_null() {
+        if !buffer.host.is_null() {
+            unsafe { hipHostFree(buffer.host) };
+            return;
+        }
+        if buffer.ptr.is_null() {
+            return;
+        }
+        let cached = self
+            .block_cache
+            .lock()
+            .is_ok_and(|mut cache| cache.put(buffer.ptr, buffer.block));
+        if !cached {
+            alloc::free_later(self.info.ordinal, buffer.ptr);
+        }
+    }
+
+    /// Returns cached blocks to HIP and waits for queued frees, so a failed allocation can retry.
+    fn release_cached_memory(&self) {
+        let blocks = self
+            .block_cache
+            .lock()
+            .map(|mut cache| cache.drain())
+            .unwrap_or_default();
+        for ptr in blocks {
+            unsafe {
                 hipSetDevice(self.info.ordinal);
-                hipFree(buffer.ptr);
+                hipFree(ptr);
             }
         }
+        alloc::wait_for_frees(Duration::from_secs(5));
     }
 
     fn launch(&self, op: &DispatchOp<'_>) -> Result<()> {
@@ -836,8 +859,15 @@ impl Drop for HipCore {
         if let Ok(shaders) = self.shaders.get_mut() {
             drop(shaders.drain().collect::<Vec<_>>());
         }
+        let cached = self
+            .block_cache
+            .get_mut()
+            .map(|cache| cache.drain())
+            .unwrap_or_default();
         unsafe {
-            hipStreamSynchronize(self.stream);
+            for ptr in cached {
+                hipFree(ptr);
+            }
             hipStreamDestroy(self.stream);
         }
     }
@@ -1061,48 +1091,6 @@ impl GpuInstance for HipInstance {
     }
 }
 
-/// Smallest buffer taken from the stream-ordered pool. Below 2 MiB, HIP sub-allocates `hipMalloc`
-/// itself (~1 µs). From 2 MiB, `hipMalloc` plus `hipFree` costs 160-2300 µs on an RX 9060 XT,
-/// against ~20 µs from the pool.
-const POOL_MIN_BYTES: usize = 2 << 20;
-
-/// Opt-out for the stream-ordered allocator.
-pub const NO_MEMPOOL_ENV: &str = "ZENGPU_HIP_NO_MEMPOOL";
-
-/// `hipMemPoolAttrReleaseThreshold` (CUDA-compatible enum value).
-const HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD: i32 = 4;
-
-/// Uses the device's default memory pool for large buffers when the runtime has one (ROCm 6.0+; 5.x
-/// is skipped as less proven).
-///
-/// `hipFree` syncs the whole device, so freeing a buffer during a kernel blocks until it ends.
-/// `hipFreeAsync` returns at once. The default release threshold of 0 returns memory to the driver
-/// at every sync, which makes the pool as slow as `hipMalloc`. Keeping up to an eighth of VRAM (at
-/// most 512 MiB) cached avoids that.
-fn setup_mem_pool(info: &HipDeviceInfo) -> bool {
-    if env::var_os(NO_MEMPOOL_ENV).is_some()
-        || !ffi::pools_loaded()
-        || !info.capabilities.runtime_rocm.at_least(6, 0)
-    {
-        return false;
-    }
-    let mut pool: HipMemPool = ptr::null_mut();
-    if unsafe { hipDeviceGetDefaultMemPool(&mut pool, info.ordinal) } != HIP_SUCCESS
-        || pool.is_null()
-    {
-        return false;
-    }
-    let mut threshold: u64 = (info.total_mem as u64 / 8).min(512 << 20);
-    let rc = unsafe {
-        hipMemPoolSetAttribute(
-            pool,
-            HIP_MEM_POOL_ATTR_RELEASE_THRESHOLD,
-            (&mut threshold as *mut u64).cast(),
-        )
-    };
-    rc == HIP_SUCCESS
-}
-
 pub struct HipAdapter {
     info: AdapterInfo,
     dev_info: HipDeviceInfo,
@@ -1136,7 +1124,9 @@ impl GpuAdapter for HipAdapter {
                 peer_access: Mutex::new(HashMap::new()),
                 cache_dir: req.pipeline_cache_path.as_deref().map(cache::dir_for),
                 peer_staging: Mutex::new(None),
-                pooled_alloc: setup_mem_pool(&self.dev_info),
+                block_cache: Mutex::new(BlockCache::new(
+                    (self.dev_info.total_mem / 8).min(512 << 20),
+                )),
                 allocated: AtomicU64::new(0),
                 lost: AtomicBool::new(false),
             }),
@@ -1266,9 +1256,13 @@ impl GpuDevice for HipDevice {
             return None;
         }
         let usage = self.core.allocated.load(Ordering::Relaxed);
+        let cached = self.core.block_cache.lock().map_or(0, |c| c.bytes()) as u64;
         Some(MemoryBudget {
             device_local: total as u64,
-            budget: (free as u64).saturating_add(usage).min(total as u64),
+            budget: (free as u64)
+                .saturating_add(usage)
+                .saturating_add(cached)
+                .min(total as u64),
             usage,
         })
     }
@@ -1283,15 +1277,19 @@ impl GpuDevice for HipDevice {
         self.core.activate()?;
         let mut ptr: *mut c_void = ptr::null_mut();
         let mut host: *mut c_void = ptr::null_mut();
-        let mut pooled = false;
-        if size >= POOL_MIN_BYTES && self.core.pooled_alloc {
-            pooled = unsafe { hipMallocAsync(&mut ptr, size, self.core.stream) } == HIP_SUCCESS;
-            if !pooled {
-                ptr = ptr::null_mut();
-            }
+        let mut block = size;
+        if size >= alloc::CACHE_MIN_BYTES
+            && let Some((cached, cached_block)) = lock(&self.core.block_cache)?.take(size)
+        {
+            ptr = cached;
+            block = cached_block;
         }
-        if size != 0 && !pooled {
-            let rc = unsafe { hipMalloc(&mut ptr, size) };
+        if size != 0 && ptr.is_null() {
+            let mut rc = unsafe { hipMalloc(&mut ptr, size) };
+            if rc == HIP_ERROR_OUT_OF_MEMORY {
+                self.core.release_cached_memory();
+                rc = unsafe { hipMalloc(&mut ptr, size) };
+            }
             if rc == HIP_ERROR_OUT_OF_MEMORY && self.core.info.integrated {
                 unsafe {
                     self.core.check(
@@ -1319,7 +1317,7 @@ impl GpuDevice for HipDevice {
             size,
             usage: desc.usage,
             host,
-            pooled,
+            block,
         }))
     }
 
@@ -3704,8 +3702,7 @@ extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// `hipFree` waits for every kernel on the GPU. Large buffers come from the stream-ordered
-    /// pool, so destroying one does not.
+    /// Destroying a buffer never calls `hipFree` inline (it waits for every kernel).
     #[test]
     fn destroying_large_buffer_does_not_wait_for_busy_gpu() {
         const SPIN: &str = r#"
@@ -3718,11 +3715,6 @@ extern "C" __global__ void spin(unsigned int ticks) {
         let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
         let busy = adapter.open(DeviceRequest::default()).unwrap();
         let other = adapter.open(DeviceRequest::default()).unwrap();
-        let hip = other.as_any().downcast_ref::<HipDevice>().unwrap();
-        if !hip.core.pooled_alloc {
-            println!("hip: stream-ordered pool unavailable; skipped");
-            return;
-        }
 
         let shader = busy.create_shader(ShaderDesc::hip(SPIN)).unwrap();
         let pipeline = busy
@@ -3732,8 +3724,11 @@ extern "C" __global__ void spin(unsigned int ticks) {
                 block: [1, 1, 1],
             })
             .unwrap();
-        let big = buffer(other.as_ref(), 64 << 20, BufferUsage::STORAGE);
-        other.write_buffer(big, 0, &[0u8; 16]).unwrap();
+        let sizes: [u64; 3] = [64 << 20, 1 << 20, 600 << 20];
+        let bufs: Vec<_> = sizes
+            .iter()
+            .map(|&size| buffer(other.as_ref(), size, BufferUsage::STORAGE))
+            .collect();
 
         let ticks = zengpu_hal::Scalar::U32(50_000_000);
         let submission = busy
@@ -3751,11 +3746,15 @@ extern "C" __global__ void spin(unsigned int ticks) {
             .unwrap();
         sleep(Duration::from_millis(50));
         let t = Instant::now();
-        other.destroy_buffer(big);
+        for b in bufs {
+            other.destroy_buffer(b);
+        }
         let took = t.elapsed();
         let pending = submission.poll().unwrap() == SubmissionStatus::Pending;
         submission.wait(Duration::from_secs(30)).unwrap();
-        println!("hip: destroy 64 MiB while GPU busy: {took:?} (kernel still running: {pending})");
+        println!(
+            "hip: destroy 64 MiB + 1 MiB + 600 MiB while GPU busy: {took:?} (kernel still running: {pending})"
+        );
         assert!(
             pending,
             "spin kernel ended too early for the test to mean anything"

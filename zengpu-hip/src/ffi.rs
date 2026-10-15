@@ -20,7 +20,6 @@ pub type HipFunction = *mut c_void;
 pub type HipStream = *mut c_void;
 pub type HipEvent = *mut c_void;
 pub type HiprtcProg = *mut c_void;
-pub type HipMemPool = *mut c_void;
 
 /// Returned by every entry point when the runtime did not load.
 pub const HIP_ERROR_NOT_SUPPORTED: HipError = 801;
@@ -229,14 +228,6 @@ entry_points! {
     fn hiprtcGetProgramLog(prog: HiprtcProg, log: *mut c_char) -> i32 = HIPRTC_ERROR_NOT_LOADED;
 }
 
-entry_points! {
-    PoolTable, pool_table;
-    fn hipDeviceGetDefaultMemPool(pool: *mut HipMemPool, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
-    fn hipMemPoolSetAttribute(pool: HipMemPool, attr: i32, value: *mut c_void) -> HipError = HIP_ERROR_NOT_SUPPORTED;
-    fn hipMallocAsync(ptr: *mut *mut c_void, size: usize, stream: HipStream) -> HipError = HIP_ERROR_NOT_SUPPORTED;
-    fn hipFreeAsync(ptr: *mut c_void, stream: HipStream) -> HipError = HIP_ERROR_NOT_SUPPORTED;
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PropsAbi {
     /// `hipGetDevicePropertiesR0600` for the ROCm 6+ struct layout.
@@ -248,8 +239,6 @@ pub enum PropsAbi {
 struct Runtime {
     hip: HipTable,
     rtc: Option<RtcTable>,
-    /// Stream-ordered allocator (ROCm 5.2+), absent on older runtimes.
-    pool: Option<PoolTable>,
     props: unsafe extern "C" fn(*mut u8, i32) -> HipError,
     props_abi: PropsAbi,
 }
@@ -294,12 +283,9 @@ fn load() -> Result<Runtime, String> {
         }
     };
 
-    let pool = PoolTable::load(&[hip]).ok();
-
     Ok(Runtime {
         hip: table,
         rtc,
-        pool,
         // SAFETY: both symbols take (hipDeviceProp_t*, int) -> hipError_t.
         props: unsafe {
             transmute::<*mut c_void, unsafe extern "C" fn(*mut u8, i32) -> HipError>(props)
@@ -316,18 +302,9 @@ fn rtc_table() -> Option<&'static RtcTable> {
     runtime().and_then(|rt| rt.rtc.as_ref())
 }
 
-fn pool_table() -> Option<&'static PoolTable> {
-    runtime().and_then(|rt| rt.pool.as_ref())
-}
-
-pub fn pools_loaded() -> bool {
-    pool_table().is_some()
-}
-
 pub fn runtime_loaded() -> bool {
     runtime().is_some()
 }
-
 pub fn hiprtc_loaded() -> bool {
     rtc_table().is_some()
 }
