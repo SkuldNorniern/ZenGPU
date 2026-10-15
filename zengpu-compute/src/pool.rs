@@ -50,10 +50,15 @@ impl BufferPool {
         };
         let buffer = match buffer {
             Some(b) => b,
+            // Device-local: kernels read arrays at VRAM speed, and every
+            // backend moves host data in and out (Vulkan through staging).
             None => self.device.create_buffer(BufferDesc {
                 size: allocation_size,
-                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
-                memory: MemoryUsage::Upload,
+                usage: BufferUsage::STORAGE
+                    | BufferUsage::READBACK
+                    | BufferUsage::TRANSFER_SRC
+                    | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::GpuOnly,
             })?,
         };
 
