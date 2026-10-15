@@ -56,6 +56,9 @@ use ffi::*;
 
 mod cache;
 
+mod peer;
+use peer::PeerStaging;
+
 const HIP_SUCCESS: HipError = 0;
 const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
 const HIP_ERROR_INVALID_IMAGE: HipError = 200;
@@ -569,6 +572,9 @@ struct HipCore {
     peer_access: Mutex<HashMap<i32, bool>>,
     /// Persistent code-object cache, from `DeviceRequest::pipeline_cache_path`.
     cache_dir: Option<PathBuf>,
+    /// Pinned slots for host-staged copies from other GPUs, made on first
+    /// use; `Some(None)` records that pinned memory was unavailable.
+    peer_staging: Mutex<Option<Option<PeerStaging>>>,
     /// Whether buffers of [`POOL_MIN_BYTES`] and up come from the
     /// stream-ordered pool.
     pooled_alloc: bool,
@@ -1223,6 +1229,7 @@ impl GpuAdapter for HipAdapter {
                 lifetime: Mutex::new(LifetimeState::default()),
                 peer_access: Mutex::new(HashMap::new()),
                 cache_dir: req.pipeline_cache_path.as_deref().map(cache::dir_for),
+                peer_staging: Mutex::new(None),
                 pooled_alloc: setup_mem_pool(&self.dev_info),
                 allocated: AtomicU64::new(0),
                 lost: AtomicBool::new(false),
@@ -1579,6 +1586,11 @@ impl GpuDevice for HipDevice {
                     "hipMemcpyPeer",
                 )?;
             }
+        } else if let Some(staging) = lock(&self.core.peer_staging)?
+            .get_or_insert_with(PeerStaging::new)
+            .as_ref()
+        {
+            staging.copy(&self.core, dst_buf, &src_device.core, src_buf, bytes)?;
         } else {
             let mut staging = vec![0u8; bytes];
             src_device.core.activate()?;
@@ -3987,5 +3999,42 @@ extern "C" __global__ void spin(unsigned int ticks) {
 
         busy.destroy_pipeline(pipeline);
         busy.destroy_shader(shader);
+    }
+
+    /// Host-staged copies between GPUs are pipelined in 4 MiB chunks; check
+    /// a size that is not a whole number of chunks.
+    #[test]
+    fn large_peer_copy_round_trips() {
+        let Some(inst) = try_instance() else { return };
+        let adapters = inst.enumerate_adapters();
+        if adapters.len() < 2 {
+            return;
+        }
+        let dst_dev = adapters[0].open(DeviceRequest::default()).unwrap();
+        let src_dev = adapters[1].open(DeviceRequest::default()).unwrap();
+        let bytes = (64 << 20) + 4100;
+        let data: Vec<u8> = (0..bytes).map(|i| (i * 7 % 251) as u8).collect();
+        let src = buffer(src_dev.as_ref(), bytes as u64, BufferUsage::STORAGE);
+        let dst = buffer(
+            dst_dev.as_ref(),
+            bytes as u64,
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        src_dev.write_buffer(src, 0, &data).unwrap();
+        dst_dev
+            .copy_from_peer(dst, src_dev.as_ref(), src, bytes as u64)
+            .unwrap();
+        let t = Instant::now();
+        dst_dev
+            .copy_from_peer(dst, src_dev.as_ref(), src, bytes as u64)
+            .unwrap();
+        let secs = t.elapsed().as_secs_f64();
+        println!(
+            "hip: peer copy 64 MiB  {:.1} GB/s",
+            bytes as f64 / secs / 1e9
+        );
+        assert_eq!(dst_dev.read_buffer(dst, 0, bytes as u64).unwrap(), data);
+        src_dev.destroy_buffer(src);
+        dst_dev.destroy_buffer(dst);
     }
 }

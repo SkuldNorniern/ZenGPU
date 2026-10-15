@@ -216,6 +216,7 @@ entry_points! {
     fn hipEventQuery(event: HipEvent) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipEventSynchronize(event: HipEvent) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipEventDestroy(event: HipEvent) -> HipError = HIP_ERROR_NOT_SUPPORTED;
+    fn hipStreamWaitEvent(stream: HipStream, event: HipEvent, flags: u32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleLoadData(module: *mut HipModuleRaw, image: *const c_void) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleGetFunction(func: *mut HipFunction, module: HipModuleRaw, name: *const c_char) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipModuleUnload(module: HipModuleRaw) -> HipError = HIP_ERROR_NOT_SUPPORTED;
