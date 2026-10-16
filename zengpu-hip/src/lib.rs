@@ -1344,6 +1344,13 @@ impl GpuDevice for HipDevice {
             // Kernel arguments; scalars share the parameter slots with buffers.
             max_push_constant_size: (MAX_PARAMS * 4) as u32,
             max_storage_buffers: MAX_PARAMS as u32,
+            // HIP counts WGPs (two CUs each) as multiprocessors on RDNA,
+            // where kernels run in WGP mode: 16 on a 32-CU RX 9060 XT.
+            compute_units: if info.gfx_family.is_rdna() {
+                info.cu_count * 2
+            } else {
+                info.cu_count
+            },
             ..DeviceLimits::default()
         }
     }

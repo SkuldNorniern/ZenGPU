@@ -1403,6 +1403,7 @@ pub(crate) fn physical_device_limits(
         max_memory_allocations: limits.max_memory_allocation_count,
         timestamp_supported,
         timestamp_period_ns: limits.timestamp_period,
+        compute_units: 0,
     }
 }
 
