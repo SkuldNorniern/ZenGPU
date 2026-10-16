@@ -9,7 +9,8 @@
 //! `cI_J` (row I, column J) and the loads and stores are unrolled.
 //!
 //! RX 9060 XT under RADV: 5.45 TFLOP/s at 4096³, 4.9 at 2048³, against
-//! 0.56 for the naive kernel.
+//! 0.56 for the naive kernel. Apple M1 under Metal, in Low Power Mode:
+//! 0.52 TFLOP/s at 2048³–4096³, against 0.15.
 
 use zengpu_spirv::{ZslShader, zsl};
 
