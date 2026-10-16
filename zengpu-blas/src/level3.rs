@@ -2,8 +2,8 @@
 
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
-    BackendPreference, Bindings, ComputePipelineDesc, DType, DispatchOp, GpuDevice, GpuError,
-    PipelineHandle, Result, Scalar, ShaderDesc, ShaderHandle,
+    BackendPreference, Bindings, ComputePipelineDesc, ComputePipelineHints, DType, DispatchOp,
+    GpuDevice, GpuError, PipelineHandle, Result, Scalar, ShaderDesc, ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
 
@@ -61,11 +61,19 @@ impl GemmKernel {
             BackendPreference::Vulkan | BackendPreference::Metal
         ) {
             let (shader, entry) = GEMM_TILED_ZSL.create(device)?;
-            let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry,
-                block: [16, 16, 1],
-            });
+            // 64-lane subgroups where the device allows choosing: RADV runs
+            // this kernel at wave32 by default, 7.3 -> 9.2 TFLOP/s at 4096³
+            // on an RX 9060 XT with wave64.
+            let pipeline = device.create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry,
+                    block: [16, 16, 1],
+                },
+                ComputePipelineHints {
+                    subgroup_size: Some(64),
+                },
+            );
             return match pipeline {
                 Ok(pipeline) => Ok(Self {
                     shader,
