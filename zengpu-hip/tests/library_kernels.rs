@@ -4,11 +4,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use zengpu_blas::Blas;
 use zengpu_compute::elementwise::ElementwiseKernels;
-use zengpu_compute::{BufferPool, DeviceArray};
+use zengpu_compute::{BufferPool, DeviceArray, OpList};
 use zengpu_hal::{AdapterRequest, BackendPreference, DType, DeviceRequest, GpuDevice, GpuInstance};
 use zengpu_hip::HipInstance;
 
@@ -36,6 +36,102 @@ fn download(device: &dyn GpuDevice, array: &DeviceArray) -> Vec<f32> {
 
 fn close(a: f32, b: f32) -> bool {
     (a - b).abs() <= 1e-4 * b.abs().max(1.0)
+}
+
+/// Uploads f16 or bf16 bit patterns as little-endian bytes.
+fn upload_half(pool: &BufferPool, shape: Vec<u32>, dtype: DType, bits: &[u16]) -> DeviceArray {
+    let array = pool.alloc(shape, dtype).unwrap();
+    let bytes: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+    pool.device().write_buffer(array.buffer, 0, &bytes).unwrap();
+    array
+}
+
+/// Converts f32 to bf16, rounding to nearest even on the top 16 bits.
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16
+}
+
+fn bf16_bits_to_f32(h: u16) -> f32 {
+    f32::from_bits(u32::from(h) << 16)
+}
+
+/// Converts f32 to binary16 with nearest even rounding. Subnormals are kept and overflow goes
+/// to inf.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let man = b & 0x007f_ffff;
+    if exp == 0xff {
+        let payload = if man != 0 { 0x0200 } else { 0 };
+        return sign | 0x7c00 | payload;
+    }
+    let e = exp - 112;
+    if e >= 31 {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let full = man | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let q = full >> shift;
+        let rem = full & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        let q = if rem > half || (rem == half && (q & 1) == 1) {
+            q + 1
+        } else {
+            q
+        };
+        return sign | q as u16;
+    }
+    let m = man >> 13;
+    let rem = man & 0x1fff;
+    let h = ((e as u32) << 10) | m;
+    let h = if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        h + 1
+    } else {
+        h
+    };
+    sign | h as u16
+}
+
+/// Converts binary16 to f32 exactly, subnormals included.
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = i32::from((h >> 10) & 0x1f);
+    let man = f32::from(h & 0x3ff);
+    match exp {
+        0 => sign * man * 2f32.powi(-24),
+        31 if man == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+    }
+}
+
+/// Measures the best per-call time over three rounds of ten `sgemm` calls, after one warm-up.
+fn best_sgemm_time(
+    device: &dyn GpuDevice,
+    pool: &BufferPool,
+    blas: &Blas,
+    a: &DeviceArray,
+    b: &DeviceArray,
+) -> Duration {
+    let warm = blas.sgemm(device, pool, 1.0, a, b).unwrap();
+    pool.free(warm);
+    (0..3)
+        .map(|_| {
+            let t = Instant::now();
+            for _ in 0..10 {
+                let c = blas.sgemm(device, pool, 1.0, a, b).unwrap();
+                pool.free(c);
+            }
+            t.elapsed() / 10
+        })
+        .min()
+        .unwrap()
 }
 
 #[test]
@@ -258,5 +354,263 @@ fn memory_bound_kernel_bandwidth() {
     pool.free(a);
     pool.free(b);
     kernels.destroy(&*device);
+    blas.destroy(&*device);
+}
+
+/// Width of the decode-step chain: x is [1, K], W1 and W2 are [K, K].
+const DECODE_K: u32 = 4096;
+
+fn decode_inputs() -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+    let x: Vec<f32> = (0..DECODE_K)
+        .map(|i| ((i % 17) as f32 - 8.0) * 0.01)
+        .collect();
+    let w1: Vec<f32> = (0..DECODE_K * DECODE_K)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.001)
+        .collect();
+    let w2: Vec<f32> = (0..DECODE_K * DECODE_K)
+        .map(|i| ((i % 11) as f32 - 5.0) * 0.001)
+        .collect();
+    (x, w1, w2)
+}
+
+/// z = 2.5 * (relu(x @ W1) @ W2), computed in f64.
+fn decode_reference(x: &[f32], w1: &[f32], w2: &[f32]) -> Vec<f64> {
+    let n = DECODE_K as usize;
+    let h: Vec<f64> = (0..n)
+        .map(|j| {
+            (0..n)
+                .map(|i| f64::from(x[i]) * f64::from(w1[i * n + j]))
+                .sum()
+        })
+        .collect();
+    let r: Vec<f64> = h.iter().map(|v| v.max(0.0)).collect();
+    (0..n)
+        .map(|c| {
+            let y: f64 = (0..n).map(|k| r[k] * f64::from(w2[k * n + c])).sum();
+            2.5 * y
+        })
+        .collect()
+}
+
+#[test]
+fn op_list_chains_and_replays() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+    let kernels = ElementwiseKernels::new(&*device).unwrap();
+
+    let (x, w1, w2) = decode_inputs();
+    let dx = upload(&pool, vec![1, DECODE_K], &x);
+    let dw1 = upload(&pool, vec![DECODE_K, DECODE_K], &w1);
+    let dw2 = upload(&pool, vec![DECODE_K, DECODE_K], &w2);
+
+    let mut ops = OpList::new(&pool);
+    let h = blas.gemm.record_sgemm(&mut ops, 1.0, &dx, &dw1).unwrap();
+    let r = kernels.record_relu(&mut ops, &h).unwrap();
+    let y = blas.gemm.record_sgemm(&mut ops, 1.0, &r, &dw2).unwrap();
+    let z = kernels.record_add(&mut ops, &y, &y).unwrap();
+    blas.level1.record_saxpy(&mut ops, 0.5, &y, &z).unwrap();
+
+    ops.run(&*device).unwrap();
+    let first = download(&*device, &z);
+    let want = decode_reference(&x, &w1, &w2);
+    assert_eq!(first.len(), want.len());
+    for col in (0..first.len()).step_by(31) {
+        assert!(
+            close(first[col], want[col] as f32),
+            "z[{col}] = {}, want {}",
+            first[col],
+            want[col]
+        );
+    }
+
+    for _ in 0..2 {
+        ops.run(&*device).unwrap();
+    }
+    let replay = download(&*device, &z);
+    assert_eq!(replay, first);
+
+    ops.clear();
+    for array in [dx, dw1, dw2, h, r, y, z] {
+        pool.free(array);
+    }
+    blas.destroy(&*device);
+    kernels.destroy(&*device);
+}
+
+#[test]
+fn op_list_beats_per_op_waits() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+    let kernels = ElementwiseKernels::new(&*device).unwrap();
+
+    let (x, w1, w2) = decode_inputs();
+    let dx = upload(&pool, vec![1, DECODE_K], &x);
+    let dw1 = upload(&pool, vec![DECODE_K, DECODE_K], &w1);
+    let dw2 = upload(&pool, vec![DECODE_K, DECODE_K], &w2);
+    const ITERS: u32 = 20;
+
+    let t = Instant::now();
+    let mut per_op_z: Option<DeviceArray> = None;
+    for _ in 0..ITERS {
+        let h = blas.sgemm(&*device, &pool, 1.0, &dx, &dw1).unwrap();
+        let r = kernels.relu(&*device, &pool, &h).unwrap();
+        pool.free(h);
+        let y = blas.sgemm(&*device, &pool, 1.0, &r, &dw2).unwrap();
+        pool.free(r);
+        let z = kernels.add(&*device, &pool, &y, &y).unwrap();
+        blas.saxpy(&*device, &pool, 0.5, &y, &z).unwrap();
+        pool.free(y);
+        if let Some(old) = per_op_z.replace(z) {
+            pool.free(old);
+        }
+    }
+    let per_op = t.elapsed() / ITERS;
+    let per_op_z = per_op_z.unwrap();
+
+    let mut ops = OpList::new(&pool);
+    let h = blas.gemm.record_sgemm(&mut ops, 1.0, &dx, &dw1).unwrap();
+    let r = kernels.record_relu(&mut ops, &h).unwrap();
+    let y = blas.gemm.record_sgemm(&mut ops, 1.0, &r, &dw2).unwrap();
+    let z = kernels.record_add(&mut ops, &y, &y).unwrap();
+    blas.level1.record_saxpy(&mut ops, 0.5, &y, &z).unwrap();
+
+    let t = Instant::now();
+    for _ in 0..ITERS {
+        ops.run(&*device).unwrap();
+    }
+    let op_list = t.elapsed() / ITERS;
+    println!("hip: decode chain  per-op {per_op:?}  op-list {op_list:?}");
+
+    let got_per_op = download(&*device, &per_op_z);
+    let got_list = download(&*device, &z);
+    for (col, (a, b)) in got_per_op.iter().zip(&got_list).enumerate() {
+        assert!(close(*a, *b), "col {col}: per-op {a} vs op-list {b}");
+    }
+
+    ops.clear();
+    for array in [dx, dw1, dw2, h, r, y, z, per_op_z] {
+        pool.free(array);
+    }
+    blas.destroy(&*device);
+    kernels.destroy(&*device);
+}
+
+#[test]
+fn half_conversions_round_trip() {
+    let cases: [(f32, u16); 6] = [
+        (1.0, 0x3c00),
+        (-2.0, 0xc000),
+        (0.5, 0x3800),
+        (65504.0, 0x7bff),
+        (6.1035156e-5, 0x0400),
+        (5.9604645e-8, 0x0001),
+    ];
+    for (x, bits) in cases {
+        assert_eq!(f32_to_f16_bits(x), bits, "encode {x}");
+        assert_eq!(f16_bits_to_f32(bits), x, "decode {bits:#06x}");
+    }
+    assert_eq!(f32_to_f16_bits(1.0 + 2f32.powi(-11)), 0x3c00);
+    assert_eq!(f32_to_f16_bits(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
+
+    assert_eq!(f32_to_bf16_bits(1.0), 0x3f80);
+    assert_eq!(bf16_bits_to_f32(0x3f80), 1.0);
+    assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(-2.0)), -2.0);
+}
+
+#[test]
+fn blas_sgemm_half_weights() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+
+    let cases: [(u32, u32, u32, f32); 7] = [
+        (1, 4096, 4096, 1.0),
+        (3, 1001, 257, -0.5),
+        (16, 4096, 1100, 1.0),
+        (33, 200, 129, 1.0),
+        (128, 4096, 1024, 1.0),
+        (300, 300, 1000, -1.0),
+        (512, 512, 517, 1.0),
+    ];
+    type HalfFormat = (DType, fn(f32) -> u16, fn(u16) -> f32);
+    let formats: [HalfFormat; 2] = [
+        (DType::F16, f32_to_f16_bits, f16_bits_to_f32),
+        (DType::Bf16, f32_to_bf16_bits, bf16_bits_to_f32),
+    ];
+    for (dtype, encode, decode) in formats {
+        for (m, n, k, alpha) in cases {
+            let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let bits: Vec<u16> = b.iter().map(|&v| encode(v)).collect();
+            let decoded: Vec<f32> = bits.iter().map(|&h| decode(h)).collect();
+            let da = upload(&pool, vec![m, k], &a);
+            let db = upload_half(&pool, vec![k, n], dtype, &bits);
+            let dc = blas.sgemm(&*device, &pool, alpha, &da, &db).unwrap();
+            let c = download(&*device, &dc);
+
+            let row_step = if mu <= 64 { 1 } else { 7 };
+            let col_step = if nu <= 1024 { 1 } else { 13 };
+            for row in (0..mu).step_by(row_step) {
+                for col in (0..nu).step_by(col_step) {
+                    let sum: f64 = (0..ku)
+                        .map(|i| f64::from(a[row * ku + i]) * f64::from(decoded[i * nu + col]))
+                        .sum();
+                    let want = (f64::from(alpha) * sum) as f32;
+                    let got = c[row * nu + col];
+                    assert!(
+                        close(got, want),
+                        "{dtype:?} m={m} n={n} k={k} row={row} col={col} got={got} want={want}"
+                    );
+                }
+            }
+
+            for array in [da, db, dc] {
+                pool.free(array);
+            }
+        }
+    }
+    blas.destroy(&*device);
+}
+
+#[test]
+fn blas_sgemm_half_weights_speed() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+
+    for (m, n, k) in [
+        (1u32, 4096u32, 4096u32),
+        (16, 4096, 4096),
+        (128, 4096, 4096),
+        (2048, 2048, 2048),
+    ] {
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let bits_f16: Vec<u16> = b.iter().map(|&v| f32_to_f16_bits(v)).collect();
+        let bits_bf16: Vec<u16> = b.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+
+        let da = upload(&pool, vec![m, k], &a);
+        let db_f32 = upload(&pool, vec![k, n], &b);
+        let db_f16 = upload_half(&pool, vec![k, n], DType::F16, &bits_f16);
+        let db_bf16 = upload_half(&pool, vec![k, n], DType::Bf16, &bits_bf16);
+
+        let t_f32 = best_sgemm_time(&*device, &pool, &blas, &da, &db_f32);
+        let t_f16 = best_sgemm_time(&*device, &pool, &blas, &da, &db_f16);
+        let t_bf16 = best_sgemm_time(&*device, &pool, &blas, &da, &db_bf16);
+        println!(
+            "hip: half-weight sgemm M={m} N={n} K={k}  f32 {t_f32:?}  f16 {t_f16:?}  bf16 {t_bf16:?}"
+        );
+
+        for array in [da, db_f32, db_f16, db_bf16] {
+            pool.free(array);
+        }
+    }
     blas.destroy(&*device);
 }
