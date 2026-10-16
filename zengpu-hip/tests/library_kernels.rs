@@ -144,6 +144,65 @@ fn blas_saxpy_sscal_sgemm() {
 }
 
 #[test]
+fn blas_sgemm_every_plan() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+
+    // Each shape lands on a different branch of the planner: skinny rows
+    // 1/4/8/16/32, the 64 tile with and without split-K, and the 128 tile
+    // with and without split-K.
+    let cases: [(u32, u32, u32, f32); 14] = [
+        (1, 4096, 4096, 1.0),
+        (3, 1001, 257, -0.5),
+        (5, 64, 40, 2.0),
+        (13, 4096, 1100, 1.0),
+        (31, 777, 300, 1.5),
+        (32, 128, 2048, 1.0),
+        (33, 200, 129, 1.0),
+        (64, 4096, 512, 1.0),
+        (100, 100, 64, 3.0),
+        (128, 4096, 1024, 1.0),
+        (300, 300, 1000, -1.0),
+        (384, 384, 384, 1.0),
+        (512, 512, 517, 1.0),
+        (777, 300, 1000, 0.25),
+    ];
+    for (m, n, k, alpha) in cases {
+        let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let da = upload(&pool, vec![m, k], &a);
+        let db = upload(&pool, vec![k, n], &b);
+        let dc = blas.sgemm(&*device, &pool, alpha, &da, &db).unwrap();
+        let c = download(&*device, &dc);
+
+        let row_step = if mu <= 64 { 1 } else { 7 };
+        let col_step = if nu <= 1024 { 1 } else { 13 };
+        for row in (0..mu).step_by(row_step) {
+            for col in (0..nu).step_by(col_step) {
+                let sum: f64 = (0..ku)
+                    .map(|i| f64::from(a[row * ku + i]) * f64::from(b[i * nu + col]))
+                    .sum();
+                let want = alpha * sum as f32;
+                let got = c[row * nu + col];
+                assert!(
+                    close(got, want),
+                    "m={m} n={n} k={k} row={row} col={col} got={got} want={want}"
+                );
+            }
+        }
+
+        for array in [da, db, dc] {
+            pool.free(array);
+        }
+    }
+    blas.destroy(&*device);
+}
+
+#[test]
 fn blas_sgemm_throughput() {
     let Some(device) = hip_device() else { return };
     let pool = BufferPool::new(device.clone());
