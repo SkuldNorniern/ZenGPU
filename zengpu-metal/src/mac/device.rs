@@ -5,10 +5,10 @@ use std::ffi::c_void;
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use block::ConcreteBlock;
 use metal::{
     BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
     ComputeCommandEncoderRef, ComputePipelineState, DepthStencilState, Device, Library,
@@ -81,6 +81,24 @@ pub(crate) struct Inner {
     /// Last committed buffer. Earlier ones finish first, so waiting on it waits for the device.
     pub(crate) last_submit: Mutex<Option<CommandBuffer>>,
     pub(crate) lost: AtomicBool,
+    /// Signalled as each command buffer completes.
+    pub(crate) completions: Arc<Completions>,
+}
+
+/// Completed-buffer count. Waiters block on the condvar instead of polling.
+#[derive(Default)]
+pub(crate) struct Completions {
+    count: Mutex<u64>,
+    rung: Condvar,
+}
+
+impl Completions {
+    fn ring(&self) {
+        if let Ok(mut count) = self.count.lock() {
+            *count += 1;
+        }
+        self.rung.notify_all();
+    }
 }
 
 // SAFETY: Metal objects are thread-safe. Rust-side tables sit behind a Mutex.
@@ -99,6 +117,9 @@ impl Inner {
     }
 
     pub(crate) fn commit(&self, cmd: &CommandBufferRef) {
+        let completions = Arc::clone(&self.completions);
+        let handler = ConcreteBlock::new(move |_: &CommandBufferRef| completions.ring()).copy();
+        cmd.add_completed_handler(&handler);
         if let Ok(mut last) = self.last_submit.lock() {
             cmd.commit();
             *last = Some(cmd.to_owned());
@@ -180,9 +201,6 @@ impl Drop for DepthTarget {
     }
 }
 
-/// Pause between polls while a submission is waited on with a deadline.
-const WAIT_POLL: Duration = Duration::from_micros(100);
-
 /// Holds committed copies still in flight, which keeps their resources alive.
 ///
 /// Dropping one never waits.
@@ -235,12 +253,25 @@ impl GpuSubmission for MetalSubmission {
             }
             return Ok(());
         };
+        let completions = &self.inner.completions;
+        let mut count = lock(&completions.count)?;
         while self.poll()? == SubmissionStatus::Pending {
             let now = Instant::now();
             if now >= deadline {
                 return Err(GpuError::Timeout);
             }
-            thread::sleep((deadline - now).min(WAIT_POLL));
+            let seen = *count;
+            while *count == seen {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                count = completions
+                    .rung
+                    .wait_timeout(count, left)
+                    .map_err(|_| GpuError::DeviceLost)?
+                    .0;
+            }
         }
         Ok(())
     }
@@ -267,6 +298,7 @@ impl MetalDevice {
                 table: Mutex::new(table),
                 last_submit: Mutex::new(None),
                 lost: AtomicBool::new(false),
+                completions: Arc::default(),
             }),
         })
     }
