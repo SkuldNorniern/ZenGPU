@@ -2,8 +2,7 @@
 
 use zengpu_compute::{BufferPool, DeviceArray, OpList};
 use zengpu_hal::{
-    ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderHandle,
+    ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar, ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
 
