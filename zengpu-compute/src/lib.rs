@@ -8,8 +8,10 @@
 mod pool;
 
 pub mod elementwise;
+pub mod ops;
 
 pub use elementwise::ElementwiseKernels;
+pub use ops::OpList;
 pub use pool::BufferPool;
 
 use zengpu_hal::{BufferHandle, DType};

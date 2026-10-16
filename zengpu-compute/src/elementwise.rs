@@ -6,12 +6,11 @@
 //! rejected with [`GpuError::Dispatch`].
 
 use zengpu_hal::{
-    Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
-    ShaderHandle,
+    ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar, ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
 
-use crate::{BufferPool, DeviceArray};
+use crate::{BufferPool, DeviceArray, OpList};
 
 /// `out[i] = a[i] + b[i]` (matches `ZenGPU/examples/vec_add.rs`).
 const ADD_ZSL: ZslShader = zsl!(
@@ -98,6 +97,19 @@ impl ElementwiseKernels {
         a: &DeviceArray,
         b: &DeviceArray,
     ) -> Result<DeviceArray> {
+        let mut ops = OpList::new(pool);
+        let out = self.record_add(&mut ops, a, b)?;
+        finish(pool, out, ops.run(device))
+    }
+
+    /// Record [`Self::add`] into `ops`; `out` is allocated now and written
+    /// when the list runs.
+    pub fn record_add(
+        &self,
+        ops: &mut OpList<'_>,
+        a: &DeviceArray,
+        b: &DeviceArray,
+    ) -> Result<DeviceArray> {
         check_f32(a.dtype, "elementwise::add")?;
         check_f32(b.dtype, "elementwise::add")?;
         if a.shape != b.shape {
@@ -106,20 +118,15 @@ impl ElementwiseKernels {
                 a.shape, b.shape
             )));
         }
-
-        let out = pool.alloc(a.shape.clone(), DType::F32)?;
+        let out = ops.pool().alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        let dispatched = device.dispatch(
+        ops.dispatch(
             self.add_pipeline,
-            Bindings {
-                buffers: &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
-                scalars: &[Scalar::U32(n)],
-                textures: &[],
-                images: &[],
-            },
+            &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
+            &[Scalar::U32(n)],
             [n.div_ceil(256), 1, 1],
         );
-        finish(pool, out, dispatched)
+        Ok(out)
     }
 
     /// `out[i] = max(a[i], 0)`. `a` must be `DType::F32`. Allocates `out`
@@ -130,21 +137,24 @@ impl ElementwiseKernels {
         pool: &BufferPool,
         a: &DeviceArray,
     ) -> Result<DeviceArray> {
-        check_f32(a.dtype, "elementwise::relu")?;
+        let mut ops = OpList::new(pool);
+        let out = self.record_relu(&mut ops, a)?;
+        finish(pool, out, ops.run(device))
+    }
 
-        let out = pool.alloc(a.shape.clone(), DType::F32)?;
+    /// Record [`Self::relu`] into `ops`; `out` is allocated now and written
+    /// when the list runs.
+    pub fn record_relu(&self, ops: &mut OpList<'_>, a: &DeviceArray) -> Result<DeviceArray> {
+        check_f32(a.dtype, "elementwise::relu")?;
+        let out = ops.pool().alloc(a.shape.clone(), DType::F32)?;
         let n = a.len();
-        let dispatched = device.dispatch(
+        ops.dispatch(
             self.relu_pipeline,
-            Bindings {
-                buffers: &[a.buffer.index(), out.buffer.index()],
-                scalars: &[Scalar::U32(n)],
-                textures: &[],
-                images: &[],
-            },
+            &[a.buffer.index(), out.buffer.index()],
+            &[Scalar::U32(n)],
             [n.div_ceil(256), 1, 1],
         );
-        finish(pool, out, dispatched)
+        Ok(out)
     }
 }
 
