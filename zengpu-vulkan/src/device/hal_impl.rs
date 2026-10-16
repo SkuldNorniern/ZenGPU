@@ -829,6 +829,14 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
+        self.create_compute_pipeline_with(desc, zengpu_hal::ComputePipelineHints::default())
+    }
+
+    fn create_compute_pipeline_with(
+        &self,
+        desc: ComputePipelineDesc<'_>,
+        hints: zengpu_hal::ComputePipelineHints,
+    ) -> Result<PipelineHandle> {
         let shader_module = {
             let shaders = self.shaders.lock().unwrap();
             *shaders
@@ -859,7 +867,25 @@ impl GpuDevice for VulkanDevice {
 
         let entry = CString::new(desc.entry)
             .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
+        // A requested subgroup size applies only inside the device's range
+        // and as a power of two; anything else keeps the driver's choice.
+        let required_size = hints.subgroup_size.filter(|&size| {
+            size.is_power_of_two()
+                && self
+                    .inner
+                    .compute_subgroup_sizes
+                    .is_some_and(|(min, max)| (min..=max).contains(&size))
+        });
+        let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT {
+            required_subgroup_size: required_size.unwrap_or(0),
+            ..Default::default()
+        };
         let stage = vk::PipelineShaderStageCreateInfo {
+            p_next: if required_size.is_some() {
+                &mut required as *mut _ as *const c_void
+            } else {
+                null()
+            },
             stage: vk::ShaderStageFlags::COMPUTE,
             module: shader_module,
             p_name: entry.as_ptr(),
