@@ -79,7 +79,14 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let mut s = String::new();
 
     if !f16_buffers.is_empty() {
-        s.push_str("#include <hip/hip_fp16.h>\n");
+        s.push_str(
+            "__device__ __forceinline__ unsigned short f32_to_f16(float x) {\n\
+             \x20   return __builtin_bit_cast(unsigned short, (_Float16)x);\n\
+             }\n\
+             __device__ __forceinline__ float f16_to_f32(unsigned short x) {\n\
+             \x20   return (float)__builtin_bit_cast(_Float16, x);\n\
+             }\n",
+        );
     }
     if !bf16_buffers.is_empty() {
         s.push_str(
@@ -234,7 +241,7 @@ fn hip_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
         } => Ok("unsigned short"),
         Type::Float {
             format: FloatFormat::F16,
-        } => Ok("__half"),
+        } => Ok("unsigned short"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
@@ -272,7 +279,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let val = if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("f32_to_bf16({val})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
-                format!("__float2half({val})")
+                format!("f32_to_f16({val})")
             } else {
                 val
             };
@@ -369,7 +376,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("bf16_to_f32({inner})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
-                format!("__half2float({inner})")
+                format!("f16_to_f32({inner})")
             } else {
                 inner
             }
