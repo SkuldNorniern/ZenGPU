@@ -8,6 +8,9 @@ use zengpu_hal::{
 use zengpu_spirv::{ZslShader, zsl};
 
 use crate::gemm_hip::{self, Plan, SKINNY_ROWS};
+use crate::gemm_skinny::{
+    self, SKINNY_1_ZSL, SKINNY_4_ZSL, SKINNY_8_ZSL, SKINNY_16_ZSL, SPLIT_REDUCE_ZSL,
+};
 use crate::gemm_tiled::{GEMM_TILED_ZSL, TILE as TILED_GEMM_TILE};
 
 /// Computes `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`.
@@ -38,6 +41,8 @@ pub struct GemmKernel {
     tile: u32,
     /// The shape-specific kernels, on HIP.
     hip: Option<HipGemm>,
+    /// The few-row kernels, on Vulkan.
+    skinny: Option<ZslSkinny>,
 }
 
 struct HipGemm {
@@ -47,9 +52,16 @@ struct HipGemm {
     compute_units: u32,
 }
 
+struct ZslSkinny {
+    skinny: [PipelineHandle; 4],
+    shaders: [ShaderHandle; 4],
+    reduce: PipelineHandle,
+    reduce_shader: ShaderHandle,
+}
+
 impl GemmKernel {
-    /// Compiles the GEMM pipeline. HIP uses the hand-written kernel, Vulkan and Metal use
-    /// register-blocked ZSL, and other backends use naive ZSL.
+    /// Compile the GEMM pipeline. HIP: hand-written. Vulkan, Metal: register-blocked ZSL. Others:
+    /// naive ZSL. Vulkan `sgemm` uses the skinny kernels for `m <= 16`.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         if matches!(
             device.backend(),
@@ -66,18 +78,32 @@ impl GemmKernel {
                     subgroup_size: Some(64),
                 },
             );
-            return match pipeline {
-                Ok(pipeline) => Ok(Self {
-                    shader,
-                    pipeline,
-                    tile: TILED_GEMM_TILE,
-                    hip: None,
-                }),
+            let pipeline = match pipeline {
+                Ok(pipeline) => pipeline,
                 Err(e) => {
                     device.destroy_shader(shader);
-                    Err(e)
+                    return Err(e);
                 }
             };
+            let skinny = if device.backend() == BackendPreference::Vulkan {
+                match Self::new_zsl_skinny(device) {
+                    Ok(skinny) => Some(skinny),
+                    Err(e) => {
+                        device.destroy_pipeline(pipeline);
+                        device.destroy_shader(shader);
+                        return Err(e);
+                    }
+                }
+            } else {
+                None
+            };
+            return Ok(Self {
+                shader,
+                pipeline,
+                tile: TILED_GEMM_TILE,
+                hip: None,
+                skinny,
+            });
         }
         if device.backend() == BackendPreference::Hip {
             return Self::new_hip(device);
@@ -93,7 +119,54 @@ impl GemmKernel {
             pipeline,
             tile: 16,
             hip: None,
+            skinny: None,
         })
+    }
+
+    /// Builds the Vulkan skinny kernels and the split-K reduction.
+    ///
+    /// # Errors
+    ///
+    /// Everything created here is destroyed before the error is returned.
+    fn new_zsl_skinny(device: &dyn GpuDevice) -> Result<ZslSkinny> {
+        let mut shaders: Vec<ShaderHandle> = Vec::new();
+        let mut pipelines: Vec<PipelineHandle> = Vec::new();
+        let built = (|| {
+            let mut build = |source: &ZslShader| -> Result<(ShaderHandle, PipelineHandle)> {
+                let (shader, entry) = source.create(device)?;
+                shaders.push(shader);
+                let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry,
+                    block: [256, 1, 1],
+                })?;
+                pipelines.push(pipeline);
+                Ok((shader, pipeline))
+            };
+            let (s1, p1) = build(&SKINNY_1_ZSL)?;
+            let (s4, p4) = build(&SKINNY_4_ZSL)?;
+            let (s8, p8) = build(&SKINNY_8_ZSL)?;
+            let (s16, p16) = build(&SKINNY_16_ZSL)?;
+            let (reduce_shader, reduce) = build(&SPLIT_REDUCE_ZSL)?;
+            Ok(ZslSkinny {
+                skinny: [p1, p4, p8, p16],
+                shaders: [s1, s4, s8, s16],
+                reduce,
+                reduce_shader,
+            })
+        })();
+        match built {
+            Ok(skinny) => Ok(skinny),
+            Err(e) => {
+                for p in pipelines {
+                    device.destroy_pipeline(p);
+                }
+                for s in shaders {
+                    device.destroy_shader(s);
+                }
+                Err(e)
+            }
+        }
     }
 
     fn new_hip(device: &dyn GpuDevice) -> Result<Self> {
@@ -129,6 +202,7 @@ impl GemmKernel {
                     reduce,
                     compute_units: device.limits().compute_units,
                 }),
+                skinny: None,
             }),
             Err(e) => {
                 for p in made {
@@ -148,6 +222,16 @@ impl GemmKernel {
             for p in hip.skinny {
                 device.destroy_pipeline(p);
             }
+        }
+        if let Some(zsl) = self.skinny {
+            for p in zsl.skinny {
+                device.destroy_pipeline(p);
+            }
+            device.destroy_pipeline(zsl.reduce);
+            for s in zsl.shaders {
+                device.destroy_shader(s);
+            }
+            device.destroy_shader(zsl.reduce_shader);
         }
         device.destroy_shader(self.shader);
     }
@@ -182,6 +266,15 @@ impl GemmKernel {
         let c = pool.alloc(vec![m, n], DType::F32)?;
         if let Some(hip) = &self.hip {
             return match self.sgemm_hip(hip, device, pool, alpha, a, b, &c, [m, n, k]) {
+                Ok(()) => Ok(c),
+                Err(e) => {
+                    pool.free(c);
+                    Err(e)
+                }
+            };
+        }
+        if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
+            return match self.sgemm_skinny(zsl, device, pool, alpha, a, b, &c, [m, n, k]) {
                 Ok(()) => Ok(c),
                 Err(e) => {
                     pool.free(c);
@@ -277,6 +370,66 @@ impl GemmKernel {
         if let Some(workspace) = workspace {
             pool.free(workspace);
         }
+        result
+    }
+
+    /// Runs the Vulkan skinny kernel for the smallest row class holding `m` rows, then the split-K
+    /// reduction, as one batch. The skinny kernel always writes partials, so the reduction runs.
+    #[allow(clippy::too_many_arguments)]
+    fn sgemm_skinny(
+        &self,
+        zsl: &ZslSkinny,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+        c: &DeviceArray,
+        [m, n, k]: [u32; 3],
+    ) -> Result<()> {
+        let mn = m.checked_mul(n).ok_or_else(|| {
+            GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
+        })?;
+        let split = k.max(1).div_ceil(gemm_skinny::KC);
+        let slot = gemm_skinny::ROWS
+            .iter()
+            .position(|&r| r >= m)
+            .unwrap_or(gemm_skinny::ROWS.len() - 1);
+        let workspace = pool.alloc(vec![split, m, n], DType::F32)?;
+        let gemm_buffers = [a.buffer.index(), b.buffer.index(), workspace.buffer.index()];
+        let gemm_scalars = [
+            Scalar::U32(m),
+            Scalar::U32(n),
+            Scalar::U32(k),
+            Scalar::U32(gemm_skinny::KC),
+            Scalar::F32(alpha),
+        ];
+        let reduce_buffers = [workspace.buffer.index(), c.buffer.index()];
+        let reduce_scalars = [Scalar::U32(mn), Scalar::U32(split)];
+        let ops = [
+            DispatchOp {
+                pipeline: zsl.skinny[slot],
+                bindings: Bindings {
+                    buffers: &gemm_buffers,
+                    textures: &[],
+                    images: &[],
+                    scalars: &gemm_scalars,
+                },
+                grid: [n.div_ceil(256), split, 1],
+            },
+            DispatchOp {
+                pipeline: zsl.reduce,
+                bindings: Bindings {
+                    buffers: &reduce_buffers,
+                    textures: &[],
+                    images: &[],
+                    scalars: &reduce_scalars,
+                },
+                grid: [mn.div_ceil(256), 1, 1],
+            },
+        ];
+        let result = device.dispatch_batch(&ops);
+        pool.free(workspace);
         result
     }
 

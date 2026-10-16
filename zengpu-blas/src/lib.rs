@@ -30,6 +30,7 @@
 //! `zengpu-compute`, so it works with any HAL backend.
 
 mod gemm_hip;
+mod gemm_skinny;
 mod gemm_tiled;
 pub mod level1;
 pub mod level3;
