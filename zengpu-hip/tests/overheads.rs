@@ -98,17 +98,25 @@ fn overheads() {
         })
         .unwrap();
     let host = vec![7u8; mb << 20];
-    dev.write_buffer(big, 0, &host).unwrap();
-    let t = Instant::now();
-    dev.write_buffer(big, 0, &host).unwrap();
-    let up = t.elapsed();
     let mut back = vec![1u8; mb << 20];
+    dev.write_buffer(big, 0, &host).unwrap();
     dev.read_buffer_into(big, 0, &mut back).unwrap();
-    let t = Instant::now();
-    dev.read_buffer_into(big, 0, &mut back).unwrap();
-    let down = t.elapsed();
+    let best = |mut op: Box<dyn FnMut() + '_>| {
+        (0..3)
+            .map(|_| {
+                let t = Instant::now();
+                op();
+                t.elapsed()
+            })
+            .min()
+            .unwrap()
+    };
+    let up = best(Box::new(|| dev.write_buffer(big, 0, &host).unwrap()));
+    let down = best(Box::new(|| {
+        dev.read_buffer_into(big, 0, &mut back).unwrap()
+    }));
     assert_eq!(back[12345], 7);
-    let gbps = |d: Duration| (mb as f64 / 1024.0) / d.as_secs_f64();
+    let gbps = |d: Duration| (mb << 20) as f64 / d.as_secs_f64() / 1e9;
     println!("hip: upload   {mb} MiB             {:.1} GB/s", gbps(up));
     println!("hip: readback {mb} MiB             {:.1} GB/s", gbps(down));
 
