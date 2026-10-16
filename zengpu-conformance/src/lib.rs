@@ -411,7 +411,7 @@ mod cpu_vs_vulkan_tests {
                     .zip(&b)
                     .flat_map(|(x, y)| (x + y).to_le_bytes())
                     .collect();
-                ctx.buffers[2] = out;
+                ctx.buffers[2][..out.len()].copy_from_slice(&out);
             }),
         );
     }
@@ -881,7 +881,7 @@ mod devarray_matmul_tests {
                             .copy_from_slice(&(alpha * sum).to_le_bytes());
                     }
                 }
-                ctx.buffers[2] = c;
+                ctx.buffers[2][..c.len()].copy_from_slice(&c);
             }),
         );
     }
