@@ -428,6 +428,8 @@ pub(crate) struct VulkanDeviceInner {
     /// `Depth24PlusStencil8` here: `D24_UNORM_S8_UINT` if present, else `D32_SFLOAT_S8_UINT`. AMD
     /// exposes no D24S8. "24 plus" allows the wider depth.
     pub depth24_stencil8: vk::Format,
+    /// `(min, max)` subgroup sizes a compute pipeline may require (`VK_EXT_subgroup_size_control`).
+    pub compute_subgroup_sizes: Option<(u32, u32)>,
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
@@ -771,8 +773,11 @@ impl VulkanDevice {
         let mut supported_desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
         let mut supported_dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
         let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
+        let mut supported_subgroup_size =
+            vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
         supported_desc_idx.p_next = &mut supported_dynamic_rendering as *mut _ as *mut c_void;
         supported_dynamic_rendering.p_next = &mut supported_atomic_float as *mut _ as *mut c_void;
+        supported_atomic_float.p_next = &mut supported_subgroup_size as *mut _ as *mut c_void;
         let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
             p_next: &mut supported_desc_idx as *mut _ as *mut c_void,
             ..Default::default()
@@ -817,6 +822,29 @@ impl VulkanDevice {
         let budget_enabled = supports_extension(ext::memory_budget::NAME);
         if budget_enabled {
             extensions.push(ext::memory_budget::NAME.as_ptr());
+        }
+        let compute_subgroup_sizes = if supports_extension(ext::subgroup_size_control::NAME)
+            && supported_subgroup_size.subgroup_size_control == vk::TRUE
+        {
+            let mut sizes = vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT::default();
+            let mut props = vk::PhysicalDeviceProperties2 {
+                p_next: &mut sizes as *mut _ as *mut c_void,
+                ..Default::default()
+            };
+            unsafe {
+                shared
+                    .instance
+                    .get_physical_device_properties2(physical, &mut props)
+            };
+            sizes
+                .required_subgroup_size_stages
+                .contains(vk::ShaderStageFlags::COMPUTE)
+                .then_some((sizes.min_subgroup_size, sizes.max_subgroup_size))
+        } else {
+            None
+        };
+        if compute_subgroup_sizes.is_some() {
+            extensions.push(ext::subgroup_size_control::NAME.as_ptr());
         }
 
         let supported_features = supported_features2.features;
@@ -893,6 +921,14 @@ impl VulkanDevice {
             ..Default::default()
         };
         features2.p_next = &mut desc_idx as *mut _ as *mut c_void;
+        let mut subgroup_size_feat = vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT {
+            subgroup_size_control: vk::TRUE,
+            ..Default::default()
+        };
+        if compute_subgroup_sizes.is_some() {
+            subgroup_size_feat.p_next = features2.p_next;
+            features2.p_next = &mut subgroup_size_feat as *mut _ as *mut c_void;
+        }
 
         let device_create_info = vk::DeviceCreateInfo {
             p_next: &features2 as *const _ as *const c_void,
@@ -952,6 +988,7 @@ impl VulkanDevice {
             sampler_anisotropy,
             max_sampler_anisotropy,
             depth24_stencil8,
+            compute_subgroup_sizes,
             dynamic_rendering,
             debug_utils,
         });
