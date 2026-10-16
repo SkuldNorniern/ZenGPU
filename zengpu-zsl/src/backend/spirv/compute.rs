@@ -159,12 +159,32 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     // kernel just picks the table matching each buffer param's declared
     // element type; no bitcast is needed anywhere. Buffer params receive
     // auto-injected u32 indices in the push-constant block.
+    // f16/bf16 buffers go through the u32 table, two halves per word: no
+    // 16-bit storage feature needed, so they run on every Vulkan device.
+    let f16_id = types.f16_id();
+    let bf16_id = types.bf16_id();
+    let half_of = |elem: TypeId| {
+        if elem == f16_id {
+            Some(Half::F16)
+        } else if elem == bf16_id {
+            Some(Half::Bf16)
+        } else {
+            None
+        }
+    };
+    let table_of = |elem: TypeId| {
+        if half_of(elem).is_some() {
+            u32_id
+        } else {
+            elem
+        }
+    };
     let mut ssbo_tables: HashMap<TypeId, SsboTable> = HashMap::new();
     for (_, elem) in &buf_params {
-        if ssbo_tables.contains_key(elem) {
+        let elem_ty = table_of(*elem);
+        if ssbo_tables.contains_key(&elem_ty) {
             continue;
         }
-        let elem_ty = *elem;
         let t_elem = if elem_ty == f32_id {
             t_f32
         } else if elem_ty == u32_id {
@@ -172,20 +192,12 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         } else if elem_ty == i32_id {
             t_i32
         } else {
-            // bf16/f16 typed storage is not yet implemented for SPIR-V: real
-            // 16-bit storage needs a device-capability-gated 4th bindless
-            // table (Int16 capability + StorageBuffer16BitAccess extension),
-            // which depends on device-profile integration `ir::capability`
-            // deliberately deferred (see its module doc comment) — not a
-            // language-level restriction, so this is a clean diagnostic, not
-            // a compiler defect.
             return Err(format!(
-                "ZSL: SPIR-V backend does not yet support buffer<{:?}> \
-                 (only f32/u32/i32 typed storage exists today)",
+                "ZSL: SPIR-V backend does not support buffer<{:?}>",
                 types.get(elem_ty)
             ));
         };
-        let binding = ssbo_binding_for(elem_ty, f32_id, u32_id, i32_id);
+        let binding = ssbo_binding_for(elem_ty, &mut types);
 
         let t_ra = spv.type_runtime_array(t_elem);
         spv.decorate(t_ra, deco::ARRAY_STRIDE, &[4]);
@@ -205,6 +217,16 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 
     // ── Texture tables: set 0, sampled and storage, as zengpu-vulkan lays
     // them out ──────────────────────────────────────────────────────────
+    // Declared once: image access and f16 packing both use it, and SPIR-V
+    // forbids a second identical vector type.
+    let has_f16 = buf_params
+        .iter()
+        .any(|(_, e)| half_of(*e) == Some(Half::F16));
+    let t_vec2 = if has_f16 || !tex_params.is_empty() {
+        spv.type_vector(t_f32, 2)
+    } else {
+        Id(0)
+    };
     let images = if tex_params.is_empty() {
         None
     } else {
@@ -212,7 +234,6 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         if tex_params.iter().any(|(_, storage)| *storage) {
             spv.capability_storage_image_without_format();
         }
-        let t_vec2 = spv.type_vector(t_f32, 2);
         let t_vec4 = spv.type_vector(t_f32, 4);
         let t_ivec2 = spv.type_vector(t_i32, 2);
         let t_image = spv.type_image_2d(t_f32);
@@ -351,6 +372,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
                 BufInfo {
                     pc_index: i as u32,
                     elem: *elem,
+                    table: table_of(*elem),
+                    half: half_of(*elem),
                 },
             )
         })
@@ -455,6 +478,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         t_f32,
         t_uvec3,
         t_uvec4,
+        t_vec2,
         ssbo_tables,
         n_slot_params,
         glsl_ext,
@@ -492,6 +516,16 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 struct BufInfo {
     pc_index: u32,
     elem: TypeId,
+    /// Key of the SSBO table the buffer is read through (`u32` for halves).
+    table: TypeId,
+    half: Option<Half>,
+}
+
+/// A 16-bit float buffer element, stored packed two per `u32` word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Half {
+    F16,
+    Bf16,
 }
 
 /// A bindless SSBO array typed for one buffer element type, and the
@@ -571,6 +605,8 @@ struct LowerCtx<'a> {
     t_f32: Id,
     t_uvec3: Id,
     t_uvec4: Id,
+    /// `vec2<f32>`, declared only when an f16 buffer or a texture needs it.
+    t_vec2: Id,
     /// One bindless SSBO table per distinct buffer-element type this kernel
     /// actually uses, keyed by the element's canonical `TypeId`. See the
     /// construction comment in `lower_compute_inner` for the binding scheme.
@@ -671,7 +707,7 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
             let table = *ctx
                 .ssbo_tables
-                .get(&info.elem)
+                .get(&info.table)
                 .expect("buffer element type has no SSBO table");
             let pc_var = ctx
                 .pc_var
@@ -682,6 +718,12 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
+            if let Some(half) = info.half {
+                let rhs = lower_expr(ctx, value)?;
+                let rhs_id = coerce(ctx, rhs, ctx.f32_id);
+                store_half(ctx, half, table, buf_idx, idx_id, rhs_id);
+                return Ok(());
+            }
             let c0 = ctx.const_0_u32;
             let ptr_elem =
                 ctx.spv
@@ -918,7 +960,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
             let table = *ctx
                 .ssbo_tables
-                .get(&info.elem)
+                .get(&info.table)
                 .expect("buffer element type has no SSBO table");
             let pc_var = ctx
                 .pc_var
@@ -931,6 +973,10 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             // g_bufs[buf_idx].data[elem_idx]
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
+            if let Some(half) = info.half {
+                let id = load_half(ctx, half, table, buf_idx, idx_id);
+                return Ok(Val { id, ty: ctx.f32_id });
+            }
             let c0 = ctx.const_0_u32;
             let ptr_elem =
                 ctx.spv
@@ -1697,6 +1743,95 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
         }
         _ => unreachable!(),
     }
+}
+
+const GLSL_PACK_HALF_2X16: u32 = 58;
+const GLSL_UNPACK_HALF_2X16: u32 = 62;
+
+/// Pointer to the `u32` word holding half element `idx`, and the element's
+/// bit offset in it (0 or 16).
+fn half_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> (Id, Id) {
+    let t_u32 = ctx.t_u32;
+    let c1 = ctx.spv.constant_u32(t_u32, 1);
+    let c4 = ctx.spv.constant_u32(t_u32, 4);
+    let word = ctx.spv.op_shift_right_logical(t_u32, idx, c1);
+    let ptr = ctx.spv.op_access_chain(
+        table.t_ptr_elem,
+        table.var,
+        &[buf_idx, ctx.const_0_u32, word],
+    );
+    let lane = ctx.spv.op_bitwise_and(t_u32, idx, c1);
+    let shift = ctx.spv.op_shift_left_logical(t_u32, lane, c4);
+    (ptr, shift)
+}
+
+/// Load half element `idx` widened to `f32`.
+fn load_half(ctx: &mut LowerCtx<'_>, half: Half, table: SsboTable, buf_idx: Id, idx: Id) -> Id {
+    let (t_u32, t_f32) = (ctx.t_u32, ctx.t_f32);
+    let (ptr, shift) = half_word(ctx, table, buf_idx, idx);
+    let word = ctx.spv.op_load(t_u32, ptr);
+    let shifted = ctx.spv.op_shift_right_logical(t_u32, word, shift);
+    match half {
+        Half::F16 => {
+            // UnpackHalf2x16 reads the low 16 bits into lane 0.
+            let v2 =
+                ctx.spv
+                    .op_ext_inst(ctx.t_vec2, ctx.glsl_ext, GLSL_UNPACK_HALF_2X16, &[shifted]);
+            ctx.spv.op_composite_extract(t_f32, v2, &[0])
+        }
+        Half::Bf16 => {
+            let c16 = ctx.spv.constant_u32(t_u32, 16);
+            let high = ctx.spv.op_shift_left_logical(t_u32, shifted, c16);
+            ctx.spv.op_bitcast(t_f32, high)
+        }
+    }
+}
+
+/// Store `value` (an `f32`) narrowed into half element `idx`. Two atomics
+/// (clear own half, then set it) keep a neighbour writing the other half of
+/// the same word from being lost.
+fn store_half(
+    ctx: &mut LowerCtx<'_>,
+    half: Half,
+    table: SsboTable,
+    buf_idx: Id,
+    idx: Id,
+    value: Id,
+) {
+    let t_u32 = ctx.t_u32;
+    let c16 = ctx.spv.constant_u32(t_u32, 16);
+    let bits = match half {
+        Half::F16 => {
+            let zero = ctx.spv.constant_f32(ctx.t_f32, 0.0);
+            let v2 = ctx.spv.op_composite_construct(ctx.t_vec2, &[value, zero]);
+            ctx.spv
+                .op_ext_inst(t_u32, ctx.glsl_ext, GLSL_PACK_HALF_2X16, &[v2])
+        }
+        Half::Bf16 => {
+            // Round to nearest even, as the HIP/CUDA/MSL backends do.
+            let c1 = ctx.spv.constant_u32(t_u32, 1);
+            let c7fff = ctx.spv.constant_u32(t_u32, 0x7fff);
+            let raw = ctx.spv.op_bitcast(t_u32, value);
+            let upper = ctx.spv.op_shift_right_logical(t_u32, raw, c16);
+            let lsb = ctx.spv.op_bitwise_and(t_u32, upper, c1);
+            let bias = ctx.spv.op_iadd(t_u32, c7fff, lsb);
+            let rounded = ctx.spv.op_iadd(t_u32, raw, bias);
+            ctx.spv.op_shift_right_logical(t_u32, rounded, c16)
+        }
+    };
+    let (ptr, shift) = half_word(ctx, table, buf_idx, idx);
+    let lane_mask = ctx.spv.constant_u32(t_u32, 0xffff);
+    let all = ctx.spv.constant_u32(t_u32, u32::MAX);
+    let own = ctx.spv.op_shift_left_logical(t_u32, lane_mask, shift);
+    let keep = ctx.spv.op_bitwise_xor(t_u32, own, all);
+    let placed = ctx.spv.op_shift_left_logical(t_u32, bits, shift);
+    // ScopeDevice = 1; MemorySemanticsRelaxed = 0.
+    let scope = ctx.spv.constant_u32(t_u32, 1);
+    let relaxed = ctx.const_0_u32;
+    ctx.spv
+        .op_atomic_int(op::ATOMIC_AND, t_u32, ptr, scope, relaxed, keep);
+    ctx.spv
+        .op_atomic_int(op::ATOMIC_OR, t_u32, ptr, scope, relaxed, placed);
 }
 
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {

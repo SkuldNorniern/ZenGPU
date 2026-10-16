@@ -8,6 +8,7 @@
 //! module is the shared, authoritative version — the backend calls
 //! [`ssbo_binding_for`] here instead of keeping a private copy.
 
+use crate::ir::arena::TypeArena;
 use crate::ir::types::TypeId;
 use crate::ir::{GraphicsEntry, GraphicsModule, Module, ParamKind};
 
@@ -24,13 +25,14 @@ pub struct BindingInfo {
 /// `zengpu-vulkan/src/device/mod.rs`'s `SSBO_BINDING_F32`/`SSBO_BINDING_U32`/
 /// `SSBO_BINDING_I32` constants exactly (f32→0, u32→2, i32→3) — kept in sync
 /// by convention (not a shared crate constant across `zengpu-zsl` and
-/// `zengpu-vulkan` — there are only three, and they rarely change).
-pub fn ssbo_binding_for(elem: TypeId, f32_id: TypeId, u32_id: TypeId, i32_id: TypeId) -> u32 {
-    if elem == f32_id {
+/// `zengpu-vulkan` — there are only three, and they rarely change). `f16` and
+/// `bf16` buffers are read through the u32 table, two halves per word.
+pub fn ssbo_binding_for(elem: TypeId, types: &mut TypeArena) -> u32 {
+    if elem == types.f32_id() {
         0
-    } else if elem == u32_id {
+    } else if elem == types.u32_id() || elem == types.f16_id() || elem == types.bf16_id() {
         2
-    } else if elem == i32_id {
+    } else if elem == types.i32_id() {
         3
     } else {
         unreachable!("unsupported compute buffer element")
@@ -48,9 +50,6 @@ pub const IMAGE_BINDING: u32 = 4;
 /// assignment, in declaration order.
 pub fn compute_bindings(module: &Module) -> Vec<(String, BindingInfo)> {
     let mut types = module.types.clone();
-    let f32_id = types.f32_id();
-    let u32_id = types.u32_id();
-    let i32_id = types.i32_id();
     module
         .entry
         .params
@@ -59,7 +58,7 @@ pub fn compute_bindings(module: &Module) -> Vec<(String, BindingInfo)> {
             ParamKind::Buffer { elem, .. } => Some((
                 p.name.clone(),
                 BindingInfo {
-                    binding: ssbo_binding_for(*elem, f32_id, u32_id, i32_id),
+                    binding: ssbo_binding_for(*elem, &mut types),
                 },
             )),
             ParamKind::Texture => Some((

@@ -46,6 +46,8 @@ pub(crate) mod op {
     pub const RETURN: u32 = 253;
     pub const CONTROL_BARRIER: u32 = 224;
     pub const ATOMIC_FADD_EXT: u32 = 6035;
+    pub const ATOMIC_AND: u32 = 240;
+    pub const ATOMIC_OR: u32 = 241;
     pub const IADD: u32 = 128;
     pub const FADD: u32 = 129;
     pub const ISUB: u32 = 130;
@@ -616,6 +618,25 @@ impl SpvBuilder {
         emit(
             &mut self.functions,
             op::ATOMIC_FADD_EXT,
+            &[ty.0, id.0, ptr.0, scope.0, semantics.0, value.0],
+        );
+        id
+    }
+
+    /// Integer atomic read-modify-write (`OpAtomicAnd`, `OpAtomicOr`, ...).
+    pub fn op_atomic_int(
+        &mut self,
+        opcode: u32,
+        ty: Id,
+        ptr: Id,
+        scope: Id,
+        semantics: Id,
+        value: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            opcode,
             &[ty.0, id.0, ptr.0, scope.0, semantics.0, value.0],
         );
         id

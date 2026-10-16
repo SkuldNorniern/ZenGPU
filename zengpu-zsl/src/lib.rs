@@ -264,6 +264,12 @@ fn scalar_kind_name(ty: TypeId, types: &TypeArena) -> &'static str {
         Type::Float {
             format: FloatFormat::F32,
         } => "F32",
+        Type::Float {
+            format: FloatFormat::F16,
+        } => "F16",
+        Type::Float {
+            format: FloatFormat::Bf16,
+        } => "Bf16",
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
@@ -371,6 +377,17 @@ mod phase_z_tests {
 
     use crate::backend::{cuda, hip, msl, spirv};
     use crate::frontend::parser::parse_compute;
+
+    /// Opcode of every instruction in a SPIR-V module, header skipped.
+    fn spirv_opcodes(words: &[u32]) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut at = 5;
+        while at < words.len() {
+            out.push(words[at] & 0xffff);
+            at += (words[at] >> 16).max(1) as usize;
+        }
+        out
+    }
 
     const TILED_GEMM: &str = r#"
         push Shape { m: u32, n: u32, k: u32 }
@@ -553,17 +570,12 @@ mod phase_z_tests {
     }
 
     #[test]
-    fn bf16_buffer_rejects_cleanly_on_spirv_backend() {
-        // SPIR-V bf16 storage isn't implemented yet (needs a device-
-        // capability-gated 16-bit bindless table); this must be a clean
-        // `Diagnostic`, never a panic.
+    fn bf16_buffer_lowers_on_spirv_through_u32_words() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
-        let err = spirv::lower_compute(&module).expect_err("bf16 must be rejected on SPIR-V");
-        assert!(
-            err.message.contains("does not yet support"),
-            "got: {}",
-            err.message
-        );
+        let words = spirv::lower_compute(&module).expect("lower copy_bf16 to SPIR-V");
+        // Stores into a packed word are OpAtomicAnd (240) then OpAtomicOr (241).
+        let opcodes: Vec<u32> = spirv_opcodes(&words);
+        assert!(opcodes.contains(&240) && opcodes.contains(&241));
     }
 
     #[test]
@@ -674,17 +686,12 @@ int main() {{
     }
 
     #[test]
-    fn f16_buffer_rejects_cleanly_on_spirv_backend() {
-        // SPIR-V f16 storage isn't implemented yet, same reasoning as bf16
-        // (needs a device-capability-gated 16-bit bindless table); this must
-        // be a clean `Diagnostic`, never a panic.
+    fn f16_buffer_lowers_on_spirv_through_u32_words() {
         let module = parse_compute(COPY_F16).expect("parse copy_f16");
-        let err = spirv::lower_compute(&module).expect_err("f16 must be rejected on SPIR-V");
-        assert!(
-            err.message.contains("does not yet support"),
-            "got: {}",
-            err.message
-        );
+        let words = spirv::lower_compute(&module).expect("lower copy_f16 to SPIR-V");
+        // Stores into a packed word are OpAtomicAnd (240) then OpAtomicOr (241).
+        let opcodes: Vec<u32> = spirv_opcodes(&words);
+        assert!(opcodes.contains(&240) && opcodes.contains(&241));
     }
 
     #[test]
