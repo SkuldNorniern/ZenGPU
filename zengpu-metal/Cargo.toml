@@ -29,3 +29,4 @@ core-graphics-types = "0.1"
 # Native ZSL→MSL shaders for the compute tests.
 [dev-dependencies]
 zengpu-spirv = { workspace = true, features = ["metal"] }
+zengpu-compute.workspace = true
