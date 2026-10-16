@@ -1029,4 +1029,53 @@ mod devarray_matmul_tests {
         pool.free(c);
         gemm.destroy(&*vk);
     }
+
+    #[test]
+    fn devarray_matmul_vulkan_skinny() {
+        let Some(vk) = vulkan_device() else { return };
+        let gemm = GemmKernel::new(&*vk).unwrap();
+        let pool = BufferPool::new(vk.clone());
+        // (m, n, k, alpha): few-row shapes for the skinny kernels, including
+        // row counts between the 1/4/8/16 classes and K past one 128-deep chunk.
+        let cases: [(u32, u32, u32, f32); 7] = [
+            (1, 4096, 1024, 1.0),
+            (3, 1001, 257, -0.5),
+            (4, 300, 129, 2.0),
+            (8, 77, 1000, 1.0),
+            (13, 4096, 1100, 1.5),
+            (16, 512, 64, 1.0),
+            (17, 300, 300, 1.0),
+        ];
+        for (m, n, k, alpha) in cases {
+            let a_data: Vec<f32> = (0..m * k).map(|i| ((i % 19) as f32 - 9.0) * 0.05).collect();
+            let b_data: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let a = pool.alloc(vec![m, k], DType::F32).unwrap();
+            let b = pool.alloc(vec![k, n], DType::F32).unwrap();
+            vk.write_buffer(a.buffer, 0, as_bytes_f32(&a_data)).unwrap();
+            vk.write_buffer(b.buffer, 0, as_bytes_f32(&b_data)).unwrap();
+            let c = gemm.sgemm(&*vk, &pool, alpha, &a, &b).unwrap();
+            let out = from_bytes_f32(&vk.read_buffer(c.buffer, 0, c.size_bytes()).unwrap());
+            let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+            // Every row, and every 7th column.
+            for row in 0..mu {
+                for col in (0..nu).step_by(7) {
+                    let sum: f64 = (0..ku)
+                        .map(|i| f64::from(a_data[row * ku + i]) * f64::from(b_data[i * nu + col]))
+                        .sum();
+                    let want = f64::from(alpha) * sum;
+                    let got = out[row * nu + col];
+                    assert!(
+                        (f64::from(got) - want).abs() <= 1e-4 * want.abs().max(1.0),
+                        "m={m} n={n} k={k} row={row} col={col} got={got} want={want}"
+                    );
+                }
+            }
+            pool.free(a);
+            pool.free(b);
+            pool.free(c);
+        }
+        gemm.destroy(&*vk);
+    }
 }
