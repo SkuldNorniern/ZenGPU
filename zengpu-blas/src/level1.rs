@@ -1,8 +1,8 @@
 //! BLAS Level 1: vector operations.
 
-use zengpu_compute::{BufferPool, DeviceArray};
+use zengpu_compute::{BufferPool, DeviceArray, OpList};
 use zengpu_hal::{
-    Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
+    ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar,
     ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
@@ -90,32 +90,47 @@ impl Level1Kernels {
     pub fn saxpy(
         &self,
         device: &dyn GpuDevice,
-        _pool: &BufferPool,
+        pool: &BufferPool,
+        alpha: f32,
+        x: &DeviceArray,
+        y: &DeviceArray,
+    ) -> Result<()> {
+        let mut ops = OpList::new(pool);
+        self.record_saxpy(&mut ops, alpha, x, y)?;
+        ops.run(device)
+    }
+
+    pub fn record_saxpy(
+        &self,
+        ops: &mut OpList<'_>,
         alpha: f32,
         x: &DeviceArray,
         y: &DeviceArray,
     ) -> Result<()> {
         let n = check_f32_shape(x, y, "saxpy")?;
-        device.dispatch(
+        ops.dispatch(
             self.axpy_pipeline,
-            Bindings {
-                buffers: &[x.buffer.index(), y.buffer.index()],
-                scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
-                textures: &[],
-                images: &[],
-            },
+            &[x.buffer.index(), y.buffer.index()],
+            &[Scalar::U32(n), Scalar::F32(alpha)],
             [n.div_ceil(256), 1, 1],
-        )
+        );
+        Ok(())
     }
 
     /// Computes `x[i] *= alpha` in place, with no allocation.
     pub fn sscal(
         &self,
         device: &dyn GpuDevice,
-        _pool: &BufferPool,
+        pool: &BufferPool,
         alpha: f32,
         x: &DeviceArray,
     ) -> Result<()> {
+        let mut ops = OpList::new(pool);
+        self.record_sscal(&mut ops, alpha, x)?;
+        ops.run(device)
+    }
+
+    pub fn record_sscal(&self, ops: &mut OpList<'_>, alpha: f32, x: &DeviceArray) -> Result<()> {
         if x.dtype != DType::F32 {
             return Err(GpuError::Dispatch(format!(
                 "sscal: only f32 supported, got {:?}",
@@ -123,15 +138,12 @@ impl Level1Kernels {
             )));
         }
         let n = x.len();
-        device.dispatch(
+        ops.dispatch(
             self.scal_pipeline,
-            Bindings {
-                buffers: &[x.buffer.index()],
-                scalars: &[Scalar::U32(n), Scalar::F32(alpha)],
-                textures: &[],
-                images: &[],
-            },
+            &[x.buffer.index()],
+            &[Scalar::U32(n), Scalar::F32(alpha)],
             [n.div_ceil(256), 1, 1],
-        )
+        );
+        Ok(())
     }
 }
