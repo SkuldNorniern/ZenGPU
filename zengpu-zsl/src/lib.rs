@@ -662,10 +662,10 @@ int main() {{
         let msl_source = msl::lower_compute(&module)
             .expect("lower copy_f16 to MSL")
             .source;
-        assert!(hip_source.contains("#include <hip/hip_fp16.h>"));
-        assert!(hip_source.contains("const __half* __restrict__ src"));
-        assert!(hip_source.contains("__half* __restrict__ out"));
-        assert!(hip_source.contains("__float2half(__half2float(src[gx]))"));
+        assert!(!hip_source.contains("#include"));
+        assert!(hip_source.contains("const unsigned short* __restrict__ src"));
+        assert!(hip_source.contains("unsigned short* __restrict__ out"));
+        assert!(hip_source.contains("f32_to_f16(f16_to_f32(src[gx]))"));
         assert!(cuda_source.contains("#include <cuda_fp16.h>"));
         assert!(cuda_source.contains("const __half* __restrict__ src"));
         assert!(cuda_source.contains("__float2half(__half2float(src[gx]))"));
@@ -705,7 +705,7 @@ int main() {{
         let src_path = dir.join(format!("zsl_f16_{}_{}.hip", id(), tag));
         let exe_path = dir.join(format!("zsl_f16_{}_{}", id(), tag));
         // Every source value is first rounded to an exactly-representable
-        // half (`__float2half`), so the kernel's half->float->half round
+        // half (`_Float16`), so the kernel's half->float->half round
         // trip must reproduce the exact same bits — a real proof the
         // generated load/store conversion pair is exactly invertible.
         let harness = format!(
@@ -722,14 +722,14 @@ int main() {{
     std::vector<unsigned short> src(N), out(N, 0);
     for (unsigned i = 0; i < N; ++i) {{
         float x = (float)i * 0.01f - 300.0f;
-        __half h = __float2half(x);
+        _Float16 h = (_Float16)x;
         std::memcpy(&src[i], &h, sizeof(unsigned short));
     }}
     unsigned short *dsrc = nullptr, *dout = nullptr;
     if (hipMalloc(&dsrc, src.size()*sizeof(unsigned short)) != hipSuccess ||
         hipMalloc(&dout, out.size()*sizeof(unsigned short)) != hipSuccess) return 2;
     hipMemcpy(dsrc, src.data(), src.size()*sizeof(unsigned short), hipMemcpyHostToDevice);
-    zsl_kernel<<<dim3((N+63)/64), dim3(64)>>>((const __half*)dsrc, (__half*)dout);
+    zsl_kernel<<<dim3((N+63)/64), dim3(64)>>>(dsrc, dout);
     if (hipDeviceSynchronize() != hipSuccess) return 3;
     hipMemcpy(out.data(), dout, out.size()*sizeof(unsigned short), hipMemcpyDeviceToHost);
     unsigned mismatches = 0;

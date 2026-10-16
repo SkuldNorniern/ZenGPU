@@ -63,11 +63,9 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         .map(|(name, _, _)| *name)
         .collect();
 
-    // Buffers whose element is `f16`: storage is the real `__half` type
-    // (`<hip/hip_fp16.h>`), converted via the compiler/hardware's own
-    // `__float2half`/`__half2float` — no hand-rolled bit algorithm needed,
-    // unlike bf16 (which has no dedicated hardware conversion path and must
-    // match `laminax-runtime`'s existing raw-bit algorithm bit-for-bit).
+    // Buffers whose element is `f16`: storage is `unsigned short`, converted
+    // through clang's native `_Float16` (hardware cvt). Not `__half`: hipRTC
+    // ships no `<hip/hip_fp16.h>`, so including it fails at runtime compile.
     let f16_id = {
         let mut t = module.types.clone();
         t.f16_id()
@@ -91,7 +89,14 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let mut s = String::new();
 
     if !f16_buffers.is_empty() {
-        s.push_str("#include <hip/hip_fp16.h>\n");
+        s.push_str(
+            "__device__ __forceinline__ unsigned short f32_to_f16(float x) {\n\
+             \x20   return __builtin_bit_cast(unsigned short, (_Float16)x);\n\
+             }\n\
+             __device__ __forceinline__ float f16_to_f32(unsigned short x) {\n\
+             \x20   return (float)__builtin_bit_cast(_Float16, x);\n\
+             }\n",
+        );
     }
     if !bf16_buffers.is_empty() {
         s.push_str(
@@ -198,7 +203,7 @@ struct Ctx<'a> {
     /// wrapped in `bf16_to_f32`/`f32_to_bf16`.
     bf16_buffers: HashSet<&'a str>,
     /// Buffer names whose element is `f16` — every load/store on these is
-    /// wrapped in `__half2float`/`__float2half`.
+    /// wrapped in `f16_to_f32`/`f32_to_f16`.
     f16_buffers: HashSet<&'a str>,
     /// Resolved expression symbols used only to select type-specific subgroup
     /// reduction spellings and the exclusive-scan identity literal.
@@ -258,7 +263,7 @@ fn hip_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
         } => Ok("unsigned short"),
         Type::Float {
             format: FloatFormat::F16,
-        } => Ok("__half"),
+        } => Ok("unsigned short"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
@@ -296,7 +301,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let val = if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("f32_to_bf16({val})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
-                format!("__float2half({val})")
+                format!("f32_to_f16({val})")
             } else {
                 val
             };
@@ -393,7 +398,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             if ctx.bf16_buffers.contains(buf.as_str()) {
                 format!("bf16_to_f32({inner})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
-                format!("__half2float({inner})")
+                format!("f16_to_f32({inner})")
             } else {
                 inner
             }
