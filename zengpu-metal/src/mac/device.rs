@@ -11,21 +11,21 @@ use std::time::{Duration, Instant};
 
 use metal::{
     BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
-    ComputePipelineState, DepthStencilState, Device, Library, MTLBlitOption,
-    MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType, MTLResourceOptions, MTLSize,
-    MTLStorageMode, MTLTextureType, MTLTextureUsage, RenderPipelineState, SamplerDescriptor,
-    SamplerState, Texture, TextureDescriptor,
+    ComputeCommandEncoderRef, ComputePipelineState, DepthStencilState, Device, Library,
+    MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    BackendPreference, Bindings, BufferDesc, BufferHandle, BufferUsage, ComputePipelineDesc,
-    DeviceLimits, Features, Format, FormatCaps, GpuDevice, GpuError, GpuSubmission,
-    HalCapabilities, MemoryBudget, PipelineHandle, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, TargetHandle,
-    TexDim, TextureDesc, TextureHandle, TextureRegion, TextureUsage, TextureWrite, TransferCaps,
-    UsageError, marker,
+    BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeOp,
+    ComputePipelineDesc, DeviceLimits, DispatchOp, Features, Format, FormatCaps, GpuDevice,
+    GpuError, GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
+    SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
+    TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
@@ -188,13 +188,23 @@ const WAIT_POLL: Duration = Duration::from_micros(100);
 /// Dropping one never waits.
 pub(crate) struct MetalSubmission {
     inner: Arc<Inner>,
+    cycle_id: u64,
     cmds: Vec<CommandBuffer>,
 }
 
 impl MetalSubmission {
     pub(crate) fn boxed(inner: &Arc<Inner>, cmds: Vec<CommandBuffer>) -> Submission {
+        Self::boxed_cycle(inner, 0, cmds)
+    }
+
+    pub(crate) fn boxed_cycle(
+        inner: &Arc<Inner>,
+        cycle_id: u64,
+        cmds: Vec<CommandBuffer>,
+    ) -> Submission {
         Box::new(Self {
             inner: Arc::clone(inner),
+            cycle_id,
             cmds,
         })
     }
@@ -202,7 +212,7 @@ impl MetalSubmission {
 
 impl GpuSubmission for MetalSubmission {
     fn cycle_id(&self) -> u64 {
-        0
+        self.cycle_id
     }
 
     fn poll(&self) -> Result<SubmissionStatus> {
@@ -360,13 +370,6 @@ impl MetalDevice {
         }
     }
 
-    fn buffer(&self, handle: BufferHandle) -> Result<Buffer> {
-        lock(&self.inner.buffers)?
-            .get(handle)
-            .map(|b| b.buf.clone())
-            .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))
-    }
-
     fn texture(&self, handle: TextureHandle) -> Result<(Texture, TextureDesc)> {
         lock(&self.inner.textures)?
             .get(handle)
@@ -503,16 +506,14 @@ impl MetalDevice {
         self.stage_into(&tex, &layout, region, data)
     }
 
-    /// Encode and submit one compute dispatch, blocking until completion. `bindings.buffers` bind
-    /// to `[[buffer(0..n)]]`, scalars pack into `Push` at `[[buffer(n)]]`. `grid` is the
-    /// threadgroup count; the pipeline's `block` is threads per threadgroup.
-    fn dispatch_one(
-        &self,
-        pipeline: PipelineHandle,
-        bindings: Bindings<'_>,
-        grid: [u32; 3],
-    ) -> Result<()> {
-        let (state, block) = match lock(&self.inner.pipelines)?.get(pipeline) {
+    /// Dispatches a compute pipeline.
+    ///
+    /// Buffers in `bindings.buffers` bind to `[[buffer(0..n)]]`, and scalars pack into `Push` at
+    /// `[[buffer(n)]]`. Textures in `bindings.textures` (table slots) bind to `[[texture(0..t)]]`,
+    /// samplers to `[[sampler(0..t)]]`, and storage images follow. `grid` is the threadgroup count.
+    /// The pipeline's `block` is threads per threadgroup.
+    fn resolve_dispatch(&self, op: &DispatchOp<'_>) -> Result<ResolvedDispatch> {
+        let (state, block) = match lock(&self.inner.pipelines)?.get(op.pipeline) {
             Some(MetalPipeline::Compute { state, block }) => (state.clone(), *block),
             Some(MetalPipeline::Render(_)) => {
                 return Err(GpuError::Dispatch(
@@ -530,7 +531,7 @@ impl MetalDevice {
         }
         let buffers: Vec<Buffer> = {
             let table = lock(&self.inner.buffers)?;
-            bindings
+            op.bindings
                 .buffers
                 .iter()
                 .map(|&slot| {
@@ -545,7 +546,7 @@ impl MetalDevice {
         };
         let sampled: Vec<(Texture, SamplerState)> = {
             let table = lock(&self.inner.table)?;
-            bindings
+            op.bindings
                 .textures
                 .iter()
                 .map(|&slot| {
@@ -557,7 +558,7 @@ impl MetalDevice {
         };
         let images: Vec<Texture> = {
             let textures = lock(&self.inner.textures)?;
-            bindings
+            op.bindings
                 .images
                 .iter()
                 .map(|&slot| match textures.get_by_slot_index(slot) {
@@ -572,40 +573,134 @@ impl MetalDevice {
                 })
                 .collect::<Result<_>>()?
         };
+        Ok(ResolvedDispatch {
+            state,
+            block,
+            grid: op.grid,
+            buffers,
+            sampled,
+            images,
+            push: pack_scalars(op.bindings.scalars),
+        })
+    }
+
+    fn resolve_copy(&self, copy: &BufferCopyOp) -> Result<ResolvedCopy> {
+        let buffers = lock(&self.inner.buffers)?;
+        let (Some(src), Some(dst)) = (buffers.get(copy.src), buffers.get(copy.dst)) else {
+            return Err(GpuError::Backend("metal: invalid buffer handle".into()));
+        };
+        Self::in_bounds(copy.src_offset, copy.len, src.size)?;
+        Self::in_bounds(copy.dst_offset, copy.len, dst.size)?;
+        Ok(ResolvedCopy {
+            src: src.buf.clone(),
+            src_offset: copy.src_offset,
+            dst: dst.buf.clone(),
+            dst_offset: copy.dst_offset,
+            len: copy.len,
+        })
+    }
+
+    /// Records ops into one command buffer and commits it. All ops are checked before
+    /// any is encoded.
+    ///
+    /// Dispatches share a serial encoder, so later ops see earlier writes without a barrier.
+    fn commit_ops(&self, ops: &[ComputeOp<'_>]) -> Result<CommandBuffer> {
+        let resolved = ops
+            .iter()
+            .map(|op| match op {
+                ComputeOp::Dispatch(d) => self.resolve_dispatch(d).map(Resolved::Dispatch),
+                ComputeOp::CopyBuffer(c) => self.resolve_copy(c).map(Resolved::Copy),
+            })
+            .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
-            let enc = cmd.new_compute_command_encoder();
-            enc.set_compute_pipeline_state(&state);
-            for (i, b) in buffers.iter().enumerate() {
-                enc.set_buffer(i as u64, Some(b), 0);
+            let mut rest = resolved.as_slice();
+            while let Some(first) = rest.first() {
+                let run = rest
+                    .iter()
+                    .position(|r| {
+                        matches!(r, Resolved::Dispatch(_)) != matches!(first, Resolved::Dispatch(_))
+                    })
+                    .unwrap_or(rest.len());
+                let (group, tail) = rest.split_at(run);
+                rest = tail;
+                if matches!(first, Resolved::Dispatch(_)) {
+                    let enc = cmd.new_compute_command_encoder();
+                    for r in group {
+                        if let Resolved::Dispatch(d) = r {
+                            d.encode(enc);
+                        }
+                    }
+                    enc.end_encoding();
+                } else {
+                    let blit = cmd.new_blit_command_encoder();
+                    for r in group {
+                        if let Resolved::Copy(c) = r {
+                            blit.copy_from_buffer(
+                                &c.src,
+                                c.src_offset,
+                                &c.dst,
+                                c.dst_offset,
+                                c.len,
+                            );
+                        }
+                    }
+                    blit.end_encoding();
+                }
             }
-            for (i, (tex, smp)) in sampled.iter().enumerate() {
-                enc.set_texture(i as u64, Some(tex));
-                enc.set_sampler_state(i as u64, Some(smp));
-            }
-            for (i, tex) in images.iter().enumerate() {
-                enc.set_texture((sampled.len() + i) as u64, Some(tex));
-            }
-            if !bindings.scalars.is_empty() {
-                let packed = pack_scalars(bindings.scalars);
-                enc.set_bytes(
-                    buffers.len() as u64,
-                    packed.len() as u64,
-                    packed.as_ptr() as *const c_void,
-                );
-            }
-            enc.dispatch_thread_groups(
-                MTLSize::new(u64::from(grid[0]), u64::from(grid[1]), u64::from(grid[2])),
-                MTLSize::new(
-                    u64::from(block[0]),
-                    u64::from(block[1]),
-                    u64::from(block[2]),
-                ),
-            );
-            enc.end_encoding();
         });
-        self.inner.commit_and_wait(&cmd)
+        self.inner.commit(&cmd);
+        Ok(cmd)
     }
+}
+
+struct ResolvedDispatch {
+    state: ComputePipelineState,
+    block: [u32; 3],
+    grid: [u32; 3],
+    buffers: Vec<Buffer>,
+    sampled: Vec<(Texture, SamplerState)>,
+    images: Vec<Texture>,
+    push: Vec<u8>,
+}
+
+impl ResolvedDispatch {
+    fn encode(&self, enc: &ComputeCommandEncoderRef) {
+        enc.set_compute_pipeline_state(&self.state);
+        for (i, b) in self.buffers.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), 0);
+        }
+        for (i, (tex, smp)) in self.sampled.iter().enumerate() {
+            enc.set_texture(i as u64, Some(tex));
+            enc.set_sampler_state(i as u64, Some(smp));
+        }
+        for (i, tex) in self.images.iter().enumerate() {
+            enc.set_texture((self.sampled.len() + i) as u64, Some(tex));
+        }
+        if !self.push.is_empty() {
+            enc.set_bytes(
+                self.buffers.len() as u64,
+                self.push.len() as u64,
+                self.push.as_ptr() as *const c_void,
+            );
+        }
+        let [gx, gy, gz] = self.grid.map(u64::from);
+        let [bx, by, bz] = self.block.map(u64::from);
+        enc.dispatch_thread_groups(MTLSize::new(gx, gy, gz), MTLSize::new(bx, by, bz));
+    }
+}
+
+struct ResolvedCopy {
+    src: Buffer,
+    src_offset: u64,
+    dst: Buffer,
+    dst_offset: u64,
+    len: u64,
+}
+
+enum Resolved {
+    Dispatch(ResolvedDispatch),
+    Copy(ResolvedCopy),
 }
 
 /// Four bytes per scalar, in the field order of ZSL's MSL `struct Push`.
@@ -738,23 +833,15 @@ impl GpuDevice for MetalDevice {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
-        {
-            let buffers = lock(&self.inner.buffers)?;
-            let size = |h| buffers.get(h).map(|b: &MetalBuffer| b.size);
-            let (Some(s), Some(d)) = (size(src), size(dst)) else {
-                return Err(GpuError::Backend("metal: invalid buffer handle".into()));
-            };
-            Self::in_bounds(src_offset, len, s)?;
-            Self::in_bounds(dst_offset, len, d)?;
-        }
-        let (s, d) = (self.buffer(src)?, self.buffer(dst)?);
-        let cmd = self.inner.command_buffer();
-        autoreleasepool(|| {
-            let blit = cmd.new_blit_command_encoder();
-            blit.copy_from_buffer(&s, src_offset, &d, dst_offset, len);
-            blit.end_encoding();
+        let op = ComputeOp::CopyBuffer(BufferCopyOp {
+            src,
+            src_offset,
+            dst,
+            dst_offset,
+            len,
         });
-        self.inner.commit_and_wait(&cmd)
+        let cmd = self.commit_ops(&[op])?;
+        self.inner.wait_for(&cmd)
     }
 
     fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
@@ -1144,6 +1231,31 @@ impl GpuDevice for MetalDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
-        self.dispatch_one(pipeline, bindings, grid)
+        self.dispatch_batch(&[DispatchOp {
+            pipeline,
+            bindings,
+            grid,
+        }])
+    }
+
+    /// One command buffer for the whole batch, waited on once.
+    fn dispatch_batch(&self, ops: &[DispatchOp<'_>]) -> Result<()> {
+        let ops: Vec<ComputeOp<'_>> = ops.iter().copied().map(ComputeOp::Dispatch).collect();
+        let cmd = self.commit_ops(&ops)?;
+        self.inner.wait_for(&cmd)
+    }
+
+    fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
+        let ops: Vec<ComputeOp<'_>> = ops.iter().copied().map(ComputeOp::Dispatch).collect();
+        self.submit_compute_ops(cycle_id, &ops)
+    }
+
+    fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
+        let cmd = self.commit_ops(ops)?;
+        Ok(MetalSubmission::boxed_cycle(
+            &self.inner,
+            cycle_id,
+            vec![cmd],
+        ))
     }
 }
