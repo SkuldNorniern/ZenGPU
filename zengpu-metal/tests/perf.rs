@@ -12,8 +12,8 @@ use zengpu_compute::elementwise::ElementwiseKernels;
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
     AdapterRequest, Bindings, BufferCopyOp, BufferDesc, BufferUsage, ComputeOp,
-    ComputePipelineDesc, DType, DeviceRequest, DispatchOp, GpuDevice, GpuInstance, MemoryUsage,
-    Scalar, SubmissionStatus,
+    ComputePipelineDesc, DType, DeviceRequest, DispatchOp, Format, GpuDevice, GpuInstance,
+    MemoryUsage, Scalar, SubmissionStatus, TexDim, TextureDesc, TextureUsage,
 };
 use zengpu_metal::MetalInstance;
 use zengpu_spirv::{ZslShader, zsl};
@@ -154,6 +154,33 @@ fn overheads() {
             "metal: create+destroy {mib:>2} MiB     {:?}",
             per_iter(t, 100)
         );
+    }
+
+    for (side, reps) in [(64u32, 500u32), (1024, 20)] {
+        let texture = dev
+            .create_texture(TextureDesc {
+                width: side,
+                height: side,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let pixels = vec![9u8; (side * side * 4) as usize];
+        dev.upload_texture_data(texture, &pixels).unwrap();
+        let t = Instant::now();
+        for _ in 0..reps {
+            dev.upload_texture_data(texture, &pixels).unwrap();
+        }
+        println!(
+            "metal: texture upload {side:>4}²       {:?}",
+            per_iter(t, reps)
+        );
+        dev.destroy_texture(texture);
     }
 
     let first = dev.read_buffer(out, 0, 4).unwrap();
