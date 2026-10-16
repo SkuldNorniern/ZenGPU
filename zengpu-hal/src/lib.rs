@@ -35,11 +35,11 @@ pub use surface::WindowHandles;
 
 pub use desc::{
     AddressMode, BlendComponent, BlendFactor, BlendMode, BlendOp, BlendState, BorderColor,
-    BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, CullMode, DepthState, FilterMode,
-    FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology, RasterState, RenderTargetDesc,
-    SamplerDesc, ShaderDesc, ShaderSource, StencilFaceState, StencilOp, StencilState, StepMode,
-    SurfaceConfig, TexDim, TextureDesc, TextureRegion, TextureWrite, VertexAttribute, VertexFormat,
-    VertexLayout,
+    BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, ComputePipelineHints, CullMode,
+    DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, PolygonMode, PrimitiveTopology,
+    RasterState, RenderTargetDesc, SamplerDesc, ShaderDesc, ShaderSource, StencilFaceState,
+    StencilOp, StencilState, StepMode, SurfaceConfig, TexDim, TextureDesc, TextureRegion,
+    TextureWrite, VertexAttribute, VertexFormat, VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{

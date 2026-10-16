@@ -5,8 +5,8 @@ use core::any::Any;
 
 use crate::command::{Bindings, ComputeOp, DispatchOp};
 use crate::desc::{
-    BufferDesc, ComputePipelineDesc, SamplerDesc, ShaderDesc, TextureDesc, TextureRegion,
-    TextureWrite,
+    BufferDesc, ComputePipelineDesc, ComputePipelineHints, SamplerDesc, ShaderDesc, TextureDesc,
+    TextureRegion, TextureWrite,
 };
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
@@ -245,6 +245,16 @@ pub trait GpuDevice: Send + Sync {
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
         let _ = desc;
         Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
+    /// Same as `create_compute_pipeline`. `hints` is applied where supported and ignored elsewhere.
+    fn create_compute_pipeline_with(
+        &self,
+        desc: ComputePipelineDesc<'_>,
+        hints: ComputePipelineHints,
+    ) -> Result<PipelineHandle> {
+        let _ = hints;
+        self.create_compute_pipeline(desc)
     }
 
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}

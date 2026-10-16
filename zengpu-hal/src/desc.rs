@@ -105,6 +105,14 @@ pub struct ComputePipelineDesc<'a> {
     pub block: [u32; 3],
 }
 
+/// Tuning requests a backend may ignore. Results never depend on them, only speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ComputePipelineHints {
+    /// lanes per subgroup, e.g. 64 for wave64 on RDNA (drivers often default to wave32). Ignored
+    /// outside the device range.
+    pub subgroup_size: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {
     #[default]
