@@ -107,10 +107,13 @@ void sgemm_tiled(const float* __restrict__ A, const float* __restrict__ B,
 "#;
 
 impl GemmKernel {
-    /// Compiles the GEMM pipeline. HIP uses the hand-written kernel, Vulkan uses register-blocked
-    /// ZSL, and other backends use naive ZSL.
+    /// Compiles the GEMM pipeline. HIP uses the hand-written kernel, Vulkan and Metal use
+    /// register-blocked ZSL, and other backends use naive ZSL.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
-        if device.backend() == BackendPreference::Vulkan {
+        if matches!(
+            device.backend(),
+            BackendPreference::Vulkan | BackendPreference::Metal
+        ) {
             let (shader, entry) = GEMM_TILED_ZSL.create(device)?;
             let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
                 shader,
