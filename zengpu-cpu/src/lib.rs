@@ -10,8 +10,8 @@
 //! pipeline as usual and then register a Rust function for that
 //! [`PipelineHandle`] via [`CpuDevice::register_kernel`]. When
 //! [`GpuDevice::dispatch`] is called, the backend looks up the function
-//! registered for the dispatched pipeline, copies the bound buffer data into a
-//! [`CpuKernelCtx`], calls the function, and writes modified buffers back.
+//! registered for the dispatched pipeline, lends the bound buffers' data to
+//! it in a [`CpuKernelCtx`], calls it, and puts the data back.
 //! This is the "oracle" model: CPU kernels are hand-written Rust
 //! functions that should produce bit-identical results to the GPU SPIR-V.
 //!
@@ -26,6 +26,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::mem::take;
 use std::sync::Mutex;
 
 use zengpu_hal::{
@@ -40,9 +41,9 @@ use zengpu_hal::{
 
 /// Arguments passed to a CPU kernel by [`CpuDevice::dispatch`].
 ///
-/// `buffers[i]` is a clone of the data in the buffer at slot index
-/// `bindings.buffers[i]`. Modify in place; the backend writes modified data
-/// back to the originating slots after the kernel returns.
+/// `buffers[i]` holds the data of the buffer at slot index
+/// `bindings.buffers[i]`, lent for the call. Modify it in place, keeping its
+/// length; it goes back to its buffer when the kernel returns.
 pub struct CpuKernelCtx {
     pub buffers: Vec<Vec<u8>>,
     pub scalars: Vec<Scalar>,
@@ -317,7 +318,6 @@ impl GpuDevice for CpuDevice {
         bindings: Bindings<'_>,
         grid: [u32; 3],
     ) -> Result<()> {
-        // Get entry name.
         let entry = {
             let pipelines = self.pipelines.lock().unwrap();
             let p = pipelines
@@ -325,51 +325,61 @@ impl GpuDevice for CpuDevice {
                 .ok_or_else(|| GpuError::Dispatch("stale pipeline handle".to_string()))?;
             p.entry.clone()
         };
+        let kernels = self.kernels.lock().unwrap();
+        let kernel = kernels.get(&pipeline).ok_or_else(|| {
+            GpuError::Dispatch(format!(
+                "no CPU kernel registered for pipeline (entry '{entry}'); \
+                 call CpuDevice::register_kernel before dispatching"
+            ))
+        })?;
 
-        // Snapshot bound buffer data (clone so we can write back without holding lock).
-        let mut buf_data: Vec<Vec<u8>> = {
-            let buffers = self.buffers.lock().unwrap();
-            bindings
-                .buffers
-                .iter()
-                .map(|&idx| {
-                    buffers
-                        .get_by_slot_index(idx)
-                        .map(|b| b.data.clone())
-                        .unwrap_or_default()
-                })
-                .collect()
-        };
-
-        // Build context and invoke kernel.
+        // The bound buffers are lent to the kernel rather than copied, and
+        // the table stays locked meanwhile so nobody sees them taken. Each
+        // buffer is bound once: two copies of one would leave which write
+        // wins to chance.
+        let mut buffers = self.buffers.lock().unwrap();
+        for (i, &idx) in bindings.buffers.iter().enumerate() {
+            if buffers.get_by_slot_index(idx).is_none() {
+                return Err(GpuError::Dispatch(format!(
+                    "binding {i} names buffer slot {idx}, which holds no buffer"
+                )));
+            }
+            if bindings.buffers[..i].contains(&idx) {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!(
+                        "buffer slot {idx} is bound twice; the CPU backend binds each buffer once"
+                    ),
+                )));
+            }
+        }
+        let lent: Vec<Vec<u8>> = bindings
+            .buffers
+            .iter()
+            .map(|&idx| take(&mut buffers.get_mut_by_slot_index(idx).unwrap().data))
+            .collect();
+        let sizes: Vec<usize> = lent.iter().map(Vec::len).collect();
         let mut ctx = CpuKernelCtx {
-            buffers: buf_data,
+            buffers: lent,
             scalars: bindings.scalars.to_vec(),
             grid,
         };
-        {
-            let kernels = self.kernels.lock().unwrap();
-            let kernel = kernels.get(&pipeline).ok_or_else(|| {
-                GpuError::Dispatch(format!(
-                    "no CPU kernel registered for pipeline (entry '{entry}'); \
-                     call CpuDevice::register_kernel before dispatching"
-                ))
-            })?;
-            kernel(&mut ctx);
-        }
-        buf_data = ctx.buffers;
+        kernel(&mut ctx);
 
-        // Write modified buffer data back.
-        {
-            let mut buffers = self.buffers.lock().unwrap();
-            for (&idx, new_data) in bindings.buffers.iter().zip(buf_data.iter()) {
-                if let Some(buf) = buffers.get_mut_by_slot_index(idx) {
-                    buf.data.clear();
-                    buf.data.extend_from_slice(new_data);
-                }
+        // A kernel cannot resize a buffer; one that tried gets its buffer
+        // back at its own size and an error.
+        let mut resized = None;
+        for ((&idx, mut data), size) in bindings.buffers.iter().zip(ctx.buffers).zip(sizes) {
+            if data.len() != size {
+                resized = Some(idx);
+                data.resize(size, 0);
             }
+            buffers.get_mut_by_slot_index(idx).unwrap().data = data;
         }
-
+        if let Some(idx) = resized {
+            return Err(GpuError::Dispatch(format!(
+                "the kernel for entry '{entry}' resized buffer slot {idx}"
+            )));
+        }
         Ok(())
     }
 }
@@ -666,6 +676,62 @@ mod tests {
         dev.destroy_buffer(ha);
         dev.destroy_buffer(hb);
         dev.destroy_buffer(hout);
+    }
+
+    fn noop_pipeline(dev: &CpuDevice, kernel: CpuKernel) -> PipelineHandle {
+        let shader = dev.create_shader(ShaderDesc::spirv(&[0u8; 4])).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        dev.register_kernel(pipeline, kernel);
+        pipeline
+    }
+
+    fn bound(buffers: &[u32]) -> Bindings<'_> {
+        Bindings {
+            buffers,
+            ..Bindings::default()
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_missing_and_repeated_buffers() {
+        let dev = CpuDevice::new();
+        let pipeline = noop_pipeline(&dev, Box::new(|_| {}));
+        let h = dev.create_buffer(rw_desc(4)).unwrap();
+        assert!(matches!(
+            dev.dispatch(pipeline, bound(&[h.index() + 1]), [1, 1, 1]),
+            Err(GpuError::Dispatch(_))
+        ));
+        assert!(matches!(
+            dev.dispatch(pipeline, bound(&[h.index(), h.index()]), [1, 1, 1]),
+            Err(GpuError::InvalidUsage(UsageError::BindingMismatch(_)))
+        ));
+        dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_kernel_cannot_resize_a_buffer() {
+        let dev = CpuDevice::new();
+        let pipeline = noop_pipeline(
+            &dev,
+            Box::new(|ctx| {
+                ctx.buffers[0][0] = 7;
+                ctx.buffers[0].push(9);
+            }),
+        );
+        let h = dev.create_buffer(rw_desc(4)).unwrap();
+        assert!(
+            dev.dispatch(pipeline, bound(&[h.index()]), [1, 1, 1])
+                .is_err()
+        );
+        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [7, 0, 0, 0]);
+        assert!(dev.read_buffer(h, 0, 5).is_err());
     }
 
     #[test]
