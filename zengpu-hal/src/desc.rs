@@ -125,6 +125,17 @@ pub struct ComputePipelineDesc<'a> {
     pub block: [u32; 3],
 }
 
+/// Optional tuning for a compute pipeline. Every field is a request a
+/// backend may ignore when the device cannot honour it; results never
+/// depend on it, only speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ComputePipelineHints {
+    /// Lanes per subgroup (wave/warp) to run the pipeline at, e.g. 64 for
+    /// wave64 on AMD RDNA, whose drivers often default compute to wave32.
+    /// Ignored outside the device's supported range.
+    pub subgroup_size: Option<u32>,
+}
+
 /// Texture sampling filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FilterMode {

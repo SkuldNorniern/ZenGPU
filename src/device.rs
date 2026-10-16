@@ -3,9 +3,9 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
     BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
-    DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities, MemoryBudget,
-    PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle, Submission,
-    TextureDesc, TextureHandle, TextureRegion, TextureWrite,
+    ComputePipelineHints, DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities,
+    MemoryBudget, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
+    Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -321,6 +321,14 @@ impl GpuDevice for Device {
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
         self.inner.create_compute_pipeline(desc)
+    }
+
+    fn create_compute_pipeline_with(
+        &self,
+        desc: ComputePipelineDesc<'_>,
+        hints: ComputePipelineHints,
+    ) -> Result<PipelineHandle> {
+        self.inner.create_compute_pipeline_with(desc, hints)
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
