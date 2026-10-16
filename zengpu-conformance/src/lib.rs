@@ -1079,3 +1079,127 @@ mod devarray_matmul_tests {
         gemm.destroy(&*vk);
     }
 }
+
+#[cfg(test)]
+mod half_buffer_tests {
+    //! ZSL `buffer<f16>`/`buffer<bf16>` on Vulkan, where halves are packed two
+    //! per u32 word. Skips if no Vulkan driver is present.
+
+    use zengpu_hal::{
+        AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
+        GpuInstance, MemoryUsage, Scalar,
+    };
+    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_vulkan::VulkanInstance;
+
+    const HALF_IO_ZSL: ZslShader = zsl!(
+        push P { n: u32 }
+        @workgroup_size(64)
+        kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.n {
+                yh[i] = xh[i] * 2.0
+                yb[i] = xb[i] * 2.0
+                sum[i] = xh[i] + xb[i]
+            }
+        }
+    );
+
+    /// Binary16 bits of `x`, for values exactly representable as normal halves.
+    fn f16_bits(x: f32) -> u16 {
+        if x == 0.0 {
+            return 0;
+        }
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as u16 - 112;
+        sign | (exp << 10) | ((b & 0x007f_ffff) >> 13) as u16
+    }
+
+    fn f16_value(h: u16) -> f32 {
+        if h & 0x7fff == 0 {
+            return 0.0;
+        }
+        let sign = u32::from(h & 0x8000) << 16;
+        let exp = u32::from((h >> 10) & 0x1f) + 112;
+        f32::from_bits(sign | (exp << 23) | (u32::from(h & 0x3ff) << 13))
+    }
+
+    #[test]
+    fn vulkan_half_buffers_load_and_store() {
+        let Some(vk) = VulkanInstance::new().ok().and_then(|inst| {
+            inst.request_adapter(AdapterRequest::default())?
+                .open(DeviceRequest::default())
+                .ok()
+        }) else {
+            return;
+        };
+        let (shader, entry) = HALF_IO_ZSL.create(&*vk).unwrap();
+        let pipeline = vk
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        // Odd length so the last element sits alone in its word; exact in
+        // both formats (bf16 keeps 8 significant bits).
+        let n = 1001u32;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 256) as f32 - 128.0) * 0.25).collect();
+        let xh: Vec<u8> = x.iter().flat_map(|&v| f16_bits(v).to_le_bytes()).collect();
+        let xb: Vec<u8> = x
+            .iter()
+            .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        let buffer = |size: u64| {
+            vk.create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+        };
+        let half_bytes = u64::from(n) * 2;
+        let bufs = [
+            buffer(half_bytes),
+            buffer(half_bytes),
+            buffer(half_bytes),
+            buffer(half_bytes),
+            buffer(u64::from(n) * 4),
+        ];
+        vk.write_buffer(bufs[0], 0, &xh).unwrap();
+        vk.write_buffer(bufs[1], 0, &xb).unwrap();
+        let slots: Vec<u32> = bufs.iter().map(|b| b.index()).collect();
+        vk.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+        let halves = |i: usize| -> Vec<u16> {
+            vk.read_buffer(bufs[i], 0, half_bytes)
+                .unwrap()
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect()
+        };
+        let (yh, yb) = (halves(2), halves(3));
+        let sum = crate::from_bytes_f32(&vk.read_buffer(bufs[4], 0, u64::from(n) * 4).unwrap());
+        for i in 0..n as usize {
+            let want = 2.0 * x[i];
+            assert_eq!(f16_value(yh[i]), want, "f16 at {i}");
+            assert_eq!(f32::from_bits(u32::from(yb[i]) << 16), want, "bf16 at {i}");
+            assert_eq!(sum[i], want, "sum at {i}");
+        }
+        for b in bufs {
+            vk.destroy_buffer(b);
+        }
+        vk.destroy_pipeline(pipeline);
+        vk.destroy_shader(shader);
+    }
+}
