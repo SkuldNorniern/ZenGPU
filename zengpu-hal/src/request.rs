@@ -127,6 +127,8 @@ pub struct DeviceLimits {
     pub timestamp_supported: bool,
     /// Nanoseconds per timestamp tick.
     pub timestamp_period_ns: f32,
+    /// Parallel units (CUs, SMs, GPU cores), for sizing grids. 0 if unknown.
+    pub compute_units: u32,
 }
 
 #[cfg(test)]

@@ -1245,6 +1245,11 @@ impl GpuDevice for HipDevice {
             max_storage_buffer_range: info.total_mem as u64,
             max_push_constant_size: (MAX_PARAMS * 4) as u32,
             max_storage_buffers: MAX_PARAMS as u32,
+            compute_units: if info.gfx_family.is_rdna() {
+                info.cu_count * 2
+            } else {
+                info.cu_count
+            },
             ..DeviceLimits::default()
         }
     }
