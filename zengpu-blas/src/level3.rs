@@ -1,9 +1,9 @@
 //! BLAS Level 3 — matrix-matrix operations.
 
-use zengpu_compute::{BufferPool, DeviceArray};
+use zengpu_compute::{BufferPool, DeviceArray, OpList};
 use zengpu_hal::{
-    BackendPreference, Bindings, ComputePipelineDesc, ComputePipelineHints, DType, DispatchOp,
-    GpuDevice, GpuError, PipelineHandle, Result, Scalar, ShaderDesc, ShaderHandle,
+    BackendPreference, ComputePipelineDesc, ComputePipelineHints, DType, GpuDevice, GpuError,
+    PipelineHandle, Result, Scalar, ShaderDesc, ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
 
@@ -249,11 +249,32 @@ impl GemmKernel {
     ///
     /// `a.shape = [m, k]`, `b.shape = [k, n]`. `C` is allocated from `pool`
     /// and returned as a new `[m, n]` `DeviceArray`. `alpha = 1.0` gives
-    /// the simple `C = A @ B` form.
+    /// the simple `C = A @ B` form. Waits for the GPU; use
+    /// [`Self::record_sgemm`] to chain it with other ops in one submission.
     pub fn sgemm(
         &self,
         device: &dyn GpuDevice,
         pool: &BufferPool,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+    ) -> Result<DeviceArray> {
+        let mut ops = OpList::new(pool);
+        let c = self.record_sgemm(&mut ops, alpha, a, b)?;
+        match ops.run(device) {
+            Ok(()) => Ok(c),
+            Err(e) => {
+                pool.free(c);
+                Err(e)
+            }
+        }
+    }
+
+    /// Record [`Self::sgemm`] into `ops`. `C` is allocated now and written
+    /// when the list runs; any split-K workspace is kept by the list.
+    pub fn record_sgemm(
+        &self,
+        ops: &mut OpList<'_>,
         alpha: f32,
         a: &DeviceArray,
         b: &DeviceArray,
@@ -275,69 +296,58 @@ impl GemmKernel {
                 "sgemm: inner dimensions mismatch ({k} vs {k2})"
             )));
         }
+        let mn = m.checked_mul(n).ok_or_else(|| {
+            GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
+        })?;
 
-        let c = pool.alloc(vec![m, n], DType::F32)?;
-        if let Some(hip) = &self.hip {
-            return match self.sgemm_hip(hip, device, pool, alpha, a, b, &c, [m, n, k]) {
-                Ok(()) => Ok(c),
-                Err(e) => {
-                    pool.free(c);
-                    Err(e)
-                }
-            };
-        }
-        if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
-            return match self.sgemm_skinny(zsl, device, pool, alpha, a, b, &c, [m, n, k]) {
-                Ok(()) => Ok(c),
-                Err(e) => {
-                    pool.free(c);
-                    Err(e)
-                }
-            };
-        }
-        device.dispatch(
-            self.pipeline,
-            Bindings {
-                buffers: &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
-                scalars: &[
+        let c = ops.pool().alloc(vec![m, n], DType::F32)?;
+        let recorded = if let Some(hip) = &self.hip {
+            self.record_hip(hip, ops, alpha, a, b, &c, [m, n, k, mn])
+        } else if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
+            record_skinny(zsl, ops, alpha, a, b, &c, [m, n, k, mn])
+        } else {
+            ops.dispatch(
+                self.pipeline,
+                &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
+                &[
                     Scalar::U32(m),
                     Scalar::U32(n),
                     Scalar::U32(k),
                     Scalar::F32(alpha),
                 ],
-                textures: &[],
-                images: &[],
-            },
-            [n.div_ceil(self.tile), m.div_ceil(self.tile), 1],
-        )?;
-        Ok(c)
+                [n.div_ceil(self.tile), m.div_ceil(self.tile), 1],
+            );
+            Ok(())
+        };
+        match recorded {
+            Ok(()) => Ok(c),
+            Err(e) => {
+                ops.pool().free(c);
+                Err(e)
+            }
+        }
     }
 
-    /// Run the HIP kernel [`gemm_hip::plan`] picks for this shape, then the
-    /// split-K reduction when K was split, as one batch.
+    /// Record the HIP kernel [`gemm_hip::plan`] picks for this shape, then
+    /// the split-K reduction when K was split.
     #[allow(clippy::too_many_arguments)]
-    fn sgemm_hip(
+    fn record_hip(
         &self,
         hip: &HipGemm,
-        device: &dyn GpuDevice,
-        pool: &BufferPool,
+        ops: &mut OpList<'_>,
         alpha: f32,
         a: &DeviceArray,
         b: &DeviceArray,
         c: &DeviceArray,
-        [m, n, k]: [u32; 3],
+        [m, n, k, mn]: [u32; 4],
     ) -> Result<()> {
-        let mn = m.checked_mul(n).ok_or_else(|| {
-            GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
-        })?;
         let plan = gemm_hip::plan(m, n, k, hip.compute_units);
         let split = plan.split();
-        let workspace = if split > 1 {
-            Some(pool.alloc(vec![split, m, n], DType::F32)?)
+        let target = if split > 1 {
+            ops.scratch(vec![split, m, n], DType::F32)?
         } else {
-            None
+            c.buffer.index()
         };
-        let target = workspace.as_ref().unwrap_or(c);
         let (pipeline, kparam) = match plan {
             Plan::Skinny { rows, kc, .. } => {
                 let slot = SKINNY_ROWS.iter().position(|&r| r == rows).unwrap_or(0);
@@ -347,104 +357,27 @@ impl GemmKernel {
                 (if tile == 128 { self.pipeline } else { hip.t64 }, kchunk)
             }
         };
-        let gemm_buffers = [a.buffer.index(), b.buffer.index(), target.buffer.index()];
-        let gemm_scalars = [
-            Scalar::U32(m),
-            Scalar::U32(n),
-            Scalar::U32(k),
-            Scalar::U32(kparam),
-            Scalar::F32(alpha),
-        ];
-        let reduce_buffers = [target.buffer.index(), c.buffer.index()];
-        let reduce_scalars = [Scalar::U32(mn), Scalar::U32(split)];
-        let mut ops = vec![DispatchOp {
+        ops.dispatch(
             pipeline,
-            bindings: Bindings {
-                buffers: &gemm_buffers,
-                textures: &[],
-                images: &[],
-                scalars: &gemm_scalars,
-            },
-            grid: plan.grid(m, n),
-        }];
-        if workspace.is_some() {
-            ops.push(DispatchOp {
-                pipeline: hip.reduce,
-                bindings: Bindings {
-                    buffers: &reduce_buffers,
-                    textures: &[],
-                    images: &[],
-                    scalars: &reduce_scalars,
-                },
-                grid: [mn.div_ceil(256), 1, 1],
-            });
+            &[a.buffer.index(), b.buffer.index(), target],
+            &[
+                Scalar::U32(m),
+                Scalar::U32(n),
+                Scalar::U32(k),
+                Scalar::U32(kparam),
+                Scalar::F32(alpha),
+            ],
+            plan.grid(m, n),
+        );
+        if split > 1 {
+            ops.dispatch(
+                hip.reduce,
+                &[target, c.buffer.index()],
+                &[Scalar::U32(mn), Scalar::U32(split)],
+                [mn.div_ceil(256), 1, 1],
+            );
         }
-        let result = device.dispatch_batch(&ops);
-        if let Some(workspace) = workspace {
-            pool.free(workspace);
-        }
-        result
-    }
-
-    /// Run the Vulkan skinny kernel for the smallest row class holding `m`
-    /// rows, then the split-K reduction, as one batch. The skinny kernel
-    /// always writes partial sums to the workspace, so the reduce always runs.
-    #[allow(clippy::too_many_arguments)]
-    fn sgemm_skinny(
-        &self,
-        zsl: &ZslSkinny,
-        device: &dyn GpuDevice,
-        pool: &BufferPool,
-        alpha: f32,
-        a: &DeviceArray,
-        b: &DeviceArray,
-        c: &DeviceArray,
-        [m, n, k]: [u32; 3],
-    ) -> Result<()> {
-        let mn = m.checked_mul(n).ok_or_else(|| {
-            GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
-        })?;
-        let split = k.max(1).div_ceil(gemm_skinny::KC);
-        let slot = gemm_skinny::ROWS
-            .iter()
-            .position(|&r| r >= m)
-            .unwrap_or(gemm_skinny::ROWS.len() - 1);
-        let workspace = pool.alloc(vec![split, m, n], DType::F32)?;
-        let gemm_buffers = [a.buffer.index(), b.buffer.index(), workspace.buffer.index()];
-        let gemm_scalars = [
-            Scalar::U32(m),
-            Scalar::U32(n),
-            Scalar::U32(k),
-            Scalar::U32(gemm_skinny::KC),
-            Scalar::F32(alpha),
-        ];
-        let reduce_buffers = [workspace.buffer.index(), c.buffer.index()];
-        let reduce_scalars = [Scalar::U32(mn), Scalar::U32(split)];
-        let ops = [
-            DispatchOp {
-                pipeline: zsl.skinny[slot],
-                bindings: Bindings {
-                    buffers: &gemm_buffers,
-                    textures: &[],
-                    images: &[],
-                    scalars: &gemm_scalars,
-                },
-                grid: [n.div_ceil(256), split, 1],
-            },
-            DispatchOp {
-                pipeline: zsl.reduce,
-                bindings: Bindings {
-                    buffers: &reduce_buffers,
-                    textures: &[],
-                    images: &[],
-                    scalars: &reduce_scalars,
-                },
-                grid: [mn.div_ceil(256), 1, 1],
-            },
-        ];
-        let result = device.dispatch_batch(&ops);
-        pool.free(workspace);
-        result
+        Ok(())
     }
 
     /// `C = A @ B` — shorthand for [`Self::sgemm`] with `alpha = 1.0`.
@@ -457,4 +390,44 @@ impl GemmKernel {
     ) -> Result<DeviceArray> {
         self.sgemm(device, pool, 1.0, a, b)
     }
+}
+
+/// Record the Vulkan skinny kernel for the smallest row class holding `m`
+/// rows, then the split-K reduction. The skinny kernel always writes partial
+/// sums to the workspace, so the reduction always runs.
+#[allow(clippy::too_many_arguments)]
+fn record_skinny(
+    zsl: &ZslSkinny,
+    ops: &mut OpList<'_>,
+    alpha: f32,
+    a: &DeviceArray,
+    b: &DeviceArray,
+    c: &DeviceArray,
+    [m, n, k, mn]: [u32; 4],
+) -> Result<()> {
+    let split = k.max(1).div_ceil(gemm_skinny::KC);
+    let slot = gemm_skinny::ROWS
+        .iter()
+        .position(|&r| r >= m)
+        .unwrap_or(gemm_skinny::ROWS.len() - 1);
+    let workspace = ops.scratch(vec![split, m, n], DType::F32)?;
+    ops.dispatch(
+        zsl.skinny[slot],
+        &[a.buffer.index(), b.buffer.index(), workspace],
+        &[
+            Scalar::U32(m),
+            Scalar::U32(n),
+            Scalar::U32(k),
+            Scalar::U32(gemm_skinny::KC),
+            Scalar::F32(alpha),
+        ],
+        [n.div_ceil(256), split, 1],
+    );
+    ops.dispatch(
+        zsl.reduce,
+        &[workspace, c.buffer.index()],
+        &[Scalar::U32(mn), Scalar::U32(split)],
+        [mn.div_ceil(256), 1, 1],
+    );
+    Ok(())
 }
