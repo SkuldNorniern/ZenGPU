@@ -2,11 +2,12 @@
 
 use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
-    BackendPreference, Bindings, ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle,
-    Result, Scalar, ShaderDesc, ShaderHandle,
+    BackendPreference, Bindings, ComputePipelineDesc, DType, DispatchOp, GpuDevice, GpuError,
+    PipelineHandle, Result, Scalar, ShaderDesc, ShaderHandle,
 };
 use zengpu_spirv::{ZslShader, zsl};
 
+use crate::gemm_hip::{self, Plan, SKINNY_ROWS};
 use crate::gemm_tiled::{GEMM_TILED_ZSL, TILE as TILED_GEMM_TILE};
 
 /// Computes `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`.
@@ -31,80 +32,20 @@ const GEMM_ZSL: ZslShader = zsl!(
 /// Compiled GEMM pipeline. Create once per device, reuse across dispatches.
 pub struct GemmKernel {
     shader: ShaderHandle,
+    /// The general-purpose pipeline (on HIP, the 128×128-tile kernel).
     pub pipeline: PipelineHandle,
     /// Output tile per workgroup: 16 for the naive kernel, 128 for the register-blocked ones.
     tile: u32,
+    /// The shape-specific kernels, on HIP.
+    hip: Option<HipGemm>,
 }
 
-/// Register-blocked f32 GEMM for AMD GPUs (HIP).
-///
-/// Each 256-thread block computes a 128×128 tile of C from 8-deep slices of A and B in LDS. Each
-/// thread accumulates an 8×8 sub-block in registers with a 16-element stride, so LDS reads are
-/// conflict-free. A is staged transposed (`As[k][m]`), padded by 4 against bank conflicts on the
-/// transposed store. Edges zero-fill on load and mask on store.
-///
-/// LDS use is 8.4 KiB, so it fits every gfx9-gfx12 part.
-const GEMM_HIP_TILED: &str = r#"
-#define BM 128
-#define BN 128
-#define BK 8
-#define TM 8
-#define TN 8
-extern "C" __global__ __launch_bounds__(256)
-void sgemm_tiled(const float* __restrict__ A, const float* __restrict__ B,
-                 float* __restrict__ C, unsigned int M, unsigned int N,
-                 unsigned int K, float alpha) {
-    __shared__ float As[BK][BM + 4];
-    __shared__ float Bs[BK][BN + 4];
-    const int tid = threadIdx.x;
-    const int tx = tid % 16;
-    const int ty = tid / 16;
-    const int bm = blockIdx.y * BM;
-    const int bn = blockIdx.x * BN;
-    float acc[TM][TN] = {};
-    for (unsigned int k0 = 0; k0 < K; k0 += BK) {
-        #pragma unroll
-        for (int s = 0; s < (BM * BK) / 256; ++s) {
-            int idx = tid + s * 256;
-            int r = idx / BK, c = idx % BK;
-            unsigned int gm = bm + r, gk = k0 + c;
-            As[c][r] = (gm < M && gk < K) ? A[(size_t)gm * K + gk] : 0.0f;
-        }
-        #pragma unroll
-        for (int s = 0; s < (BN * BK) / 256; ++s) {
-            int idx = tid + s * 256;
-            int r = idx / BN, c = idx % BN;
-            unsigned int gk = k0 + r, gn = bn + c;
-            Bs[r][c] = (gk < K && gn < N) ? B[(size_t)gk * N + gn] : 0.0f;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < BK; ++k) {
-            float a[TM], b[TN];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i) a[i] = As[k][ty + i * 16];
-            #pragma unroll
-            for (int j = 0; j < TN; ++j) b[j] = Bs[k][tx + j * 16];
-            #pragma unroll
-            for (int i = 0; i < TM; ++i)
-                #pragma unroll
-                for (int j = 0; j < TN; ++j) acc[i][j] += a[i] * b[j];
-        }
-        __syncthreads();
-    }
-    #pragma unroll
-    for (int i = 0; i < TM; ++i) {
-        unsigned int gm = bm + ty + i * 16;
-        if (gm < M) {
-            #pragma unroll
-            for (int j = 0; j < TN; ++j) {
-                unsigned int gn = bn + tx + j * 16;
-                if (gn < N) C[(size_t)gm * N + gn] = alpha * acc[i][j];
-            }
-        }
-    }
+struct HipGemm {
+    t64: PipelineHandle,
+    skinny: [PipelineHandle; SKINNY_ROWS.len()],
+    reduce: PipelineHandle,
+    compute_units: u32,
 }
-"#;
 
 impl GemmKernel {
     /// Compiles the GEMM pipeline. HIP uses the hand-written kernel, Vulkan and Metal use
@@ -125,6 +66,7 @@ impl GemmKernel {
                     shader,
                     pipeline,
                     tile: TILED_GEMM_TILE,
+                    hip: None,
                 }),
                 Err(e) => {
                     device.destroy_shader(shader);
@@ -133,23 +75,7 @@ impl GemmKernel {
             };
         }
         if device.backend() == BackendPreference::Hip {
-            let shader = device.create_shader(ShaderDesc::hip(GEMM_HIP_TILED))?;
-            let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "sgemm_tiled",
-                block: [256, 1, 1],
-            });
-            return match pipeline {
-                Ok(pipeline) => Ok(Self {
-                    shader,
-                    pipeline,
-                    tile: 128,
-                }),
-                Err(e) => {
-                    device.destroy_shader(shader);
-                    Err(e)
-                }
-            };
+            return Self::new_hip(device);
         }
         let (shader, entry) = GEMM_ZSL.create(device)?;
         let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
@@ -161,11 +87,63 @@ impl GemmKernel {
             shader,
             pipeline,
             tile: 16,
+            hip: None,
         })
+    }
+
+    fn new_hip(device: &dyn GpuDevice) -> Result<Self> {
+        let shader = device.create_shader(ShaderDesc::hip(gemm_hip::SOURCE))?;
+        let mut made: Vec<PipelineHandle> = Vec::new();
+        let mut pipeline = |entry: &str, block: u32| -> Result<PipelineHandle> {
+            let p = device.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [block, 1, 1],
+            })?;
+            made.push(p);
+            Ok(p)
+        };
+        let built = (|| {
+            let t128 = pipeline("sgemm_t128", 256)?;
+            let t64 = pipeline("sgemm_t64", 256)?;
+            let reduce = pipeline("sgemm_reduce", 256)?;
+            let mut skinny = [t128; SKINNY_ROWS.len()];
+            for (slot, rows) in skinny.iter_mut().zip(SKINNY_ROWS) {
+                *slot = pipeline(&format!("sgemm_skinny_{rows}"), gemm_hip::SKINNY_THREADS)?;
+            }
+            Ok((t128, t64, reduce, skinny))
+        })();
+        match built {
+            Ok((t128, t64, reduce, skinny)) => Ok(Self {
+                shader,
+                pipeline: t128,
+                tile: 128,
+                hip: Some(HipGemm {
+                    t64,
+                    skinny,
+                    reduce,
+                    compute_units: device.limits().compute_units,
+                }),
+            }),
+            Err(e) => {
+                for p in made {
+                    device.destroy_pipeline(p);
+                }
+                device.destroy_shader(shader);
+                Err(e)
+            }
+        }
     }
 
     pub fn destroy(self, device: &dyn GpuDevice) {
         device.destroy_pipeline(self.pipeline);
+        if let Some(hip) = self.hip {
+            device.destroy_pipeline(hip.t64);
+            device.destroy_pipeline(hip.reduce);
+            for p in hip.skinny {
+                device.destroy_pipeline(p);
+            }
+        }
         device.destroy_shader(self.shader);
     }
 
@@ -197,6 +175,15 @@ impl GemmKernel {
         }
 
         let c = pool.alloc(vec![m, n], DType::F32)?;
+        if let Some(hip) = &self.hip {
+            return match self.sgemm_hip(hip, device, pool, alpha, a, b, &c, [m, n, k]) {
+                Ok(()) => Ok(c),
+                Err(e) => {
+                    pool.free(c);
+                    Err(e)
+                }
+            };
+        }
         device.dispatch(
             self.pipeline,
             Bindings {
@@ -213,6 +200,79 @@ impl GemmKernel {
             [n.div_ceil(self.tile), m.div_ceil(self.tile), 1],
         )?;
         Ok(c)
+    }
+
+    /// Runs the [`gemm_hip::plan`] kernel for this shape, then the split-K reduction if K was
+    /// split, as one batch.
+    #[allow(clippy::too_many_arguments)]
+    fn sgemm_hip(
+        &self,
+        hip: &HipGemm,
+        device: &dyn GpuDevice,
+        pool: &BufferPool,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+        c: &DeviceArray,
+        [m, n, k]: [u32; 3],
+    ) -> Result<()> {
+        let mn = m.checked_mul(n).ok_or_else(|| {
+            GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
+        })?;
+        let plan = gemm_hip::plan(m, n, k, hip.compute_units);
+        let split = plan.split();
+        let workspace = if split > 1 {
+            Some(pool.alloc(vec![split, m, n], DType::F32)?)
+        } else {
+            None
+        };
+        let target = workspace.as_ref().unwrap_or(c);
+        let (pipeline, kparam) = match plan {
+            Plan::Skinny { rows, kc, .. } => {
+                let slot = SKINNY_ROWS.iter().position(|&r| r == rows).unwrap_or(0);
+                (hip.skinny[slot], kc)
+            }
+            Plan::Tile { tile, kchunk, .. } => {
+                (if tile == 128 { self.pipeline } else { hip.t64 }, kchunk)
+            }
+        };
+        let gemm_buffers = [a.buffer.index(), b.buffer.index(), target.buffer.index()];
+        let gemm_scalars = [
+            Scalar::U32(m),
+            Scalar::U32(n),
+            Scalar::U32(k),
+            Scalar::U32(kparam),
+            Scalar::F32(alpha),
+        ];
+        let reduce_buffers = [target.buffer.index(), c.buffer.index()];
+        let reduce_scalars = [Scalar::U32(mn), Scalar::U32(split)];
+        let mut ops = vec![DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &gemm_buffers,
+                textures: &[],
+                images: &[],
+                scalars: &gemm_scalars,
+            },
+            grid: plan.grid(m, n),
+        }];
+        if workspace.is_some() {
+            ops.push(DispatchOp {
+                pipeline: hip.reduce,
+                bindings: Bindings {
+                    buffers: &reduce_buffers,
+                    textures: &[],
+                    images: &[],
+                    scalars: &reduce_scalars,
+                },
+                grid: [mn.div_ceil(256), 1, 1],
+            });
+        }
+        let result = device.dispatch_batch(&ops);
+        if let Some(workspace) = workspace {
+            pool.free(workspace);
+        }
+        result
     }
 
     /// Computes `C = A @ B`. This is [`Self::sgemm`] with `alpha = 1.0`.
