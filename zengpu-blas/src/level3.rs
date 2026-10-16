@@ -7,7 +7,7 @@ use zengpu_hal::{
 };
 use zengpu_spirv::{ZslShader, zsl};
 
-use crate::gemm_hip::{self, Plan, SKINNY_ROWS};
+use crate::gemm_hip::{self, B_TYPES, Plan, SKINNY_ROWS};
 use crate::gemm_skinny::{
     self, SKINNY_1_ZSL, SKINNY_4_ZSL, SKINNY_8_ZSL, SKINNY_16_ZSL, SPLIT_REDUCE_ZSL,
 };
@@ -50,8 +50,11 @@ pub struct GemmKernel {
 
 /// Every HIP GEMM entry point, from one module.
 struct HipGemm {
-    t64: PipelineHandle,
-    skinny: [PipelineHandle; SKINNY_ROWS.len()],
+    /// Per B element type, in `gemm_hip::B_TYPES` order (f32 first; the f32
+    /// 128 tile is also `GemmKernel::pipeline`).
+    t128: [PipelineHandle; B_TYPES.len()],
+    t64: [PipelineHandle; B_TYPES.len()],
+    skinny: [[PipelineHandle; SKINNY_ROWS.len()]; B_TYPES.len()],
     reduce: PipelineHandle,
     compute_units: u32,
 }
@@ -190,21 +193,29 @@ impl GemmKernel {
             Ok(p)
         };
         let built = (|| {
-            let t128 = pipeline("sgemm_t128", 256)?;
-            let t64 = pipeline("sgemm_t64", 256)?;
             let reduce = pipeline("sgemm_reduce", 256)?;
-            let mut skinny = [t128; SKINNY_ROWS.len()];
-            for (slot, rows) in skinny.iter_mut().zip(SKINNY_ROWS) {
-                *slot = pipeline(&format!("sgemm_skinny_{rows}"), gemm_hip::SKINNY_THREADS)?;
+            let mut t128 = [reduce; B_TYPES.len()];
+            let mut t64 = [reduce; B_TYPES.len()];
+            let mut skinny = [[reduce; SKINNY_ROWS.len()]; B_TYPES.len()];
+            for (i, (_, suffix)) in B_TYPES.iter().enumerate() {
+                t128[i] = pipeline(&format!("sgemm_t128{suffix}"), 256)?;
+                t64[i] = pipeline(&format!("sgemm_t64{suffix}"), 256)?;
+                for (slot, rows) in skinny[i].iter_mut().zip(SKINNY_ROWS) {
+                    *slot = pipeline(
+                        &format!("sgemm_skinny_{rows}{suffix}"),
+                        gemm_hip::SKINNY_THREADS,
+                    )?;
+                }
             }
             Ok((t128, t64, reduce, skinny))
         })();
         match built {
             Ok((t128, t64, reduce, skinny)) => Ok(Self {
                 shader,
-                pipeline: t128,
+                pipeline: t128[0],
                 tile: 128,
                 hip: Some(HipGemm {
+                    t128,
                     t64,
                     skinny,
                     reduce,
@@ -226,9 +237,12 @@ impl GemmKernel {
     pub fn destroy(self, device: &dyn GpuDevice) {
         device.destroy_pipeline(self.pipeline);
         if let Some(hip) = self.hip {
-            device.destroy_pipeline(hip.t64);
+            // t128[0] is `self.pipeline`, destroyed above.
+            for p in hip.t128.into_iter().skip(1).chain(hip.t64) {
+                device.destroy_pipeline(p);
+            }
             device.destroy_pipeline(hip.reduce);
-            for p in hip.skinny {
+            for p in hip.skinny.into_iter().flatten() {
                 device.destroy_pipeline(p);
             }
         }
@@ -279,12 +293,20 @@ impl GemmKernel {
         a: &DeviceArray,
         b: &DeviceArray,
     ) -> Result<DeviceArray> {
-        if a.dtype != DType::F32 || b.dtype != DType::F32 {
+        // Half-precision B (weights) runs on HIP; elsewhere everything is f32.
+        let b_type = B_TYPES.iter().position(|&(dtype, _)| dtype == b.dtype);
+        let b_ok = match b_type {
+            Some(0) => true,
+            Some(_) => self.hip.is_some(),
+            None => false,
+        };
+        if a.dtype != DType::F32 || !b_ok {
             return Err(GpuError::Dispatch(format!(
-                "sgemm: only f32 is supported, got {:?} and {:?}",
+                "sgemm: A must be f32 and B f32 (or f16/bf16 on HIP), got {:?} and {:?}",
                 a.dtype, b.dtype
             )));
         }
+        let b_type = b_type.unwrap_or(0);
         let (&[m, k], &[k2, n]) = (a.shape.as_slice(), b.shape.as_slice()) else {
             return Err(GpuError::Dispatch(format!(
                 "sgemm: expected 2D arrays, got shapes {:?} and {:?}",
@@ -302,7 +324,7 @@ impl GemmKernel {
 
         let c = ops.pool().alloc(vec![m, n], DType::F32)?;
         let recorded = if let Some(hip) = &self.hip {
-            self.record_hip(hip, ops, alpha, a, b, &c, [m, n, k, mn])
+            Self::record_hip(hip, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
         } else if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
             record_skinny(zsl, ops, alpha, a, b, &c, [m, n, k, mn])
         } else {
@@ -332,8 +354,8 @@ impl GemmKernel {
     /// the split-K reduction when K was split.
     #[allow(clippy::too_many_arguments)]
     fn record_hip(
-        &self,
         hip: &HipGemm,
+        b_type: usize,
         ops: &mut OpList<'_>,
         alpha: f32,
         a: &DeviceArray,
@@ -351,11 +373,16 @@ impl GemmKernel {
         let (pipeline, kparam) = match plan {
             Plan::Skinny { rows, kc, .. } => {
                 let slot = SKINNY_ROWS.iter().position(|&r| r == rows).unwrap_or(0);
-                (hip.skinny[slot], kc)
+                (hip.skinny[b_type][slot], kc)
             }
-            Plan::Tile { tile, kchunk, .. } => {
-                (if tile == 128 { self.pipeline } else { hip.t64 }, kchunk)
-            }
+            Plan::Tile { tile, kchunk, .. } => (
+                if tile == 128 {
+                    hip.t128[b_type]
+                } else {
+                    hip.t64[b_type]
+                },
+                kchunk,
+            ),
         };
         ops.dispatch(
             pipeline,
