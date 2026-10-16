@@ -1,17 +1,69 @@
 //! Hand-written f32 GEMM kernels for AMD GPUs (HIP), and the choice between them per shape.
 //!
-//! - Large outputs: a 128×128 tile per 256-thread workgroup, with an 8×8 register block per thread.
-//! - Small outputs: K is split across workgroups (partial products, then a deterministic
-//!    reduction). Below ~384², a 64×64 tile with a 4×4 register block is used.
-//! - M ≤ 32 (LLM decode) is bandwidth-bound: each thread streams four B columns with one 16-byte
-//!    load per row of K, keeps every output row in registers, and splits K for parallelism.
+//! - Large outputs: a 128×128 tile per 256-thread workgroup, 8×8 register block per thread.
+//! - Small outputs: split K across workgroups (partial products, then a deterministic reduction).
+//!    Below ~384², a 64×64 tile with a 4×4 register block.
+//! - M ≤ 32 (LLM decode) is bandwidth-bound. Each thread streams four B columns, loads one 16-byte
+//!    chunk per row of K, keeps every output row in registers, and splits K for parallelism.
 //!
-//! All kernels zero-fill past the edges and mask stores, so any M, N, K works.
+//! All kernels zero-fill past the edges and mask stores, so any M, N, K works. B may be f32, f16 or
+//! bf16 (LLM weights); A, C and arithmetic are f32.
 
 pub(crate) const SOURCE: &str = r#"
-template <int BM, int BN, int BK, int TM, int TN>
+// Half as raw bits: hipRTC has no hip_fp16.h. Conversion goes through clang's _Float16 on every
+// AMDGPU target.
+struct f16 { unsigned short bits; };
+struct bf16 { unsigned short bits; };
+
+__device__ __forceinline__ float f16_bits(unsigned int bits) {
+    return (float)__builtin_bit_cast(_Float16, (unsigned short)bits);
+}
+__device__ __forceinline__ float bf16_bits(unsigned int bits) {
+    return __uint_as_float(bits << 16);
+}
+__device__ __forceinline__ float to_f32(float v) { return v; }
+__device__ __forceinline__ float to_f32(f16 v) { return f16_bits(v.bits); }
+__device__ __forceinline__ float to_f32(bf16 v) { return bf16_bits(v.bits); }
+__device__ __forceinline__ float half_bits_to_f32(unsigned int bits, const f16*) {
+    return f16_bits(bits);
+}
+__device__ __forceinline__ float half_bits_to_f32(unsigned int bits, const bf16*) {
+    return bf16_bits(bits);
+}
+
+// Four consecutive B elements as f32; one aligned `vec` load when N % 4 == 0.
+__device__ __forceinline__ float4 load4(const float* row, unsigned int col,
+                                        unsigned int N, bool vec) {
+    if (vec) return *reinterpret_cast<const float4*>(row + col);
+    float4 b;
+    b.x = row[col];
+    b.y = col + 1 < N ? row[col + 1] : 0.0f;
+    b.z = col + 2 < N ? row[col + 2] : 0.0f;
+    b.w = col + 3 < N ? row[col + 3] : 0.0f;
+    return b;
+}
+template <typename H>
+__device__ __forceinline__ float4 load4(const H* row, unsigned int col,
+                                        unsigned int N, bool vec) {
+    float4 b;
+    if (vec) {
+        uint2 w = *reinterpret_cast<const uint2*>(row + col);
+        b.x = half_bits_to_f32(w.x & 0xffffu, row);
+        b.y = half_bits_to_f32(w.x >> 16, row);
+        b.z = half_bits_to_f32(w.y & 0xffffu, row);
+        b.w = half_bits_to_f32(w.y >> 16, row);
+        return b;
+    }
+    b.x = to_f32(row[col]);
+    b.y = col + 1 < N ? to_f32(row[col + 1]) : 0.0f;
+    b.z = col + 2 < N ? to_f32(row[col + 2]) : 0.0f;
+    b.w = col + 3 < N ? to_f32(row[col + 3]) : 0.0f;
+    return b;
+}
+
+template <int BM, int BN, int BK, int TM, int TN, typename BT>
 __device__ __forceinline__ void tile_gemm(
-        const float* __restrict__ A, const float* __restrict__ B,
+        const float* __restrict__ A, const BT* __restrict__ B,
         float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
         unsigned int kchunk, float alpha) {
     __shared__ float As[BK][BM + 4];
@@ -37,7 +89,7 @@ __device__ __forceinline__ void tile_gemm(
             int idx = tid + s * 256;
             int r = idx / BN, c = idx % BN;
             unsigned int gk = k0 + r, gn = bn + c;
-            Bs[r][c] = (gk < ke && gn < N) ? B[(size_t)gk * N + gn] : 0.0f;
+            Bs[r][c] = (gk < ke && gn < N) ? to_f32(B[(size_t)gk * N + gn]) : 0.0f;
         }
         __syncthreads();
         #pragma unroll
@@ -68,27 +120,27 @@ __device__ __forceinline__ void tile_gemm(
     }
 }
 
-extern "C" __global__ __launch_bounds__(256)
-void sgemm_t128(const float* __restrict__ A, const float* __restrict__ B,
-                float* __restrict__ C, unsigned int M, unsigned int N,
-                unsigned int K, unsigned int kchunk, float alpha) {
-    tile_gemm<128, 128, 8, 8, 8>(A, B, C, M, N, K, kchunk, alpha);
+#define TILE(NAME, BT, BM, BN, BK, TM, TN)                                     \
+extern "C" __global__ __launch_bounds__(256)                                   \
+void NAME(const float* __restrict__ A, const BT* __restrict__ B,               \
+          float* __restrict__ C, unsigned int M, unsigned int N,              \
+          unsigned int K, unsigned int kchunk, float alpha) {                  \
+    tile_gemm<BM, BN, BK, TM, TN, BT>(A, B, C, M, N, K, kchunk, alpha);        \
 }
-
-extern "C" __global__ __launch_bounds__(256)
-void sgemm_t64(const float* __restrict__ A, const float* __restrict__ B,
-               float* __restrict__ C, unsigned int M, unsigned int N,
-               unsigned int K, unsigned int kchunk, float alpha) {
-    tile_gemm<64, 64, 16, 4, 4>(A, B, C, M, N, K, kchunk, alpha);
-}
+TILE(sgemm_t128, float, 128, 128, 8, 8, 8)
+TILE(sgemm_t128_f16, f16, 128, 128, 8, 8, 8)
+TILE(sgemm_t128_bf16, bf16, 128, 128, 8, 8, 8)
+TILE(sgemm_t64, float, 64, 64, 16, 4, 4)
+TILE(sgemm_t64_f16, f16, 64, 64, 16, 4, 4)
+TILE(sgemm_t64_bf16, bf16, 64, 64, 16, 4, 4)
 
 #define SKINNY_THREADS 128
 #define SKINNY_KC_MAX 128
 
 // Rows 0..M of C (M <= MT). This thread owns columns col..col+3; K range [k0, k0 + kc).
-template <int MT>
+template <int MT, typename BT>
 __device__ __forceinline__ void skinny_gemm(
-        const float* __restrict__ A, const float* __restrict__ B,
+        const float* __restrict__ A, const BT* __restrict__ B,
         float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
         unsigned int kc, float alpha) {
     __shared__ float As[MT * SKINNY_KC_MAX];
@@ -104,16 +156,7 @@ __device__ __forceinline__ void skinny_gemm(
     float acc[MT][4] = {};
     const bool vec = (N % 4 == 0);
     for (unsigned int k = k0; k < k1; ++k) {
-        const float* row = B + (size_t)k * N;
-        float4 b;
-        if (vec) {
-            b = *reinterpret_cast<const float4*>(row + col);
-        } else {
-            b.x = row[col];
-            b.y = col + 1 < N ? row[col + 1] : 0.0f;
-            b.z = col + 2 < N ? row[col + 2] : 0.0f;
-            b.w = col + 3 < N ? row[col + 3] : 0.0f;
-        }
+        const float4 b = load4(B + (size_t)k * N, col, N, vec);
         const unsigned int kk = k - k0;
         #pragma unroll
         for (int m = 0; m < MT; ++m) {
@@ -135,19 +178,22 @@ __device__ __forceinline__ void skinny_gemm(
     }
 }
 
-#define SKINNY(MT)                                                             \
+#define SKINNY(NAME, MT, BT)                                                   \
 extern "C" __global__ __launch_bounds__(SKINNY_THREADS)                        \
-void sgemm_skinny_##MT(const float* __restrict__ A,                           \
-                       const float* __restrict__ B, float* __restrict__ C,    \
-                       unsigned int M, unsigned int N, unsigned int K,        \
-                       unsigned int kc, float alpha) {                         \
-    skinny_gemm<MT>(A, B, C, M, N, K, kc, alpha);                              \
+void NAME(const float* __restrict__ A, const BT* __restrict__ B,               \
+          float* __restrict__ C, unsigned int M, unsigned int N,              \
+          unsigned int K, unsigned int kc, float alpha) {                      \
+    skinny_gemm<MT, BT>(A, B, C, M, N, K, kc, alpha);                          \
 }
-SKINNY(1)
-SKINNY(4)
-SKINNY(8)
-SKINNY(16)
-SKINNY(32)
+#define SKINNY_ALL(MT)                                                         \
+    SKINNY(sgemm_skinny_##MT, MT, float)                                       \
+    SKINNY(sgemm_skinny_##MT##_f16, MT, f16)                                \
+    SKINNY(sgemm_skinny_##MT##_bf16, MT, bf16)
+SKINNY_ALL(1)
+SKINNY_ALL(4)
+SKINNY_ALL(8)
+SKINNY_ALL(16)
+SKINNY_ALL(32)
 
 extern "C" __global__ __launch_bounds__(256)
 void sgemm_reduce(const float* __restrict__ P, float* __restrict__ C,
@@ -160,6 +206,12 @@ void sgemm_reduce(const float* __restrict__ P, float* __restrict__ C,
     }
 }
 "#;
+
+pub(crate) const B_TYPES: [(zengpu_hal::DType, &str); 3] = [
+    (zengpu_hal::DType::F32, ""),
+    (zengpu_hal::DType::F16, "_f16"),
+    (zengpu_hal::DType::Bf16, "_bf16"),
+];
 
 pub(crate) const SKINNY_ROWS: [u32; 5] = [1, 4, 8, 16, 32];
 
