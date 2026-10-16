@@ -12,7 +12,7 @@ use zengpu_compute::{BufferPool, DeviceArray};
 use zengpu_hal::{
     AdapterRequest, Bindings, BufferCopyOp, BufferDesc, BufferUsage, ComputeOp,
     ComputePipelineDesc, DType, DeviceRequest, DispatchOp, GpuDevice, GpuInstance, MemoryUsage,
-    Scalar,
+    Scalar, SubmissionStatus,
 };
 use zengpu_metal::MetalInstance;
 use zengpu_spirv::{ZslShader, zsl};
@@ -223,8 +223,13 @@ fn batched_ops_run_in_order() {
         dst_offset: 0,
         len: desc.size,
     }));
+    let other = dev.create_buffer(desc).unwrap();
     let sub = dev.submit_compute_ops(7, &ops).unwrap();
     assert_eq!(sub.cycle_id(), 7);
+    dev.write_buffer(other, 0, &[1; 4]).unwrap();
+    if dev.read_buffer(copy, 0, 4).is_ok() {
+        assert_eq!(sub.poll().unwrap(), SubmissionStatus::Complete);
+    }
     sub.wait(Duration::from_secs(10)).unwrap();
     let words = |b| {
         dev.read_buffer(b, 0, desc.size)
@@ -237,6 +242,7 @@ fn batched_ops_run_in_order() {
     assert!(words(copy).iter().all(|&v| v == 150));
     dev.destroy_buffer(data);
     dev.destroy_buffer(copy);
+    dev.destroy_buffer(other);
     dev.destroy_pipeline(pipeline);
     dev.destroy_shader(shader);
 }

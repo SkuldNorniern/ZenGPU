@@ -83,6 +83,8 @@ pub(crate) struct Inner {
     pub(crate) lost: AtomicBool,
     /// Signalled as each command buffer completes.
     pub(crate) completions: Arc<Completions>,
+    /// Async submissions and their buffer slots. The host must not touch those buffers until done.
+    pub(crate) in_flight: Mutex<Vec<(CommandBuffer, Vec<u32>)>>,
 }
 
 /// Completed-buffer count. Waiters block on the condvar instead of polling.
@@ -299,6 +301,7 @@ impl MetalDevice {
                 last_submit: Mutex::new(None),
                 lost: AtomicBool::new(false),
                 completions: Arc::default(),
+                in_flight: Mutex::new(Vec::new()),
             }),
         })
     }
@@ -407,6 +410,24 @@ impl MetalDevice {
             .get(handle)
             .map(|t| (t.tex.clone(), t.desc))
             .ok_or_else(|| GpuError::Backend("metal: invalid texture handle".into()))
+    }
+
+    /// Fails while async work uses the buffer. Its contents belong to the GPU until done.
+    fn ensure_not_busy(&self, index: u32, op: &str) -> Result<()> {
+        let mut in_flight = lock(&self.inner.in_flight)?;
+        in_flight.retain(|(cmd, _)| {
+            !matches!(
+                cmd.status(),
+                MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+            )
+        });
+        if in_flight.iter().any(|(_, slots)| slots.contains(&index)) {
+            return Err(UsageError::BindingMismatch(format!(
+                "metal: {op} cannot touch a buffer pending GPU work still uses"
+            ))
+            .into());
+        }
+        Ok(())
     }
 
     fn in_bounds(offset: u64, len: u64, size: u64) -> Result<()> {
@@ -820,6 +841,7 @@ impl GpuDevice for MetalDevice {
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
+        self.ensure_not_busy(buffer.index(), "write_buffer")?;
         let buffers = lock(&self.inner.buffers)?;
         let b = buffers
             .get(buffer)
@@ -844,10 +866,17 @@ impl GpuDevice for MetalDevice {
     }
 
     fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.ensure_not_busy(buffer.index(), "read_buffer")?;
         let buffers = lock(&self.inner.buffers)?;
         let b = buffers
             .get(buffer)
             .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))?;
+        if !b.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
         Self::in_bounds(offset, dst.len() as u64, b.size)?;
         // SAFETY: as above.
         unsafe {
@@ -1284,6 +1313,14 @@ impl GpuDevice for MetalDevice {
 
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
         let cmd = self.commit_ops(ops)?;
+        let slots = ops
+            .iter()
+            .flat_map(|op| match op {
+                ComputeOp::Dispatch(d) => d.bindings.buffers.to_vec(),
+                ComputeOp::CopyBuffer(c) => vec![c.src.index(), c.dst.index()],
+            })
+            .collect();
+        lock(&self.inner.in_flight)?.push((cmd.clone(), slots));
         Ok(MetalSubmission::boxed_cycle(
             &self.inner,
             cycle_id,

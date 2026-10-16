@@ -223,6 +223,16 @@ mod tests {
         assert!(device.write_buffer(buf, u64::MAX - 1, &[0u8; 4]).is_err());
         assert!(device.read_buffer(buf, u64::MAX - 1, 4).is_err());
         device.destroy_buffer(buf);
+
+        let storage = device
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: zengpu_hal::BufferUsage::STORAGE,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create buffer");
+        assert!(device.read_buffer(storage, 0, 4).is_err());
+        device.destroy_buffer(storage);
     }
 
     #[cfg(target_os = "macos")]
