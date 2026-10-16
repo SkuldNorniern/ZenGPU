@@ -1917,6 +1917,7 @@ dependencies = [
 name = "zengpu-metal"
 version = "0.0.1"
 dependencies = [
+ "block",
  "core-graphics-types",
  "log",
  "metal",
