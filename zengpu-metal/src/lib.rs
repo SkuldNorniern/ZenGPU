@@ -382,6 +382,54 @@ mod tests {
         dev.read_buffer_into(buf, 0, &mut out).unwrap();
         assert_eq!(out, texels);
     }
+
+    /// A cube's six faces arrive in one upload, each at its own layer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cube_uploads_land_on_their_faces() {
+        use std::time::Duration;
+        use zengpu_hal::{
+            BufferUsage, Format, MemoryUsage, TexDim, TextureDesc, TextureRegion, TextureUsage,
+        };
+        let Some(dev) = open_metal() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::Cube,
+                mip_levels: 1,
+                array_layers: 6,
+            })
+            .unwrap();
+        let faces: Vec<u8> = (0..6u8).flat_map(|face| [face * 40 + 1; 16]).collect();
+        dev.upload_texture_data(tex, &faces).unwrap();
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        for layer in 0..6u32 {
+            let region = TextureRegion {
+                layer,
+                ..TextureRegion::rect(0, 0, 2, 2)
+            };
+            dev.copy_texture_region_to_buffer(tex, region, buf, 0, 8)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let mut out = [0u8; 16];
+            dev.read_buffer_into(buf, 0, &mut out).unwrap();
+            assert_eq!(out, [layer as u8 * 40 + 1; 16], "face {layer}");
+        }
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

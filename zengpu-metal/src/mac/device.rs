@@ -1050,16 +1050,25 @@ impl GpuDevice for MetalDevice {
             )
             .into());
         }
-        for layer in 0..layers {
-            let start = layer as usize * layer_bytes;
-            let chunk = &data[start..start + layer_bytes];
-            let region = TextureRegion {
-                layer,
-                ..TextureRegion::rect(0, 0, desc.width, desc.height)
-            };
-            self.write_region(texture, region, chunk, 0)?;
-        }
-        Ok(())
+        // Every layer in one command buffer, waited on once.
+        let (tex, _) = self.texture(texture)?;
+        let staged = (0..layers)
+            .map(|layer| {
+                let start = layer as usize * layer_bytes;
+                let region = TextureRegion { layer, ..region };
+                self.stage_rows(&layout, region, &data[start..start + layer_bytes])
+                    .map(|staging| (staging, region))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let cmd = self.inner.command_buffer();
+        autoreleasepool(|| {
+            let blit = cmd.new_blit_command_encoder();
+            for (staging, region) in &staged {
+                Self::encode_upload(blit, staging, &tex, &layout, *region);
+            }
+            blit.end_encoding();
+        });
+        self.inner.commit_and_wait(&cmd)
     }
 
     fn upload_texture_data_region(
