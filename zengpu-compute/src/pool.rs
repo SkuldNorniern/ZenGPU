@@ -87,9 +87,17 @@ fn checked_len(shape: &[u32]) -> Result<u32> {
     Ok(len)
 }
 
+/// Buffer size for `size` bytes: powers of two up to 1 MiB, then steps of 1/8 of the power. Waste
+/// stays under 12.5% for large arrays.
 fn size_class(size: u64) -> u64 {
     const MIN_CLASS: u64 = 256;
-    size.max(1).next_power_of_two().max(MIN_CLASS)
+    const FINE_FROM: u64 = 1 << 20;
+    let pow2 = size.max(1).next_power_of_two().max(MIN_CLASS);
+    if pow2 <= FINE_FROM {
+        return pow2;
+    }
+    let step = pow2 / 16;
+    size.div_ceil(step) * step
 }
 
 impl Drop for BufferPool {
@@ -125,5 +133,19 @@ mod tests {
         assert_eq!(size_class(256), 256);
         assert_eq!(size_class(257), 512);
         assert_eq!(size_class(4097), 8192);
+        assert_eq!(size_class(1 << 20), 1 << 20);
+    }
+
+    #[test]
+    fn large_size_classes_waste_at_most_an_eighth() {
+        let weight = 4096 * 11008 * 4;
+        assert_eq!(size_class(weight), 176 << 20);
+        assert_eq!(size_class((1 << 20) + 1), (1 << 20) + (1 << 17));
+        for size in [(1u64 << 20) + 1, 3 << 20, 100_000_000, 180_355_072, 5 << 30] {
+            let class = size_class(size);
+            assert!(class >= size, "{size}");
+            assert!(class - size < size / 8, "{size} -> {class}");
+            assert_eq!(size_class(class), class, "{size}");
+        }
     }
 }
