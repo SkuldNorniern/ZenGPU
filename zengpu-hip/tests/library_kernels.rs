@@ -634,3 +634,75 @@ fn blas_sgemm_half_weights_speed() {
     }
     blas.destroy(&*device);
 }
+
+const HALF_IO_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32 }
+    @workgroup_size(64)
+    kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            yh[i] = xh[i] * 2.0
+            yb[i] = xb[i] * 2.0
+            sum[i] = xh[i] + xb[i]
+        }
+    }
+);
+
+#[test]
+fn zsl_half_buffers_load_and_store() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let (shader, entry) = HALF_IO_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    // Odd length: last element sits alone in its 32-bit word.
+    let n = 1001u32;
+    // Exact in both formats (bf16 keeps 8 significant bits).
+    let x: Vec<f32> = (0..n).map(|i| ((i % 256) as f32 - 128.0) * 0.25).collect();
+    let xh_bits: Vec<u16> = x.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let xb_bits: Vec<u16> = x.iter().map(|&v| f32_to_bf16_bits(v)).collect();
+    let xh = upload_half(&pool, vec![n], DType::F16, &xh_bits);
+    let xb = upload_half(&pool, vec![n], DType::Bf16, &xb_bits);
+    let yh = pool.alloc(vec![n], DType::F16).unwrap();
+    let yb = pool.alloc(vec![n], DType::Bf16).unwrap();
+    let sum = pool.alloc(vec![n], DType::F32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            xh.buffer.index(),
+            xb.buffer.index(),
+            yh.buffer.index(),
+            yb.buffer.index(),
+            sum.buffer.index(),
+        ],
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let halves = |a: &DeviceArray| -> Vec<u16> {
+        device
+            .read_buffer(a.buffer, 0, a.size_bytes())
+            .unwrap()
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
+    };
+    let (out_h, out_b, out_sum) = (halves(&yh), halves(&yb), download(&*device, &sum));
+    for i in 0..n as usize {
+        assert_eq!(f16_bits_to_f32(out_h[i]), 2.0 * x[i], "f16 at {i}");
+        assert_eq!(bf16_bits_to_f32(out_b[i]), 2.0 * x[i], "bf16 at {i}");
+        assert_eq!(out_sum[i], 2.0 * x[i], "sum at {i}");
+    }
+    drop(ops);
+    for a in [xh, xb, yh, yb, sum] {
+        pool.free(a);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
