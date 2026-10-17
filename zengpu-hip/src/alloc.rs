@@ -18,7 +18,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{Builder, sleep};
 use std::time::{Duration, Instant};
 
-use crate::ffi::{hipFree, hipSetDevice};
+use crate::ffi::{hipFree, hipHostFree, hipSetDevice};
 
 /// Smallest block worth caching; smaller ones go straight back to HIP.
 pub(crate) const CACHE_MIN_BYTES: usize = 4 << 10;
@@ -76,21 +76,25 @@ impl BlockCache {
 
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
-/// Pending frees, as (device ordinal, pointer) pairs.
-type FreeQueue = Mutex<Sender<(i32, usize)>>;
+/// Identifies a block by the device ordinal and pointer. Pinned host memory has no ordinal.
+type FreeQueue = Mutex<Sender<(Option<i32>, usize)>>;
 
 fn reaper() -> Option<&'static FreeQueue> {
     static REAPER: OnceLock<Option<FreeQueue>> = OnceLock::new();
     REAPER
         .get_or_init(|| {
-            let (tx, rx) = channel::<(i32, usize)>();
+            let (tx, rx) = channel::<(Option<i32>, usize)>();
             Builder::new()
                 .name("zengpu-hip-free".into())
                 .spawn(move || {
                     for (ordinal, ptr) in rx {
                         unsafe {
-                            hipSetDevice(ordinal);
-                            hipFree(ptr as *mut c_void);
+                            if let Some(ordinal) = ordinal {
+                                hipSetDevice(ordinal);
+                                hipFree(ptr as *mut c_void);
+                            } else {
+                                hipHostFree(ptr as *mut c_void);
+                            }
                         }
                         PENDING.fetch_sub(1, Ordering::AcqRel);
                     }
@@ -104,8 +108,25 @@ fn reaper() -> Option<&'static FreeQueue> {
 /// Frees `ptr` without waiting for the GPU. Falls back to an inline `hipFree` if the background
 /// thread is unavailable.
 pub(crate) fn free_later(ordinal: i32, ptr: *mut c_void) {
+    if !send(Some(ordinal), ptr) {
+        unsafe {
+            hipSetDevice(ordinal);
+            hipFree(ptr);
+        }
+    }
+}
+
+/// Frees pinned host memory off-thread, since `hipHostFree` waits for every kernel on every device.
+pub(crate) fn free_host_later(ptr: *mut c_void) {
+    if !send(None, ptr) {
+        unsafe { hipHostFree(ptr) };
+    }
+}
+
+/// `false` when the background thread is unavailable.
+fn send(ordinal: Option<i32>, ptr: *mut c_void) -> bool {
     if ptr.is_null() {
-        return;
+        return true;
     }
     PENDING.fetch_add(1, Ordering::AcqRel);
     let sent = reaper()
@@ -113,11 +134,8 @@ pub(crate) fn free_later(ordinal: i32, ptr: *mut c_void) {
         .is_some_and(|tx| tx.send((ordinal, ptr as usize)).is_ok());
     if !sent {
         PENDING.fetch_sub(1, Ordering::AcqRel);
-        unsafe {
-            hipSetDevice(ordinal);
-            hipFree(ptr);
-        }
     }
+    sent
 }
 
 /// Waits up to `timeout` for queued frees. Returns `true` when none are left.
