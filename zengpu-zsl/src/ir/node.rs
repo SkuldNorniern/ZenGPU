@@ -616,7 +616,7 @@ pub enum IrBinOp {
     And,
     Or,
     /// Unsigned-integer-only: `&`, `|`, `^`, `<<`, `>>` (logical, not
-    /// arithmetic, shift). SPIR-V only today; other backends reject them.
+    /// arithmetic, shift).
     BitAnd,
     BitOr,
     BitXor,

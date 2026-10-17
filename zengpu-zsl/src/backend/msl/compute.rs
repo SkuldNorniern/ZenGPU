@@ -534,16 +534,12 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
         IrBinOp::Ne => "!=",
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
-        // Not yet supported on this backend; see the SPIR-V-only note on
-        // `IrBinOp`. Previously emitted a deliberately invalid marker
-        // comment; now fails ZSL compilation itself instead.
-        IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            return Err(Diagnostic::new(
-                DiagnosticCode::Unsupported,
-                "MSL backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
-                 this ZSL source is SPIR-V-only today",
-            ));
-        }
+        // u32 only (checked by typeck), so `>>` is a logical shift.
+        IrBinOp::BitAnd => "&",
+        IrBinOp::BitOr => "|",
+        IrBinOp::BitXor => "^",
+        IrBinOp::Shl => "<<",
+        IrBinOp::Shr => ">>",
     })
 }
 

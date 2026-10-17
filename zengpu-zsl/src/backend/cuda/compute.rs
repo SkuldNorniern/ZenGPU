@@ -621,21 +621,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 IrBinOp::Ne => "!=",
                 IrBinOp::And => "&&",
                 IrBinOp::Or => "||",
-                // Not yet supported on this backend; see the SPIR-V-only note
-                // on `IrBinOp`. Previously emitted a deliberately invalid
-                // marker comment so a downstream C++ compile would fail
-                // loudly; now fails ZSL compilation itself instead.
-                IrBinOp::BitAnd
-                | IrBinOp::BitOr
-                | IrBinOp::BitXor
-                | IrBinOp::Shl
-                | IrBinOp::Shr => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::Unsupported,
-                        "CUDA backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
-                         this ZSL source is SPIR-V-only today",
-                    ));
-                }
+                // u32 only (checked by typeck), so `>>` is a logical shift.
+                IrBinOp::BitAnd => "&",
+                IrBinOp::BitOr => "|",
+                IrBinOp::BitXor => "^",
+                IrBinOp::Shl => "<<",
+                IrBinOp::Shr => ">>",
             };
             format!(
                 "({} {} {})",

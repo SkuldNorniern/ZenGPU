@@ -183,9 +183,9 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     #[cfg(feature = "hip")]
     let hip_src = match &shader {
         // A `Diagnostic` here means this shader uses a construct HIP cannot
-        // lower (e.g. bitwise operators, SPIR-V-only today) — not that
-        // something is broken. Treat it the same as the graphics arm below:
-        // no HIP artifact for this shader, not a hard macro-compile failure.
+        // lower (e.g. subgroup_ballot) — not that something is broken. Treat
+        // it the same as the graphics arm below: no HIP artifact for this
+        // shader, not a hard macro-compile failure.
         Shader::Compute(m) => backend::hip::lower_compute(m)
             .map(|shader| shader.source)
             .unwrap_or_default(),
@@ -213,9 +213,9 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     #[cfg(feature = "cuda")]
     let cuda_src = match &shader {
         // See the `hip_src` arm above: a `Diagnostic` here means this shader
-        // uses a construct CUDA cannot lower (e.g. bitwise operators,
-        // SPIR-V-only today), not that something is broken — no CUDA
-        // artifact for this shader, not a hard macro-compile failure.
+        // uses a construct CUDA cannot lower (e.g. subgroup_ballot), not that
+        // something is broken — no CUDA artifact for this shader, not a hard
+        // macro-compile failure.
         Shader::Compute(m) => backend::cuda::lower_compute(m)
             .map(|shader| shader.source)
             .unwrap_or_default(),
