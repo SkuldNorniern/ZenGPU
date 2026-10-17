@@ -684,3 +684,60 @@ fn zsl_half_buffers_load_and_store() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+const NIBBLES_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32 }
+    @workgroup_size(64)
+    kernel nibbles(packed: device buffer<u32>, out: device mut buffer<u32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            let w = packed[i >> 3]
+            out[i] = ((w >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8)
+        }
+    }
+);
+
+#[test]
+fn zsl_bitwise_ops_unpack_nibbles() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = NIBBLES_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 1000u32;
+    let words: Vec<u32> = (0..n.div_ceil(8))
+        .map(|i| i.wrapping_mul(0x9e37_79b9))
+        .collect();
+    let packed = pool.alloc(vec![words.len() as u32], DType::U32).unwrap();
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    device.write_buffer(packed.buffer, 0, &bytes).unwrap();
+    let out = pool.alloc(vec![n], DType::U32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[packed.buffer.index(), out.buffer.index()],
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got: Vec<u32> = device
+        .read_buffer(out.buffer, 0, out.size_bytes())
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for i in 0..n {
+        let want = ((words[(i >> 3) as usize] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8);
+        assert_eq!(got[i as usize], want, "at {i}");
+    }
+    drop(ops);
+    pool.free(packed);
+    pool.free(out);
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
