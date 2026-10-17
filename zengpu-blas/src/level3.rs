@@ -12,6 +12,11 @@ use crate::gemm_skinny::{
     self, SKINNY_1_ZSL, SKINNY_4_ZSL, SKINNY_8_ZSL, SKINNY_16_ZSL, SPLIT_REDUCE_ZSL,
 };
 use crate::gemm_tiled::{GEMM_TILED_ZSL, TILE as TILED_GEMM_TILE};
+use crate::gemm_wmma;
+
+/// Rows above which half-precision A and B go to the WMMA kernels; fewer
+/// rows widen A and take the f32-A skinny kernels, which stream B faster.
+const WMMA_MIN_ROWS: u32 = 8;
 
 /// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
@@ -56,7 +61,17 @@ struct HipGemm {
     t64: [PipelineHandle; B_TYPES.len()],
     skinny: [[PipelineHandle; SKINNY_ROWS.len()]; B_TYPES.len()],
     reduce: PipelineHandle,
+    /// Half-to-f32 conversion of A, f16 then bf16.
+    widen: [PipelineHandle; 2],
+    /// Matrix-core kernels, when the device has them.
+    wmma: Option<HipWmma>,
     compute_units: u32,
+}
+
+/// The RDNA4 WMMA kernels ([`gemm_wmma`]), f16 then bf16.
+struct HipWmma {
+    shader: ShaderHandle,
+    pipelines: [PipelineHandle; 2],
 }
 
 /// The Vulkan few-row GEMM kernels and their split-K reduction.
@@ -207,10 +222,11 @@ impl GemmKernel {
                     )?;
                 }
             }
-            Ok((t128, t64, reduce, skinny))
+            let widen = [pipeline("widen_f16", 256)?, pipeline("widen_bf16", 256)?];
+            Ok((t128, t64, reduce, skinny, widen))
         })();
         match built {
-            Ok((t128, t64, reduce, skinny)) => Ok(Self {
+            Ok((t128, t64, reduce, skinny, widen)) => Ok(Self {
                 shader,
                 pipeline: t128[0],
                 tile: 128,
@@ -219,6 +235,8 @@ impl GemmKernel {
                     t64,
                     skinny,
                     reduce,
+                    widen,
+                    wmma: Self::new_wmma(device),
                     compute_units: device.limits().compute_units,
                 }),
                 skinny: None,
@@ -233,6 +251,39 @@ impl GemmKernel {
         }
     }
 
+    /// The WMMA kernels, or `None` off gfx12, where the module compiles
+    /// without them.
+    fn new_wmma(device: &dyn GpuDevice) -> Option<HipWmma> {
+        // Off gfx12 the module compiles empty, so a failure here is a bug.
+        let shader = match device.create_shader(ShaderDesc::hip(gemm_wmma::SOURCE)) {
+            Ok(shader) => shader,
+            Err(e) => {
+                log::warn!("zengpu-blas: WMMA GEMM failed to build: {e}");
+                return None;
+            }
+        };
+        let pipeline = |entry| {
+            device.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [256, 1, 1],
+            })
+        };
+        match (pipeline("hgemm_wmma_f16"), pipeline("hgemm_wmma_bf16")) {
+            (Ok(f16), Ok(bf16)) => Some(HipWmma {
+                shader,
+                pipelines: [f16, bf16],
+            }),
+            (f16, bf16) => {
+                for p in [f16, bf16].into_iter().flatten() {
+                    device.destroy_pipeline(p);
+                }
+                device.destroy_shader(shader);
+                None
+            }
+        }
+    }
+
     /// Destroy the pipelines and shader created by [`Self::new`].
     pub fn destroy(self, device: &dyn GpuDevice) {
         device.destroy_pipeline(self.pipeline);
@@ -242,8 +293,14 @@ impl GemmKernel {
                 device.destroy_pipeline(p);
             }
             device.destroy_pipeline(hip.reduce);
-            for p in hip.skinny.into_iter().flatten() {
+            for p in hip.skinny.into_iter().flatten().chain(hip.widen) {
                 device.destroy_pipeline(p);
+            }
+            if let Some(wmma) = hip.wmma {
+                for p in wmma.pipelines {
+                    device.destroy_pipeline(p);
+                }
+                device.destroy_shader(wmma.shader);
             }
         }
         if let Some(zsl) = self.skinny {
@@ -293,19 +350,21 @@ impl GemmKernel {
         a: &DeviceArray,
         b: &DeviceArray,
     ) -> Result<DeviceArray> {
-        // Half-precision B (weights) runs on HIP; elsewhere everything is f32.
+        // Half-precision A and B run on HIP; elsewhere everything is f32.
         let b_type = B_TYPES.iter().position(|&(dtype, _)| dtype == b.dtype);
-        let b_ok = match b_type {
-            Some(0) => true,
-            Some(_) => self.hip.is_some(),
-            None => false,
+        let a_type = B_TYPES.iter().position(|&(dtype, _)| dtype == a.dtype);
+        let types_ok = match (a_type, b_type) {
+            (Some(0), Some(0)) => true,
+            (Some(_), Some(_)) => self.hip.is_some(),
+            _ => false,
         };
-        if a.dtype != DType::F32 || !b_ok {
+        if !types_ok {
             return Err(GpuError::Dispatch(format!(
-                "sgemm: A must be f32 and B f32 (or f16/bf16 on HIP), got {:?} and {:?}",
+                "sgemm: A and B must be f32 (or f16/bf16 on HIP), got {:?} and {:?}",
                 a.dtype, b.dtype
             )));
         }
+        let a_type = a_type.unwrap_or(0);
         let b_type = b_type.unwrap_or(0);
         let (&[m, k], &[k2, n]) = (a.shape.as_slice(), b.shape.as_slice()) else {
             return Err(GpuError::Dispatch(format!(
@@ -324,7 +383,7 @@ impl GemmKernel {
 
         let c = ops.pool().alloc(vec![m, n], DType::F32)?;
         let recorded = if let Some(hip) = &self.hip {
-            Self::record_hip(hip, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
+            Self::record_hip(hip, a_type, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
         } else if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
             record_skinny(zsl, ops, alpha, a, b, &c, [m, n, k, mn])
         } else {
@@ -350,11 +409,14 @@ impl GemmKernel {
         }
     }
 
-    /// Record the HIP kernel [`gemm_hip::plan`] picks for this shape, then
-    /// the split-K reduction when K was split.
+    /// Record the HIP kernel for this shape: WMMA when A and B are the same
+    /// half type and the device has matrix cores, otherwise the kernel
+    /// [`gemm_hip::plan`] picks (on A widened to f32 if it is half), then the
+    /// split-K reduction when K was split.
     #[allow(clippy::too_many_arguments)]
     fn record_hip(
         hip: &HipGemm,
+        a_type: usize,
         b_type: usize,
         ops: &mut OpList<'_>,
         alpha: f32,
@@ -363,6 +425,39 @@ impl GemmKernel {
         c: &DeviceArray,
         [m, n, k, mn]: [u32; 4],
     ) -> Result<()> {
+        if let Some(wmma) = &hip.wmma
+            && a_type != 0
+            && a_type == b_type
+            && m > WMMA_MIN_ROWS
+            && gemm_wmma::fits(n, k)
+        {
+            ops.dispatch(
+                wmma.pipelines[a_type - 1],
+                &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
+                &[
+                    Scalar::U32(m),
+                    Scalar::U32(n),
+                    Scalar::U32(k),
+                    Scalar::U32(gemm_wmma::group(n, k)),
+                    Scalar::F32(alpha),
+                ],
+                gemm_wmma::grid(m, n),
+            );
+            return Ok(());
+        }
+        let a_slot = if a_type == 0 {
+            a.buffer.index()
+        } else {
+            let mk = m * k;
+            let wide = ops.scratch(vec![m, k], DType::F32)?;
+            ops.dispatch(
+                hip.widen[a_type - 1],
+                &[a.buffer.index(), wide],
+                &[Scalar::U32(mk)],
+                [mk.div_ceil(256), 1, 1],
+            );
+            wide
+        };
         let plan = gemm_hip::plan(m, n, k, hip.compute_units);
         let split = plan.split();
         let target = if split > 1 {
@@ -386,7 +481,7 @@ impl GemmKernel {
         };
         ops.dispatch(
             pipeline,
-            &[a.buffer.index(), b.buffer.index(), target],
+            &[a_slot, b.buffer.index(), target],
             &[
                 Scalar::U32(m),
                 Scalar::U32(n),

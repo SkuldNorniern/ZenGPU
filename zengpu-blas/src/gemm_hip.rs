@@ -218,6 +218,22 @@ void sgemm_reduce(const float* __restrict__ P, float* __restrict__ C,
         C[i] = s;
     }
 }
+
+// dst[i] = src[i] widened to f32: half-precision A for the f32-A kernels.
+template <class H>
+__device__ __forceinline__ void widen(const H* __restrict__ src, float* __restrict__ dst,
+                                      unsigned int n) {
+    unsigned int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] = to_f32(src[i]);
+}
+extern "C" __global__ __launch_bounds__(256)
+void widen_f16(const f16* __restrict__ src, float* __restrict__ dst, unsigned int n) {
+    widen(src, dst, n);
+}
+extern "C" __global__ __launch_bounds__(256)
+void widen_bf16(const bf16* __restrict__ src, float* __restrict__ dst, unsigned int n) {
+    widen(src, dst, n);
+}
 "#;
 
 /// Element types B can hold, and the entry-point suffix of each.

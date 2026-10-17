@@ -1844,6 +1844,7 @@ dependencies = [
 name = "zengpu-blas"
 version = "0.0.1"
 dependencies = [
+ "log",
  "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",

@@ -18,3 +18,4 @@ workspace = true
 zengpu-hal.workspace = true
 zengpu-compute.workspace = true
 zengpu-spirv.workspace = true
+log.workspace = true
