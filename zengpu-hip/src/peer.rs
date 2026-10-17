@@ -12,7 +12,7 @@ use crate::ffi::*;
 use crate::{HIP_EVENT_DISABLE_TIMING, HIP_SUCCESS, HipBuffer, HipCore};
 use crate::{HIP_MEMCPY_D2H, HIP_MEMCPY_H2D};
 
-const CHUNK: usize = 4 << 20;
+pub(crate) const CHUNK: usize = 4 << 20;
 
 /// Pinned host memory usable from every device (`hipHostMallocPortable`).
 const HIP_HOST_MALLOC_PORTABLE: u32 = 1;
