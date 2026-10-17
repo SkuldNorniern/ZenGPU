@@ -146,7 +146,7 @@ TILE(sgemm_t64_f16, f16, 64, 64, 16, 4, 4)
 TILE(sgemm_t64_bf16, bf16, 64, 64, 16, 4, 4)
 
 #define SKINNY_THREADS 128
-#define SKINNY_KC_MAX 128
+#define SKINNY_KC_MAX 256
 
 // Rows 0..M of C (M <= MT); this thread owns columns col..col+3, this
 // workgroup K range [k0, k0 + kc).
@@ -155,7 +155,8 @@ __device__ __forceinline__ void skinny_gemm(
         const float* __restrict__ A, const BT* __restrict__ B,
         float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
         unsigned int kc, float alpha) {
-    __shared__ float As[MT * SKINNY_KC_MAX];
+    // The planner gives 32 rows half the chunk, so their LDS slice stays 16 KiB.
+    __shared__ float As[MT * (MT <= 16 ? SKINNY_KC_MAX : SKINNY_KC_MAX / 2)];
     const unsigned int col = (blockIdx.x * SKINNY_THREADS + threadIdx.x) * 4;
     const unsigned int k0 = blockIdx.y * kc;
     const unsigned int k1 = min(k0 + kc, K);
@@ -246,6 +247,9 @@ pub(crate) const B_TYPES: [(zengpu_hal::DType, &str); 3] = [
 /// Row counts the skinny kernel is instantiated for (`sgemm_skinny_<n>`).
 pub(crate) const SKINNY_ROWS: [u32; 5] = [1, 4, 8, 16, 32];
 
+/// K chunk of the skinny kernel (`SKINNY_KC_MAX` in [`SOURCE`]).
+pub(crate) const SKINNY_KC: u32 = 256;
+
 /// Threads per skinny workgroup; each owns four columns.
 pub(crate) const SKINNY_THREADS: u32 = 128;
 
@@ -287,9 +291,10 @@ pub(crate) fn plan(m: u32, n: u32, k: u32, cus: u32) -> Plan {
     let k = k.max(1);
     if m <= 32 {
         let rows = SKINNY_ROWS.into_iter().find(|&r| r >= m).unwrap_or(32);
-        // 128-deep K chunks keep the A slice in LDS small; more rows share
-        // each chunk, so 64 balances them better.
-        let kc: u32 = if rows <= 8 { 128 } else { 64 };
+        // 256-deep K chunks: fewer split-K partials to write and reduce
+        // (16 rows: 320 -> 255 us at 4096², RX 9060 XT). At 32 rows that
+        // A slice is 32 KiB of LDS and costs occupancy, so 128 there.
+        let kc: u32 = if rows <= 16 { SKINNY_KC } else { SKINNY_KC / 2 };
         let kc = kc.min(k);
         return Plan::Skinny {
             rows,
@@ -335,21 +340,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skinny_chunk_fits_the_kernel_lds() {
+        assert!(SOURCE.contains(&format!("#define SKINNY_KC_MAX {SKINNY_KC}")));
+    }
+
+    #[test]
     fn decode_shapes_use_the_skinny_kernel() {
         assert_eq!(
             plan(1, 4096, 4096, 32),
             Plan::Skinny {
                 rows: 1,
-                kc: 128,
-                split: 32
+                kc: 256,
+                split: 16
             }
         );
         assert_eq!(
             plan(13, 4096, 11008, 32),
             Plan::Skinny {
                 rows: 16,
-                kc: 64,
-                split: 172
+                kc: 256,
+                split: 43
             }
         );
         // K smaller than one chunk: one pass, no reduction.
@@ -399,7 +409,7 @@ mod tests {
     #[test]
     fn grids_cover_the_output() {
         let p = plan(1, 4100, 4096, 32);
-        assert_eq!(p.grid(1, 4100), [9, 32, 1]);
+        assert_eq!(p.grid(1, 4100), [9, 16, 1]);
         let p = plan(1000, 1000, 1000, 32);
         let Plan::Tile { tile, split, .. } = p else {
             panic!("tile plan");
