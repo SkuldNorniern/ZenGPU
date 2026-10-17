@@ -59,6 +59,8 @@ struct CudaGemm {
     shader: ShaderHandle,
     /// Per entry of `gemm_cuda::VARIANTS`, f16 then bf16.
     pipelines: [[PipelineHandle; 2]; gemm_cuda::VARIANTS.len()],
+    /// The f32 SIMT kernel (`sgemm_simt128`).
+    simt: PipelineHandle,
     /// The split-K reduction.
     reduce: PipelineHandle,
 }
@@ -99,7 +101,8 @@ impl GemmKernel {
     /// HIP, the register-blocked ZSL kernel on Vulkan, Metal and CUDA, and
     /// the naive ZSL kernel on backends the blocked one has not been measured
     /// on. On Vulkan, `sgemm` also uses the skinny ZSL kernels when `m <= 16`.
-    /// On CUDA, half-precision inputs use the tensor-core kernels.
+    /// On CUDA, half-precision inputs use the tensor-core kernels, and f32
+    /// inputs with more than 16 rows use the SIMT kernel.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         if matches!(
             device.backend(),
@@ -195,6 +198,11 @@ impl GemmKernel {
                     })?);
                 }
             }
+            let simt = device.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm_simt128",
+                block: [256, 1, 1],
+            })?;
             let reduce = device.create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "sgemm_tc_reduce",
@@ -203,6 +211,7 @@ impl GemmKernel {
             Ok(CudaGemm {
                 shader,
                 pipelines: from_fn(|v| [made[2 * v], made[2 * v + 1]]),
+                simt,
                 reduce,
             })
         };
@@ -388,7 +397,7 @@ impl GemmKernel {
             device.destroy_shader(zsl.reduce_shader);
         }
         if let Some(cuda) = self.cuda {
-            for p in cuda.pipelines.into_iter().flatten() {
+            for p in cuda.pipelines.into_iter().flatten().chain([cuda.simt]) {
                 device.destroy_pipeline(p);
             }
             device.destroy_pipeline(cuda.reduce);
@@ -473,6 +482,12 @@ impl GemmKernel {
             Self::record_hip(hip, a_type, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
         } else if let Some(cuda) = self.cuda.as_ref().filter(|_| a_type != 0) {
             Self::record_cuda(cuda, a_type, ops, alpha, a, b, &c, [m, n, k, mn])
+        } else if let Some(cuda) = self
+            .cuda
+            .as_ref()
+            .filter(|_| m > gemm_cuda::SKINNY_ROWS && gemm_cuda::simt_fits(n, k))
+        {
+            Self::record_cuda_simt(cuda, ops, alpha, a, b, &c, [m, n, k])
         } else if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
             record_skinny(zsl, ops, alpha, a, b, &c, [m, n, k, mn])
         } else {
@@ -543,6 +558,30 @@ impl GemmKernel {
                 [mn.div_ceil(256), 1, 1],
             );
         }
+        Ok(())
+    }
+
+    /// Record the f32 SIMT kernel: 128×128 tiles, no split-K.
+    fn record_cuda_simt(
+        cuda: &CudaGemm,
+        ops: &mut OpList<'_>,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+        c: &DeviceArray,
+        [m, n, k]: [u32; 3],
+    ) -> Result<()> {
+        ops.dispatch(
+            cuda.simt,
+            &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
+            &[
+                Scalar::U32(m),
+                Scalar::U32(n),
+                Scalar::U32(k),
+                Scalar::F32(alpha),
+            ],
+            [n.div_ceil(128), m.div_ceil(128), 1],
+        );
         Ok(())
     }
 

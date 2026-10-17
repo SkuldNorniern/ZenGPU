@@ -14,8 +14,27 @@
 //! | 4096³            | 151–154 / 151–167 TF | 171 / 142 TF   |
 //! | 8192³            | 148–152 / 145–158 TF | 156 / 156 TF   |
 //!
-//! f32 takes the tiled ZSL kernel ([`crate::gemm_tiled`]), 25–30 TF at 1024³
-//! and up. Run-to-run variation is about ±20% at 1024³.
+//! f32 on CUDA (m > 16, N and K multiples of 4) takes `sgemm_simt128`, a
+//! hand-written SIMT kernel: 128×128 tiles, 8×8 outputs per thread, float4
+//! loads, register-prefetched double-buffered shared memory. Same session as
+//! the table above, against the tiled ZSL kernel it replaced
+//! ([`crate::gemm_tiled`], 26.6–29.8 TF at 1024³ and up):
+//!
+//! | shape            | f32 SIMT (this) | f32 ZSL (before) |
+//! |------------------|-----------------|------------------|
+//! | 1024³            | 41–44 TF        | 27 TF            |
+//! | 2048³            | 38–47 TF        | 30 TF            |
+//! | 4096³            | 40–42 TF        | 27 TF            |
+//! | 8192³            | 41 TF           | 27 TF            |
+//!
+//! Accuracy at 512×512×4096 (inputs in [-1, 1), max error / max |C| against
+//! f64) is 2.7e-6 for both. 3×TF32 (Ootomo & Yokota) was built and measured
+//! too, at 17–22 TF from 1024³ up, so it is not used. A version that
+//! accumulates all three mma products into one register set had error
+//! growing with K (4.5e-5 at 512×512×4096); adding each k step's products
+//! to the f32 accumulator with a plain add brought it to 1.0e-6, which
+//! points at the tensor-core accumulator's rounding. Run-to-run variation is
+//! about ±10% for f32.
 //!
 //! Each kernel is a [`Variant`]: a block tile of `bm`×`bn`, 16-byte `cp.async`
 //! loads into a three-stage shared-memory pipeline, `ldmatrix` fragment loads
@@ -81,6 +100,12 @@ const FULL_TILES: u64 = 256;
 /// use this path.
 pub(crate) fn fits(n: u32, k: u32) -> bool {
     n.is_multiple_of(8) && k.is_multiple_of(8)
+}
+
+/// The f32 SIMT kernel needs N and K multiples of 4: rows are then whole
+/// 16-byte chunks, which its float4 loads require.
+pub(crate) fn simt_fits(n: u32, k: u32) -> bool {
+    n.is_multiple_of(4) && k.is_multiple_of(4)
 }
 
 /// The variant for `m`×`n` outputs: the split-K kernel for at most
@@ -287,6 +312,85 @@ TC_ENTRY(sgemm_tc64_f16, false, 64, 64, 32, 32)
 TC_ENTRY(sgemm_tc64_bf16, true, 64, 64, 32, 32)
 TC_ENTRY(sgemm_tc16_f16, false, 16, 64, 16, 16)
 TC_ENTRY(sgemm_tc16_bf16, true, 16, 64, 16, 16)
+
+// f32 SIMT: 128×128 block tile, BK = 8, 8×8 outputs per thread. A is staged
+// transposed ([k][m]) so each k step reads its A and B fragments as float4 pairs;
+// global loads are register-prefetched one tile ahead into a double-buffered
+// shared tile, one __syncthreads per k tile. Needs N and K multiples of 4.
+extern "C" __global__ void __launch_bounds__(256) sgemm_simt128(
+        const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+        unsigned M, unsigned N, unsigned K, float alpha) {
+    __shared__ __align__(16) float As[2][8][128 + 4];
+    __shared__ __align__(16) float Bs[2][8][128];
+    const unsigned tid = threadIdx.x;
+    const unsigned tx = tid & 15, ty = tid >> 4;
+    const unsigned bm = blockIdx.y * 128, bn = blockIdx.x * 128;
+    // A load: row ar, k chunk ac..ac+3. B load: row br, columns bc..bc+3.
+    const unsigned ar = tid >> 1, ac = (tid & 1) * 4;
+    const unsigned br = tid >> 5, bc = (tid & 31) * 4;
+    const bool a_row = bm + ar < M, b_col = bn + bc < N;
+    const float* a_src = A + (size_t)(bm + ar) * K + ac;
+    const float* b_src = B + (size_t)br * N + bn + bc;
+
+    float4 ra, rb;
+    auto fetch = [&](unsigned k0) {
+        ra = a_row && k0 + ac < K ? *reinterpret_cast<const float4*>(a_src + k0)
+                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        rb = b_col && k0 + br < K ? *reinterpret_cast<const float4*>(b_src + (size_t)k0 * N)
+                                  : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    };
+    auto store = [&](unsigned buf) {
+        As[buf][ac][ar] = ra.x;
+        As[buf][ac + 1][ar] = ra.y;
+        As[buf][ac + 2][ar] = ra.z;
+        As[buf][ac + 3][ar] = ra.w;
+        *reinterpret_cast<float4*>(&Bs[buf][br][bc]) = rb;
+    };
+
+    float acc[8][8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j) acc[i][j] = 0.0f;
+
+    const unsigned nk = (K + 7) / 8;
+    fetch(0);
+    store(0);
+    __syncthreads();
+    for (unsigned kt = 0; kt < nk; ++kt) {
+        const unsigned cur = kt & 1;
+        if (kt + 1 < nk) fetch((kt + 1) * 8);
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const float4 a0 = *reinterpret_cast<const float4*>(&As[cur][k][ty * 4]);
+            const float4 a1 = *reinterpret_cast<const float4*>(&As[cur][k][64 + ty * 4]);
+            const float4 b0 = *reinterpret_cast<const float4*>(&Bs[cur][k][tx * 4]);
+            const float4 b1 = *reinterpret_cast<const float4*>(&Bs[cur][k][64 + tx * 4]);
+            const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+            for (int i = 0; i < 8; ++i)
+#pragma unroll
+                for (int j = 0; j < 8; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+        }
+        if (kt + 1 < nk) store(cur ^ 1);
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const unsigned row = bm + (i < 4 ? ty * 4 + i : 64 + ty * 4 + i - 4);
+        if (row >= M) continue;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const unsigned col = bn + h * 64 + tx * 4;
+            if (col < N)
+                *reinterpret_cast<float4*>(C + (size_t)row * N + col) =
+                    make_float4(alpha * acc[i][h * 4], alpha * acc[i][h * 4 + 1],
+                                alpha * acc[i][h * 4 + 2], alpha * acc[i][h * 4 + 3]);
+        }
+    }
+}
 
 // Sums the split-K partials: out[i] = sum over z of ws[z*mn + i].
 extern "C" __global__ void sgemm_tc_reduce(const float* ws, float* out, unsigned mn, unsigned split) {
