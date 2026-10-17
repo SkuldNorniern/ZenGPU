@@ -4429,6 +4429,53 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         pool.free(c);
     }
 
+    /// Measures the max |C - ref| / max |ref| for `C = A·B` on f32 inputs in [-1, 1) (fixed LCG),
+    /// against an f64 CPU reference.
+    ///
+    /// These inputs are not exact in any tensor-core format, so this measures f32 arithmetic.
+    fn gemm_f32_error(pool: &BufferPool, kernel: &GemmKernel, m: usize, n: usize, k: usize) -> f64 {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        let a_vals: Vec<f32> = (0..m * k).map(|_| next()).collect();
+        let b_vals: Vec<f32> = (0..k * n).map(|_| next()).collect();
+        let mut want = vec![0f64; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                let av = f64::from(a_vals[i * k + p]);
+                for j in 0..n {
+                    want[i * n + j] += av * f64::from(b_vals[p * n + j]);
+                }
+            }
+        }
+        let device = pool.device();
+        let upload = |shape: Vec<u32>, vals: &[f32]| {
+            let array = pool.alloc(shape, DType::F32).expect("alloc");
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+            device
+                .write_buffer(array.buffer, 0, &bytes)
+                .expect("upload");
+            array
+        };
+        let a = upload(vec![m as u32, k as u32], &a_vals);
+        let b = upload(vec![k as u32, n as u32], &b_vals);
+        let c = kernel.sgemm(device, pool, 1.0, &a, &b).expect("sgemm");
+        let raw = device.read_buffer(c.buffer, 0, (m * n * 4) as u64).unwrap();
+        let scale = want.iter().fold(0f64, |acc, w| acc.max(w.abs()));
+        let err = raw.chunks(4).zip(&want).fold(0f64, |acc, (g, w)| {
+            let got = f32::from_le_bytes(g.try_into().unwrap());
+            acc.max((f64::from(got) - w).abs())
+        });
+        pool.free(a);
+        pool.free(b);
+        pool.free(c);
+        err / scale
+    }
+
     const GEMM_SHAPES: [(usize, usize, usize); 7] = [
         (1, 4096, 4096),
         (16, 4096, 4096),
@@ -4451,6 +4498,21 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
     #[test]
     fn gemm_f32_matches_reference() {
         gemm_matches_reference(DType::F32);
+    }
+
+    /// Checks the f32 path (SIMT for m > 16) against f64 at 512×512×4096.
+    ///
+    /// The bound is about 2× the measured 2.7e-6.
+    #[test]
+    fn gemm_f32_accuracy_matches_reference() {
+        let Some(pool) = cuda_pool() else { return };
+        let kernel = GemmKernel::new(pool.device()).expect("GEMM kernel");
+        let err = gemm_f32_error(&pool, &kernel, 512, 512, 4096);
+        kernel.destroy(pool.device());
+        assert!(
+            err < 5e-6,
+            "f32 GEMM 512x512x4096: max error / max |C| = {err:e}"
+        );
     }
 
     #[test]
