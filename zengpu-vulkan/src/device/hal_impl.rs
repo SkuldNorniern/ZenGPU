@@ -65,8 +65,9 @@ impl GpuDevice for VulkanDevice {
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         self.collect_garbage();
+        let alloc_size = desc.size.max(4).next_multiple_of(4);
         if desc.usage.contains(BufferUsage::STORAGE)
-            && desc.size > self.inner.limits.max_storage_buffer_range
+            && alloc_size > self.inner.limits.max_storage_buffer_range
         {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
                 format!(
@@ -77,7 +78,7 @@ impl GpuDevice for VulkanDevice {
         }
         let vk_usage = buffer_usage_to_vk(desc.usage);
         let buffer_info = vk::BufferCreateInfo {
-            size: desc.size,
+            size: alloc_size,
             usage: vk_usage,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
@@ -125,7 +126,7 @@ impl GpuDevice for VulkanDevice {
             match unsafe {
                 self.inner
                     .device
-                    .map_memory(memory, 0, desc.size, vk::MemoryMapFlags::empty())
+                    .map_memory(memory, 0, alloc_size, vk::MemoryMapFlags::empty())
             } {
                 Ok(ptr) => ptr as *mut u8,
                 Err(e) => {
@@ -168,7 +169,7 @@ impl GpuDevice for VulkanDevice {
         });
         drop(buffers);
         if desc.usage.contains(BufferUsage::STORAGE) {
-            self.bind_buffer_to_bindless(handle.index(), vk_buf, desc.size);
+            self.bind_buffer_to_bindless(handle.index(), vk_buf, alloc_size);
         }
         Ok(handle)
     }
