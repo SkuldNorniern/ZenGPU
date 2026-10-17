@@ -13,15 +13,16 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::mem::{take, zeroed};
 use std::sync::{Arc, Mutex};
-use std::thread::yield_now;
+use std::thread::{self, yield_now};
 use std::time::{Duration, Instant};
 use std::{ptr, slice};
 
 use cuda_oxide::{Cuda, context::Context, device::Device, sys};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, ComputeOp, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
-    GpuError, GpuInstance, GpuSubmission, HalCapabilities, PipelineHandle, Result, SamplerDesc,
+    BufferUsage, CompletedReadback, CompletedSubmission, ComputeOp, ComputePipelineDesc,
+    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuReadback,
+    GpuSubmission, HalCapabilities, PipelineHandle, ReadSubmission, Result, SamplerDesc,
     SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
     SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
@@ -258,26 +259,33 @@ impl GpuAdapter for CudaAdapter {
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
         let sm = from_cuda(self.dev.compute_capability())?;
         let mut ctx = from_cuda(Context::new(&self.dev))?;
-        let (stream, raw_ctx) = {
+        let (streams, raw_ctx) = {
             let _handle = from_cuda(ctx.enter())?;
             // SAFETY: the context was just entered on this thread, so the query returns it.
             let mut raw: sys::CUcontext = ptr::null_mut();
             cu(unsafe { sys::cuCtxGetCurrent(&mut raw) })?;
-            let mut s: sys::CUstream = ptr::null_mut();
-            cu(unsafe {
-                sys::cuStreamCreate(&mut s, sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING)
-            })?;
-            (s, raw)
+            let mut streams = [ptr::null_mut(); 3];
+            for stream in &mut streams {
+                // On error the streams already created leak with the context; the context is torn down.
+                cu(unsafe {
+                    sys::cuStreamCreate(stream, sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING)
+                })?;
+            }
+            (streams, raw)
         };
+        let [stream, upload_stream, download_stream] = streams;
         Ok(Box::new(CudaDevice {
             shared: Arc::new(CudaShared {
                 _ctx: ctx,
                 raw_ctx,
                 ctx_lock: Mutex::new(()),
                 stream,
+                upload_stream,
+                download_stream,
                 sm: (sm.major, sm.minor),
-                events: Mutex::new(Vec::new()),
+                events: Arc::new(EventPool(Mutex::new(Vec::new()))),
                 staging: Mutex::new(None),
+                pinned: Arc::new(PinnedPool(Mutex::new(Vec::new()))),
                 graphs: Mutex::new(GraphCache::default()),
             }),
             buffers: Arc::new(Mutex::new(SlotMap::new())),
@@ -333,10 +341,36 @@ enum DeferredCudaResource {
     Pipeline(u32),
 }
 
+/// Last accesses to one buffer, by base device pointer. Each event is a
+/// completion point that covers every earlier access to the buffer, so only the
+/// latest read and the latest write need to be remembered.
+#[derive(Default)]
+struct BufferHazard {
+    last_access: Option<Access>,
+    last_write: Option<Access>,
+}
+
+#[derive(Clone)]
+struct Access {
+    event: Arc<OwnedEvent>,
+    /// The stream the event was recorded on.
+    lane: Lane,
+}
+
+/// The streams work is queued on. Work on one lane is ordered; ordering across
+/// lanes needs an event wait.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    Compute,
+    Upload,
+    Download,
+}
+
 #[derive(Default)]
 struct CudaLifetimeState {
     in_flight: usize,
     deferred: Vec<DeferredCudaResource>,
+    hazards: HashMap<u64, BufferHazard>,
 }
 
 // ── Pinned staging ────────────────────────────────────────────────────────────
@@ -396,6 +430,27 @@ impl Drop for Staging {
     }
 }
 
+/// Host copies at least this large are split across threads. One core cannot keep
+/// up with the copy engines, which move 13 GB/s or more.
+const PARALLEL_COPY_MIN: usize = 8 << 20;
+
+/// Threads used for a large host copy.
+const PARALLEL_COPY_THREADS: usize = 4;
+
+/// Copy `src` into `dst` (same length), in parallel when the copy is large.
+fn copy_host(dst: &mut [u8], src: &[u8]) {
+    if dst.len() < PARALLEL_COPY_MIN {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let chunk = dst.len().div_ceil(PARALLEL_COPY_THREADS);
+    thread::scope(|scope| {
+        for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
+            scope.spawn(move || d.copy_from_slice(s));
+        }
+    });
+}
+
 /// Spin on `cuEventQuery` until `ev` completes. Used instead of
 /// `cuEventSynchronize`: the context is created with blocking-sync scheduling,
 /// which would add an OS sleep to every wait. The context must be current.
@@ -410,6 +465,144 @@ fn wait_event(ev: sys::CUevent) -> Result<()> {
             return cu(code);
         }
         yield_now();
+    }
+}
+
+/// Recycled timing-disabled events. Shared with every `OwnedEvent`, so an event
+/// returns here when its last reference drops.
+struct EventPool(Mutex<Vec<sys::CUevent>>);
+
+// SAFETY: CUevent handles are opaque and the pool is only touched under its mutex.
+unsafe impl Send for EventPool {}
+unsafe impl Sync for EventPool {}
+
+impl EventPool {
+    fn put(&self, ev: sys::CUevent) {
+        match self.0.lock() {
+            Ok(mut pool) => pool.push(ev),
+            Err(_) => {
+                unsafe { sys::cuEventDestroy_v2(ev) };
+            }
+        }
+    }
+}
+
+impl Drop for EventPool {
+    fn drop(&mut self) {
+        for ev in self
+            .0
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            unsafe { sys::cuEventDestroy_v2(ev) };
+        }
+    }
+}
+
+/// A recorded event that is recycled only after its last holder drops it, so a
+/// buffer hazard and a submission can both refer to one stream position.
+struct OwnedEvent {
+    ev: sys::CUevent,
+    pool: Arc<EventPool>,
+}
+
+// SAFETY: the event is an opaque handle; it is only recorded and queried in the serialized context.
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+
+impl OwnedEvent {
+    /// Record a new event on `stream`. The context must be current.
+    fn record(shared: &CudaShared, stream: sys::CUstream) -> Result<Arc<Self>> {
+        let ev = shared.take_event()?;
+        if let Err(error) = cu(unsafe { sys::cuEventRecord(ev, stream) }) {
+            shared.events.put(ev);
+            return Err(error);
+        }
+        Ok(Arc::new(OwnedEvent {
+            ev,
+            pool: Arc::clone(&shared.events),
+        }))
+    }
+}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        self.pool.put(self.ev);
+    }
+}
+
+/// Pinned host memory block used to stage one asynchronous transfer.
+#[derive(Clone, Copy)]
+struct PinnedBlock {
+    ptr: *mut c_void,
+    cap: usize,
+}
+
+// SAFETY: a pinned block is plain host memory; access is ordered by the events of the transfer using it.
+unsafe impl Send for PinnedBlock {}
+unsafe impl Sync for PinnedBlock {}
+
+/// Free pinned blocks for asynchronous transfers. Blocks are leased per transfer
+/// and reused, so pinned allocation is not paid on every call.
+struct PinnedPool(Mutex<Vec<PinnedBlock>>);
+
+impl PinnedPool {
+    /// Lease a block of at least `len` bytes. The context must be current.
+    fn lease(self: &Arc<Self>, len: usize) -> Result<PinnedLease> {
+        let reused = {
+            let mut free = self.0.lock().map_err(|_| GpuError::DeviceLost)?;
+            let best = free
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.cap >= len)
+                .min_by_key(|(_, b)| b.cap)
+                .map(|(i, _)| i);
+            best.map(|i| free.swap_remove(i))
+        };
+        let block = match reused {
+            Some(block) => block,
+            None => {
+                let mut ptr: *mut c_void = ptr::null_mut();
+                // SAFETY: writes one pinned allocation pointer into `ptr`.
+                cu(unsafe { sys::cuMemHostAlloc(&mut ptr, driver_len(len)?, 0) })?;
+                PinnedBlock { ptr, cap: len }
+            }
+        };
+        Ok(PinnedLease {
+            block,
+            pool: Arc::clone(self),
+        })
+    }
+}
+
+impl Drop for PinnedPool {
+    fn drop(&mut self) {
+        // Only reached with the context current (see CudaShared::drop), or on error paths
+        // where the driver call simply fails.
+        for block in self
+            .0
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            unsafe { sys::cuMemFreeHost(block.ptr) };
+        }
+    }
+}
+
+/// A pinned block held until the transfer using it has finished and, for a
+/// readback, its bytes have been taken. Returns the block to its pool on drop.
+struct PinnedLease {
+    block: PinnedBlock,
+    pool: Arc<PinnedPool>,
+}
+
+impl Drop for PinnedLease {
+    fn drop(&mut self) {
+        if let Ok(mut free) = self.pool.0.lock() {
+            free.push(self.block);
+        }
     }
 }
 
@@ -845,12 +1038,19 @@ struct CudaShared {
     /// Persistent compute stream — created once in `open()`, reused across all
     /// dispatches to eliminate per-kernel create/destroy overhead.
     stream: sys::CUstream,
+    /// Non-blocking streams for asynchronous transfers, one per direction, so
+    /// uploads and readbacks run on the copy engines alongside kernels on `stream`.
+    /// A readback waiting on a kernel does not hold up the next upload.
+    upload_stream: sys::CUstream,
+    download_stream: sys::CUstream,
     /// Compute capability, used as the NVRTC target.
     sm: (u32, u32),
     /// Timing-disabled events recycled between submissions.
-    events: Mutex<Vec<sys::CUevent>>,
+    events: Arc<EventPool>,
     /// Pinned staging for large host transfers, allocated on first use.
     staging: Mutex<Option<Staging>>,
+    /// Pinned blocks leased by asynchronous transfers.
+    pinned: Arc<PinnedPool>,
     /// Instantiated batch graphs, keyed by the structure of the batch.
     graphs: Mutex<GraphCache>,
 }
@@ -860,6 +1060,15 @@ unsafe impl Send for CudaShared {}
 unsafe impl Sync for CudaShared {}
 
 impl CudaShared {
+    /// The stream a lane's work is queued on.
+    fn stream(&self, lane: Lane) -> sys::CUstream {
+        match lane {
+            Lane::Compute => self.stream,
+            Lane::Upload => self.upload_stream,
+            Lane::Download => self.download_stream,
+        }
+    }
+
     /// Run `f` with the context current on this thread. The context is only
     /// re-set when the thread's current context differs, so the common path is
     /// one `cuCtxGetCurrent`. The current context is never cleared.
@@ -877,7 +1086,13 @@ impl CudaShared {
 
     /// Take a pooled event, or create one. The context must be current.
     fn take_event(&self) -> Result<sys::CUevent> {
-        if let Some(ev) = self.events.lock().map_err(|_| GpuError::DeviceLost)?.pop() {
+        if let Some(ev) = self
+            .events
+            .0
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .pop()
+        {
             return Ok(ev);
         }
         let mut ev: sys::CUevent = ptr::null_mut();
@@ -889,12 +1104,7 @@ impl CudaShared {
 
     /// Return a finished event to the pool. The context must be current.
     fn return_event(&self, ev: sys::CUevent) {
-        match self.events.lock() {
-            Ok(mut pool) => pool.push(ev),
-            Err(_) => {
-                unsafe { sys::cuEventDestroy_v2(ev) };
-            }
-        }
+        self.events.put(ev);
     }
 
     /// Record a completion event on the stream. The context must be current.
@@ -1272,6 +1482,8 @@ impl Drop for CudaShared {
         // because `_ctx` is dropped only after this body.
         if unsafe { sys::cuCtxSetCurrent(self.raw_ctx) } == 0 {
             unsafe { sys::cuStreamSynchronize(self.stream) };
+            unsafe { sys::cuStreamSynchronize(self.upload_stream) };
+            unsafe { sys::cuStreamSynchronize(self.download_stream) };
             // Graph execs and staging are released while the context is current.
             if let Ok(graphs) = self.graphs.get_mut() {
                 graphs.clear();
@@ -1279,12 +1491,19 @@ impl Drop for CudaShared {
             if let Ok(staging) = self.staging.get_mut() {
                 *staging = None;
             }
-            if let Ok(pool) = self.events.get_mut() {
+            if let Ok(mut pinned) = self.pinned.0.lock() {
+                for block in pinned.drain(..) {
+                    unsafe { sys::cuMemFreeHost(block.ptr) };
+                }
+            }
+            if let Ok(mut pool) = self.events.0.lock() {
                 for ev in pool.drain(..) {
                     unsafe { sys::cuEventDestroy_v2(ev) };
                 }
             }
             unsafe { sys::cuStreamDestroy_v2(self.stream) };
+            unsafe { sys::cuStreamDestroy_v2(self.upload_stream) };
+            unsafe { sys::cuStreamDestroy_v2(self.download_stream) };
         }
     }
 }
@@ -1304,7 +1523,10 @@ unsafe impl Sync for CudaDevice {}
 struct CudaSubmission {
     cycle_id: u64,
     shared: Arc<CudaShared>,
-    event: Mutex<Option<sys::CUevent>>,
+    event: Mutex<Option<Arc<OwnedEvent>>>,
+    /// Pinned block of an asynchronous transfer. Held until this submission is
+    /// dropped, so a readback's bytes stay valid until they are taken.
+    lease: Option<PinnedLease>,
     buffers: Arc<Mutex<SlotMap<marker::Buffer, CudaBuffer>>>,
     shaders: Arc<Mutex<SlotMap<marker::Shader, CudaShader>>>,
     pipelines: Arc<Mutex<SlotMap<marker::Pipeline, CudaPipeline>>>,
@@ -1328,19 +1550,15 @@ impl CudaSubmission {
 
     fn query(&self) -> Result<SubmissionStatus> {
         let mut event = self.event.lock().map_err(|_| GpuError::DeviceLost)?;
-        let Some(raw) = *event else {
+        let Some(raw) = event.as_ref().map(|ev| ev.ev) else {
             return Ok(SubmissionStatus::Complete);
         };
-        // One context entry covers the query and, on completion, the pool return.
-        let code = self.shared.with_current(|| {
-            // SAFETY: `raw` is this submission's live event.
-            let code = unsafe { sys::cuEventQuery(raw) };
-            if code == 0 {
-                self.shared.return_event(raw);
-            }
-            Ok(code)
-        })?;
+        // SAFETY (in closure): `raw` is kept alive by `event` while the lock is held.
+        let code = self
+            .shared
+            .with_current(|| Ok(unsafe { sys::cuEventQuery(raw) }))?;
         if code == 0 {
+            // Dropping the last reference returns the event to its pool.
             *event = None;
             self.release_in_flight();
             Ok(SubmissionStatus::Complete)
@@ -1383,17 +1601,65 @@ impl Drop for CudaSubmission {
         let Ok(event) = self.event.get_mut() else {
             return;
         };
-        let Some(raw) = event.take() else {
+        let Some(ev) = event.take() else {
             return;
         };
         // Preserve the resource-lifetime contract even if a pending token is
-        // dropped: wait for its exact stream position, then recycle the event.
-        let _ = self.shared.with_current(|| {
-            wait_event(raw)?;
-            self.shared.return_event(raw);
-            Ok(())
-        });
+        // dropped: wait for its exact stream position before the lease and the
+        // buffers it references can be released.
+        let _ = self.shared.with_current(|| wait_event(ev.ev));
+        drop(ev);
         self.release_in_flight();
+    }
+}
+
+/// Handle to an asynchronous buffer readback. Its bytes are in the lease of
+/// `sub`, valid once `sub` completes.
+struct CudaReadback {
+    sub: CudaSubmission,
+    len: usize,
+}
+
+impl GpuSubmission for CudaReadback {
+    fn cycle_id(&self) -> u64 {
+        self.sub.cycle_id()
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        self.sub.poll()
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        self.sub.wait(timeout)
+    }
+}
+
+impl GpuReadback for CudaReadback {
+    fn into_bytes(self: Box<Self>) -> Result<Vec<u8>> {
+        let mut bytes = vec![0u8; self.len];
+        self.read_into(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn read_into(self: Box<Self>, dst: &mut [u8]) -> Result<()> {
+        if dst.len() != self.len {
+            return Err(GpuError::Backend(format!(
+                "cuda: readback is {} bytes, destination is {}",
+                self.len,
+                dst.len()
+            )));
+        }
+        self.sub.wait(Duration::MAX)?;
+        let Some(lease) = self.sub.lease.as_ref() else {
+            return Err(GpuError::Backend(
+                "cuda: readback has no staging block".into(),
+            ));
+        };
+        // SAFETY: the transfer into this block completed (waited above), and the
+        // block stays leased to `self` for the duration of the copy.
+        let staged = unsafe { slice::from_raw_parts(lease.block.ptr as *const u8, self.len) };
+        copy_host(dst, staged);
+        Ok(())
     }
 }
 
@@ -1445,6 +1711,12 @@ impl Drop for CudaDevice {
             // A device may be dropped before its submission handles. Drain
             // work before freeing the resources owned by this device.
             cu(unsafe { sys::cuStreamSynchronize(self.shared.stream) })?;
+            cu(unsafe { sys::cuStreamSynchronize(self.shared.upload_stream) })?;
+            cu(unsafe { sys::cuStreamSynchronize(self.shared.download_stream) })?;
+            // Hazard events are released now; the streams they refer to are drained.
+            if let Ok(mut lifetime) = self.lifetime.lock() {
+                lifetime.hazards.clear();
+            }
             // Graphs reference kernels in the modules unloaded below.
             self.shared.clear_graphs();
             for cb in buffers {
@@ -1579,6 +1851,150 @@ impl CudaDevice {
             dst_buf: dst.ptr,
             src_buf: src.ptr,
         }))
+    }
+}
+
+/// Buffers a plan touches, as `(base pointer, written)`, in plan order.
+fn plan_accesses(plan: &[Launch]) -> Vec<(u64, bool)> {
+    let mut accesses = Vec::new();
+    let mut one = Vec::new();
+    for launch in plan {
+        launch_accesses(launch, &mut one);
+        accesses.append(&mut one);
+    }
+    accesses
+}
+
+impl CudaDevice {
+    /// Make `stream` wait for the events of earlier transfers or compute work that
+    /// touch `ptrs`, from the other stream. Same-stream events are ordered already.
+    /// The context must be current and `stream` must be one of this device's streams.
+    fn wait_hazards(&self, lane: Lane, ptrs: &[u64]) -> Result<()> {
+        let stream = self.shared.stream(lane);
+        let lifetime = self.lifetime.lock().map_err(|_| GpuError::DeviceLost)?;
+        for ptr in ptrs {
+            let Some(hazard) = lifetime.hazards.get(ptr) else {
+                continue;
+            };
+            for access in [&hazard.last_access, &hazard.last_write]
+                .into_iter()
+                .flatten()
+            {
+                if access.lane != lane {
+                    // SAFETY: the event is kept alive by `access` while `lifetime` is held.
+                    cu(unsafe { sys::cuStreamWaitEvent(stream, access.event.ev, 0) })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record that a work item completing at `event` on `lane` accessed `accesses`,
+    /// as `(base pointer, written)`.
+    fn publish_hazards(
+        &self,
+        accesses: &[(u64, bool)],
+        event: &Arc<OwnedEvent>,
+        lane: Lane,
+    ) -> Result<()> {
+        let mut lifetime = self.lifetime.lock().map_err(|_| GpuError::DeviceLost)?;
+        for &(ptr, written) in accesses {
+            let hazard = lifetime.hazards.entry(ptr).or_default();
+            let access = Access {
+                event: Arc::clone(event),
+                lane,
+            };
+            if written {
+                hazard.last_write = Some(access.clone());
+            }
+            hazard.last_access = Some(access);
+        }
+        Ok(())
+    }
+
+    /// Account for a new submission before any of its work is queued.
+    fn begin_submission(&self) -> Result<()> {
+        self.lifetime
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .in_flight += 1;
+        Ok(())
+    }
+
+    /// Drain `stream` after a failed submission, then release its in-flight count.
+    fn fail_submission(&self, lane: Lane, error: GpuError) -> GpuError {
+        let stream = self.shared.stream(lane);
+        let _ = self
+            .shared
+            .with_current(|| cu(unsafe { sys::cuStreamSynchronize(stream) }));
+        release_cuda_in_flight(
+            &self.shared,
+            &self.buffers,
+            &self.shaders,
+            &self.pipelines,
+            &self.lifetime,
+        );
+        error
+    }
+
+    /// Queue a resolved compute plan on the compute stream, after the copy-stream
+    /// work it depends on, and return its completion event. `resolve_error` is set
+    /// when resolution stopped early: the prefix is still queued, then the error returned.
+    /// The context must be current.
+    fn compute_plan(
+        &self,
+        plan: &[Launch],
+        op_count: usize,
+        resolve_error: Option<GpuError>,
+    ) -> Result<Arc<OwnedEvent>> {
+        let stream = self.shared.stream;
+        let accesses = plan_accesses(plan);
+        let ptrs: Vec<u64> = accesses.iter().map(|&(ptr, _)| ptr).collect();
+        self.wait_hazards(Lane::Compute, &ptrs)?;
+        if let Some(error) = resolve_error {
+            // Launch the resolved prefix, as the per-op loop did, then fail.
+            self.shared.issue(plan)?;
+            return Err(error);
+        }
+        self.shared.launch_plan(plan, op_count)?;
+        let event = OwnedEvent::record(&self.shared, stream)?;
+        self.publish_hazards(&accesses, &event, Lane::Compute)?;
+        Ok(event)
+    }
+
+    /// Wrap a copy-stream transfer's completion event as a submission.
+    fn transfer_submission(
+        &self,
+        cycle_id: u64,
+        event: Arc<OwnedEvent>,
+        lease: PinnedLease,
+    ) -> CudaSubmission {
+        CudaSubmission {
+            cycle_id,
+            shared: Arc::clone(&self.shared),
+            event: Mutex::new(Some(event)),
+            lease: Some(lease),
+            buffers: Arc::clone(&self.buffers),
+            shaders: Arc::clone(&self.shaders),
+            pipelines: Arc::clone(&self.pipelines),
+            lifetime: Arc::clone(&self.lifetime),
+        }
+    }
+
+    /// Resolve a buffer for an asynchronous transfer: its record and the base
+    /// pointer, with the byte range checked against it.
+    fn transfer_target(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<CudaBuffer> {
+        let cb = self
+            .buffers
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(buffer)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+        if offset.checked_add(len).is_none_or(|end| end > cb.len) {
+            return Err(GpuError::Backend("cuda: transfer out of bounds".into()));
+        }
+        Ok(cb)
     }
 }
 
@@ -1795,13 +2211,18 @@ impl GpuDevice for CudaDevice {
             };
             if lifetime.in_flight != 0 {
                 if let Some(cb) = buffers.retire(buffer) {
+                    lifetime.hazards.remove(&cb.ptr);
                     lifetime
                         .deferred
                         .push(DeferredCudaResource::Buffer(buffer.index(), cb));
                 }
                 None
             } else {
-                buffers.remove(buffer)
+                let cb = buffers.remove(buffer);
+                if let Some(cb) = cb {
+                    lifetime.hazards.remove(&cb.ptr);
+                }
+                cb
             }
         };
         if let Some(cb) = cb {
@@ -2002,52 +2423,30 @@ impl GpuDevice for CudaDevice {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
 
-        let stream = self.shared.stream;
-        self.lifetime
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .in_flight += 1;
+        self.begin_submission()?;
         // Same-stream launches execute and become globally visible in
         // submission order on the device, so a later op safely reads an
         // earlier op's output with no explicit barrier. The event recorded
         // after the final launch represents completion of the whole batch.
         let event = self.shared.with_current(|| {
             let (plan, resolve_error) = resolve_all(ops, |op| self.resolve_dispatch(op).map(Some));
-            if let Some(error) = resolve_error {
-                // Launch the resolved prefix, as the per-op loop did, then fail.
-                self.shared.issue(&plan)?;
-                return Err(error);
-            }
-            self.shared.launch_plan(&plan, ops.len())?;
-            self.shared.record_event()
+            self.compute_plan(&plan, ops.len(), resolve_error)
         });
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                // Some earlier launches may already be queued. Drain them
-                // before releasing any concurrently retired resources.
-                let _ = self
-                    .shared
-                    .with_current(|| cu(unsafe { sys::cuStreamSynchronize(stream) }));
-                release_cuda_in_flight(
-                    &self.shared,
-                    &self.buffers,
-                    &self.shaders,
-                    &self.pipelines,
-                    &self.lifetime,
-                );
-                return Err(error);
-            }
-        };
-        Ok(Box::new(CudaSubmission {
-            cycle_id,
-            shared: Arc::clone(&self.shared),
-            event: Mutex::new(Some(event)),
-            buffers: Arc::clone(&self.buffers),
-            shaders: Arc::clone(&self.shaders),
-            pipelines: Arc::clone(&self.pipelines),
-            lifetime: Arc::clone(&self.lifetime),
-        }))
+        match event {
+            Ok(event) => Ok(Box::new(CudaSubmission {
+                cycle_id,
+                shared: Arc::clone(&self.shared),
+                event: Mutex::new(Some(event)),
+                lease: None,
+                buffers: Arc::clone(&self.buffers),
+                shaders: Arc::clone(&self.shaders),
+                pipelines: Arc::clone(&self.pipelines),
+                lifetime: Arc::clone(&self.lifetime),
+            })),
+            // Some earlier launches may already be queued; `fail_submission` drains them
+            // before releasing any concurrently retired resources.
+            Err(error) => Err(self.fail_submission(Lane::Compute, error)),
+        }
     }
 
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
@@ -2055,49 +2454,138 @@ impl GpuDevice for CudaDevice {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
 
-        let stream = self.shared.stream;
-        self.lifetime
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .in_flight += 1;
+        self.begin_submission()?;
         let event = self.shared.with_current(|| {
             let (plan, resolve_error) = resolve_all(ops, |op| match op {
                 ComputeOp::CopyBuffer(copy) => self.resolve_copy(copy),
                 ComputeOp::Dispatch(op) => self.resolve_dispatch(op).map(Some),
             });
-            if let Some(error) = resolve_error {
-                // Launch the resolved prefix, as the per-op loop did, then fail.
-                self.shared.issue(&plan)?;
-                return Err(error);
-            }
-            self.shared.launch_plan(&plan, ops.len())?;
-            self.shared.record_event()
+            self.compute_plan(&plan, ops.len(), resolve_error)
         });
-        let event = match event {
-            Ok(event) => event,
-            Err(error) => {
-                let _ = self
-                    .shared
-                    .with_current(|| cu(unsafe { sys::cuStreamSynchronize(stream) }));
-                release_cuda_in_flight(
-                    &self.shared,
-                    &self.buffers,
-                    &self.shaders,
-                    &self.pipelines,
-                    &self.lifetime,
-                );
-                return Err(error);
-            }
-        };
-        Ok(Box::new(CudaSubmission {
-            cycle_id,
-            shared: Arc::clone(&self.shared),
-            event: Mutex::new(Some(event)),
-            buffers: Arc::clone(&self.buffers),
-            shaders: Arc::clone(&self.shaders),
-            pipelines: Arc::clone(&self.pipelines),
-            lifetime: Arc::clone(&self.lifetime),
-        }))
+        match event {
+            Ok(event) => Ok(Box::new(CudaSubmission {
+                cycle_id,
+                shared: Arc::clone(&self.shared),
+                event: Mutex::new(Some(event)),
+                lease: None,
+                buffers: Arc::clone(&self.buffers),
+                shaders: Arc::clone(&self.shaders),
+                pipelines: Arc::clone(&self.pipelines),
+                lifetime: Arc::clone(&self.lifetime),
+            })),
+            Err(error) => Err(self.fail_submission(Lane::Compute, error)),
+        }
+    }
+
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        if data.is_empty() {
+            self.transfer_target(buffer, offset, 0)?;
+            return Ok(Box::new(CompletedSubmission::new(cycle_id)));
+        }
+        let cb = self.transfer_target(buffer, offset, data.len() as u64)?;
+        let stream = self.shared.stream(Lane::Upload);
+        self.begin_submission()?;
+        let queued = self.shared.with_current(|| {
+            let lease = self.shared.pinned.lease(data.len())?;
+            // SAFETY: the lease holds at least `data.len()` bytes and is not shared
+            // with any other transfer until this one completes.
+            let staged =
+                unsafe { slice::from_raw_parts_mut(lease.block.ptr as *mut u8, data.len()) };
+            copy_host(staged, data);
+            self.wait_hazards(Lane::Upload, &[cb.ptr])?;
+            // SAFETY: the destination range was bounds-checked against the buffer.
+            cu(unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    cb.ptr + offset,
+                    lease.block.ptr as *const c_void,
+                    driver_len(data.len())?,
+                    stream,
+                )
+            })?;
+            let published = OwnedEvent::record(&self.shared, stream).and_then(|event| {
+                self.publish_hazards(&[(cb.ptr, true)], &event, Lane::Upload)
+                    .map(|()| event)
+            });
+            let event = match published {
+                Ok(event) => event,
+                Err(error) => {
+                    // The copy may already read `lease`: drain it before the lease is returned.
+                    let _ = cu(unsafe { sys::cuStreamSynchronize(stream) });
+                    return Err(error);
+                }
+            };
+            Ok((event, lease))
+        });
+        match queued {
+            Ok((event, lease)) => Ok(Box::new(self.transfer_submission(cycle_id, event, lease))),
+            Err(error) => Err(self.fail_submission(Lane::Upload, error)),
+        }
+    }
+
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        let cb = self.transfer_target(buffer, offset, len)?;
+        if !cb.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
+        let len_bytes = usize::try_from(len).map_err(|_| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "cuda: read length exceeds host address range".into(),
+            ))
+        })?;
+        if len_bytes == 0 {
+            return Ok(Box::new(CompletedReadback::new(cycle_id, Vec::new())));
+        }
+        let stream = self.shared.stream(Lane::Download);
+        self.begin_submission()?;
+        let queued = self.shared.with_current(|| {
+            let lease = self.shared.pinned.lease(len_bytes)?;
+            self.wait_hazards(Lane::Download, &[cb.ptr])?;
+            // SAFETY: the lease holds at least `len_bytes` bytes; the source range was
+            // bounds-checked against the buffer.
+            cu(unsafe {
+                sys::cuMemcpyDtoHAsync_v2(
+                    lease.block.ptr,
+                    cb.ptr + offset,
+                    driver_len(len_bytes)?,
+                    stream,
+                )
+            })?;
+            let published = OwnedEvent::record(&self.shared, stream).and_then(|event| {
+                self.publish_hazards(&[(cb.ptr, false)], &event, Lane::Download)
+                    .map(|()| event)
+            });
+            let event = match published {
+                Ok(event) => event,
+                Err(error) => {
+                    // The copy writes into `lease`: drain it before the lease is returned.
+                    let _ = cu(unsafe { sys::cuStreamSynchronize(stream) });
+                    return Err(error);
+                }
+            };
+            Ok((event, lease))
+        });
+        match queued {
+            Ok((event, lease)) => Ok(Box::new(CudaReadback {
+                sub: self.transfer_submission(cycle_id, event, lease),
+                len: len_bytes,
+            })),
+            Err(error) => Err(self.fail_submission(Lane::Download, error)),
+        }
     }
 }
 
@@ -3749,5 +4237,231 @@ void trig(
         for buf in ins.into_iter().chain(outs) {
             device.destroy_buffer(buf);
         }
+    }
+
+    /// `slow_copy` spins for about `cycles` clock cycles in every thread, then copies `in` to `out`.
+    const SLOW_COPY_CUDA: &str = r#"
+extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n, unsigned int cycles) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const long long start = clock64();
+    while ((unsigned long long)(clock64() - start) < cycles) {
+    }
+    if (i < n) {
+        out[i] = in[i];
+    }
+}
+"#;
+
+    fn f32_values(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+
+    fn f32_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
+        values.flat_map(f32::to_le_bytes).collect()
+    }
+
+    /// Compile `entry` from `src` into a pipeline with 64-thread blocks.
+    fn pipeline_for(
+        device: &dyn GpuDevice,
+        src: &str,
+        entry: &str,
+    ) -> (ShaderHandle, PipelineHandle) {
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(src))
+            .expect("compile kernel");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+        (shader, pipeline)
+    }
+
+    /// Submit one dispatch of a `pipeline` over `buffers` (bound in order) and `scalars`.
+    fn submit_one(
+        device: &dyn GpuDevice,
+        pipeline: PipelineHandle,
+        buffers: &[BufferHandle],
+        scalars: &[Scalar],
+        n: u32,
+    ) -> Submission {
+        let slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        let op = zengpu_hal::DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &slots,
+                scalars,
+                textures: &[],
+                images: &[],
+            },
+            grid: [n.div_ceil(64), 1, 1],
+        };
+        device
+            .submit_batch(0, slice::from_ref(&op))
+            .expect("submit failed")
+    }
+
+    #[test]
+    fn async_write_dispatch_read_chain_needs_no_intermediate_waits() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let size = (N * size_of::<f32>()) as u64;
+        let input = graph_buffer(&*device, size);
+        let output = graph_buffer(&*device, size);
+        let (shader, pipeline) = pipeline_for(&*device, COPY_FILL_CUDA, "copy_add");
+        let data = f32_bytes((0..N).map(|i| i as f32));
+
+        let write = device.submit_write_buffer(1, input, 0, &data).unwrap();
+        let kernel = submit_one(
+            &*device,
+            pipeline,
+            &[input, output],
+            &[Scalar::F32(2.0), Scalar::U32(N as u32)],
+            N as u32,
+        );
+        let readback = device.submit_read_buffer(2, output, 0, size).unwrap();
+        assert_eq!(readback.cycle_id(), 2);
+        let got = f32_values(&readback.into_bytes().unwrap());
+        let expected: Vec<f32> = (0..N).map(|i| i as f32 + 2.0).collect();
+        assert_eq!(got, expected);
+        write.wait(Duration::from_secs(5)).unwrap();
+        kernel.wait(Duration::from_secs(5)).unwrap();
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(input);
+        device.destroy_buffer(output);
+    }
+
+    #[test]
+    fn async_ping_pong_chain_waits_only_on_final_readbacks() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 512;
+        const ROUNDS: usize = 6;
+        let size = (N * size_of::<f32>()) as u64;
+        let bufs = [graph_buffer(&*device, size), graph_buffer(&*device, size)];
+        let (shader, pipeline) = pipeline_for(&*device, COPY_FILL_CUDA, "copy_add");
+        let mut pending = Vec::new();
+        let mut readbacks = Vec::new();
+        for round in 0..ROUNDS {
+            let (src, dst) = (bufs[round % 2], bufs[(round + 1) % 2]);
+            let data = f32_bytes((0..N).map(|i| (round * 1000 + i) as f32));
+            pending.push(
+                device
+                    .submit_write_buffer(round as u64, src, 0, &data)
+                    .unwrap(),
+            );
+            pending.push(submit_one(
+                &*device,
+                pipeline,
+                &[src, dst],
+                &[Scalar::F32(1.0), Scalar::U32(N as u32)],
+                N as u32,
+            ));
+            readbacks.push(
+                device
+                    .submit_read_buffer(round as u64, dst, 0, size)
+                    .unwrap(),
+            );
+        }
+        for (round, readback) in readbacks.into_iter().enumerate() {
+            let got = f32_values(&readback.into_bytes().unwrap());
+            let expected: Vec<f32> = (0..N).map(|i| (round * 1000 + i) as f32 + 1.0).collect();
+            assert_eq!(got, expected, "round {round}");
+        }
+        drop(pending);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for buf in bufs {
+            device.destroy_buffer(buf);
+        }
+    }
+
+    #[test]
+    fn async_write_lands_after_earlier_reader_finishes() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let size = (N * size_of::<f32>()) as u64;
+        let x = graph_buffer(&*device, size);
+        let y = graph_buffer(&*device, size);
+        let (shader, pipeline) = pipeline_for(&*device, SLOW_COPY_CUDA, "slow_copy");
+        let old: Vec<f32> = (0..N).map(|i| i as f32 + 0.5).collect();
+        let new: Vec<f32> = (0..N).map(|i| i as f32 + 1000.0).collect();
+        device
+            .write_buffer(x, 0, &f32_bytes(old.iter().copied()))
+            .unwrap();
+
+        // The kernel reads x for tens of milliseconds; the write must not overtake it.
+        let kernel = submit_one(
+            &*device,
+            pipeline,
+            &[x, y],
+            &[Scalar::U32(N as u32), Scalar::U32(50_000_000)],
+            N as u32,
+        );
+        let write = device
+            .submit_write_buffer(1, x, 0, &f32_bytes(new.iter().copied()))
+            .unwrap();
+        let readback = device.submit_read_buffer(2, y, 0, size).unwrap();
+        assert_eq!(f32_values(&readback.into_bytes().unwrap()), old);
+        kernel.wait(Duration::from_secs(10)).unwrap();
+        write.wait(Duration::from_secs(10)).unwrap();
+
+        let check = device.submit_read_buffer(3, x, 0, size).unwrap();
+        assert_eq!(f32_values(&check.into_bytes().unwrap()), new);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(x);
+        device.destroy_buffer(y);
+    }
+
+    #[test]
+    fn async_large_write_round_trips() {
+        let Some(device) = cuda_device() else { return };
+        const SIZE: usize = 80 * 1024 * 1024 + 13;
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..SIZE)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect();
+        let write = device.submit_write_buffer(0, buf, 0, &data).unwrap();
+        let readback = device.submit_read_buffer(0, buf, 0, SIZE as u64).unwrap();
+        assert!(readback.into_bytes().unwrap() == data);
+        write.wait(Duration::from_secs(10)).unwrap();
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn async_write_copies_data_before_returning() {
+        let Some(device) = cuda_device() else { return };
+        const SIZE: usize = 4096;
+        let buf = graph_buffer(&*device, SIZE as u64);
+        let mut data: Vec<u8> = (0..SIZE).map(|i| (i % 253) as u8).collect();
+        let expected = data.clone();
+        let write = device.submit_write_buffer(0, buf, 0, &data).unwrap();
+        data.fill(0);
+        let mut got = vec![0u8; SIZE];
+        device
+            .submit_read_buffer(0, buf, 0, SIZE as u64)
+            .unwrap()
+            .read_into(&mut got)
+            .unwrap();
+        assert!(got == expected);
+        write.wait(Duration::from_secs(5)).unwrap();
+        device.destroy_buffer(buf);
     }
 }
