@@ -809,6 +809,8 @@ fn blas_sgemm_half_activations_speed() {
     let blas = Blas::new(&*device).unwrap();
     for (m, n, k) in [
         (1u32, 4096u32, 4096u32),
+        (4, 4096, 4096),
+        (8, 4096, 4096),
         (16, 4096, 4096),
         (128, 4096, 4096),
         (512, 4096, 4096),
