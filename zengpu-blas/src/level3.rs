@@ -1,5 +1,7 @@
 //! BLAS Level 3 — matrix-matrix operations.
 
+use std::array::from_fn;
+
 use zengpu_compute::{BufferPool, DeviceArray, OpList};
 use zengpu_hal::{
     BackendPreference, ComputePipelineDesc, ComputePipelineHints, DType, GpuDevice, GpuError,
@@ -13,10 +15,6 @@ use crate::gemm_skinny::{
 };
 use crate::gemm_tiled::{GEMM_TILED_ZSL, TILE as TILED_GEMM_TILE};
 use crate::gemm_wmma;
-
-/// Rows above which half-precision A and B go to the WMMA kernels; fewer
-/// rows widen A and take the f32-A skinny kernels, which stream B faster.
-const WMMA_MIN_ROWS: u32 = 8;
 
 /// `C[m,n] = alpha * sum_k A[m,k] * B[k,n]`
 ///
@@ -68,10 +66,11 @@ struct HipGemm {
     compute_units: u32,
 }
 
-/// The RDNA4 WMMA kernels ([`gemm_wmma`]), f16 then bf16.
+/// The RDNA4 WMMA kernels ([`gemm_wmma`]): per entry of
+/// [`gemm_wmma::VARIANTS`], f16 then bf16.
 struct HipWmma {
     shader: ShaderHandle,
-    pipelines: [PipelineHandle; 2],
+    pipelines: [[PipelineHandle; 2]; gemm_wmma::VARIANTS.len()],
 }
 
 /// The Vulkan few-row GEMM kernels and their split-K reduction.
@@ -262,20 +261,26 @@ impl GemmKernel {
                 return None;
             }
         };
-        let pipeline = |entry| {
-            device.create_compute_pipeline(ComputePipelineDesc {
+        let mut made = Vec::new();
+        let mut built = || -> Result<HipWmma> {
+            for variant in &gemm_wmma::VARIANTS {
+                for suffix in ["_f16", "_bf16"] {
+                    made.push(device.create_compute_pipeline(ComputePipelineDesc {
+                        shader,
+                        entry: &format!("{}{suffix}", variant.name),
+                        block: [variant.threads, 1, 1],
+                    })?);
+                }
+            }
+            Ok(HipWmma {
                 shader,
-                entry,
-                block: [256, 1, 1],
+                pipelines: from_fn(|v| [made[2 * v], made[2 * v + 1]]),
             })
         };
-        match (pipeline("hgemm_wmma_f16"), pipeline("hgemm_wmma_bf16")) {
-            (Ok(f16), Ok(bf16)) => Some(HipWmma {
-                shader,
-                pipelines: [f16, bf16],
-            }),
-            (f16, bf16) => {
-                for p in [f16, bf16].into_iter().flatten() {
+        match built() {
+            Ok(wmma) => Some(wmma),
+            Err(_) => {
+                for p in made {
                     device.destroy_pipeline(p);
                 }
                 device.destroy_shader(shader);
@@ -297,7 +302,7 @@ impl GemmKernel {
                 device.destroy_pipeline(p);
             }
             if let Some(wmma) = hip.wmma {
-                for p in wmma.pipelines {
+                for p in wmma.pipelines.into_iter().flatten() {
                     device.destroy_pipeline(p);
                 }
                 device.destroy_shader(wmma.shader);
@@ -428,20 +433,20 @@ impl GemmKernel {
         if let Some(wmma) = &hip.wmma
             && a_type != 0
             && a_type == b_type
-            && m > WMMA_MIN_ROWS
             && gemm_wmma::fits(n, k)
         {
+            let variant = gemm_wmma::pick(m);
             ops.dispatch(
-                wmma.pipelines[a_type - 1],
+                wmma.pipelines[variant][a_type - 1],
                 &[a.buffer.index(), b.buffer.index(), c.buffer.index()],
                 &[
                     Scalar::U32(m),
                     Scalar::U32(n),
                     Scalar::U32(k),
-                    Scalar::U32(gemm_wmma::group(n, k)),
+                    Scalar::U32(gemm_wmma::GROUP),
                     Scalar::F32(alpha),
                 ],
-                gemm_wmma::grid(m, n),
+                gemm_wmma::grid(&gemm_wmma::VARIANTS[variant], m, n),
             );
             return Ok(());
         }
