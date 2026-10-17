@@ -15,7 +15,7 @@ use crate::{HIP_EVENT_DISABLE_TIMING, HIP_SUCCESS, HipBuffer, HipCore};
 use crate::{HIP_MEMCPY_D2H, HIP_MEMCPY_H2D};
 
 /// Bytes per pinned slot.
-const CHUNK: usize = 4 << 20;
+pub(crate) const CHUNK: usize = 4 << 20;
 
 /// `hipHostMallocPortable`: pinned for every device, not just the current one.
 const HIP_HOST_MALLOC_PORTABLE: u32 = 1;

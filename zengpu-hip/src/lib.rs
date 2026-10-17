@@ -628,10 +628,11 @@ impl HipCore {
     }
 
     fn buffer(&self, handle: BufferHandle) -> Result<HipBuffer> {
-        lock(&self.buffers)?
+        let buffers = lock(&self.buffers)?;
+        buffers
             .get(handle)
             .copied()
-            .ok_or_else(|| stale(handle))
+            .ok_or_else(|| stale(&buffers, handle))
     }
 
     fn release_in_flight(&self) {
@@ -710,10 +711,13 @@ impl HipCore {
 
     /// Queue one kernel launch on the device stream.
     fn launch(&self, op: &DispatchOp<'_>) -> Result<()> {
-        let pipe = lock(&self.pipelines)?
-            .get(op.pipeline)
-            .cloned()
-            .ok_or_else(|| stale(op.pipeline))?;
+        let pipe = {
+            let pipelines = lock(&self.pipelines)?;
+            pipelines
+                .get(op.pipeline)
+                .cloned()
+                .ok_or_else(|| stale(&pipelines, op.pipeline))?
+        };
         if !op.bindings.textures.is_empty() || !op.bindings.images.is_empty() {
             return Err(GpuError::Unsupported(
                 "hip: compute-only backend has no texture or image bindings".into(),
@@ -745,7 +749,8 @@ impl HipCore {
             }
         }
 
-        let mut storage = [[0u8; 8]; MAX_PARAMS];
+        // 8-byte aligned so each slot can be read as a pointer or a scalar.
+        let mut storage = [0u64; MAX_PARAMS];
         let mut n = 0usize;
         {
             let buffers = lock(&self.buffers)?;
@@ -753,7 +758,7 @@ impl HipCore {
                 let buffer = buffers.get_by_slot_index(slot).ok_or_else(|| {
                     binding_error(format!("hip: binding refers to unknown buffer slot {slot}"))
                 })?;
-                storage[n] = (buffer.ptr as u64).to_ne_bytes();
+                storage[n] = buffer.ptr as u64;
                 n += 1;
             }
         }
@@ -763,12 +768,15 @@ impl HipCore {
                 Scalar::I32(v) => v.to_ne_bytes(),
                 Scalar::F32(v) => v.to_bits().to_ne_bytes(),
             };
-            storage[n][..4].copy_from_slice(&bytes);
+            // Scalars occupy the first four bytes of their slot; the rest is zero.
+            let mut slot = [0u8; 8];
+            slot[..4].copy_from_slice(&bytes);
+            storage[n] = u64::from_ne_bytes(slot);
             n += 1;
         }
         let mut params = [ptr::null_mut::<c_void>(); MAX_PARAMS];
         for (param, slot) in params.iter_mut().zip(storage.iter_mut()).take(n) {
-            *param = slot.as_mut_ptr() as *mut c_void;
+            *param = slot as *mut u64 as *mut c_void;
         }
 
         unsafe {
@@ -940,11 +948,11 @@ impl Drop for HipCore {
     }
 }
 
-fn stale<K>(handle: zengpu_hal::Handle<K>) -> GpuError {
+fn stale<K, V>(table: &SlotMap<K, V>, handle: zengpu_hal::Handle<K>) -> GpuError {
     GpuError::InvalidUsage(UsageError::StaleHandle {
         index: handle.index(),
         expected_gen: handle.generation(),
-        actual_gen: 0,
+        actual_gen: table.generation_at(handle.index()).unwrap_or(0),
     })
 }
 
@@ -1596,30 +1604,36 @@ impl GpuDevice for HipDevice {
         {
             staging.copy(&self.core, dst_buf, &src_device.core, src_buf, bytes)?;
         } else {
-            let mut staging = vec![0u8; bytes];
-            src_device.core.activate()?;
-            unsafe {
-                src_device.core.check(
-                    hipMemcpy(
-                        staging.as_mut_ptr() as *mut c_void,
-                        src_buf.ptr,
-                        bytes,
-                        src_buf.copy_kind(HIP_MEMCPY_D2H),
-                    ),
-                    "hipMemcpy peer fallback D→H",
-                )?;
-            }
-            self.core.activate()?;
-            unsafe {
-                self.core.check(
-                    hipMemcpy(
-                        dst_buf.ptr,
-                        staging.as_ptr() as *const c_void,
-                        bytes,
-                        dst_buf.copy_kind(HIP_MEMCPY_H2D),
-                    ),
-                    "hipMemcpy peer fallback H→D",
-                )?;
+            // One pageable chunk at a time, so the host never holds the whole
+            // transfer.
+            let mut staging = vec![0u8; bytes.min(peer::CHUNK)];
+            for offset in (0..bytes).step_by(peer::CHUNK) {
+                let len = (bytes - offset).min(peer::CHUNK);
+                let chunk = &mut staging[..len];
+                src_device.core.activate()?;
+                unsafe {
+                    src_device.core.check(
+                        hipMemcpy(
+                            chunk.as_mut_ptr() as *mut c_void,
+                            src_buf.ptr.cast::<u8>().add(offset).cast::<c_void>(),
+                            len,
+                            src_buf.copy_kind(HIP_MEMCPY_D2H),
+                        ),
+                        "hipMemcpy peer fallback D→H",
+                    )?;
+                }
+                self.core.activate()?;
+                unsafe {
+                    self.core.check(
+                        hipMemcpy(
+                            dst_buf.ptr.cast::<u8>().add(offset).cast::<c_void>(),
+                            chunk.as_ptr() as *const c_void,
+                            len,
+                            dst_buf.copy_kind(HIP_MEMCPY_H2D),
+                        ),
+                        "hipMemcpy peer fallback H→D",
+                    )?;
+                }
             }
         }
         Ok(())
@@ -1723,8 +1737,12 @@ impl GpuDevice for HipDevice {
                     .push(Deferred::Shader(shader.index(), module));
             }
         } else {
-            // Unloads now unless a pipeline still holds the module.
-            shaders.remove(shader);
+            // Unloads now unless a pipeline still holds the module. Release the
+            // table and lifetime locks before the last reference can unload it.
+            let removed = shaders.remove(shader);
+            drop(shaders);
+            drop(lifetime);
+            drop(removed);
         }
     }
 
@@ -1805,7 +1823,12 @@ impl GpuDevice for HipDevice {
                     .push(Deferred::Pipeline(pipeline.index(), pipe));
             }
         } else {
-            pipelines.remove(pipeline);
+            // Dropping the pipeline may release the last module reference, so
+            // do it after the locks are gone.
+            let removed = pipelines.remove(pipeline);
+            drop(pipelines);
+            drop(lifetime);
+            drop(removed);
         }
     }
 
