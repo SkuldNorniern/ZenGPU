@@ -538,7 +538,7 @@ mod phase_z_tests {
             .source;
         assert!(hip_source.contains("const unsigned short* __restrict__ src"));
         assert!(hip_source.contains("unsigned short* __restrict__ out"));
-        assert!(hip_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
+        assert!(hip_source.contains("f32_to_bf16(bf16_to_f32(src[zsl_gx]))"));
         assert!(hip_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
         assert!(hip_source.contains("__device__ __forceinline__ float bf16_to_f32"));
     }
@@ -551,7 +551,7 @@ mod phase_z_tests {
             .source;
         assert!(cuda_source.contains("const unsigned short* __restrict__ src"));
         assert!(cuda_source.contains("unsigned short* __restrict__ out"));
-        assert!(cuda_source.contains("f32_to_bf16(bf16_to_f32(src[gx]))"));
+        assert!(cuda_source.contains("f32_to_bf16(bf16_to_f32(src[zsl_gx]))"));
         assert!(cuda_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
         assert!(cuda_source.contains("__device__ __forceinline__ float bf16_to_f32"));
     }
@@ -677,10 +677,10 @@ int main() {{
         assert!(!hip_source.contains("#include"));
         assert!(hip_source.contains("const unsigned short* __restrict__ src"));
         assert!(hip_source.contains("unsigned short* __restrict__ out"));
-        assert!(hip_source.contains("f32_to_f16(f16_to_f32(src[gx]))"));
+        assert!(hip_source.contains("f32_to_f16(f16_to_f32(src[zsl_gx]))"));
         assert!(cuda_source.contains("#include <cuda_fp16.h>"));
         assert!(cuda_source.contains("const __half* __restrict__ src"));
-        assert!(cuda_source.contains("__float2half(__half2float(src[gx]))"));
+        assert!(cuda_source.contains("__float2half(__half2float(src[zsl_gx]))"));
         assert!(msl_source.contains("device half* src"));
         assert!(msl_source.contains("half(float(src[gid.x]))"));
     }
@@ -1138,10 +1138,10 @@ int main() {{
         let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
         for src in [&hip_source, &cuda_source] {
-            assert!(src.contains("(a[gx] + ((int)(b[gx])))"));
-            assert!(src.contains("(a[gx] < ((int)(b[gx])))"));
-            assert!(src.contains("(((int)(b[gx])) >= a[gx])"));
-            assert!(!src.contains("(a[gx] + b[gx])"));
+            assert!(src.contains("(a[zsl_gx] + ((int)(b[zsl_gx])))"));
+            assert!(src.contains("(a[zsl_gx] < ((int)(b[zsl_gx])))"));
+            assert!(src.contains("(((int)(b[zsl_gx])) >= a[zsl_gx])"));
+            assert!(!src.contains("(a[zsl_gx] + b[zsl_gx])"));
         }
         spirv::lower_compute(&module).expect("lower to SPIR-V");
     }
@@ -1158,9 +1158,27 @@ int main() {{
         let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
         for src in [&hip_source, &cuda_source] {
-            assert!(src.contains("unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"));
-            assert!(src.contains("unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"));
-            assert!(src.contains("(gy + gz)"));
+            assert!(src.contains("unsigned int zsl_gy = blockIdx.y * blockDim.y + threadIdx.y;"));
+            assert!(src.contains("unsigned int zsl_gz = blockIdx.z * blockDim.z + threadIdx.z;"));
+            assert!(src.contains("(zsl_gy + zsl_gz)"));
+        }
+    }
+
+    #[test]
+    fn user_locals_named_like_global_ids_do_not_collide() {
+        let source = r#"
+            @workgroup_size(64)
+            kernel ids(out: device mut buffer<u32>, id: global_id) {
+                let gy = id.x
+                out[gy] = gy
+            }
+        "#;
+        let module = parse_compute(source).expect("parse kernel");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        for src in [&hip_source, &cuda_source] {
+            assert_eq!(src.matches("unsigned int gy =").count(), 1);
+            assert!(src.contains("unsigned int zsl_gy ="));
         }
     }
 
@@ -1756,8 +1774,8 @@ int main() {{
         let msl_source = msl::lower_compute(&module)
             .expect("lower fma3 to MSL")
             .source;
-        assert!(hip_source.contains("fmaf(a[gx], b[gx], c[gx])"));
-        assert!(cuda_source.contains("fmaf(a[gx], b[gx], c[gx])"));
+        assert!(hip_source.contains("fmaf(a[zsl_gx], b[zsl_gx], c[zsl_gx])"));
+        assert!(cuda_source.contains("fmaf(a[zsl_gx], b[zsl_gx], c[zsl_gx])"));
         assert!(msl_source.contains("fma(a[gid.x], b[gid.x], c[gid.x])"));
         spirv::lower_compute(&module).expect("lower fma3 to SPIR-V");
     }
