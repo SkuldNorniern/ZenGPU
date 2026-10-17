@@ -2667,6 +2667,9 @@ mod tests {
     use std::mem::{size_of, size_of_val};
     use std::thread;
 
+    use zengpu_blas::level3::GemmKernel;
+    use zengpu_compute::BufferPool;
+    use zengpu_hal::DType;
     use zengpu_spirv::{ZslShader, zsl};
 
     const TRIG_ZSL: ZslShader = zsl!(
@@ -4463,5 +4466,151 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         assert!(got == expected);
         write.wait(Duration::from_secs(5)).unwrap();
         device.destroy_buffer(buf);
+    }
+
+    /// Values `i/8` for `i` in [-32, 32]. They are exact in f16 and bf16, and
+    /// every product and partial sum is exact in f32, so any accumulation
+    /// order (tensor-core, split-K, tiled) must match the CPU reference exactly.
+    fn exact_values(count: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) % 65) as f32 / 8.0 - 4.0
+            })
+            .collect()
+    }
+
+    /// IEEE half bits of an [`exact_values`] entry (normal range, no rounding).
+    fn f16_bits(x: f32) -> u16 {
+        if x == 0.0 {
+            return 0;
+        }
+        let bits = x.to_bits();
+        let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        assert!(
+            bits & 0x1fff == 0 && (1..31).contains(&exp),
+            "{x} is not exact in f16"
+        );
+        (((bits >> 31) as u16) << 15) | ((exp as u16) << 10) | ((bits & 0x7f_ffff) >> 13) as u16
+    }
+
+    /// bfloat16 bits of an [`exact_values`] entry (the top 16 bits of f32).
+    fn bf16_bits(x: f32) -> u16 {
+        assert!(x.to_bits() & 0xffff == 0, "{x} is not exact in bf16");
+        (x.to_bits() >> 16) as u16
+    }
+
+    fn cpu_gemm(m: usize, n: usize, k: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
+        let mut c = vec![0.0f32; m * n];
+        for i in 0..m {
+            let crow = &mut c[i * n..(i + 1) * n];
+            for p in 0..k {
+                let av = a[i * k + p];
+                for (cv, bv) in crow.iter_mut().zip(&b[p * n..(p + 1) * n]) {
+                    *cv += av * bv;
+                }
+            }
+        }
+        c
+    }
+
+    /// A CUDA pool for the GEMM tests, or None to skip.
+    fn cuda_pool() -> Option<BufferPool> {
+        Some(BufferPool::new(Arc::from(cuda_device()?)))
+    }
+
+    /// C = A @ B on the device for `dtype` inputs (f32, f16 or bf16), checked
+    /// against the CPU reference.
+    fn check_gemm(
+        pool: &BufferPool,
+        kernel: &GemmKernel,
+        dtype: DType,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let a_vals = exact_values(m * k, (m * 31 + k) as u64);
+        let b_vals = exact_values(k * n, (n * 17 + k + 1) as u64);
+        let want = cpu_gemm(m, n, k, &a_vals, &b_vals);
+        let encode = |vals: &[f32]| -> Vec<u8> {
+            match dtype {
+                DType::F16 => vals
+                    .iter()
+                    .flat_map(|&v| f16_bits(v).to_le_bytes())
+                    .collect(),
+                DType::Bf16 => vals
+                    .iter()
+                    .flat_map(|&v| bf16_bits(v).to_le_bytes())
+                    .collect(),
+                _ => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            }
+        };
+        let device = pool.device();
+        let upload = |shape: Vec<u32>, bytes: &[u8]| {
+            let array = pool.alloc(shape, dtype).expect("alloc");
+            device.write_buffer(array.buffer, 0, bytes).expect("upload");
+            array
+        };
+        let a = upload(vec![m as u32, k as u32], &encode(&a_vals));
+        let b = upload(vec![k as u32, n as u32], &encode(&b_vals));
+        let c = kernel.sgemm(device, pool, 1.0, &a, &b).expect("sgemm");
+        let raw = device.read_buffer(c.buffer, 0, (m * n * 4) as u64).unwrap();
+        let mut bad = 0;
+        for (i, want) in want.iter().enumerate() {
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            if got != *want {
+                if bad < 3 {
+                    println!(
+                        "{dtype:?} {m}x{n}x{k} [{}, {}]: got {got}, want {want}",
+                        i / n,
+                        i % n
+                    );
+                }
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "{dtype:?} {m}x{n}x{k}: {bad} mismatches");
+        pool.free(a);
+        pool.free(b);
+        pool.free(c);
+    }
+
+    /// Shapes covering the few-row split-K kernel (with and without a split),
+    /// the 64×64 and 128×128 tiles, and partial tiles in M, N and K.
+    const GEMM_SHAPES: [(usize, usize, usize); 7] = [
+        (1, 4096, 4096),
+        (16, 4096, 4096),
+        (77, 200, 136),
+        (513, 1000, 264),
+        (1024, 1024, 1024),
+        (2048, 2048, 64),
+        (3, 16, 8),
+    ];
+
+    fn gemm_matches_reference(dtype: DType) {
+        let Some(pool) = cuda_pool() else { return };
+        let kernel = GemmKernel::new(pool.device()).expect("GEMM kernel");
+        for (m, n, k) in GEMM_SHAPES {
+            check_gemm(&pool, &kernel, dtype, m, n, k);
+        }
+        kernel.destroy(pool.device());
+    }
+
+    #[test]
+    fn gemm_f32_matches_reference() {
+        gemm_matches_reference(DType::F32);
+    }
+
+    #[test]
+    fn gemm_f16_tensor_cores_match_reference() {
+        gemm_matches_reference(DType::F16);
+    }
+
+    #[test]
+    fn gemm_bf16_tensor_cores_match_reference() {
+        gemm_matches_reference(DType::Bf16);
     }
 }
