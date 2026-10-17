@@ -9,6 +9,7 @@
 mod error;
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::mem::take;
 use std::sync::{Arc, Mutex};
@@ -277,6 +278,7 @@ impl GpuAdapter for CudaAdapter {
                 sm: (sm.major, sm.minor),
                 events: Mutex::new(Vec::new()),
                 staging: Mutex::new(None),
+                graphs: Mutex::new(GraphCache::default()),
             }),
             buffers: Arc::new(Mutex::new(SlotMap::new())),
             shaders: Arc::new(Mutex::new(SlotMap::new())),
@@ -405,6 +407,153 @@ fn wait_event(ev: sys::CUevent) -> Result<()> {
     }
 }
 
+// ── Graph replay ──────────────────────────────────────────────────────────────
+
+/// Batches with at least this many ops are candidates for graph replay.
+const GRAPH_MIN_OPS: usize = 4;
+
+/// Instantiated graphs kept per device; one is evicted to make room for a new one.
+const GRAPH_MAX_READY: usize = 64;
+
+/// Cache entries that are not instantiated graphs are dropped wholesale past this count.
+const GRAPH_MAX_UNREADY: usize = 1024;
+
+/// Kernel parameter slots per launch. Fixed size keeps launches heap-free.
+const MAX_PARAMS: usize = 32;
+
+/// One resolved driver call of a batch. Every value a launch needs is held by
+/// value, so the same list can be issued directly or recorded into a graph.
+#[derive(Clone, Copy)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "plans are short-lived; inline params avoid a heap allocation per launch"
+)]
+enum Launch {
+    Kernel {
+        func: sys::CUfunction,
+        grid: [u32; 3],
+        block: [u32; 3],
+        /// Each parameter takes an 8-byte slot; scalars use the low 4 bytes.
+        params: [[u8; 8]; MAX_PARAMS],
+        n_params: usize,
+    },
+    Copy {
+        dst: u64,
+        src: u64,
+        len: sys::size_t,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum GraphEntry {
+    /// Launched once directly; the next identical batch is captured.
+    Seen,
+    /// Instantiated graph, replayed with `cuGraphLaunch`.
+    Ready(sys::CUgraphExec),
+    /// Capture or instantiation failed; always launched directly.
+    Uncachable,
+}
+
+/// Per-device graph cache. Its keys are the exact resolved launch values, so a
+/// hit means the same kernels run with the same pointers and scalars.
+#[derive(Default)]
+struct GraphCache {
+    entries: HashMap<Vec<u64>, GraphEntry>,
+    ready: usize,
+}
+
+impl GraphCache {
+    /// Destroy every instantiated graph and forget all entries. The context must be current.
+    fn clear(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            if let GraphEntry::Ready(exec) = entry {
+                // SAFETY: `exec` came from cuGraphInstantiate_v2 and leaves the map here, once.
+                unsafe { sys::cuGraphExecDestroy(exec) };
+            }
+        }
+        self.ready = 0;
+    }
+
+    /// Store a freshly instantiated graph, evicting one at capacity. The context must be current.
+    fn insert_ready(&mut self, key: Vec<u64>, exec: sys::CUgraphExec) {
+        if self.ready >= GRAPH_MAX_READY {
+            let victim = self
+                .entries
+                .iter()
+                .find(|(_, entry)| matches!(entry, GraphEntry::Ready(_)))
+                .map(|(key, _)| key.clone());
+            if let Some(victim) = victim
+                && let Some(GraphEntry::Ready(old)) = self.entries.remove(&victim)
+            {
+                // SAFETY: `old` is no longer reachable through the cache.
+                unsafe { sys::cuGraphExecDestroy(old) };
+                self.ready -= 1;
+            }
+        }
+        self.entries.insert(key, GraphEntry::Ready(exec));
+        self.ready += 1;
+    }
+
+    /// Record a first sighting of `key`, dropping unready entries when too many build up.
+    fn note_seen(&mut self, key: Vec<u64>) {
+        if self.entries.len() - self.ready >= GRAPH_MAX_UNREADY {
+            self.entries
+                .retain(|_, entry| matches!(entry, GraphEntry::Ready(_)));
+        }
+        self.entries.insert(key, GraphEntry::Seen);
+    }
+}
+
+/// Flatten a resolved batch into the values that a replay depends on.
+fn plan_key(plan: &[Launch]) -> Vec<u64> {
+    const KERNEL_TAG: u64 = 0;
+    const COPY_TAG: u64 = 1;
+    let mut key = Vec::new();
+    for launch in plan {
+        match launch {
+            Launch::Kernel {
+                func,
+                grid,
+                block,
+                params,
+                n_params,
+            } => {
+                key.push(KERNEL_TAG);
+                key.push(*func as usize as u64);
+                key.extend(grid.iter().chain(block).map(|&v| u64::from(v)));
+                key.push(*n_params as u64);
+                key.extend(
+                    params[..*n_params]
+                        .iter()
+                        .map(|slot| u64::from_le_bytes(*slot)),
+                );
+            }
+            Launch::Copy { dst, src, len } => {
+                key.extend([COPY_TAG, *dst, *src, *len as u64]);
+            }
+        }
+    }
+    key
+}
+
+/// Resolve ops in order until one fails. Returns the launches resolved before the
+/// failure and that failure, so the caller can still issue the prefix as a per-op
+/// loop always has.
+fn resolve_all<T>(
+    ops: &[T],
+    mut resolve: impl FnMut(&T) -> Result<Option<Launch>>,
+) -> (Vec<Launch>, Option<GpuError>) {
+    let mut plan = Vec::with_capacity(ops.len());
+    for op in ops {
+        match resolve(op) {
+            Ok(Some(launch)) => plan.push(launch),
+            Ok(None) => {}
+            Err(error) => return (plan, Some(error)),
+        }
+    }
+    (plan, None)
+}
+
 // ── CudaDevice ────────────────────────────────────────────────────────────────
 
 /// An opened CUDA device. Provides compute-only buffer, shader, and dispatch
@@ -431,6 +580,8 @@ struct CudaShared {
     events: Mutex<Vec<sys::CUevent>>,
     /// Pinned staging for large host transfers, allocated on first use.
     staging: Mutex<Option<Staging>>,
+    /// Captured batch graphs, keyed by the exact launch values of the batch.
+    graphs: Mutex<GraphCache>,
 }
 
 // SAFETY: every context entry is serialized by ctx_lock.
@@ -492,6 +643,139 @@ impl CudaShared {
         let waited = wait_event(ev);
         self.return_event(ev);
         waited
+    }
+
+    /// Issue `plan` on the stream in order. The context must be current and
+    /// `ctx_lock` held. Serves direct launches and graph capture alike.
+    fn issue(&self, plan: &[Launch]) -> Result<()> {
+        for launch in plan {
+            match *launch {
+                Launch::Kernel {
+                    func,
+                    grid,
+                    block,
+                    mut params,
+                    n_params,
+                } => {
+                    let mut kernel_params: [*mut c_void; MAX_PARAMS] =
+                        [ptr::null_mut(); MAX_PARAMS];
+                    for (i, slot) in params.iter_mut().take(n_params).enumerate() {
+                        kernel_params[i] = slot.as_mut_ptr() as *mut c_void;
+                    }
+                    // SAFETY: each pointer aims into `params`, which lives across the call.
+                    cu(unsafe {
+                        sys::cuLaunchKernel(
+                            func,
+                            grid[0],
+                            grid[1],
+                            grid[2],
+                            block[0],
+                            block[1],
+                            block[2],
+                            0,
+                            self.stream,
+                            kernel_params.as_mut_ptr(),
+                            ptr::null_mut(),
+                        )
+                    })?;
+                }
+                Launch::Copy { dst, src, len } => {
+                    // SAFETY: both ranges were bounds-checked against their buffers when resolved.
+                    cu(unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, len, self.stream) })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record `plan` into a graph and instantiate it without executing anything.
+    /// Returns None, with the capture ended, if any step fails. The context must be current.
+    fn capture(&self, plan: &[Launch]) -> Option<sys::CUgraphExec> {
+        // SAFETY: `stream` is this device's live stream and is not capturing.
+        cu(unsafe {
+            sys::cuStreamBeginCapture_v2(
+                self.stream,
+                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
+            )
+        })
+        .ok()?;
+        let recorded = self.issue(plan).is_ok();
+        let mut graph: sys::CUgraph = ptr::null_mut();
+        // SAFETY: writes one graph handle into `graph`; this ends the capture on every path.
+        let ended = cu(unsafe { sys::cuStreamEndCapture(self.stream, &mut graph) }).is_ok();
+        if !recorded || !ended {
+            if !graph.is_null() {
+                // SAFETY: `graph` was produced by the EndCapture call above and is unused.
+                unsafe { sys::cuGraphDestroy(graph) };
+            }
+            return None;
+        }
+        let mut exec: sys::CUgraphExec = ptr::null_mut();
+        // SAFETY: `graph` is the complete capture; no error-node or log output is requested.
+        let instantiated = cu(unsafe {
+            sys::cuGraphInstantiate_v2(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0)
+        })
+        .is_ok();
+        // SAFETY: the template graph is not needed once instantiation has run.
+        unsafe { sys::cuGraphDestroy(graph) };
+        instantiated.then_some(exec)
+    }
+
+    /// Launch `plan` for a batch of `op_count` ops. A batch seen before is captured
+    /// on its second sighting and replayed from then on. The context must be
+    /// current and `ctx_lock` held.
+    fn launch_plan(&self, plan: &[Launch], op_count: usize) -> Result<()> {
+        if op_count < GRAPH_MIN_OPS || plan.is_empty() {
+            return self.issue(plan);
+        }
+        let key = plan_key(plan);
+        let mut graphs = self.graphs.lock().map_err(|_| GpuError::DeviceLost)?;
+        let entry = graphs.entries.get(&key).copied();
+        match entry {
+            Some(GraphEntry::Ready(exec)) => {
+                drop(graphs);
+                // SAFETY: `exec` is cached, so it is live; it is destroyed only under ctx_lock.
+                cu(unsafe { sys::cuGraphLaunch(exec, self.stream) })
+            }
+            Some(GraphEntry::Uncachable) => {
+                drop(graphs);
+                self.issue(plan)
+            }
+            Some(GraphEntry::Seen) => {
+                drop(graphs);
+                let Some(exec) = self.capture(plan) else {
+                    self.graphs
+                        .lock()
+                        .map_err(|_| GpuError::DeviceLost)?
+                        .entries
+                        .insert(key, GraphEntry::Uncachable);
+                    return self.issue(plan);
+                };
+                match self.graphs.lock() {
+                    Ok(mut graphs) => graphs.insert_ready(key, exec),
+                    Err(_) => {
+                        // SAFETY: nothing else holds `exec`; it is destroyed rather than leaked.
+                        unsafe { sys::cuGraphExecDestroy(exec) };
+                        return Err(GpuError::DeviceLost);
+                    }
+                }
+                // SAFETY: `exec` was just instantiated and is cached, so it is live.
+                cu(unsafe { sys::cuGraphLaunch(exec, self.stream) })
+            }
+            None => {
+                graphs.note_seen(key);
+                drop(graphs);
+                self.issue(plan)
+            }
+        }
+    }
+
+    /// Destroy all cached graphs, e.g. before the kernels they reference are unloaded.
+    /// The context must be current and `ctx_lock` held.
+    fn clear_graphs(&self) {
+        if let Ok(mut graphs) = self.graphs.lock() {
+            graphs.clear();
+        }
     }
 
     /// Copy host `src` to device address `dst`. The context must be current and
@@ -622,7 +906,10 @@ impl Drop for CudaShared {
         // because `_ctx` is dropped only after this body.
         if unsafe { sys::cuCtxSetCurrent(self.raw_ctx) } == 0 {
             unsafe { sys::cuStreamSynchronize(self.stream) };
-            // Staging and pooled events are released while the context is current.
+            // Graph execs and staging are released while the context is current.
+            if let Ok(graphs) = self.graphs.get_mut() {
+                graphs.clear();
+            }
             if let Ok(staging) = self.staging.get_mut() {
                 *staging = None;
             }
@@ -768,7 +1055,10 @@ fn release_cuda_in_flight(
                 buffers.lock().unwrap().release_retired(index);
             }
             DeferredCudaResource::Shader(index, shader) => {
-                let _ = shared.with_current(|| cu(unsafe { sys::cuModuleUnload(shader.module) }));
+                let _ = shared.with_current(|| {
+                    shared.clear_graphs();
+                    cu(unsafe { sys::cuModuleUnload(shader.module) })
+                });
                 shaders.lock().unwrap().release_retired(index);
             }
             DeferredCudaResource::Pipeline(index) => {
@@ -789,6 +1079,8 @@ impl Drop for CudaDevice {
             // A device may be dropped before its submission handles. Drain
             // work before freeing the resources owned by this device.
             cu(unsafe { sys::cuStreamSynchronize(self.shared.stream) })?;
+            // Graphs reference kernels in the modules unloaded below.
+            self.shared.clear_graphs();
             for cb in buffers {
                 // SAFETY: ptr came from cuMemAlloc_v2 and is freed exactly once here.
                 let _ = unsafe { sys::cuMemFree_v2(cb.ptr) };
@@ -799,6 +1091,117 @@ impl Drop for CudaDevice {
             }
             Ok(())
         });
+    }
+}
+
+impl CudaDevice {
+    /// Resolve a dispatch into its launch values. No driver call is made, so the
+    /// context need not be current.
+    fn resolve_dispatch(&self, op: &zengpu_hal::DispatchOp<'_>) -> Result<Launch> {
+        let cp = self
+            .pipelines
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(op.pipeline)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid pipeline handle".into()))?;
+
+        let mut params = [[0u8; 8]; MAX_PARAMS];
+        let mut n_params = 0usize;
+        {
+            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+            for &slot in op.bindings.buffers {
+                if n_params >= MAX_PARAMS {
+                    return Err(GpuError::Dispatch(format!(
+                        "dispatch: more than {MAX_PARAMS} kernel parameters"
+                    )));
+                }
+                let cb = buffers.get_by_slot_index(slot).ok_or_else(|| {
+                    GpuError::Backend("cuda: invalid buffer slot in bindings".into())
+                })?;
+                params[n_params] = cb.ptr.to_le_bytes();
+                n_params += 1;
+            }
+        }
+        for scalar in op.bindings.scalars {
+            if n_params >= MAX_PARAMS {
+                return Err(GpuError::Dispatch(format!(
+                    "dispatch: more than {MAX_PARAMS} kernel parameters"
+                )));
+            }
+            let bytes = match scalar {
+                Scalar::U32(v) => v.to_le_bytes(),
+                Scalar::I32(v) => v.to_le_bytes(),
+                Scalar::F32(v) => v.to_bits().to_le_bytes(),
+            };
+            params[n_params][..4].copy_from_slice(&bytes);
+            n_params += 1;
+        }
+        Ok(Launch::Kernel {
+            func: cp.func,
+            grid: op.grid,
+            block: cp.block,
+            params,
+            n_params,
+        })
+    }
+
+    /// Validate a buffer copy and resolve it. A zero-length copy needs no launch.
+    fn resolve_copy(&self, copy: &zengpu_hal::BufferCopyOp) -> Result<Option<Launch>> {
+        let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+        let src = buffers
+            .get(copy.src)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid source buffer handle".into()))?;
+        let dst = buffers
+            .get(copy.dst)
+            .copied()
+            .ok_or_else(|| GpuError::Backend("cuda: invalid destination buffer handle".into()))?;
+        if copy.src == copy.dst {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "copy_buffer requires distinct source and destination buffers".into(),
+            )));
+        }
+        if !src.usage.contains(BufferUsage::TRANSFER_SRC) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "source buffer",
+                needed: "TRANSFER_SRC",
+            }));
+        }
+        if !dst.usage.contains(BufferUsage::TRANSFER_DST) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "destination buffer",
+                needed: "TRANSFER_DST",
+            }));
+        }
+        let src_end = copy.src_offset.checked_add(copy.len).ok_or_else(|| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "source copy range overflows u64".into(),
+            ))
+        })?;
+        let dst_end = copy.dst_offset.checked_add(copy.len).ok_or_else(|| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "destination copy range overflows u64".into(),
+            ))
+        })?;
+        if src_end > src.len || dst_end > dst.len {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "cuda: mixed-submission copy range exceeds buffer".into(),
+            )));
+        }
+        if copy.len == 0 {
+            return Ok(None);
+        }
+        let len = sys::size_t::try_from(copy.len).map_err(|_| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "cuda: copy exceeds driver byte-count range".into(),
+            ))
+        })?;
+        Ok(Some(Launch::Copy {
+            dst: dst.ptr + copy.dst_offset,
+            src: src.ptr + copy.src_offset,
+            len,
+        }))
     }
 }
 
@@ -1109,9 +1512,10 @@ impl GpuDevice for CudaDevice {
             }
         };
         if let Some(cs) = cs {
-            let _ = self
-                .shared
-                .with_current(|| cu(unsafe { sys::cuModuleUnload(cs.module) }));
+            let _ = self.shared.with_current(|| {
+                self.shared.clear_graphs();
+                cu(unsafe { sys::cuModuleUnload(cs.module) })
+            });
         }
     }
 
@@ -1147,6 +1551,11 @@ impl GpuDevice for CudaDevice {
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
+        // Graphs captured from this pipeline hold its function handle.
+        let _ = self.shared.with_current(|| {
+            self.shared.clear_graphs();
+            Ok(())
+        });
         let Ok(mut pipelines) = self.pipelines.lock() else {
             return;
         };
@@ -1191,13 +1600,6 @@ impl GpuDevice for CudaDevice {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
 
-        // Kernel parameters live in a fixed-size, per-op stack buffer — no
-        // heap allocation per dispatch. Each slot is 8 bytes regardless of
-        // the value's actual size (4-byte scalars only use the low bytes);
-        // `cuLaunchKernel` reads exactly as many bytes as the kernel
-        // signature declares for that parameter, so the unused tail is inert.
-        const MAX_PARAMS: usize = 32;
-
         let stream = self.shared.stream;
         self.lifetime
             .lock()
@@ -1208,68 +1610,13 @@ impl GpuDevice for CudaDevice {
         // earlier op's output with no explicit barrier. The event recorded
         // after the final launch represents completion of the whole batch.
         let event = self.shared.with_current(|| {
-            for op in ops {
-                let cp = self
-                    .pipelines
-                    .lock()
-                    .map_err(|_| GpuError::DeviceLost)?
-                    .get(op.pipeline)
-                    .copied()
-                    .ok_or_else(|| GpuError::Backend("cuda: invalid pipeline handle".into()))?;
-
-                let mut storage = [[0u8; 8]; MAX_PARAMS];
-                let mut n_params = 0usize;
-                {
-                    let buf_guard = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
-                    for &slot in op.bindings.buffers {
-                        if n_params >= MAX_PARAMS {
-                            return Err(GpuError::Dispatch(format!(
-                                "dispatch: more than {MAX_PARAMS} kernel parameters"
-                            )));
-                        }
-                        let cb = buf_guard.get_by_slot_index(slot).ok_or_else(|| {
-                            GpuError::Backend("cuda: invalid buffer slot in bindings".into())
-                        })?;
-                        storage[n_params] = cb.ptr.to_le_bytes();
-                        n_params += 1;
-                    }
-                }
-                for s in op.bindings.scalars {
-                    if n_params >= MAX_PARAMS {
-                        return Err(GpuError::Dispatch(format!(
-                            "dispatch: more than {MAX_PARAMS} kernel parameters"
-                        )));
-                    }
-                    let bytes4 = match s {
-                        Scalar::U32(v) => v.to_le_bytes(),
-                        Scalar::I32(v) => v.to_le_bytes(),
-                        Scalar::F32(v) => v.to_bits().to_le_bytes(),
-                    };
-                    storage[n_params][..4].copy_from_slice(&bytes4);
-                    n_params += 1;
-                }
-
-                let mut kernel_params: [*mut c_void; MAX_PARAMS] = [ptr::null_mut(); MAX_PARAMS];
-                for (i, slot) in storage.iter_mut().take(n_params).enumerate() {
-                    kernel_params[i] = slot.as_mut_ptr() as *mut c_void;
-                }
-
-                cu(unsafe {
-                    sys::cuLaunchKernel(
-                        cp.func,
-                        op.grid[0],
-                        op.grid[1],
-                        op.grid[2],
-                        cp.block[0],
-                        cp.block[1],
-                        cp.block[2],
-                        0,
-                        stream,
-                        kernel_params.as_mut_ptr(),
-                        ptr::null_mut(),
-                    )
-                })?;
+            let (plan, resolve_error) = resolve_all(ops, |op| self.resolve_dispatch(op).map(Some));
+            if let Some(error) = resolve_error {
+                // Launch the resolved prefix, as the per-op loop did, then fail.
+                self.shared.issue(&plan)?;
+                return Err(error);
             }
+            self.shared.launch_plan(&plan, ops.len())?;
             self.shared.record_event()
         });
         let event = match event {
@@ -1306,137 +1653,22 @@ impl GpuDevice for CudaDevice {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
 
-        const MAX_PARAMS: usize = 32;
         let stream = self.shared.stream;
         self.lifetime
             .lock()
             .map_err(|_| GpuError::DeviceLost)?
             .in_flight += 1;
         let event = self.shared.with_current(|| {
-            for op in ops {
-                match op {
-                    ComputeOp::CopyBuffer(copy) => {
-                        let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
-                        let src = buffers.get(copy.src).copied().ok_or_else(|| {
-                            GpuError::Backend("cuda: invalid source buffer handle".into())
-                        })?;
-                        let dst = buffers.get(copy.dst).copied().ok_or_else(|| {
-                            GpuError::Backend("cuda: invalid destination buffer handle".into())
-                        })?;
-                        if copy.src == copy.dst {
-                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                "copy_buffer requires distinct source and destination buffers"
-                                    .into(),
-                            )));
-                        }
-                        if !src.usage.contains(BufferUsage::TRANSFER_SRC) {
-                            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                                resource: "source buffer",
-                                needed: "TRANSFER_SRC",
-                            }));
-                        }
-                        if !dst.usage.contains(BufferUsage::TRANSFER_DST) {
-                            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                                resource: "destination buffer",
-                                needed: "TRANSFER_DST",
-                            }));
-                        }
-                        let src_end = copy.src_offset.checked_add(copy.len).ok_or_else(|| {
-                            GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                "source copy range overflows u64".into(),
-                            ))
-                        })?;
-                        let dst_end = copy.dst_offset.checked_add(copy.len).ok_or_else(|| {
-                            GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                "destination copy range overflows u64".into(),
-                            ))
-                        })?;
-                        if src_end > src.len || dst_end > dst.len {
-                            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                "cuda: mixed-submission copy range exceeds buffer".into(),
-                            )));
-                        }
-                        if copy.len != 0 {
-                            let byte_count = sys::size_t::try_from(copy.len).map_err(|_| {
-                                GpuError::InvalidUsage(UsageError::BindingMismatch(
-                                    "cuda: copy exceeds driver byte-count range".into(),
-                                ))
-                            })?;
-                            cu(unsafe {
-                                sys::cuMemcpyDtoDAsync_v2(
-                                    dst.ptr + copy.dst_offset,
-                                    src.ptr + copy.src_offset,
-                                    byte_count,
-                                    stream,
-                                )
-                            })?;
-                        }
-                    }
-                    ComputeOp::Dispatch(op) => {
-                        let cp = self
-                            .pipelines
-                            .lock()
-                            .map_err(|_| GpuError::DeviceLost)?
-                            .get(op.pipeline)
-                            .copied()
-                            .ok_or_else(|| {
-                                GpuError::Backend("cuda: invalid pipeline handle".into())
-                            })?;
-                        let mut storage = [[0u8; 8]; MAX_PARAMS];
-                        let mut n_params = 0usize;
-                        {
-                            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
-                            for &slot in op.bindings.buffers {
-                                if n_params >= MAX_PARAMS {
-                                    return Err(GpuError::Dispatch(format!(
-                                        "dispatch: more than {MAX_PARAMS} kernel parameters"
-                                    )));
-                                }
-                                let buffer = buffers.get_by_slot_index(slot).ok_or_else(|| {
-                                    GpuError::Backend(
-                                        "cuda: invalid buffer slot in bindings".into(),
-                                    )
-                                })?;
-                                storage[n_params] = buffer.ptr.to_le_bytes();
-                                n_params += 1;
-                            }
-                        }
-                        for scalar in op.bindings.scalars {
-                            if n_params >= MAX_PARAMS {
-                                return Err(GpuError::Dispatch(format!(
-                                    "dispatch: more than {MAX_PARAMS} kernel parameters"
-                                )));
-                            }
-                            let bytes = match scalar {
-                                Scalar::U32(v) => v.to_le_bytes(),
-                                Scalar::I32(v) => v.to_le_bytes(),
-                                Scalar::F32(v) => v.to_bits().to_le_bytes(),
-                            };
-                            storage[n_params][..4].copy_from_slice(&bytes);
-                            n_params += 1;
-                        }
-                        let mut params = [ptr::null_mut(); MAX_PARAMS];
-                        for (index, slot) in storage.iter_mut().take(n_params).enumerate() {
-                            params[index] = slot.as_mut_ptr() as *mut c_void;
-                        }
-                        cu(unsafe {
-                            sys::cuLaunchKernel(
-                                cp.func,
-                                op.grid[0],
-                                op.grid[1],
-                                op.grid[2],
-                                cp.block[0],
-                                cp.block[1],
-                                cp.block[2],
-                                0,
-                                stream,
-                                params.as_mut_ptr(),
-                                ptr::null_mut(),
-                            )
-                        })?;
-                    }
-                }
+            let (plan, resolve_error) = resolve_all(ops, |op| match op {
+                ComputeOp::CopyBuffer(copy) => self.resolve_copy(copy),
+                ComputeOp::Dispatch(op) => self.resolve_dispatch(op).map(Some),
+            });
+            if let Some(error) = resolve_error {
+                // Launch the resolved prefix, as the per-op loop did, then fail.
+                self.shared.issue(&plan)?;
+                return Err(error);
             }
+            self.shared.launch_plan(&plan, ops.len())?;
             self.shared.record_event()
         });
         let event = match event {
@@ -2378,5 +2610,252 @@ mod tests {
             sm.0,
             sm.1
         );
+    }
+
+    const ACCUM_CUDA: &str = r#"
+extern "C" __global__ void accum(float* out, float v, unsigned int n) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] += v;
+    }
+}
+"#;
+
+    const SCALE_ADD_CUDA: &str = r#"
+extern "C" __global__ void scale_add(float* out, float v, unsigned int n) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = out[i] * 2.0f + v;
+    }
+}
+"#;
+
+    /// Device buffer that can be read back, copied from and dispatched on.
+    fn graph_buffer(device: &dyn GpuDevice, size: u64) -> BufferHandle {
+        device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE
+                    | BufferUsage::TRANSFER_SRC
+                    | BufferUsage::TRANSFER_DST
+                    | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+    }
+
+    fn read_f32(device: &dyn GpuDevice, buffer: BufferHandle, n: usize) -> Vec<f32> {
+        let bytes = device
+            .read_buffer(buffer, 0, (n * size_of::<f32>()) as u64)
+            .unwrap();
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect()
+    }
+
+    /// Submit one `accum` dispatch per entry of `adds`, all over `out`, and wait.
+    fn submit_accum(
+        device: &dyn GpuDevice,
+        pipeline: PipelineHandle,
+        out: BufferHandle,
+        adds: &[f32],
+        n: u32,
+    ) {
+        let slots = [out.index()];
+        let scalars: Vec<[Scalar; 2]> = adds
+            .iter()
+            .map(|&v| [Scalar::F32(v), Scalar::U32(n)])
+            .collect();
+        let ops: Vec<zengpu_hal::DispatchOp<'_>> = scalars
+            .iter()
+            .map(|s| zengpu_hal::DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &slots,
+                    scalars: s,
+                    textures: &[],
+                    images: &[],
+                },
+                grid: [n.div_ceil(64), 1, 1],
+            })
+            .collect();
+        device
+            .submit_batch(0, &ops)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn graph_replay_matches_direct_launches() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let out = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(out, 0, &init).unwrap();
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        // Five identical batches cross Seen -> Ready -> replay.
+        let adds = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for _ in 0..5 {
+            submit_accum(&*device, pipeline, out, &adds, N as u32);
+        }
+        let mut expected: Vec<f32> = (0..N).map(|i| i as f32 + 5.0 * 36.0).collect();
+        assert_eq!(read_f32(&*device, out, N), expected);
+
+        // A changed scalar is a different batch: it misses, then is captured on its second run.
+        let changed = [100.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for _ in 0..3 {
+            submit_accum(&*device, pipeline, out, &changed, N as u32);
+        }
+        for v in &mut expected {
+            *v += 3.0 * 135.0;
+        }
+        assert_eq!(read_f32(&*device, out, N), expected);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn graph_cache_is_invalidated_when_pipeline_is_destroyed() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let out = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(out, 0, &init).unwrap();
+        let adds = [1.0, 2.0, 3.0, 4.0];
+
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+        // Three runs: the batch is captured and replayed before it is invalidated.
+        for _ in 0..3 {
+            submit_accum(&*device, pipeline, out, &adds, N as u32);
+        }
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+
+        // Same grid and buffers, different kernel: a stale replay would add instead of scale.
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(SCALE_ADD_CUDA))
+            .expect("compile scale_add");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "scale_add",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+        for _ in 0..3 {
+            submit_accum(&*device, pipeline, out, &adds, N as u32);
+        }
+
+        let mut expected: Vec<f32> = (0..N).map(|i| i as f32 + 3.0 * 10.0).collect();
+        for _ in 0..3 {
+            for &v in &adds {
+                for x in &mut expected {
+                    *x = *x * 2.0 + v;
+                }
+            }
+        }
+        assert_eq!(read_f32(&*device, out, N), expected);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn mixed_copy_and_dispatch_batch_replays_correctly() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let base = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let acc = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(base, 0, &init).unwrap();
+
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        // Each run re-copies `base` into `acc` and adds 1 + 2 + 3 to it, so the
+        // result is the same every time only if the copy is replayed too.
+        let slots = [acc.index()];
+        let scalars: Vec<[Scalar; 2]> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .map(|&v| [Scalar::F32(v), Scalar::U32(N as u32)])
+            .collect();
+        let copy = zengpu_hal::BufferCopyOp {
+            src: base,
+            src_offset: 0,
+            dst: acc,
+            dst_offset: 0,
+            len: size,
+        };
+        let mut ops = vec![ComputeOp::CopyBuffer(copy)];
+        ops.extend(scalars.iter().map(|s| {
+            ComputeOp::Dispatch(zengpu_hal::DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &slots,
+                    scalars: s,
+                    textures: &[],
+                    images: &[],
+                },
+                grid: [(N as u32).div_ceil(64), 1, 1],
+            })
+        }));
+
+        let expected: Vec<f32> = (0..N).map(|i| i as f32 + 6.0).collect();
+        for _ in 0..3 {
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(read_f32(&*device, acc, N), expected);
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(base);
+        device.destroy_buffer(acc);
     }
 }
