@@ -1169,13 +1169,17 @@ impl GpuInstance for HipInstance {
     }
 
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>> {
-        let want_integrated = req.power == PowerPreference::LowPower;
-        self.devices
-            .iter()
-            .find(|d| d.integrated == want_integrated)
-            .or_else(|| self.devices.first())
+        pick_device(&self.devices, req.power == PowerPreference::LowPower)
             .map(|d| Box::new(Self::adapter(d)) as Box<dyn GpuAdapter>)
     }
+}
+
+/// Requested kind first, then most compute units. Ties keep the lowest ordinal.
+fn pick_device(devices: &[HipDeviceInfo], want_integrated: bool) -> Option<&HipDeviceInfo> {
+    devices
+        .iter()
+        .rev()
+        .max_by_key(|d| (d.integrated == want_integrated, d.cu_count))
 }
 
 pub struct HipAdapter {
@@ -3776,6 +3780,40 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
                 assert!(!code.is_empty(), "{gfx}: empty code object");
             }
         }
+    }
+
+    #[test]
+    fn adapter_pick_prefers_kind_then_compute_units() {
+        let dev = |ordinal, cu_count, integrated| {
+            let family = GfxFamily::Rdna2;
+            HipDeviceInfo {
+                ordinal,
+                name: String::new(),
+                gfx_target: "gfx1030".into(),
+                gfx_family: family,
+                total_mem: 0,
+                cu_count,
+                clock_mhz: 0,
+                wave_size: 32,
+                integrated,
+                max_threads_per_block: 1024,
+                max_block_dim: [1024; 3],
+                max_grid_dim: [1 << 30; 3],
+                capabilities: HipCapabilities::for_family(
+                    RocmVersion::COMPILE_TIME,
+                    RocmVersion::COMPILE_TIME,
+                    family,
+                ),
+            }
+        };
+        let pick = |devs: &[HipDeviceInfo], low| pick_device(devs, low).map(|d| d.ordinal);
+        let devs = [dev(0, 2, true), dev(1, 28, false), dev(2, 80, false)];
+        assert_eq!(pick(&devs, false), Some(2));
+        assert_eq!(pick(&devs, true), Some(0));
+        let twins = [dev(0, 32, false), dev(1, 32, false)];
+        assert_eq!(pick(&twins, false), Some(0));
+        assert_eq!(pick(&twins, true), Some(0));
+        assert_eq!(pick(&[], false), None);
     }
 
     #[test]
