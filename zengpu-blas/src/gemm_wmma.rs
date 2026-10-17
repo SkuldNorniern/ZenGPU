@@ -13,7 +13,8 @@
 /// Interior blocks have no bounds checks. Edge blocks clamp addresses and skip out-of-range stores.
 /// Past K, A reads as zero, so clamped B rows add nothing. Needs `N % 8 == 0` and `K % 8 == 0`.
 pub(crate) const SOURCE: &str = r#"
-#if defined(__GFX12__)
+// gfx12 WMMA builtins exist only in wave32 code.
+#if defined(__GFX12__) && (!defined(__AMDGCN_WAVEFRONT_SIZE__) || __AMDGCN_WAVEFRONT_SIZE__ == 32)
 typedef short wm_s8 __attribute__((ext_vector_type(8)));
 typedef _Float16 wm_h8 __attribute__((ext_vector_type(8)));
 typedef float wm_f8 __attribute__((ext_vector_type(8)));
