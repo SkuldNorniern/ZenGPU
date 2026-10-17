@@ -107,14 +107,6 @@ impl PinnedLease {
         // SAFETY: the block holds `cap` bytes and nothing else writes it.
         unsafe { slice::from_raw_parts(block.ptr, len) }
     }
-
-    /// Returns the first `len` bytes, before the transfer is queued.
-    pub(crate) fn bytes_mut(&mut self, len: usize) -> &mut [u8] {
-        let block = self.block.as_ref().expect("lease holds a block");
-        assert!(len <= block.cap);
-        // SAFETY: as in `bytes`; the lease is borrowed mutably.
-        unsafe { slice::from_raw_parts_mut(block.ptr, len) }
-    }
 }
 
 impl Drop for PinnedLease {

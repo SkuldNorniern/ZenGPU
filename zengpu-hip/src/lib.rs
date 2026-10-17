@@ -58,6 +58,8 @@ use peer::PeerStaging;
 mod pinned;
 use pinned::{PinnedLease, PinnedPool};
 
+const STAGE_CHUNK: usize = 1 << 20;
+
 const HIP_SUCCESS: HipError = 0;
 const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
 const HIP_ERROR_INVALID_IMAGE: HipError = 200;
@@ -1833,20 +1835,28 @@ impl GpuDevice for HipDevice {
             return Ok(Box::new(CompletedSubmission::new(cycle_id)));
         }
         self.core.activate()?;
-        let mut lease = self.core.pinned.lease(data.len())?;
-        lease.bytes_mut(data.len()).copy_from_slice(data);
-        let src = lease.ptr();
-        let sub = self.core.record(cycle_id, Some(lease), |core| unsafe {
-            core.check(
-                hipMemcpyAsync(
-                    (buf.ptr as *mut u8).add(offset) as *mut c_void,
-                    src as *const c_void,
-                    data.len(),
-                    buf.copy_kind(HIP_MEMCPY_H2D),
-                    core.stream,
-                ),
-                "hipMemcpyAsync H→D",
-            )
+        let lease = self.core.pinned.lease(data.len())?;
+        let staging = lease.ptr();
+        let sub = self.core.record(cycle_id, Some(lease), |core| {
+            for (i, chunk) in data.chunks(STAGE_CHUNK).enumerate() {
+                let at = i * STAGE_CHUNK;
+                unsafe {
+                    // SAFETY: the lease holds `data.len()` bytes, and this range is not yet queued.
+                    let src = staging.add(at);
+                    ptr::copy_nonoverlapping(chunk.as_ptr(), src, chunk.len());
+                    core.check(
+                        hipMemcpyAsync(
+                            (buf.ptr as *mut u8).add(offset + at) as *mut c_void,
+                            src as *const c_void,
+                            chunk.len(),
+                            buf.copy_kind(HIP_MEMCPY_H2D),
+                            core.stream,
+                        ),
+                        "hipMemcpyAsync H→D",
+                    )?;
+                }
+            }
+            Ok(())
         })?;
         Ok(Box::new(sub))
     }
