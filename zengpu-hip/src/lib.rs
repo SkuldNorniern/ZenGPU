@@ -2072,7 +2072,7 @@ mod tests {
     use std::env::temp_dir;
     use std::fs;
     use std::process;
-    use std::slice::from_raw_parts;
+    use std::slice::{from_raw_parts, from_ref};
     use std::sync::Arc;
     use std::thread::{sleep, spawn};
     use std::time::Instant;
@@ -4184,5 +4184,220 @@ extern "C" __global__ void spin(unsigned int ticks) {
         assert_eq!(dst_dev.read_buffer(dst, 0, bytes as u64).unwrap(), data);
         src_dev.destroy_buffer(src);
         dst_dev.destroy_buffer(dst);
+    }
+
+    fn open_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = try_instance()?;
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        adapter.open(DeviceRequest::default()).ok()
+    }
+
+    fn rw_buffer(device: &dyn GpuDevice, size: u64) -> BufferHandle {
+        device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE
+                    | BufferUsage::TRANSFER_SRC
+                    | BufferUsage::TRANSFER_DST
+                    | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+    }
+
+    fn kernel(device: &dyn GpuDevice, src: &str, entry: &str) -> (ShaderHandle, PipelineHandle) {
+        let shader = device.create_shader(ShaderDesc::hip(src)).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        (shader, pipeline)
+    }
+
+    fn dispatch(
+        device: &dyn GpuDevice,
+        pipeline: PipelineHandle,
+        buffers: &[BufferHandle],
+        scalars: &[Scalar],
+        n: u32,
+    ) -> Submission {
+        let slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        let op = DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &slots,
+                scalars,
+                textures: &[],
+                images: &[],
+            },
+            grid: [n.div_ceil(64), 1, 1],
+        };
+        device.submit_batch(0, from_ref(&op)).unwrap()
+    }
+
+    fn floats(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    fn float_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
+        values.flat_map(f32::to_le_bytes).collect()
+    }
+
+    const COPY_SRC: &str = r#"
+extern "C" __global__ void copy_add(const float* in, float* out, float v, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = in[i] + v;
+}
+extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n, unsigned int cycles) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    long long start = clock64();
+    volatile long long now = start;
+    while (now - start < (long long)cycles) now = clock64();
+    if (i < n) out[i] = in[i];
+}
+"#;
+
+    #[test]
+    fn async_write_dispatch_read_stay_ordered() {
+        let Some(device) = open_device() else { return };
+        let device = &*device;
+        const N: usize = 1 << 19;
+        let size = (N * 4) as u64;
+        let (x, y) = (rw_buffer(device, size), rw_buffer(device, size));
+        let (shader, copy) = kernel(device, COPY_SRC, "copy_add");
+        let (slow_shader, slow) = kernel(device, COPY_SRC, "slow_copy");
+
+        let first = float_bytes((0..N).map(|i| i as f32));
+        let write = device.submit_write_buffer(1, x, 0, &first).unwrap();
+        let add = dispatch(
+            device,
+            copy,
+            &[x, y],
+            &[Scalar::F32(2.0), Scalar::U32(N as u32)],
+            N as u32,
+        );
+        let read = device.submit_read_buffer(2, y, 0, size).unwrap();
+        let want: Vec<f32> = (0..N).map(|i| i as f32 + 2.0).collect();
+        assert_eq!(floats(&read.into_bytes().unwrap()), want);
+
+        let spin = dispatch(
+            device,
+            slow,
+            &[x, y],
+            &[Scalar::U32(N as u32), Scalar::U32(50_000_000)],
+            N as u32,
+        );
+        let second = float_bytes((0..N).map(|i| -(i as f32)));
+        let rewrite = device.submit_write_buffer(3, x, 0, &second).unwrap();
+        let copied = device.submit_read_buffer(4, y, 0, size).unwrap();
+        assert_eq!(floats(&copied.into_bytes().unwrap()), floats(&first));
+        let now = device.submit_read_buffer(5, x, 0, size).unwrap();
+        assert_eq!(now.into_bytes().unwrap(), second);
+        for sub in [write, add, spin, rewrite] {
+            sub.wait(Duration::from_secs(10)).unwrap();
+        }
+        for p in [copy, slow] {
+            device.destroy_pipeline(p);
+        }
+        device.destroy_shader(shader);
+        device.destroy_shader(slow_shader);
+        device.destroy_buffer(x);
+        device.destroy_buffer(y);
+    }
+
+    const HALF_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        push P { n: u32 }
+        @workgroup_size(64)
+        kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, packed: device buffer<u32>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, nib: device mut buffer<u32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.n {
+                yh[i] = xh[i] * 2.0
+                yb[i] = xb[i] * 2.0
+                nib[i] = ((packed[i >> 3] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8)
+            }
+        }
+    );
+
+    #[test]
+    fn zsl_half_buffers_and_bitwise_ops() {
+        let Some(device) = open_device() else { return };
+        let device = &*device;
+        let (shader, entry) = HALF_ZSL.create(device).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let n = 1001u32;
+        let x: Vec<f32> = (0..n).map(|i| ((i % 256) as f32 - 128.0) * 0.25).collect();
+        let f16_bits = |v: f32| -> u16 {
+            if v == 0.0 {
+                return 0;
+            }
+            let b = v.to_bits();
+            (((b >> 16) & 0x8000) | ((((b >> 23) & 0xff) - 112) << 10) | ((b >> 13) & 0x3ff)) as u16
+        };
+        let halves =
+            |bits: Vec<u16>| -> Vec<u8> { bits.into_iter().flat_map(u16::to_le_bytes).collect() };
+        let words: Vec<u32> = (0..n.div_ceil(8))
+            .map(|i| i.wrapping_mul(0x9e37_79b9))
+            .collect();
+        let inputs = [
+            halves(x.iter().map(|&v| f16_bits(v)).collect()),
+            halves(x.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()),
+            words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        ];
+        let mut bufs = Vec::new();
+        for data in &inputs {
+            let b = rw_buffer(device, data.len() as u64);
+            device.write_buffer(b, 0, data).unwrap();
+            bufs.push(b);
+        }
+        for size in [2 * n, 2 * n, 4 * n] {
+            bufs.push(rw_buffer(device, u64::from(size)));
+        }
+        dispatch(device, pipeline, &bufs, &[Scalar::U32(n)], n)
+            .wait(Duration::MAX)
+            .unwrap();
+
+        let read = |b: BufferHandle, len: u32| device.read_buffer(b, 0, u64::from(len)).unwrap();
+        let (yh, yb, nib) = (
+            read(bufs[3], 2 * n),
+            read(bufs[4], 2 * n),
+            read(bufs[5], 4 * n),
+        );
+        for i in 0..n as usize {
+            let want = 2.0 * x[i];
+            assert_eq!(
+                u16::from_le_bytes([yh[2 * i], yh[2 * i + 1]]),
+                f16_bits(want),
+                "f16 {i}"
+            );
+            assert_eq!(
+                u16::from_le_bytes([yb[2 * i], yb[2 * i + 1]]),
+                (want.to_bits() >> 16) as u16,
+                "bf16 {i}"
+            );
+            let w = words[i >> 3];
+            let got = u32::from_le_bytes(nib[4 * i..4 * i + 4].try_into().unwrap());
+            assert_eq!(
+                got,
+                ((w >> ((i & 7) << 2)) & 15) | (((i ^ 1) as u32) << 8),
+                "nibble {i}"
+            );
+        }
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for b in bufs {
+            device.destroy_buffer(b);
+        }
     }
 }
