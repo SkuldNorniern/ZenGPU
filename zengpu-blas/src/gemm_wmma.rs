@@ -2,9 +2,10 @@
 //!
 //! `C[M,N] = alpha * A[M,K] @ B[K,N]`, row-major, A and B both f16 or both
 //! bf16, accumulated and stored in f32. On an RX 9060 XT (ROCm 7.2) this
-//! matches or beats rocBLAS `gemm_ex` (f16 in, f32 out): 67 TFLOP/s at
-//! 4096³ (rocBLAS 68), 67 at 1024×11008×4096 (rocBLAS 59), and 1.2–1.3× at
-//! 17–64 rows.
+//! beats rocBLAS `gemm_ex` (f16 in, f32 out) by 1.10× (f16) and 1.12×
+//! (bf16) geomean over 13 LLM shapes: 70.9 TFLOP/s at 4096³ (rocBLAS 67),
+//! 1.2–1.4× at 1–64 rows, 0.95–1.0× at 512 rows. A register-only WMMA loop
+//! peaks near 90 TFLOP/s; the large shapes are bound by L2 traffic.
 //!
 //! The kernels only exist when hipRTC compiles for a gfx12 target
 //! (`__GFX12__`); elsewhere the module is empty and pipeline creation fails,
