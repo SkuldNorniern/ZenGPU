@@ -15,7 +15,7 @@ use crate::desc::{
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
-use crate::submission::{CompletedSubmission, Submission};
+use crate::submission::{CompletedReadback, CompletedSubmission, ReadSubmission, Submission};
 use crate::types::{BackendPreference, Features, Format};
 
 /// A created device: owns GPU resources and runs work. `Send + Sync` so worker
@@ -66,6 +66,44 @@ pub trait GpuDevice: Send + Sync {
     /// Read `len` bytes from `buffer` starting at byte `offset`. The buffer must
     /// have been created with [`crate::BufferUsage::READBACK`].
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// Upload `data` into `buffer` at `offset` as part of the device's ordered
+    /// work, returning before the copy has necessarily finished.
+    ///
+    /// `data` is copied before this returns, so the caller may reuse it at once.
+    /// Later submissions observe the write; earlier submissions that use the
+    /// buffer finish before it lands. Unlike [`Self::write_buffer`], this is
+    /// allowed while other submissions are pending. Poll the handle for completion.
+    ///
+    /// The default performs [`Self::write_buffer`] and returns a completed handle.
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.write_buffer(buffer, offset, data)?;
+        Ok(Box::new(CompletedSubmission::new(cycle_id)))
+    }
+
+    /// Read `len` bytes from `buffer` at `offset` as part of the device's
+    /// ordered work. The read observes every earlier submission that writes
+    /// `buffer`. The buffer must have [`crate::BufferUsage::READBACK`]. Take the
+    /// bytes with [`crate::GpuReadback::into_bytes`] or `read_into`, which wait
+    /// for completion if needed.
+    ///
+    /// The default performs [`Self::read_buffer`] and returns a completed handle.
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        let bytes = self.read_buffer(buffer, offset, len)?;
+        Ok(Box::new(CompletedReadback::new(cycle_id, bytes)))
+    }
 
     /// Read bytes into caller-owned storage without requiring an allocation.
     /// The buffer must have [`crate::BufferUsage::READBACK`]; the read range is
