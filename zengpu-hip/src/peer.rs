@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use zengpu_hal::Result;
 
 use crate::ffi::*;
-use crate::{HIP_EVENT_DISABLE_TIMING, HIP_SUCCESS, HipBuffer, HipCore};
+use crate::{HIP_EVENT_DISABLE_TIMING, HIP_SUCCESS, HipBuffer, HipCore, alloc};
 use crate::{HIP_MEMCPY_D2H, HIP_MEMCPY_H2D};
 
 pub(crate) const CHUNK: usize = 4 << 20;
@@ -135,7 +135,7 @@ impl PeerStaging {
 impl Drop for PeerStaging {
     fn drop(&mut self) {
         for slot in self.slots {
-            unsafe { hipHostFree(slot.cast()) };
+            alloc::free_host_later(slot.cast());
         }
     }
 }

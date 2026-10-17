@@ -697,7 +697,7 @@ impl HipCore {
         self.allocated
             .fetch_sub(buffer.size as u64, Ordering::Relaxed);
         if !buffer.host.is_null() {
-            unsafe { hipHostFree(buffer.host) };
+            alloc::free_host_later(buffer.host);
             return;
         }
         if buffer.ptr.is_null() {

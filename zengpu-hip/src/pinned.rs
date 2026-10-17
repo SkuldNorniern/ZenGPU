@@ -8,11 +8,12 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::slice;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use zengpu_hal::{GpuError, Result};
 
-use crate::ffi::{hipHostFree, hipHostMalloc};
-use crate::{HIP_ERROR_OUT_OF_MEMORY, check};
+use crate::ffi::hipHostMalloc;
+use crate::{HIP_ERROR_OUT_OF_MEMORY, alloc, check};
 
 /// Smallest block size. Smaller transfers share this size class.
 const MIN_BLOCK: usize = 64 << 10;
@@ -52,6 +53,7 @@ impl PinnedPool {
                 let mut rc = unsafe { hipHostMalloc(&mut ptr, cap, 0) };
                 if rc == HIP_ERROR_OUT_OF_MEMORY {
                     self.trim(0);
+                    alloc::wait_for_frees(Duration::from_secs(5));
                     rc = unsafe { hipHostMalloc(&mut ptr, cap, 0) };
                 }
                 check(rc, "hipHostMalloc (transfer staging)")?;
@@ -74,7 +76,7 @@ impl PinnedPool {
         while total > keep {
             let Some(block) = free.pop() else { break };
             total -= block.cap;
-            unsafe { hipHostFree(block.ptr.cast()) };
+            alloc::free_host_later(block.ptr.cast());
         }
     }
 }
@@ -115,7 +117,7 @@ impl Drop for PinnedLease {
             return;
         };
         let Ok(mut free) = self.pool.0.lock() else {
-            unsafe { hipHostFree(block.ptr.cast()) };
+            alloc::free_host_later(block.ptr.cast());
             return;
         };
         let total: usize = free.iter().map(|b| b.cap).sum();
@@ -123,7 +125,7 @@ impl Drop for PinnedLease {
             free.push(block);
         } else {
             drop(free);
-            unsafe { hipHostFree(block.ptr.cast()) };
+            alloc::free_host_later(block.ptr.cast());
         }
     }
 }
