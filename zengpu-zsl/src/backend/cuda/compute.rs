@@ -67,6 +67,14 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         .collect();
     let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
+    if uses_workgroup_reduce && (local_size[1] != 1 || local_size[2] != 1) {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            format!(
+                "ZSL: workgroup_reduce_* requires a 1D workgroup, got local_size {local_size:?}"
+            ),
+        ));
+    }
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
         return Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
@@ -135,16 +143,14 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         s,
         "    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;"
     );
-    if local_size[1] > 1 || local_size[2] > 1 {
-        let _ = writeln!(
-            s,
-            "    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"
-        );
-        let _ = writeln!(
-            s,
-            "    unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"
-        );
-    }
+    let _ = writeln!(
+        s,
+        "    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"
+    );
+    let _ = writeln!(
+        s,
+        "    unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"
+    );
 
     let ctx = Ctx {
         locals,
@@ -188,10 +194,59 @@ struct Ctx<'a> {
     block_size: u32,
 }
 
-fn expr_is_f32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
+fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
     let mut types = ctx.types.borrow_mut();
-    let ty = type_of_compute_expr(expr, &ctx.type_ctx, &mut types);
-    ty == types.f32_id()
+    type_of_compute_expr(expr, &ctx.type_ctx, &mut types)
+}
+
+fn expr_is_f32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
+    let ty = expr_type_id(ctx, expr);
+    ty == ctx.types.borrow_mut().f32_id()
+}
+
+/// Mixed `i32`/`u32` operands unify to `i32`, as in SPIR-V. Bitwise and `&&`/`||` excluded.
+fn is_mixed_sign_checked_op(op: IrBinOp) -> bool {
+    matches!(
+        op,
+        IrBinOp::Add
+            | IrBinOp::Sub
+            | IrBinOp::Mul
+            | IrBinOp::Div
+            | IrBinOp::Lt
+            | IrBinOp::Le
+            | IrBinOp::Gt
+            | IrBinOp::Ge
+            | IrBinOp::Eq
+            | IrBinOp::Ne
+    )
+}
+
+/// Builtins SPIR-V rejects unless all operands are `f32`. HIP and CUDA must reject the same set.
+fn builtin_requires_f32(func: BuiltinFn) -> bool {
+    matches!(
+        func,
+        BuiltinFn::Abs
+            | BuiltinFn::Sign
+            | BuiltinFn::Exp
+            | BuiltinFn::Tanh
+            | BuiltinFn::Sin
+            | BuiltinFn::Cos
+            | BuiltinFn::Tan
+            | BuiltinFn::Log
+            | BuiltinFn::Sqrt
+            | BuiltinFn::Floor
+            | BuiltinFn::Ceil
+            | BuiltinFn::Fract
+            | BuiltinFn::IsNan
+            | BuiltinFn::IsInf
+            | BuiltinFn::IsFinite
+            | BuiltinFn::Min
+            | BuiltinFn::Max
+            | BuiltinFn::Pow
+            | BuiltinFn::Clamp
+            | BuiltinFn::Mix
+            | BuiltinFn::MulAddF32
+    )
 }
 
 fn indent(s: &mut String, depth: usize) {
@@ -356,7 +411,13 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match e {
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => {
-            if v.fract() == 0.0 {
+            if v.is_nan() {
+                "__builtin_nanf(\"\")".to_string()
+            } else if *v == f32::INFINITY {
+                "__builtin_inff()".to_string()
+            } else if *v == f32::NEG_INFINITY {
+                "(-__builtin_inff())".to_string()
+            } else if v.fract() == 0.0 {
                 format!("{v}.0f")
             } else {
                 format!("{v}f")
@@ -415,6 +476,12 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
                 args_s.push(emit_expr(ctx, a)?);
+            }
+            if builtin_requires_f32(*func) && args.iter().any(|a| !expr_is_f32(ctx, a)) {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::Unsupported,
+                    format!("ZSL: {}() requires f32 operands", func.name()),
+                ));
             }
             match func {
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
@@ -505,22 +572,26 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 | BuiltinFn::SubgroupReduceAnd
                 | BuiltinFn::SubgroupReduceOr => {
                     let combine = match func {
-                        BuiltinFn::SubgroupReduceAdd => "v + o",
-                        BuiltinFn::SubgroupReduceMin if expr_is_f32(ctx, &args[0]) => "fminf(v, o)",
-                        BuiltinFn::SubgroupReduceMin => "(v < o ? v : o)",
-                        BuiltinFn::SubgroupReduceMax if expr_is_f32(ctx, &args[0]) => "fmaxf(v, o)",
-                        BuiltinFn::SubgroupReduceMax => "(v > o ? v : o)",
-                        BuiltinFn::SubgroupReduceAnd => "(v & o)",
-                        BuiltinFn::SubgroupReduceOr => "(v | o)",
+                        BuiltinFn::SubgroupReduceAdd => "__zsl_v + __zsl_o",
+                        BuiltinFn::SubgroupReduceMin if expr_is_f32(ctx, &args[0]) => {
+                            "fminf(__zsl_v, __zsl_o)"
+                        }
+                        BuiltinFn::SubgroupReduceMin => "(__zsl_v < __zsl_o ? __zsl_v : __zsl_o)",
+                        BuiltinFn::SubgroupReduceMax if expr_is_f32(ctx, &args[0]) => {
+                            "fmaxf(__zsl_v, __zsl_o)"
+                        }
+                        BuiltinFn::SubgroupReduceMax => "(__zsl_v > __zsl_o ? __zsl_v : __zsl_o)",
+                        BuiltinFn::SubgroupReduceAnd => "(__zsl_v & __zsl_o)",
+                        BuiltinFn::SubgroupReduceOr => "(__zsl_v | __zsl_o)",
                         _ => unreachable!(),
                     };
                     format!(
-                        "({{ auto v = {}; for (unsigned int off = warpSize / 2; off > 0; off /= 2) {{ auto o = __shfl_xor_sync(0xffffffffu, v, off); v = {combine}; }} v; }})",
+                        "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = warpSize / 2; __zsl_off > 0; __zsl_off /= 2) {{ auto __zsl_o = __shfl_xor_sync(0xffffffffu, __zsl_v, __zsl_off); __zsl_v = {combine}; }} __zsl_v; }})",
                         args_s[0]
                     )
                 }
                 BuiltinFn::SubgroupScanInclusiveAdd => format!(
-                    "({{ auto v = {}; for (unsigned int off = 1; off < warpSize; off *= 2) {{ auto o = __shfl_up_sync(0xffffffffu, v, off); if ((threadIdx.x % warpSize) >= off) v = v + o; }} v; }})",
+                    "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = 1; __zsl_off < warpSize; __zsl_off *= 2) {{ auto __zsl_o = __shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off); if ((threadIdx.x % warpSize) >= __zsl_off) __zsl_v = __zsl_v + __zsl_o; }} __zsl_v; }})",
                     args_s[0]
                 ),
                 BuiltinFn::SubgroupScanExclusiveAdd => {
@@ -530,7 +601,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         "0u"
                     };
                     format!(
-                        "({{ auto v = {}; for (unsigned int off = 1; off < warpSize; off *= 2) {{ auto o = __shfl_up_sync(0xffffffffu, v, off); if ((threadIdx.x % warpSize) >= off) v = v + o; }} auto incl = v; auto excl = __shfl_up_sync(0xffffffffu, incl, 1u); if ((threadIdx.x % warpSize) == 0) excl = {zero}; excl; }})",
+                        "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = 1; __zsl_off < warpSize; __zsl_off *= 2) {{ auto __zsl_o = __shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off); if ((threadIdx.x % warpSize) >= __zsl_off) __zsl_v = __zsl_v + __zsl_o; }} auto __zsl_incl = __zsl_v; auto __zsl_excl = __shfl_up_sync(0xffffffffu, __zsl_incl, 1u); if ((threadIdx.x % warpSize) == 0) __zsl_excl = {zero}; __zsl_excl; }})",
                         args_s[0]
                     )
                 }
@@ -538,16 +609,16 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 | BuiltinFn::WorkgroupReduceMin
                 | BuiltinFn::WorkgroupReduceMax => {
                     let combine = match func {
-                        BuiltinFn::WorkgroupReduceAdd => "v + o",
-                        BuiltinFn::WorkgroupReduceMin => "fminf(v, o)",
-                        BuiltinFn::WorkgroupReduceMax => "fmaxf(v, o)",
+                        BuiltinFn::WorkgroupReduceAdd => "__zsl_v + __zsl_o",
+                        BuiltinFn::WorkgroupReduceMin => "fminf(__zsl_v, __zsl_o)",
+                        BuiltinFn::WorkgroupReduceMax => "fmaxf(__zsl_v, __zsl_o)",
                         _ => unreachable!(),
                     };
                     let mut steps = String::new();
                     let mut s = ctx.block_size / 2;
                     while s > 0 {
                         steps.push_str(&format!(
-                            "if (threadIdx.x < {s}u) {{ auto o = __zsl_wg_reduce_f32[threadIdx.x + {s}u]; auto v = __zsl_wg_reduce_f32[threadIdx.x]; __zsl_wg_reduce_f32[threadIdx.x] = {combine}; }} __syncthreads(); "
+                            "if (threadIdx.x < {s}u) {{ auto __zsl_o = __zsl_wg_reduce_f32[threadIdx.x + {s}u]; auto __zsl_v = __zsl_wg_reduce_f32[threadIdx.x]; __zsl_wg_reduce_f32[threadIdx.x] = {combine}; }} __syncthreads(); "
                         ));
                         s /= 2;
                     }
@@ -582,12 +653,21 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 IrBinOp::Shl => "<<",
                 IrBinOp::Shr => ">>",
             };
-            format!(
-                "({} {} {})",
-                emit_expr(ctx, lhs)?,
-                op_s,
-                emit_expr(ctx, rhs)?
-            )
+            let mut l = emit_expr(ctx, lhs)?;
+            let mut r = emit_expr(ctx, rhs)?;
+            if is_mixed_sign_checked_op(*op) {
+                let (lt, rt) = (expr_type_id(ctx, lhs), expr_type_id(ctx, rhs));
+                let (i32_id, u32_id) = {
+                    let mut types = ctx.types.borrow_mut();
+                    (types.i32_id(), types.u32_id())
+                };
+                if lt == i32_id && rt == u32_id {
+                    r = format!("((int)({r}))");
+                } else if lt == u32_id && rt == i32_id {
+                    l = format!("((int)({l}))");
+                }
+            }
+            format!("({l} {op_s} {r})")
         }
     })
 }
