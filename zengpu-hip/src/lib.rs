@@ -1,12 +1,15 @@
 //! ZenGPU AMD ROCm/HIP compute backend.
 //!
-//! Supports ROCm 5.x - 7.x on gfx9xx (GCN 5 / CDNA), gfx10xx (RDNA 1/2), gfx11xx (RDNA 3), gfx12xx
-//! (RDNA 4). Kernels compile at run time with hipRTC for the exact gfx target the device reports,
-//! so parts outside AMD's official support list run without `HSA_OVERRIDE_GFX_VERSION`.
+//! Supports ROCm 5.x - 7.x on gfx9xx (GCN 5 / CDNA), gfx10xx (RDNA 1/2), gfx11xx (RDNA 3),
+//! gfx12xx (RDNA 4). Kernels compile at run time with hipRTC for the exact gfx target the
+//! device reports, so parts outside AMD's official support list (RDNA 1, RDNA 2 laptop/iGPU)
+//! run without `HSA_OVERRIDE_GFX_VERSION`.
 //!
-//! Each [`HipDevice`] owns one non-blocking stream. A dispatch sees every earlier write, copy
-//! and dispatch on the same device. Multi-GPU: open one `HipDevice` per adapter. They are
-//! `Send + Sync`.
+//! Each [`HipDevice`] owns three non-blocking streams: kernels and device copies, plus async
+//! uploads and downloads. Work is ordered as if on one stream: a dispatch sees every earlier write,
+//! copy and dispatch on the same device. Streams wait on each other's events only for shared
+//! buffers, so transfers on other buffers overlap kernels. Multi-GPU: open one `HipDevice` per
+//! adapter. They are `Send + Sync`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -533,11 +536,61 @@ enum Deferred {
 struct LifetimeState {
     in_flight: usize,
     deferred: Vec<Deferred>,
+    /// Last queued access per buffer (by device pointer). Cleared when nothing is in flight.
+    hazards: HashMap<usize, Hazard>,
+}
+
+/// Streams work is queued on. Order holds within one lane; across lanes, use an event wait.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lane {
+    Compute,
+    Upload,
+    Download,
+}
+
+/// Destroyed when the last holder drops it.
+struct OwnedEvent(HipEvent);
+
+// SAFETY: hipEvent_t is an opaque handle and HIP event calls are thread-safe.
+unsafe impl Send for OwnedEvent {}
+unsafe impl Sync for OwnedEvent {}
+
+impl Drop for OwnedEvent {
+    fn drop(&mut self) {
+        unsafe { hipEventDestroy(self.0) };
+    }
+}
+
+impl Lane {
+    const ALL: [Lane; 3] = [Lane::Compute, Lane::Upload, Lane::Download];
+}
+
+/// Queued work on one buffer: last access per lane, and the last write.
+#[derive(Default)]
+struct Hazard {
+    last_access: [Option<Arc<OwnedEvent>>; 3],
+    last_write: Option<(Lane, Arc<OwnedEvent>)>,
+}
+
+/// Buffers `ops` touch as `(ptr, written)`. Kernels are taken to write every bound buffer.
+fn accesses(mut list: Vec<(usize, bool)>) -> Vec<(usize, bool)> {
+    list.sort_unstable();
+    let mut out: Vec<(usize, bool)> = Vec::with_capacity(list.len());
+    for (ptr, written) in list {
+        match out.last_mut() {
+            Some(last) if last.0 == ptr => last.1 |= written,
+            _ => out.push((ptr, written)),
+        }
+    }
+    out
 }
 
 struct HipCore {
     info: HipDeviceInfo,
     stream: HipStream,
+    /// Host-to-device writes, overlapping kernels.
+    upload: HipStream,
+    download: HipStream,
     buffers: Mutex<SlotMap<marker::Buffer, HipBuffer>>,
     shaders: Mutex<SlotMap<marker::Shader, Arc<HipModule>>>,
     pipelines: Mutex<SlotMap<marker::Pipeline, HipPipeline>>,
@@ -609,6 +662,7 @@ impl HipCore {
             debug_assert!(lifetime.in_flight > 0);
             lifetime.in_flight = lifetime.in_flight.saturating_sub(1);
             if lifetime.in_flight == 0 {
+                lifetime.hazards.clear();
                 take(&mut lifetime.deferred)
             } else {
                 Vec::new()
@@ -814,40 +868,81 @@ impl HipCore {
         self: &Arc<Self>,
         cycle_id: u64,
         ops: &[T],
+        touched: impl Fn(&Self, &T, &mut Vec<(usize, bool)>),
         enqueue: impl Fn(&Self, &T) -> Result<()>,
     ) -> Result<Submission> {
         if ops.is_empty() {
             return Ok(Box::new(CompletedSubmission::new(cycle_id)));
         }
-        let submission = self.record(cycle_id, None, |core| {
+        let mut list = Vec::new();
+        for op in ops {
+            touched(self, op, &mut list);
+        }
+        let submission = self.record(cycle_id, Lane::Compute, None, &accesses(list), |core| {
             ops.iter().try_for_each(|op| enqueue(core, op))
         })?;
         Ok(Box::new(submission))
     }
 
-    /// Runs `enqueue` on the stream and returns a submission that completes after it. The
-    /// submission keeps `lease` alive until then.
+    fn lane_stream(&self, lane: Lane) -> HipStream {
+        match lane {
+            Lane::Compute => self.stream,
+            Lane::Upload => self.upload,
+            Lane::Download => self.download,
+        }
+    }
+
+    /// Dispatch bindings, all taken as written.
+    fn dispatch_touches(&self, op: &DispatchOp<'_>, out: &mut Vec<(usize, bool)>) {
+        let Ok(buffers) = self.buffers.lock() else {
+            return;
+        };
+        for &slot in op.bindings.buffers {
+            if let Some(buffer) = buffers.get_by_slot_index(slot) {
+                out.push((buffer.ptr as usize, true));
+            }
+        }
+    }
+
+    /// Runs `enqueue` after other lanes' queued work on `touched`. Keeps `lease` alive until done.
     fn record(
         self: &Arc<Self>,
         cycle_id: u64,
+        lane: Lane,
         lease: Option<PinnedLease>,
+        touched: &[(usize, bool)],
         enqueue: impl FnOnce(&Self) -> Result<()>,
     ) -> Result<HipSubmission> {
         self.activate()?;
-        lock(&self.lifetime)?.in_flight += 1;
+        let stream = self.lane_stream(lane);
+        {
+            let mut lifetime = lock(&self.lifetime)?;
+            lifetime.in_flight += 1;
+            if let Err(e) = self.wait_hazards(&lifetime, lane, stream, touched) {
+                drop(lifetime);
+                self.release_in_flight();
+                return Err(e);
+            }
+        }
 
         let recorded = (|| {
             enqueue(self)?;
-            let mut event: HipEvent = ptr::null_mut();
+            let mut raw: HipEvent = ptr::null_mut();
             unsafe {
                 self.check(
-                    hipEventCreateWithFlags(&mut event, HIP_EVENT_DISABLE_TIMING),
+                    hipEventCreateWithFlags(&mut raw, HIP_EVENT_DISABLE_TIMING),
                     "hipEventCreateWithFlags",
                 )?;
-                if let Err(e) = self.check(hipEventRecord(event, self.stream), "hipEventRecord") {
-                    hipEventDestroy(event);
-                    return Err(e);
+            }
+            let event = Arc::new(OwnedEvent(raw));
+            unsafe { self.check(hipEventRecord(raw, stream), "hipEventRecord")? };
+            let mut lifetime = lock(&self.lifetime)?;
+            for &(ptr, written) in touched {
+                let hazard = lifetime.hazards.entry(ptr).or_default();
+                if written {
+                    hazard.last_write = Some((lane, Arc::clone(&event)));
                 }
+                hazard.last_access[lane as usize] = Some(Arc::clone(&event));
             }
             Ok(event)
         })();
@@ -860,11 +955,41 @@ impl HipCore {
                 lease,
             }),
             Err(error) => {
-                unsafe { hipStreamSynchronize(self.stream) };
+                unsafe { hipStreamSynchronize(stream) };
                 self.release_in_flight();
                 Err(error)
             }
         }
+    }
+
+    /// A write waits for every lane's last access, a read only for the last write.
+    fn wait_hazards(
+        &self,
+        lifetime: &LifetimeState,
+        lane: Lane,
+        stream: HipStream,
+        touched: &[(usize, bool)],
+    ) -> Result<()> {
+        let wait = |event: &OwnedEvent| unsafe {
+            self.check(hipStreamWaitEvent(stream, event.0, 0), "hipStreamWaitEvent")
+        };
+        for &(ptr, written) in touched {
+            let Some(hazard) = lifetime.hazards.get(&ptr) else {
+                continue;
+            };
+            if written {
+                for other in Lane::ALL.into_iter().filter(|&l| l != lane) {
+                    if let Some(event) = &hazard.last_access[other as usize] {
+                        wait(event)?;
+                    }
+                }
+            } else if let Some((writer, event)) = &hazard.last_write
+                && *writer != lane
+            {
+                wait(event)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -873,6 +998,8 @@ impl Drop for HipCore {
         unsafe {
             hipSetDevice(self.info.ordinal);
             hipStreamSynchronize(self.stream);
+            hipStreamSynchronize(self.upload);
+            hipStreamSynchronize(self.download);
         }
         let buffers: Vec<HipBuffer> = self
             .buffers
@@ -908,6 +1035,8 @@ impl Drop for HipCore {
                 hipFree(ptr);
             }
             hipStreamDestroy(self.stream);
+            hipStreamDestroy(self.upload);
+            hipStreamDestroy(self.download);
         }
     }
 }
@@ -923,31 +1052,25 @@ fn stale<K, V>(table: &SlotMap<K, V>, handle: zengpu_hal::Handle<K>) -> GpuError
 struct HipSubmission {
     cycle_id: u64,
     core: Arc<HipCore>,
-    event: Mutex<Option<HipEvent>>,
+    event: Mutex<Option<Arc<OwnedEvent>>>,
     /// Dropped only after the event completes.
     lease: Option<PinnedLease>,
 }
 
-// SAFETY: hipEvent_t is an opaque handle; HIP event calls are thread-safe and the slot is behind
-unsafe impl Send for HipSubmission {}
-unsafe impl Sync for HipSubmission {}
-
 impl HipSubmission {
     fn query(&self) -> Result<SubmissionStatus> {
         let mut event = lock(&self.event)?;
-        let Some(raw) = *event else {
+        let Some(raw) = event.as_ref().map(|e| e.0) else {
             return Ok(SubmissionStatus::Complete);
         };
         match unsafe { hipEventQuery(raw) } {
             HIP_SUCCESS => {
-                unsafe { hipEventDestroy(raw) };
                 *event = None;
                 self.core.release_in_flight();
                 Ok(SubmissionStatus::Complete)
             }
             HIP_ERROR_NOT_READY => Ok(SubmissionStatus::Pending),
             code => {
-                unsafe { hipEventDestroy(raw) };
                 *event = None;
                 self.core.release_in_flight();
                 Err(self
@@ -971,9 +1094,9 @@ impl GpuSubmission for HipSubmission {
 
     fn wait(&self, timeout: Duration) -> Result<()> {
         if timeout == Duration::MAX {
-            let raw = *lock(&self.event)?;
-            if let Some(raw) = raw {
-                let code = unsafe { hipEventSynchronize(raw) };
+            let event = lock(&self.event)?.clone();
+            if let Some(event) = event {
+                let code = unsafe { hipEventSynchronize(event.0) };
                 if code != HIP_SUCCESS && code != HIP_ERROR_NOT_READY {
                     self.core.check(code, "hipEventSynchronize")?;
                 }
@@ -1004,13 +1127,10 @@ impl Drop for HipSubmission {
         let Ok(event) = self.event.get_mut() else {
             return;
         };
-        let Some(raw) = event.take() else {
+        let Some(event) = event.take() else {
             return;
         };
-        unsafe {
-            hipEventSynchronize(raw);
-            hipEventDestroy(raw);
-        }
+        unsafe { hipEventSynchronize(event.0) };
         self.core.release_in_flight();
     }
 }
@@ -1199,15 +1319,33 @@ impl GpuAdapter for HipAdapter {
     fn open(&self, req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
         let ordinal = self.dev_info.ordinal;
         check(unsafe { hipSetDevice(ordinal) }, "hipSetDevice")?;
-        let mut stream: HipStream = ptr::null_mut();
-        check(
-            unsafe { hipStreamCreateWithFlags(&mut stream, HIP_STREAM_NON_BLOCKING) },
-            "hipStreamCreateWithFlags",
-        )?;
+        let mut streams: [HipStream; 3] = [ptr::null_mut(); 3];
+        for i in 0..streams.len() {
+            let rc = unsafe { hipStreamCreateWithFlags(&mut streams[i], HIP_STREAM_NON_BLOCKING) };
+            if let Err(e) = check(rc, "hipStreamCreateWithFlags") {
+                for &made in &streams[..i] {
+                    unsafe { hipStreamDestroy(made) };
+                }
+                return Err(e);
+            }
+        }
+        let [stream, upload, download] = streams;
+        for &copy in &[upload, download] {
+            let mut event: HipEvent = ptr::null_mut();
+            unsafe {
+                if hipEventCreateWithFlags(&mut event, HIP_EVENT_DISABLE_TIMING) == HIP_SUCCESS {
+                    hipEventRecord(event, copy);
+                    hipEventSynchronize(event);
+                    hipEventDestroy(event);
+                }
+            }
+        }
         Ok(Box::new(HipDevice {
             core: Arc::new(HipCore {
                 info: self.dev_info.clone(),
                 stream,
+                upload,
+                download,
                 buffers: Mutex::new(SlotMap::new()),
                 shaders: Mutex::new(SlotMap::new()),
                 pipelines: Mutex::new(SlotMap::new()),
@@ -1810,20 +1948,32 @@ impl GpuDevice for HipDevice {
     }
 
     fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {
-        self.core.submit(cycle_id, ops, HipCore::launch)
+        self.core
+            .submit(cycle_id, ops, HipCore::dispatch_touches, HipCore::launch)
     }
 
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
-        self.core.submit(cycle_id, ops, |core, op| match op {
-            ComputeOp::CopyBuffer(copy) => core.enqueue_copy(
-                copy.src,
-                copy.src_offset,
-                copy.dst,
-                copy.dst_offset,
-                copy.len,
-            ),
-            ComputeOp::Dispatch(dispatch) => core.launch(dispatch),
-        })
+        let touches = |core: &HipCore, op: &ComputeOp<'_>, out: &mut Vec<(usize, bool)>| match op {
+            ComputeOp::CopyBuffer(copy) => {
+                for (handle, written) in [(copy.src, false), (copy.dst, true)] {
+                    if let Ok(buffer) = core.buffer(handle) {
+                        out.push((buffer.ptr as usize, written));
+                    }
+                }
+            }
+            ComputeOp::Dispatch(dispatch) => core.dispatch_touches(dispatch, out),
+        };
+        self.core
+            .submit(cycle_id, ops, touches, |core, op| match op {
+                ComputeOp::CopyBuffer(copy) => core.enqueue_copy(
+                    copy.src,
+                    copy.src_offset,
+                    copy.dst,
+                    copy.dst_offset,
+                    copy.len,
+                ),
+                ComputeOp::Dispatch(dispatch) => core.launch(dispatch),
+            })
     }
 
     fn submit_write_buffer(
@@ -1841,27 +1991,30 @@ impl GpuDevice for HipDevice {
         self.core.activate()?;
         let lease = self.core.pinned.lease(data.len())?;
         let staging = lease.ptr();
-        let sub = self.core.record(cycle_id, Some(lease), |core| {
-            for (i, chunk) in data.chunks(STAGE_CHUNK).enumerate() {
-                let at = i * STAGE_CHUNK;
-                unsafe {
-                    // SAFETY: the lease holds `data.len()` bytes, and this range is not yet queued.
-                    let src = staging.add(at);
-                    ptr::copy_nonoverlapping(chunk.as_ptr(), src, chunk.len());
-                    core.check(
-                        hipMemcpyAsync(
-                            (buf.ptr as *mut u8).add(offset + at) as *mut c_void,
-                            src as *const c_void,
-                            chunk.len(),
-                            buf.copy_kind(HIP_MEMCPY_H2D),
-                            core.stream,
-                        ),
-                        "hipMemcpyAsync H→D",
-                    )?;
+        let touched = [(buf.ptr as usize, true)];
+        let sub = self
+            .core
+            .record(cycle_id, Lane::Upload, Some(lease), &touched, |core| {
+                for (i, chunk) in data.chunks(STAGE_CHUNK).enumerate() {
+                    let at = i * STAGE_CHUNK;
+                    unsafe {
+                        // SAFETY: the lease holds `data.len()` bytes, and this
+                        let src = staging.add(at);
+                        ptr::copy_nonoverlapping(chunk.as_ptr(), src, chunk.len());
+                        core.check(
+                            hipMemcpyAsync(
+                                (buf.ptr as *mut u8).add(offset + at) as *mut c_void,
+                                src as *const c_void,
+                                chunk.len(),
+                                buf.copy_kind(HIP_MEMCPY_H2D),
+                                core.upload,
+                            ),
+                            "hipMemcpyAsync H→D",
+                        )?;
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         Ok(Box::new(sub))
     }
 
@@ -1887,18 +2040,25 @@ impl GpuDevice for HipDevice {
         self.core.activate()?;
         let lease = self.core.pinned.lease(len)?;
         let dst = lease.ptr();
-        let sub = self.core.record(cycle_id, Some(lease), |core| unsafe {
-            core.check(
-                hipMemcpyAsync(
-                    dst as *mut c_void,
-                    (buf.ptr as *const u8).add(offset) as *const c_void,
-                    len,
-                    buf.copy_kind(HIP_MEMCPY_D2H),
-                    core.stream,
-                ),
-                "hipMemcpyAsync D→H",
-            )
-        })?;
+        let touched = [(buf.ptr as usize, false)];
+        let sub = self.core.record(
+            cycle_id,
+            Lane::Download,
+            Some(lease),
+            &touched,
+            |core| unsafe {
+                core.check(
+                    hipMemcpyAsync(
+                        dst as *mut c_void,
+                        (buf.ptr as *const u8).add(offset) as *const c_void,
+                        len,
+                        buf.copy_kind(HIP_MEMCPY_D2H),
+                        core.download,
+                    ),
+                    "hipMemcpyAsync D→H",
+                )
+            },
+        )?;
         Ok(Box::new(HipReadback { sub, len }))
     }
 }
