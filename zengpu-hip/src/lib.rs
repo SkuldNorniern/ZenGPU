@@ -1,15 +1,16 @@
 //! ZenGPU AMD ROCm/HIP compute backend.
 //!
-//! Supports ROCm 5.x - 7.x on gfx9xx (GCN 5 / CDNA), gfx10xx (RDNA 1/2), gfx11xx (RDNA 3),
-//! gfx12xx (RDNA 4). Kernels compile at run time with hipRTC for the exact gfx target the
-//! device reports, so parts outside AMD's official support list (RDNA 1, RDNA 2 laptop/iGPU)
-//! run without `HSA_OVERRIDE_GFX_VERSION`.
+//! ROCm 5.x to 7.x on gfx9, gfx10 (RDNA 1/2), gfx11 (RDNA 3) and gfx12 (RDNA 4). Kernels are
+//! compiled by hipRTC for the exact gfx target, so parts outside AMD's support list run
+//! without `HSA_OVERRIDE_GFX_VERSION`.
 //!
-//! Each [`HipDevice`] owns three non-blocking streams: kernels and device copies, plus async
-//! uploads and downloads. Work is ordered as if on one stream: a dispatch sees every earlier write,
-//! copy and dispatch on the same device. Streams wait on each other's events only for shared
-//! buffers, so transfers on other buffers overlap kernels. Multi-GPU: open one `HipDevice` per
-//! adapter. They are `Send + Sync`.
+//! Each [`HipDevice`] has three non-blocking streams: kernels and device copies, async uploads,
+//! async downloads. Work is ordered as on one stream. Streams wait on each other's events only for
+//! buffers both touch, so transfers overlap kernels.
+//!
+//! Batches are plain stream launches rather than hipGraph: on ROCm 7.2, graphs of 1-1000 small
+//! kernels ran at 0.80-1.00x stream speed. Open one `HipDevice` per adapter for multi-GPU. They are
+//! `Send + Sync`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
