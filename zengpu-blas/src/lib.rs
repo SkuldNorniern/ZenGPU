@@ -32,6 +32,7 @@
 mod gemm_hip;
 mod gemm_skinny;
 mod gemm_tiled;
+mod gemm_wmma;
 pub mod level1;
 pub mod level3;
 

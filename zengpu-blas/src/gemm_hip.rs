@@ -205,6 +205,21 @@ void sgemm_reduce(const float* __restrict__ P, float* __restrict__ C,
         C[i] = s;
     }
 }
+
+template <class H>
+__device__ __forceinline__ void widen(const H* __restrict__ src, float* __restrict__ dst,
+                                      unsigned int n) {
+    unsigned int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) dst[i] = to_f32(src[i]);
+}
+extern "C" __global__ __launch_bounds__(256)
+void widen_f16(const f16* __restrict__ src, float* __restrict__ dst, unsigned int n) {
+    widen(src, dst, n);
+}
+extern "C" __global__ __launch_bounds__(256)
+void widen_bf16(const bf16* __restrict__ src, float* __restrict__ dst, unsigned int n) {
+    widen(src, dst, n);
+}
 "#;
 
 pub(crate) const B_TYPES: [(zengpu_hal::DType, &str); 3] = [
