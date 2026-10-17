@@ -26,11 +26,12 @@ use std::time::{Duration, Instant};
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, CompletedSubmission, ComputeOp, ComputePipelineDesc, DeviceLimits, DeviceRequest,
-    DeviceType, DispatchOp, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
-    HalCapabilities, MemoryBudget, MemoryUsage, PipelineHandle, PowerPreference, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
-    Submission, SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
+    BufferUsage, CompletedReadback, CompletedSubmission, ComputeOp, ComputePipelineDesc,
+    DeviceLimits, DeviceRequest, DeviceType, DispatchOp, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget, MemoryUsage,
+    PipelineHandle, PowerPreference, ReadSubmission, Result, SamplerDesc, SamplerHandle, Scalar,
+    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, TextureDesc,
+    TextureHandle, UsageError, marker,
 };
 
 mod hip_layout {
@@ -53,6 +54,9 @@ mod cache;
 
 mod peer;
 use peer::PeerStaging;
+
+mod pinned;
+use pinned::{PinnedLease, PinnedPool};
 
 const HIP_SUCCESS: HipError = 0;
 const HIP_ERROR_OUT_OF_MEMORY: HipError = 2;
@@ -542,6 +546,7 @@ struct HipCore {
     peer_staging: Mutex<Option<Option<PeerStaging>>>,
     /// Freed blocks, reused on this device's stream.
     block_cache: Mutex<BlockCache>,
+    pinned: Arc<PinnedPool>,
     allocated: AtomicU64,
     lost: AtomicBool,
 }
@@ -812,13 +817,25 @@ impl HipCore {
         if ops.is_empty() {
             return Ok(Box::new(CompletedSubmission::new(cycle_id)));
         }
+        let submission = self.record(cycle_id, None, |core| {
+            ops.iter().try_for_each(|op| enqueue(core, op))
+        })?;
+        Ok(Box::new(submission))
+    }
+
+    /// Runs `enqueue` on the stream and returns a submission that completes after it. The
+    /// submission keeps `lease` alive until then.
+    fn record(
+        self: &Arc<Self>,
+        cycle_id: u64,
+        lease: Option<PinnedLease>,
+        enqueue: impl FnOnce(&Self) -> Result<()>,
+    ) -> Result<HipSubmission> {
         self.activate()?;
         lock(&self.lifetime)?.in_flight += 1;
 
         let recorded = (|| {
-            for op in ops {
-                enqueue(self, op)?;
-            }
+            enqueue(self)?;
             let mut event: HipEvent = ptr::null_mut();
             unsafe {
                 self.check(
@@ -834,11 +851,12 @@ impl HipCore {
         })();
 
         match recorded {
-            Ok(event) => Ok(Box::new(HipSubmission {
+            Ok(event) => Ok(HipSubmission {
                 cycle_id,
                 core: Arc::clone(self),
                 event: Mutex::new(Some(event)),
-            })),
+                lease,
+            }),
             Err(error) => {
                 unsafe { hipStreamSynchronize(self.stream) };
                 self.release_in_flight();
@@ -904,6 +922,8 @@ struct HipSubmission {
     cycle_id: u64,
     core: Arc<HipCore>,
     event: Mutex<Option<HipEvent>>,
+    /// Dropped only after the event completes.
+    lease: Option<PinnedLease>,
 }
 
 // SAFETY: hipEvent_t is an opaque handle; HIP event calls are thread-safe and the slot is behind
@@ -990,6 +1010,52 @@ impl Drop for HipSubmission {
             hipEventDestroy(raw);
         }
         self.core.release_in_flight();
+    }
+}
+
+struct HipReadback {
+    sub: HipSubmission,
+    len: usize,
+}
+
+impl HipReadback {
+    fn bytes(&self) -> Result<&[u8]> {
+        self.sub.wait(Duration::MAX)?;
+        let lease = self.sub.lease.as_ref().ok_or(GpuError::DeviceLost)?;
+        Ok(lease.bytes(self.len))
+    }
+}
+
+impl GpuSubmission for HipReadback {
+    fn cycle_id(&self) -> u64 {
+        self.sub.cycle_id
+    }
+
+    fn poll(&self) -> Result<SubmissionStatus> {
+        self.sub.poll()
+    }
+
+    fn wait(&self, timeout: Duration) -> Result<()> {
+        self.sub.wait(timeout)
+    }
+}
+
+impl GpuReadback for HipReadback {
+    fn into_bytes(self: Box<Self>) -> Result<Vec<u8>> {
+        Ok(self.bytes()?.to_vec())
+    }
+
+    fn read_into(self: Box<Self>, dst: &mut [u8]) -> Result<()> {
+        let bytes = self.bytes()?;
+        if dst.len() != bytes.len() {
+            return Err(binding_error(format!(
+                "hip: read_into got {} bytes for a {}-byte read",
+                dst.len(),
+                bytes.len()
+            )));
+        }
+        dst.copy_from_slice(bytes);
+        Ok(())
     }
 }
 
@@ -1146,6 +1212,7 @@ impl GpuAdapter for HipAdapter {
                 block_cache: Mutex::new(BlockCache::new(
                     (self.dev_info.total_mem / 8).min(512 << 20),
                 )),
+                pinned: Arc::default(),
                 allocated: AtomicU64::new(0),
                 lost: AtomicBool::new(false),
             }),
@@ -1751,6 +1818,74 @@ impl GpuDevice for HipDevice {
             ),
             ComputeOp::Dispatch(dispatch) => core.launch(dispatch),
         })
+    }
+
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        let buf = self.core.buffer(buffer)?;
+        let offset = checked_range(offset, data.len() as u64, buf.size, "write")?;
+        if data.is_empty() {
+            return Ok(Box::new(CompletedSubmission::new(cycle_id)));
+        }
+        self.core.activate()?;
+        let mut lease = self.core.pinned.lease(data.len())?;
+        lease.bytes_mut(data.len()).copy_from_slice(data);
+        let src = lease.ptr();
+        let sub = self.core.record(cycle_id, Some(lease), |core| unsafe {
+            core.check(
+                hipMemcpyAsync(
+                    (buf.ptr as *mut u8).add(offset) as *mut c_void,
+                    src as *const c_void,
+                    data.len(),
+                    buf.copy_kind(HIP_MEMCPY_H2D),
+                    core.stream,
+                ),
+                "hipMemcpyAsync H→D",
+            )
+        })?;
+        Ok(Box::new(sub))
+    }
+
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        let buf = self.core.buffer(buffer)?;
+        if !buf.usage.contains(BufferUsage::READBACK) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "buffer",
+                needed: "READBACK",
+            }));
+        }
+        let offset = checked_range(offset, len, buf.size, "read")?;
+        let len = len as usize;
+        if len == 0 {
+            return Ok(Box::new(CompletedReadback::new(cycle_id, Vec::new())));
+        }
+        self.core.activate()?;
+        let lease = self.core.pinned.lease(len)?;
+        let dst = lease.ptr();
+        let sub = self.core.record(cycle_id, Some(lease), |core| unsafe {
+            core.check(
+                hipMemcpyAsync(
+                    dst as *mut c_void,
+                    (buf.ptr as *const u8).add(offset) as *const c_void,
+                    len,
+                    buf.copy_kind(HIP_MEMCPY_D2H),
+                    core.stream,
+                ),
+                "hipMemcpyAsync D→H",
+            )
+        })?;
+        Ok(Box::new(HipReadback { sub, len }))
     }
 }
 
