@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "u32" => BuiltinFn::U32,
+        "f32" => BuiltinFn::F32,
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
         "exp" => BuiltinFn::Exp,
