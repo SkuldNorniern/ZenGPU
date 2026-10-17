@@ -8,12 +8,13 @@ mod error;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, OsStr, c_char, c_void};
 use std::mem::{take, zeroed};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, yield_now};
 use std::time::{Duration, Instant};
-use std::{ptr, slice};
+use std::{env, fs, io, process, ptr, slice};
 
 use cuda_oxide::{Cuda, context::Context, device::Device, sys};
 use zengpu_hal::{
@@ -47,6 +48,7 @@ unsafe extern "C" {
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
     fn nvrtcGetProgramLogSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
     fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut c_char) -> i32;
+    fn nvrtcVersion(major: *mut i32, minor: *mut i32) -> i32;
 }
 
 const NVRTC_SUCCESS: i32 = 0;
@@ -65,23 +67,35 @@ impl ModuleImage {
             Self::Cubin(bytes) | Self::Ptx(bytes) => bytes,
         }
     }
+
+    /// PTX image, null-terminated as `cuModuleLoadData` requires.
+    fn ptx(mut bytes: Vec<u8>) -> Self {
+        if bytes.last() != Some(&0) {
+            bytes.push(0);
+        }
+        Self::Ptx(bytes)
+    }
 }
 
-/// Compiles CUDA C++ for the device.
-///
-/// Tries an `sm_XY` cubin, then `compute_XY` PTX, then NVRTC's default PTX. An NVRTC older than the
-/// GPU still yields a runnable module.
-fn nvrtc_compile(src: &[u8], (major, minor): (u32, u32)) -> Result<ModuleImage> {
-    let cubin_arch = format!("--gpu-architecture=sm_{major}{minor}");
-    let ptx_arch = format!("--gpu-architecture=compute_{major}{minor}");
-    let attempts = [
-        (Some(cubin_arch.as_str()), true),
-        (Some(ptx_arch.as_str()), false),
+/// Build attempts for `sm`, in order: `sm_XY` cubin, `compute_XY` PTX, then NVRTC's default PTX.
+/// The first that succeeds wins.
+fn nvrtc_attempts((major, minor): (u32, u32)) -> [(Option<String>, bool); 3] {
+    [
+        (Some(format!("--gpu-architecture=sm_{major}{minor}")), true),
+        (
+            Some(format!("--gpu-architecture=compute_{major}{minor}")),
+            false,
+        ),
         (None, false),
-    ];
+    ]
+}
+
+/// Compile CUDA C++ for the device arch, trying [`nvrtc_attempts`] in order. An older NVRTC that
+/// predates the GPU still gives a runnable module.
+fn nvrtc_compile(src: &[u8], sm: (u32, u32)) -> Result<ModuleImage> {
     let mut last_error = None;
-    for (arch, want_cubin) in attempts {
-        match nvrtc_build(src, arch, want_cubin) {
+    for (arch, want_cubin) in nvrtc_attempts(sm) {
+        match nvrtc_build(src, arch.as_deref(), want_cubin) {
             Ok(image) => return Ok(image),
             Err(error) => last_error = Some(error),
         }
@@ -158,8 +172,152 @@ fn nvrtc_read_output(prog: NvrtcProgram, want_cubin: bool) -> Result<ModuleImage
     Ok(if want_cubin {
         ModuleImage::Cubin(bytes)
     } else {
-        ModuleImage::Ptx(bytes)
+        ModuleImage::ptx(bytes)
     })
+}
+
+/// NVRTC version as `(major, minor)`, or `(0, 0)` when it cannot be queried.
+fn nvrtc_version() -> (i32, i32) {
+    let (mut major, mut minor) = (0, 0);
+    // SAFETY: both out-pointers are valid for writes for the duration of the call.
+    if unsafe { nvrtcVersion(&mut major, &mut minor) } == NVRTC_SUCCESS {
+        (major, minor)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Driver version from `cuDriverGetVersion` (e.g. 12040), or 0 when unavailable.
+fn driver_version() -> i32 {
+    let mut version = 0;
+    // SAFETY: the out-pointer is valid for a write for the duration of the call.
+    if unsafe { sys::cuDriverGetVersion(&mut version) } == 0 {
+        version
+    } else {
+        0
+    }
+}
+
+/// Cache format version, in [`cache_key`]. Bump on any layout change so old entries are
+/// never loaded.
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// FNV-1a 64-bit hash. Used instead of `DefaultHasher`, which is not stable across Rust releases.
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    /// Hash one field, length-prefixed so adjacent fields cannot run together.
+    fn field(&mut self, bytes: &[u8]) {
+        self.write(&(bytes.len() as u64).to_le_bytes());
+        self.write(bytes);
+    }
+}
+
+/// Cache key for the module built from `src` for `sm` by [`nvrtc_compile`]. Covers every input to
+/// the output: format version, source, all attempt options, NVRTC and driver versions.
+fn cache_key(src: &[u8], sm: (u32, u32), nvrtc: (i32, i32), driver: i32) -> u64 {
+    let mut hash = Fnv1a::new();
+    hash.field(&CACHE_FORMAT_VERSION.to_le_bytes());
+    hash.field(src);
+    for (arch, cubin) in nvrtc_attempts(sm) {
+        hash.field(arch.unwrap_or_default().as_bytes());
+        hash.field(&[u8::from(cubin)]);
+    }
+    hash.field(format!("nvrtc {}.{}", nvrtc.0, nvrtc.1).as_bytes());
+    hash.field(format!("driver {driver}").as_bytes());
+    hash.0
+}
+
+/// Cache base from env: `ZENGPU_CACHE_DIR` (empty disables), `ZENGPU_NO_CACHE=1` disables.
+/// Otherwise `$XDG_CACHE_HOME`, then `$HOME/.cache`, or `%LOCALAPPDATA%` on Windows. `None` when
+/// caching is off.
+fn resolve_cache_base(
+    cache_dir: Option<&OsStr>,
+    no_cache: bool,
+    xdg_cache_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+    local_app_data: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if no_cache {
+        return None;
+    }
+    let non_empty = |value: Option<&OsStr>| value.filter(|v| !v.is_empty()).map(PathBuf::from);
+    if let Some(dir) = cache_dir {
+        return non_empty(Some(dir));
+    }
+    if cfg!(windows) {
+        non_empty(local_app_data)
+    } else {
+        non_empty(xdg_cache_home).or_else(|| non_empty(home).map(|home| home.join(".cache")))
+    }
+}
+
+fn default_cache_base() -> Option<PathBuf> {
+    resolve_cache_base(
+        env::var_os("ZENGPU_CACHE_DIR").as_deref(),
+        env::var_os("ZENGPU_NO_CACHE").is_some_and(|v| v.to_str() == Some("1")),
+        env::var_os("XDG_CACHE_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+        env::var_os("LOCALAPPDATA").as_deref(),
+    )
+}
+
+fn cache_entry(base: &Path, key: u64, cubin: bool) -> PathBuf {
+    let ext = if cubin { "cubin" } else { "ptx" };
+    base.join("zengpu")
+        .join("cuda")
+        .join(format!("{key:016x}.{ext}"))
+}
+
+/// Read the cached image for `key`, cubin first, then PTX. Read errors other than a missing entry
+/// log and count as a miss.
+fn cache_read(base: &Path, key: u64) -> Option<(ModuleImage, PathBuf)> {
+    for cubin in [true, false] {
+        let path = cache_entry(base, key, cubin);
+        match fs::read(&path) {
+            Ok(bytes) if cubin => return Some((ModuleImage::Cubin(bytes), path)),
+            Ok(bytes) => return Some((ModuleImage::ptx(bytes), path)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => log::debug!("cuda: cache read {} failed: {e}", path.display()),
+        }
+    }
+    None
+}
+
+/// Write `bytes` to `path` via temp file and rename, so readers never see a partial entry. Creates
+/// parent dirs.
+fn write_entry(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or(path);
+    fs::create_dir_all(dir)?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", process::id()));
+    let tmp = PathBuf::from(tmp);
+    fs::write(&tmp, bytes)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Store `image` under `key`. Failures are logged, not returned: the module is already loaded.
+fn cache_write(base: &Path, key: u64, image: &ModuleImage) {
+    let path = cache_entry(base, key, matches!(image, ModuleImage::Cubin(_)));
+    if let Err(e) = write_entry(&path, image.bytes()) {
+        log::debug!("cuda: cache write {} failed: {e}", path.display());
+    }
 }
 
 /// Convert a byte count to the driver's `size_t`, failing instead of truncating.
@@ -277,6 +435,7 @@ impl GpuAdapter for CudaAdapter {
                 staging: Mutex::new(None),
                 pinned: Arc::new(PinnedPool(Mutex::new(Vec::new()))),
                 graphs: Mutex::new(GraphCache::default()),
+                images: Mutex::new(HashMap::new()),
             }),
             buffers: Arc::new(Mutex::new(SlotMap::new())),
             shaders: Arc::new(Mutex::new(SlotMap::new())),
@@ -295,7 +454,7 @@ struct CudaBuffer {
 
 struct CudaShader {
     module: sys::CUmodule,
-    _image: ModuleImage,
+    _image: Arc<ModuleImage>,
     /// CUDA C++ source, read for kernel signatures.
     source: Option<String>,
 }
@@ -517,6 +676,26 @@ struct PinnedBlock {
 unsafe impl Send for PinnedBlock {}
 unsafe impl Sync for PinnedBlock {}
 
+/// Bytes per pinned half-block of an async upload. Uploads stage through two halves, so a large
+/// write needs `2 * UPLOAD_CHUNK` pinned bytes.
+const UPLOAD_CHUNK: usize = 8 << 20;
+
+/// Pinned sizes round up to a class: powers of two up to this step, then multiples of it. Nearby
+/// sizes share blocks.
+const PINNED_CLASS_STEP: usize = 4 << 20;
+
+/// Max pinned bytes kept free. Blocks returned past this are freed, oldest first, on
+/// the next lease.
+const PINNED_RETAIN_MAX: usize = 512 << 20;
+
+fn pinned_class(len: usize) -> usize {
+    if len <= PINNED_CLASS_STEP {
+        len.next_power_of_two()
+    } else {
+        len.div_ceil(PINNED_CLASS_STEP) * PINNED_CLASS_STEP
+    }
+}
+
 /// Free pinned blocks for async transfers. Leased per transfer and reused, so pinned allocation is
 /// not paid per call.
 struct PinnedPool(Mutex<Vec<PinnedBlock>>);
@@ -524,29 +703,44 @@ struct PinnedPool(Mutex<Vec<PinnedBlock>>);
 impl PinnedPool {
     /// Lease a block of at least `len` bytes. Context must be current.
     fn lease(self: &Arc<Self>, len: usize) -> Result<PinnedLease> {
+        let class = pinned_class(len);
         let reused = {
             let mut free = self.0.lock().map_err(|_| GpuError::DeviceLost)?;
             let best = free
                 .iter()
                 .enumerate()
-                .filter(|(_, b)| b.cap >= len)
+                .filter(|(_, b)| b.cap >= class)
                 .min_by_key(|(_, b)| b.cap)
                 .map(|(i, _)| i);
-            best.map(|i| free.swap_remove(i))
+            best.map(|i| free.remove(i))
         };
         let block = match reused {
             Some(block) => block,
             None => {
                 let mut ptr: *mut c_void = ptr::null_mut();
                 // SAFETY: writes one pinned allocation pointer into `ptr`.
-                cu(unsafe { sys::cuMemHostAlloc(&mut ptr, driver_len(len)?, 0) })?;
-                PinnedBlock { ptr, cap: len }
+                cu(unsafe { sys::cuMemHostAlloc(&mut ptr, driver_len(class)?, 0) })?;
+                PinnedBlock { ptr, cap: class }
             }
         };
+        self.trim();
         Ok(PinnedLease {
             block,
             pool: Arc::clone(self),
         })
+    }
+
+    /// Free the oldest free blocks until retained bytes fit [`PINNED_RETAIN_MAX`]. Context
+    /// must be current.
+    fn trim(&self) {
+        let Ok(mut free) = self.0.lock() else { return };
+        let mut retained: usize = free.iter().map(|b| b.cap).sum();
+        while retained > PINNED_RETAIN_MAX && !free.is_empty() {
+            let block = free.remove(0);
+            retained -= block.cap;
+            // SAFETY: a free block is not leased, so nothing touches it.
+            unsafe { sys::cuMemFreeHost(block.ptr) };
+        }
     }
 }
 
@@ -1006,6 +1200,9 @@ struct CudaShared {
     staging: Mutex<Option<Staging>>,
     pinned: Arc<PinnedPool>,
     graphs: Mutex<GraphCache>,
+    /// Device images compiled by this process, keyed by [`cache_key`]. One source compiles once per
+    /// device even with the disk cache off.
+    images: Mutex<HashMap<u64, Arc<ModuleImage>>>,
 }
 
 // SAFETY: every context entry is serialized by ctx_lock.
@@ -1297,6 +1494,65 @@ impl CudaShared {
     fn clear_graphs(&self) {
         if let Ok(mut graphs) = self.graphs.lock() {
             graphs.clear();
+        }
+    }
+
+    /// Load `image` as a module. The driver copies it, so the caller keeps ownership.
+    fn load_module(&self, image: &ModuleImage) -> Result<sys::CUmodule> {
+        self.with_current(|| {
+            let mut module: sys::CUmodule = ptr::null_mut();
+            // SAFETY: `image` is alive for the call and its bytes are null-terminated for PTX.
+            cu(unsafe {
+                sys::cuModuleLoadData(&mut module, image.bytes().as_ptr() as *const c_void)
+            })?;
+            Ok(module)
+        })
+    }
+
+    /// Builds the module for CUDA C++ `src`. Checks this process's memo first, then the disk cache
+    /// at `cache` (`None` disables it). A cached image that fails to load is deleted and the source
+    /// is recompiled.
+    fn cuda_module(
+        &self,
+        src: &[u8],
+        cache: Option<&Path>,
+    ) -> Result<(sys::CUmodule, Arc<ModuleImage>)> {
+        let key = cache_key(src, self.sm, nvrtc_version(), driver_version());
+        let memo = self
+            .images
+            .lock()
+            .ok()
+            .and_then(|images| images.get(&key).cloned());
+        if let Some(image) = memo {
+            return Ok((self.load_module(&image)?, image));
+        }
+        if let Some(base) = cache
+            && let Some((image, path)) = cache_read(base, key)
+        {
+            match self.load_module(&image) {
+                Ok(module) => {
+                    let image = Arc::new(image);
+                    self.remember_image(key, &image);
+                    return Ok((module, image));
+                }
+                Err(e) => {
+                    log::debug!("cuda: cached image {} failed to load: {e}", path.display());
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+        let image = Arc::new(nvrtc_compile(src, self.sm)?);
+        let module = self.load_module(&image)?;
+        if let Some(base) = cache {
+            cache_write(base, key, &image);
+        }
+        self.remember_image(key, &image);
+        Ok((module, image))
+    }
+
+    fn remember_image(&self, key: u64, image: &Arc<ModuleImage>) {
+        if let Ok(mut images) = self.images.lock() {
+            images.insert(key, Arc::clone(image));
         }
     }
 
@@ -1786,6 +2042,29 @@ fn plan_accesses(plan: &[Launch]) -> Vec<(u64, bool)> {
 }
 
 impl CudaDevice {
+    /// Builds a shader from CUDA C++ `src` through the compile cache at `cache`.
+    fn cuda_shader(&self, src: &[u8], cache: Option<&Path>) -> Result<ShaderHandle> {
+        let (module, image) = self.shared.cuda_module(src, cache)?;
+        self.insert_shader(module, image, str::from_utf8(src).ok().map(str::to_owned))
+    }
+
+    fn insert_shader(
+        &self,
+        module: sys::CUmodule,
+        image: Arc<ModuleImage>,
+        source: Option<String>,
+    ) -> Result<ShaderHandle> {
+        Ok(self
+            .shaders
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .insert(CudaShader {
+                module,
+                _image: image,
+                source,
+            }))
+    }
+
     /// Makes `stream` wait for earlier transfers or compute events touching `ptrs` on the other
     /// stream. Same-stream events are already ordered. The context must be current, and `stream`
     /// must be one of this device's streams.
@@ -1878,6 +2157,45 @@ impl CudaDevice {
         let event = OwnedEvent::record(&self.shared, stream)?;
         self.publish_hazards(&accesses, &event, Lane::Compute)?;
         Ok(event)
+    }
+
+    /// Stages `data` to `dst` on `stream` through the two halves of `lease`. Returns the event of
+    /// the last copy. Blocks only when both halves are in flight. `lease` must hold
+    /// `min(data.len(), 2 * UPLOAD_CHUNK)` bytes. The context must be current, and `stream` needs
+    /// its hazard waits queued first.
+    fn queue_upload(
+        &self,
+        stream: sys::CUstream,
+        lease: &PinnedLease,
+        dst: u64,
+        data: &[u8],
+    ) -> Result<Arc<OwnedEvent>> {
+        let base = lease.block.ptr as *mut u8;
+        let mut busy: [Option<Arc<OwnedEvent>>; 2] = [None, None];
+        let mut last = None;
+        for (i, chunk) in data.chunks(UPLOAD_CHUNK).enumerate() {
+            let half = i % 2;
+            if let Some(previous) = busy[half].take() {
+                wait_event(previous.ev)?;
+            }
+            // SAFETY: the half is inside the lease and its previous copy has completed, so nothing
+            let staged =
+                unsafe { slice::from_raw_parts_mut(base.add(half * UPLOAD_CHUNK), chunk.len()) };
+            copy_host(staged, chunk);
+            // SAFETY: range bounds-checked by the caller.
+            cu(unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst + (i * UPLOAD_CHUNK) as u64,
+                    staged.as_ptr() as *const c_void,
+                    driver_len(chunk.len())?,
+                    stream,
+                )
+            })?;
+            let event = OwnedEvent::record(&self.shared, stream)?;
+            busy[half] = Some(Arc::clone(&event));
+            last = Some(event);
+        }
+        last.ok_or_else(|| GpuError::Backend("cuda: empty upload".into()))
     }
 
     fn transfer_submission(
@@ -2164,40 +2482,17 @@ impl GpuDevice for CudaDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        let mut source = None;
-        let mut image = match desc.source {
-            ShaderSource::Ptx(ptx) => ModuleImage::Ptx(ptx.to_vec()),
-            ShaderSource::CudaSrc(src) => {
-                source = str::from_utf8(src).ok().map(str::to_owned);
-                nvrtc_compile(src, self.shared.sm)?
+        match desc.source {
+            ShaderSource::Ptx(ptx) => {
+                let image = Arc::new(ModuleImage::ptx(ptx.to_vec()));
+                let module = self.shared.load_module(&image)?;
+                self.insert_shader(module, image, None)
             }
-            _ => {
-                return Err(GpuError::Backend(
-                    "cuda: only PTX or CUDA C++ (CudaSrc) shaders are supported".into(),
-                ));
-            }
-        };
-        if let ModuleImage::Ptx(bytes) = &mut image
-            && bytes.last() != Some(&0)
-        {
-            bytes.push(0);
+            ShaderSource::CudaSrc(src) => self.cuda_shader(src, default_cache_base().as_deref()),
+            _ => Err(GpuError::Backend(
+                "cuda: only PTX or CUDA C++ (CudaSrc) shaders are supported".into(),
+            )),
         }
-        let module = self.shared.with_current(|| {
-            let mut m: sys::CUmodule = ptr::null_mut();
-            // SAFETY: `image` outlives the call (it is moved into the shader below).
-            cu(unsafe { sys::cuModuleLoadData(&mut m, image.bytes().as_ptr() as *const c_void) })?;
-            Ok(m)
-        })?;
-        let handle = self
-            .shaders
-            .lock()
-            .map_err(|_| GpuError::DeviceLost)?
-            .insert(CudaShader {
-                module,
-                _image: image,
-                source,
-            });
-        Ok(handle)
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
@@ -2390,32 +2685,19 @@ impl GpuDevice for CudaDevice {
         let stream = self.shared.stream(Lane::Upload);
         self.begin_submission()?;
         let queued = self.shared.with_current(|| {
-            let lease = self.shared.pinned.lease(data.len())?;
-            // SAFETY: the lease holds at least `data.len()` bytes and is not shared with any other
-            let staged =
-                unsafe { slice::from_raw_parts_mut(lease.block.ptr as *mut u8, data.len()) };
-            copy_host(staged, data);
+            let lease = self.shared.pinned.lease(data.len().min(2 * UPLOAD_CHUNK))?;
             self.wait_hazards(Lane::Upload, &[cb.ptr])?;
-            // SAFETY: the destination range was bounds-checked against the buffer.
-            cu(unsafe {
-                sys::cuMemcpyHtoDAsync_v2(
-                    cb.ptr + offset,
-                    lease.block.ptr as *const c_void,
-                    driver_len(data.len())?,
-                    stream,
-                )
-            })?;
-            let published = OwnedEvent::record(&self.shared, stream).and_then(|event| {
-                self.publish_hazards(&[(cb.ptr, true)], &event, Lane::Upload)
-                    .map(|()| event)
-            });
-            let event = match published {
+            let event = match self.queue_upload(stream, &lease, cb.ptr + offset, data) {
                 Ok(event) => event,
                 Err(error) => {
                     let _ = cu(unsafe { sys::cuStreamSynchronize(stream) });
                     return Err(error);
                 }
             };
+            if let Err(error) = self.publish_hazards(&[(cb.ptr, true)], &event, Lane::Upload) {
+                let _ = cu(unsafe { sys::cuStreamSynchronize(stream) });
+                return Err(error);
+            }
             Ok((event, lease))
         });
         match queued {
@@ -2551,6 +2833,7 @@ mod tests {
     use super::*;
     use std::mem::{size_of, size_of_val};
     use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use zengpu_blas::level3::GemmKernel;
     use zengpu_compute::BufferPool;
@@ -3354,6 +3637,232 @@ mod tests {
         });
         assert_eq!(back, data);
         device.destroy_buffer(buf);
+    }
+
+    fn as_cuda(device: &dyn GpuDevice) -> &CudaDevice {
+        device
+            .as_any()
+            .downcast_ref::<CudaDevice>()
+            .expect("cuda device")
+    }
+
+    /// Uses a unique `src` (with a timestamp comment), so no earlier run has cached it.
+    fn unique_source(src: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        format!("// {nanos}\n{src}")
+    }
+
+    fn unique_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        env::temp_dir().join(format!("zengpu-cuda-{name}-{}-{nanos}", process::id()))
+    }
+
+    fn only_entry(base: &Path) -> PathBuf {
+        let entries: Vec<PathBuf> = fs::read_dir(base.join("zengpu").join("cuda"))
+            .expect("cache directory")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "cache entries: {entries:?}");
+        entries[0].clone()
+    }
+
+    fn run_vec_add(device: &dyn GpuDevice, shader: ShaderHandle) {
+        const N: usize = 1024;
+        let size = (N * size_of::<f32>()) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let (a, b, out) = (
+            device.create_buffer(desc).expect("create a"),
+            device.create_buffer(desc).expect("create b"),
+            device.create_buffer(desc).expect("create output"),
+        );
+        let a_bytes: Vec<u8> = (0..N)
+            .flat_map(|i| (i as f32 * 0.25).to_le_bytes())
+            .collect();
+        let b_bytes: Vec<u8> = (0..N)
+            .flat_map(|i| (1000.0 - i as f32 * 0.5).to_le_bytes())
+            .collect();
+        device.write_buffer(a, 0, &a_bytes).expect("upload a");
+        device.write_buffer(b, 0, &b_bytes).expect("upload b");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .expect("create pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[a.index(), b.index(), out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                    images: &[],
+                },
+                [(N as u32).div_ceil(256), 1, 1],
+            )
+            .expect("dispatch");
+        let raw = device.read_buffer(out, 0, size).expect("read output");
+        for i in 0..N {
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            let want = i as f32 * 0.25 + (1000.0 - i as f32 * 0.5);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "out[{i}] = {got}, expected {want}"
+            );
+        }
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for h in [a, b, out] {
+            device.destroy_buffer(h);
+        }
+    }
+
+    /// A cache miss writes one entry, and a fresh device loads it unchanged and runs.
+    #[test]
+    fn compile_cache_round_trip_runs_kernel() {
+        let Some(first) = cuda_device() else { return };
+        let base = unique_dir("roundtrip");
+        let src = unique_source(VEC_ADD_CUDA);
+        let shader = as_cuda(&*first)
+            .cuda_shader(src.as_bytes(), Some(&base))
+            .expect("compile and cache");
+        let entry = only_entry(&base);
+        assert!(entry.extension().is_some_and(|e| e == "cubin"), "{entry:?}");
+        let written = fs::read(&entry).expect("read entry");
+        assert!(!written.is_empty());
+        run_vec_add(&*first, shader);
+
+        let Some(second) = cuda_device() else { return };
+        let shader = as_cuda(&*second)
+            .cuda_shader(src.as_bytes(), Some(&base))
+            .expect("load from cache");
+        assert_eq!(fs::read(&entry).expect("read entry"), written);
+        run_vec_add(&*second, shader);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A bad entry is deleted, then rebuilt and rewritten.
+    #[test]
+    fn compile_cache_corrupt_entry_recompiles() {
+        let Some(first) = cuda_device() else { return };
+        let base = unique_dir("corrupt");
+        let src = unique_source(VEC_ADD_CUDA);
+        as_cuda(&*first)
+            .cuda_shader(src.as_bytes(), Some(&base))
+            .expect("compile and cache");
+        let entry = only_entry(&base);
+
+        let garbage = b"not a module image";
+        fs::write(&entry, garbage).expect("corrupt entry");
+        let Some(second) = cuda_device() else { return };
+        let shader = as_cuda(&*second)
+            .cuda_shader(src.as_bytes(), Some(&base))
+            .expect("recompile after bad entry");
+        assert_ne!(fs::read(&entry).expect("read entry"), garbage);
+        run_vec_add(&*second, shader);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Without a cache base, nothing is written to disk.
+    #[test]
+    fn compile_cache_disabled_writes_nothing() {
+        let Some(device) = cuda_device() else { return };
+        let base = unique_dir("disabled");
+        let src = unique_source(VEC_ADD_CUDA);
+        let shader = as_cuda(&*device)
+            .cuda_shader(src.as_bytes(), None)
+            .expect("compile without cache");
+        run_vec_add(&*device, shader);
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn compile_cache_memo_serves_repeat_source() {
+        let Some(device) = cuda_device() else { return };
+        let src = unique_source(VEC_ADD_CUDA);
+        let cuda = as_cuda(&*device);
+        let (_, first) = cuda
+            .shared
+            .cuda_module(src.as_bytes(), None)
+            .expect("compile");
+        let (_, second) = cuda.shared.cuda_module(src.as_bytes(), None).expect("memo");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn cache_base_resolution() {
+        let some = |s: &'static str| Some(OsStr::new(s));
+        assert_eq!(
+            resolve_cache_base(some("/cache"), false, some("/xdg"), some("/home/u"), None),
+            Some(PathBuf::from("/cache"))
+        );
+        assert_eq!(
+            resolve_cache_base(some(""), false, some("/xdg"), some("/home/u"), None),
+            None
+        );
+        assert_eq!(
+            resolve_cache_base(some("/cache"), true, None, None, None),
+            None
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                resolve_cache_base(None, false, some("/xdg"), some("/home/u"), some("C:/Local")),
+                Some(PathBuf::from("C:/Local"))
+            );
+        } else {
+            assert_eq!(
+                resolve_cache_base(None, false, some("/xdg"), some("/home/u"), None),
+                Some(PathBuf::from("/xdg"))
+            );
+            assert_eq!(
+                resolve_cache_base(None, false, None, some("/home/u"), None),
+                Some(PathBuf::from("/home/u/.cache"))
+            );
+        }
+        assert_eq!(resolve_cache_base(None, false, None, None, None), None);
+    }
+
+    /// Entries keep their image kind (cubin or PTX) on reload.
+    #[test]
+    fn cache_entries_keep_image_kind() {
+        let base = unique_dir("kinds");
+        let cubin = ModuleImage::Cubin(b"cubin bytes".to_vec());
+        let ptx = ModuleImage::ptx(b"ptx text".to_vec());
+        cache_write(&base, 1, &cubin);
+        cache_write(&base, 2, &ptx);
+        assert!(matches!(
+            cache_read(&base, 1),
+            Some((ModuleImage::Cubin(bytes), _)) if bytes == b"cubin bytes"
+        ));
+        assert!(matches!(
+            cache_read(&base, 2),
+            Some((ModuleImage::Ptx(bytes), _)) if bytes == b"ptx text\0"
+        ));
+        assert!(cache_read(&base, 3).is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fnv1a_matches_reference_vectors() {
+        let hash = |bytes: &[u8]| {
+            let mut h = Fnv1a::new();
+            h.write(bytes);
+            h.0
+        };
+        assert_eq!(hash(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(hash(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(hash(b"foobar"), 0x8594_4171_f739_67e8);
     }
 
     /// Targets the device arch so the module is a cubin, avoiding driver JIT.
@@ -4295,6 +4804,47 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         assert!(readback.into_bytes().unwrap() == data);
         write.wait(Duration::from_secs(10)).unwrap();
         device.destroy_buffer(buf);
+    }
+
+    /// Writes asynchronously at an offset across several upload chunks, with a ragged tail.
+    /// Neighbouring bytes stay untouched.
+    #[test]
+    fn async_chunked_write_at_offset_lands_exactly() {
+        let Some(device) = cuda_device() else { return };
+        const OFFSET: usize = 5;
+        const LEN: usize = 2 * UPLOAD_CHUNK + 1000 + 3;
+        const SIZE: usize = LEN + 2 * OFFSET;
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        device.write_buffer(buf, 0, &vec![0xEEu8; SIZE]).unwrap();
+        let data: Vec<u8> = (0..LEN).map(|i| (i % 253) as u8).collect();
+        let write = device
+            .submit_write_buffer(0, buf, OFFSET as u64, &data)
+            .unwrap();
+        let back = device
+            .submit_read_buffer(0, buf, 0, SIZE as u64)
+            .unwrap()
+            .into_bytes()
+            .unwrap();
+        write.wait(Duration::from_secs(10)).unwrap();
+        assert!(back[..OFFSET].iter().all(|&b| b == 0xEE));
+        assert!(back[OFFSET..OFFSET + LEN] == data);
+        assert!(back[OFFSET + LEN..].iter().all(|&b| b == 0xEE));
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn pinned_requests_round_to_size_classes() {
+        assert_eq!(pinned_class(1), 1);
+        assert_eq!(pinned_class(5), 8);
+        assert_eq!(pinned_class(PINNED_CLASS_STEP), PINNED_CLASS_STEP);
+        assert_eq!(pinned_class(PINNED_CLASS_STEP + 1), 2 * PINNED_CLASS_STEP);
+        assert_eq!(pinned_class((64 << 20) - 1), 64 << 20);
     }
 
     #[test]
