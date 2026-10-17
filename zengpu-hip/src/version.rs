@@ -22,6 +22,10 @@
 
 use std::fmt;
 
+/// Runs RDNA kernels at wave64 to exercise the GCN/CDNA paths on RDNA. Slower: 0.84-0.92x on large
+/// f32 GEMMs on an RX 9060 XT.
+pub const WAVE64_ENV: &str = "ZENGPU_HIP_WAVE64";
+
 use crate::ffi::hipRuntimeGetVersion;
 use crate::hip_layout::{ROCM_VERSION_MAJOR, ROCM_VERSION_MINOR};
 
@@ -175,6 +179,9 @@ impl HipCapabilities {
         }
         if self.hiprtc_opt3 {
             opts.push("-O3".into());
+        }
+        if self.gfx_family.is_rdna() && self.wave_size == 64 {
+            opts.push("-mwavefrontsize64".into());
         }
         opts
     }

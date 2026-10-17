@@ -265,10 +265,14 @@ impl HipDeviceInfo {
             }
         }
 
-        let wave_size = device_attribute(HIP_ATTR_WARP_SIZE, ordinal)
-            .filter(|&w| w == 32 || w == 64)
-            .map(|w| w as u32)
-            .unwrap_or_else(|| family.wave_size());
+        let wave_size = if family.is_rdna() && env::var_os(version::WAVE64_ENV).is_some() {
+            64
+        } else {
+            device_attribute(HIP_ATTR_WARP_SIZE, ordinal)
+                .filter(|&w| w == 32 || w == 64)
+                .map(|w| w as u32)
+                .unwrap_or_else(|| family.wave_size())
+        };
 
         let runtime = RocmVersion::runtime();
         let mut caps = HipCapabilities::for_family(runtime, runtime, family);
@@ -3338,7 +3342,7 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
             assert!(info.clock_mhz > 0, "clock from attributes");
             assert!(info.wave_size == 32 || info.wave_size == 64);
             assert!(info.max_threads_per_block >= 256);
-            if info.gfx_family.is_rdna() {
+            if info.gfx_family.is_rdna() && env::var_os(version::WAVE64_ENV).is_none() {
                 assert_eq!(info.wave_size, 32, "HIP runs RDNA in wave32");
             }
         }
