@@ -741,3 +741,94 @@ fn zsl_bitwise_ops_unpack_nibbles() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+#[test]
+fn blas_sgemm_half_activations_and_weights() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+
+    let cases: [(u32, u32, u32, f32); 8] = [
+        (200, 264, 136, 1.0),
+        (128, 128, 32, 1.0),
+        (300, 520, 1000, -0.5),
+        (1024, 1024, 1024, 1.0),
+        (1, 4096, 1024, 1.0),
+        (5, 300, 72, 2.0),
+        (33, 1001, 257, 1.0),
+        (64, 100, 99, 1.0),
+    ];
+    type HalfFormat = (DType, fn(f32) -> u16, fn(u16) -> f32);
+    let formats: [HalfFormat; 2] = [
+        (DType::F16, f32_to_f16_bits, f16_bits_to_f32),
+        (DType::Bf16, f32_to_bf16_bits, bf16_bits_to_f32),
+    ];
+    for (dtype, encode, decode) in formats {
+        for (m, n, k, alpha) in cases {
+            let (mu, nu, ku) = (m as usize, n as usize, k as usize);
+            let a_bits: Vec<u16> = (0..m * k)
+                .map(|i| encode(((i % 19) as f32 - 9.0) * 0.05))
+                .collect();
+            let b_bits: Vec<u16> = (0..k * n)
+                .map(|i| encode(((i % 23) as f32 - 11.0) * 0.05))
+                .collect();
+            let a: Vec<f32> = a_bits.iter().map(|&h| decode(h)).collect();
+            let b: Vec<f32> = b_bits.iter().map(|&h| decode(h)).collect();
+            let da = upload_half(&pool, vec![m, k], dtype, &a_bits);
+            let db = upload_half(&pool, vec![k, n], dtype, &b_bits);
+            let dc = blas.sgemm(&*device, &pool, alpha, &da, &db).unwrap();
+            let c = download(&*device, &dc);
+
+            let row_step = if mu <= 64 { 1 } else { 7 };
+            let col_step = if nu <= 1024 { 1 } else { 13 };
+            for row in (0..mu).step_by(row_step) {
+                for col in (0..nu).step_by(col_step) {
+                    let sum: f64 = (0..ku)
+                        .map(|i| f64::from(a[row * ku + i]) * f64::from(b[i * nu + col]))
+                        .sum();
+                    let want = (f64::from(alpha) * sum) as f32;
+                    let got = c[row * nu + col];
+                    assert!(
+                        close(got, want),
+                        "{dtype:?} m={m} n={n} k={k} row={row} col={col} got={got} want={want}"
+                    );
+                }
+            }
+            for array in [da, db, dc] {
+                pool.free(array);
+            }
+        }
+    }
+    blas.destroy(&*device);
+}
+
+#[test]
+fn blas_sgemm_half_activations_speed() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+    for (m, n, k) in [
+        (1u32, 4096u32, 4096u32),
+        (16, 4096, 4096),
+        (128, 4096, 4096),
+        (512, 4096, 4096),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (1024, 11008, 4096),
+    ] {
+        let a: Vec<u16> = (0..m * k)
+            .map(|i| f32_to_f16_bits((i % 19) as f32 * 0.01))
+            .collect();
+        let b: Vec<u16> = (0..k * n)
+            .map(|i| f32_to_f16_bits((i % 23) as f32 * 0.01))
+            .collect();
+        let da = upload_half(&pool, vec![m, k], DType::F16, &a);
+        let db = upload_half(&pool, vec![k, n], DType::F16, &b);
+        let t = best_sgemm_time(&*device, &pool, &blas, &da, &db);
+        let tflops = 2.0 * f64::from(m) * f64::from(n) * f64::from(k) / t.as_secs_f64() / 1e12;
+        println!("hip: f16 A+B sgemm M={m} N={n} K={k}  {t:?}  {tflops:.2} TFLOP/s");
+        pool.free(da);
+        pool.free(db);
+    }
+    blas.destroy(&*device);
+}
