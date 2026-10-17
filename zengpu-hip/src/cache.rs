@@ -14,6 +14,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 const MAGIC: &[u8; 8] = b"ZGPUHIP2";
 
@@ -73,12 +74,41 @@ pub(crate) fn load(dir: &Path, key: &CacheKey) -> Option<Vec<u8>> {
     (!code.is_empty() && fnv1a(code) == checksum).then(|| code.to_vec())
 }
 
+/// Temp files older than this belong to a writer that was killed mid-store.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Removes `*.tmp` files older than [`STALE_TEMP_AGE`], so a live writer's file survives.
+///
+/// This is best-effort: errors are ignored.
+fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("tmp") {
+            continue;
+        }
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > STALE_TEMP_AGE)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 pub(crate) fn store(dir: &Path, key: &CacheKey, code: &[u8]) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     if let Err(e) = fs::create_dir_all(dir) {
         log::debug!("hip: cannot create cache dir {}: {e}", dir.display());
         return;
     }
+    sweep_stale_temps(dir);
     let mut data = Vec::with_capacity(MAGIC.len() + 8 + key.bytes.len() + code.len());
     data.extend_from_slice(MAGIC);
     data.extend_from_slice(&(key.bytes.len() as u64).to_le_bytes());
