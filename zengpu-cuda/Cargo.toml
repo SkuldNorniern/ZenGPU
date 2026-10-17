@@ -23,4 +23,6 @@ log.workspace = true
 cc = "1"
 
 [dev-dependencies]
+zengpu-blas.workspace = true
+zengpu-compute.workspace = true
 zengpu-spirv = { workspace = true, features = ["cuda"] }
