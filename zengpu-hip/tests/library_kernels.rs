@@ -834,3 +834,74 @@ fn blas_sgemm_half_activations_speed() {
     }
     blas.destroy(&*device);
 }
+
+/// Measures kernel time per sgemm with the GPU wait amortized over a batch, for comparison with
+/// libraries timed asynchronously.
+///
+/// Run with `--nocapture`.
+#[test]
+fn blas_sgemm_batched_timing() {
+    let Some(device) = hip_device() else { return };
+    let pool = BufferPool::new(device.clone());
+    let blas = Blas::new(&*device).unwrap();
+    let shapes: [(u32, u32, u32); 13] = [
+        (1, 4096, 4096),
+        (4, 4096, 4096),
+        (8, 4096, 4096),
+        (16, 4096, 4096),
+        (32, 4096, 4096),
+        (64, 4096, 4096),
+        (128, 4096, 11008),
+        (512, 4096, 4096),
+        (512, 11008, 4096),
+        (1024, 1024, 1024),
+        (2048, 2048, 2048),
+        (4096, 4096, 4096),
+        (2048, 14336, 4096),
+    ];
+    for dtype in [DType::F32, DType::F16, DType::Bf16] {
+        for (m, n, k) in shapes {
+            let upload_as = |shape: Vec<u32>, len: u32| -> DeviceArray {
+                if dtype == DType::F32 {
+                    let v: Vec<f32> = (0..len).map(|i| (i % 19) as f32 * 0.01).collect();
+                    upload(&pool, shape, &v)
+                } else {
+                    let v: Vec<u16> = (0..len)
+                        .map(|i| f32_to_f16_bits((i % 19) as f32 * 0.01))
+                        .collect();
+                    upload_half(&pool, shape, dtype, &v)
+                }
+            };
+            let da = upload_as(vec![m, k], m * k);
+            let db = upload_as(vec![k, n], k * n);
+            let flops = 2.0 * f64::from(m) * f64::from(n) * f64::from(k);
+            let reps = (2e11 / flops).clamp(5.0, 200.0) as usize;
+            let mut ops = OpList::new(&pool);
+            let mut outs = Vec::new();
+            for _ in 0..reps {
+                outs.push(blas.gemm.record_sgemm(&mut ops, 1.0, &da, &db).unwrap());
+            }
+            ops.run(&*device).unwrap();
+            let best = (0..3)
+                .map(|_| {
+                    let t = Instant::now();
+                    ops.run(&*device).unwrap();
+                    t.elapsed() / reps as u32
+                })
+                .min()
+                .unwrap();
+            println!(
+                "zenblas {dtype:?} {m}x{n}x{k} {:.1} us {:.2} TFLOP/s",
+                best.as_secs_f64() * 1e6,
+                flops / best.as_secs_f64() / 1e12
+            );
+            drop(ops);
+            for c in outs {
+                pool.free(c);
+            }
+            pool.free(da);
+            pool.free(db);
+        }
+    }
+    blas.destroy(&*device);
+}
