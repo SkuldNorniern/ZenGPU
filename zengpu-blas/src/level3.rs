@@ -9,6 +9,7 @@ use zengpu_hal::{
 };
 use zengpu_spirv::{ZslShader, zsl};
 
+use crate::gemm_cuda;
 use crate::gemm_hip::{self, B_TYPES, Plan, SKINNY_ROWS};
 use crate::gemm_skinny::{
     self, SKINNY_1_ZSL, SKINNY_4_ZSL, SKINNY_8_ZSL, SKINNY_16_ZSL, SPLIT_REDUCE_ZSL,
@@ -46,6 +47,15 @@ pub struct GemmKernel {
     hip: Option<HipGemm>,
     /// The few-row kernels, on Vulkan.
     skinny: Option<ZslSkinny>,
+    /// The tensor-core kernels for half-precision inputs, on CUDA.
+    cuda: Option<CudaGemm>,
+}
+
+struct CudaGemm {
+    shader: ShaderHandle,
+    /// Per entry of `gemm_cuda::VARIANTS`, f16 then bf16.
+    pipelines: [[PipelineHandle; 2]; gemm_cuda::VARIANTS.len()],
+    reduce: PipelineHandle,
 }
 
 struct HipGemm {
@@ -76,12 +86,12 @@ struct ZslSkinny {
 }
 
 impl GemmKernel {
-    /// Compile the GEMM pipeline. HIP: hand-written. Vulkan, Metal: register-blocked ZSL. Others:
-    /// naive ZSL. Vulkan `sgemm` uses the skinny kernels for `m <= 16`.
+    /// Compile the GEMM pipeline. HIP: hand-written kernel. Vulkan, Metal, CUDA: register-blocked
+    /// ZSL. Others: naive ZSL. CUDA: half inputs use tensor cores.
     pub fn new(device: &dyn GpuDevice) -> Result<Self> {
         if matches!(
             device.backend(),
-            BackendPreference::Vulkan | BackendPreference::Metal
+            BackendPreference::Vulkan | BackendPreference::Metal | BackendPreference::Cuda
         ) {
             let (shader, entry) = GEMM_TILED_ZSL.create(device)?;
             let pipeline = device.create_compute_pipeline_with(
@@ -101,7 +111,10 @@ impl GemmKernel {
                     return Err(e);
                 }
             };
-            let skinny = if device.backend() == BackendPreference::Vulkan {
+            let skinny = if matches!(
+                device.backend(),
+                BackendPreference::Vulkan | BackendPreference::Cuda
+            ) {
                 match Self::new_zsl_skinny(device) {
                     Ok(skinny) => Some(skinny),
                     Err(e) => {
@@ -113,12 +126,18 @@ impl GemmKernel {
             } else {
                 None
             };
+            let cuda = if device.backend() == BackendPreference::Cuda {
+                Self::new_cuda(device)
+            } else {
+                None
+            };
             return Ok(Self {
                 shader,
                 pipeline,
                 tile: TILED_GEMM_TILE,
                 hip: None,
                 skinny,
+                cuda,
             });
         }
         if device.backend() == BackendPreference::Hip {
@@ -136,7 +155,52 @@ impl GemmKernel {
             tile: 16,
             hip: None,
             skinny: None,
+            cuda: None,
         })
+    }
+
+    /// CUDA tensor-core kernels, or `None` below sm_80 (the module compiles empty).
+    fn new_cuda(device: &dyn GpuDevice) -> Option<CudaGemm> {
+        let shader = match device.create_shader(ShaderDesc::cuda_src(gemm_cuda::SOURCE)) {
+            Ok(shader) => shader,
+            Err(e) => {
+                log::warn!("zengpu-blas: CUDA tensor-core GEMM failed to build: {e}");
+                return None;
+            }
+        };
+        let mut made = Vec::new();
+        let mut built = || -> Result<CudaGemm> {
+            for variant in &gemm_cuda::VARIANTS {
+                for suffix in ["_f16", "_bf16"] {
+                    made.push(device.create_compute_pipeline(ComputePipelineDesc {
+                        shader,
+                        entry: &format!("{}{suffix}", variant.name),
+                        block: [variant.threads, 1, 1],
+                    })?);
+                }
+            }
+            let reduce = device.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm_tc_reduce",
+                block: [256, 1, 1],
+            })?;
+            Ok(CudaGemm {
+                shader,
+                pipelines: from_fn(|v| [made[2 * v], made[2 * v + 1]]),
+                reduce,
+            })
+        };
+        match built() {
+            Ok(cuda) => Some(cuda),
+            Err(e) => {
+                log::warn!("zengpu-blas: CUDA tensor-core GEMM failed to build: {e}");
+                for p in made {
+                    device.destroy_pipeline(p);
+                }
+                device.destroy_shader(shader);
+                None
+            }
+        }
     }
 
     /// Builds the Vulkan skinny kernels and the split-K reduction.
@@ -230,6 +294,7 @@ impl GemmKernel {
                     compute_units: device.limits().compute_units,
                 }),
                 skinny: None,
+                cuda: None,
             }),
             Err(e) => {
                 for p in made {
@@ -305,6 +370,13 @@ impl GemmKernel {
             }
             device.destroy_shader(zsl.reduce_shader);
         }
+        if let Some(cuda) = self.cuda {
+            for p in cuda.pipelines.into_iter().flatten() {
+                device.destroy_pipeline(p);
+            }
+            device.destroy_pipeline(cuda.reduce);
+            device.destroy_shader(cuda.shader);
+        }
         device.destroy_shader(self.shader);
     }
 
@@ -346,12 +418,12 @@ impl GemmKernel {
         let a_type = B_TYPES.iter().position(|&(dtype, _)| dtype == a.dtype);
         let types_ok = match (a_type, b_type) {
             (Some(0), Some(0)) => true,
-            (Some(_), Some(_)) => self.hip.is_some(),
+            (Some(_), Some(_)) => self.hip.is_some() || (self.cuda.is_some() && a_type == b_type),
             _ => false,
         };
         if !types_ok {
             return Err(GpuError::Dispatch(format!(
-                "sgemm: A and B must be f32 (or f16/bf16 on HIP), got {:?} and {:?}",
+                "sgemm: A and B must be f32 (or both f16 or both bf16 on HIP and CUDA), got {:?} and {:?}",
                 a.dtype, b.dtype
             )));
         }
@@ -371,10 +443,17 @@ impl GemmKernel {
         let mn = m.checked_mul(n).ok_or_else(|| {
             GpuError::Dispatch(format!("sgemm: {m}×{n} output exceeds 2^32 elements"))
         })?;
+        if self.hip.is_none() && a_type != 0 && !gemm_cuda::fits(n, k) {
+            return Err(GpuError::Dispatch(format!(
+                "sgemm: f16/bf16 on CUDA needs N and K to be multiples of 8, got n={n}, k={k}"
+            )));
+        }
 
         let c = ops.pool().alloc(vec![m, n], DType::F32)?;
         let recorded = if let Some(hip) = &self.hip {
             Self::record_hip(hip, a_type, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
+        } else if let Some(cuda) = self.cuda.as_ref().filter(|_| a_type != 0) {
+            Self::record_cuda(cuda, a_type, ops, alpha, a, b, &c, [m, n, k, mn])
         } else if let Some(zsl) = self.skinny.as_ref().filter(|_| m <= 16) {
             record_skinny(zsl, ops, alpha, a, b, &c, [m, n, k, mn])
         } else {
@@ -398,6 +477,53 @@ impl GemmKernel {
                 Err(e)
             }
         }
+    }
+
+    /// Records the CUDA tensor-core kernel for half A and B (`half`: 1 for f16, 2 for bf16), then
+    /// the split-K reduction if K was split.
+    #[allow(clippy::too_many_arguments)]
+    fn record_cuda(
+        cuda: &CudaGemm,
+        half: usize,
+        ops: &mut OpList<'_>,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+        c: &DeviceArray,
+        [m, n, k, mn]: [u32; 4],
+    ) -> Result<()> {
+        let variant = gemm_cuda::pick(m, n);
+        let (splits, kchunk) = if variant == gemm_cuda::SKINNY {
+            gemm_cuda::split(n, k)
+        } else {
+            (1, k)
+        };
+        let target = if splits > 1 {
+            ops.scratch(vec![splits, m, n], DType::F32)?
+        } else {
+            c.buffer.index()
+        };
+        ops.dispatch(
+            cuda.pipelines[variant][half - 1],
+            &[a.buffer.index(), b.buffer.index(), target],
+            &[
+                Scalar::U32(m),
+                Scalar::U32(n),
+                Scalar::U32(k),
+                Scalar::U32(kchunk),
+                Scalar::F32(alpha),
+            ],
+            gemm_cuda::grid(variant, m, n, splits),
+        );
+        if splits > 1 {
+            ops.dispatch(
+                cuda.reduce,
+                &[target, c.buffer.index()],
+                &[Scalar::U32(mn), Scalar::U32(splits)],
+                [mn.div_ceil(256), 1, 1],
+            );
+        }
+        Ok(())
     }
 
     /// Records the HIP kernel for this shape. WMMA runs for matching half A and B on matrix-core
