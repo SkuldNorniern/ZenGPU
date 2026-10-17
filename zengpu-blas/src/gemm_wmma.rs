@@ -212,7 +212,7 @@ pub(crate) const VARIANTS: [Variant; 3] = [
     Variant {
         name: "hgemm_wmma_32",
         bm: 32,
-        bn: 64,
+        bn: 128,
         threads: 128,
         speed: 0.88,
     },
@@ -276,9 +276,20 @@ mod tests {
     }
 
     #[test]
+    fn variants_match_their_kernels() {
+        // (WAVES_M, WAVES_N, TM, TN) of each WM_ENTRY, in VARIANTS order.
+        let layouts = [(2, 4, 4, 2), (1, 2, 4, 2), (1, 4, 2, 2)];
+        for (v, (wm, wn, tm, tn)) in VARIANTS.iter().zip(layouts) {
+            assert_eq!(v.bm, wm * tm * 16, "{}", v.name);
+            assert_eq!(v.bn, wn * tn * 16, "{}", v.name);
+            assert_eq!(v.threads, wm * wn * 32, "{}", v.name);
+        }
+    }
+
+    #[test]
     fn grid_covers_every_tile() {
         assert_eq!(grid(&VARIANTS[0], 1, 1), [1, 1, 1]);
         assert_eq!(grid(&VARIANTS[0], 129, 256), [4, 1, 1]);
-        assert_eq!(grid(&VARIANTS[2], 33, 65), [4, 1, 1]);
+        assert_eq!(grid(&VARIANTS[2], 33, 129), [4, 1, 1]);
     }
 }
