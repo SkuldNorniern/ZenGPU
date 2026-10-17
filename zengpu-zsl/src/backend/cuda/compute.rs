@@ -141,15 +141,15 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
 
     let _ = writeln!(
         s,
-        "    unsigned int gx = blockIdx.x * blockDim.x + threadIdx.x;"
+        "    unsigned int zsl_gx = blockIdx.x * blockDim.x + threadIdx.x;"
     );
     let _ = writeln!(
         s,
-        "    unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"
+        "    unsigned int zsl_gy = blockIdx.y * blockDim.y + threadIdx.y;"
     );
     let _ = writeln!(
         s,
-        "    unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"
+        "    unsigned int zsl_gz = blockIdx.z * blockDim.z + threadIdx.z;"
     );
 
     let ctx = Ctx {
@@ -436,9 +436,9 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             }
         }
         IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(ctx, index)?),
-        IrExpr::GlobalId(0) => "gx".into(),
-        IrExpr::GlobalId(1) => "gy".into(),
-        IrExpr::GlobalId(2) => "gz".into(),
+        IrExpr::GlobalId(0) => "zsl_gx".into(),
+        IrExpr::GlobalId(1) => "zsl_gy".into(),
+        IrExpr::GlobalId(2) => "zsl_gz".into(),
         IrExpr::GlobalId(n) => format!("/* bad GlobalId({n}) */ 0u"),
         IrExpr::LocalId(c) => format!("threadIdx.{}", ["x", "y", "z"][*c as usize]),
         IrExpr::GroupId(c) => format!("blockIdx.{}", ["x", "y", "z"][*c as usize]),
