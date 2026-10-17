@@ -9,22 +9,14 @@
 mod error;
 
 use std::any::Any;
-use std::cell::UnsafeCell;
 use std::ffi::{CString, c_char, c_void};
 use std::mem::take;
-use std::ptr;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread::yield_now;
 use std::time::{Duration, Instant};
+use std::{ptr, slice};
 
-use cuda_oxide::{
-    Cuda,
-    context::{Context, Handle},
-    device::Device,
-    mem::{DeviceBox, DevicePtr},
-    sys,
-};
+use cuda_oxide::{Cuda, context::Context, device::Device, sys};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     BufferUsage, ComputeOp, ComputePipelineDesc, DeviceRequest, DeviceType, GpuAdapter, GpuDevice,
@@ -52,6 +44,8 @@ unsafe extern "C" {
     fn nvrtcCompileProgram(prog: NvrtcProgram, num_opts: i32, opts: *const *const c_char) -> i32;
     fn nvrtcGetPTXSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
     fn nvrtcGetPTX(prog: NvrtcProgram, ptx: *mut c_char) -> i32;
+    fn nvrtcGetCUBINSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
+    fn nvrtcGetCUBIN(prog: NvrtcProgram, cubin: *mut c_char) -> i32;
     fn nvrtcDestroyProgram(prog: *mut NvrtcProgram) -> i32;
     fn nvrtcGetProgramLogSize(prog: NvrtcProgram, sz: *mut usize) -> i32;
     fn nvrtcGetProgramLog(prog: NvrtcProgram, log: *mut c_char) -> i32;
@@ -59,7 +53,44 @@ unsafe extern "C" {
 
 const NVRTC_SUCCESS: i32 = 0;
 
-fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
+/// Device code ready for `cuModuleLoadData`.
+enum ModuleImage {
+    /// Architecture-specific binary for the device; loaded without JIT.
+    Cubin(Vec<u8>),
+    /// PTX text, JIT-compiled by the driver. Null-terminated.
+    Ptx(Vec<u8>),
+}
+
+impl ModuleImage {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Cubin(bytes) | Self::Ptx(bytes) => bytes,
+        }
+    }
+}
+
+/// Compile CUDA C++ for the device's architecture. Tries `sm_XY` cubin first,
+/// then `compute_XY` PTX, then NVRTC's default PTX, so an NVRTC that predates
+/// the GPU still produces a runnable module.
+fn nvrtc_compile(src: &[u8], (major, minor): (u32, u32)) -> Result<ModuleImage> {
+    let cubin_arch = format!("--gpu-architecture=sm_{major}{minor}");
+    let ptx_arch = format!("--gpu-architecture=compute_{major}{minor}");
+    let attempts = [
+        (Some(cubin_arch.as_str()), true),
+        (Some(ptx_arch.as_str()), false),
+        (None, false),
+    ];
+    let mut last_error = None;
+    for (arch, want_cubin) in attempts {
+        match nvrtc_build(src, arch, want_cubin) {
+            Ok(image) => return Ok(image),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("nvrtc attempted at least one build"))
+}
+
+fn nvrtc_build(src: &[u8], arch: Option<&str>, want_cubin: bool) -> Result<ModuleImage> {
     let src_cstr = CString::new(src)
         .map_err(|_| GpuError::Backend("nvrtc: CUDA C++ source contains NUL byte".into()))?;
     let name_cstr = CString::new("zsl_kernel.cu").unwrap();
@@ -79,7 +110,9 @@ fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
         return Err(GpuError::Backend(format!("nvrtcCreateProgram failed: {r}")));
     }
 
-    let r = unsafe { nvrtcCompileProgram(prog, 0, ptr::null()) };
+    let opts: Vec<CString> = arch.map(|a| CString::new(a).unwrap()).into_iter().collect();
+    let opt_ptrs: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
+    let r = unsafe { nvrtcCompileProgram(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr()) };
     if r != NVRTC_SUCCESS {
         let log = unsafe {
             let mut log_size = 0usize;
@@ -94,15 +127,50 @@ fn nvrtc_compile_to_ptx(src: &[u8]) -> Result<Vec<u8>> {
         )));
     }
 
-    let ptx = unsafe {
-        let mut ptx_size = 0usize;
-        nvrtcGetPTXSize(prog, &mut ptx_size);
-        let mut buf = vec![0i8; ptx_size];
-        nvrtcGetPTX(prog, buf.as_mut_ptr());
-        nvrtcDestroyProgram(&mut prog);
-        buf.iter().map(|&b| b as u8).collect::<Vec<_>>()
+    let image = nvrtc_read_output(prog, want_cubin);
+    unsafe { nvrtcDestroyProgram(&mut prog) };
+    image
+}
+
+/// Copy the cubin or PTX produced by a successful NVRTC compile into Rust memory.
+fn nvrtc_read_output(prog: NvrtcProgram, want_cubin: bool) -> Result<ModuleImage> {
+    let read_failed = |what: &str, r: i32| GpuError::Backend(format!("nvrtc: {what} failed: {r}"));
+    let mut size = 0usize;
+    let (r, bytes) = if want_cubin {
+        let r = unsafe { nvrtcGetCUBINSize(prog, &mut size) };
+        if r != NVRTC_SUCCESS {
+            return Err(read_failed("nvrtcGetCUBINSize", r));
+        }
+        let mut buf = vec![0i8; size];
+        let r = unsafe { nvrtcGetCUBIN(prog, buf.as_mut_ptr()) };
+        (r, buf)
+    } else {
+        let r = unsafe { nvrtcGetPTXSize(prog, &mut size) };
+        if r != NVRTC_SUCCESS {
+            return Err(read_failed("nvrtcGetPTXSize", r));
+        }
+        let mut buf = vec![0i8; size];
+        let r = unsafe { nvrtcGetPTX(prog, buf.as_mut_ptr()) };
+        (r, buf)
     };
-    Ok(ptx)
+    if r != NVRTC_SUCCESS {
+        return Err(read_failed("output read", r));
+    }
+    let bytes: Vec<u8> = bytes.into_iter().map(|b| b as u8).collect();
+    Ok(if want_cubin {
+        ModuleImage::Cubin(bytes)
+    } else {
+        ModuleImage::Ptx(bytes)
+    })
+}
+
+/// Convert a byte count to the driver's `size_t`, failing instead of truncating.
+fn driver_len(n: impl TryInto<sys::size_t>) -> Result<sys::size_t> {
+    n.try_into().map_err(|_| {
+        GpuError::InvalidUsage(UsageError::BindingMismatch(
+            "cuda: byte count exceeds driver range".into(),
+        ))
+    })
 }
 
 // ── CudaInstance ──────────────────────────────────────────────────────────────
@@ -187,20 +255,28 @@ impl GpuAdapter for CudaAdapter {
     }
 
     fn open(&self, _req: DeviceRequest) -> Result<Box<dyn GpuDevice>> {
+        let sm = from_cuda(self.dev.compute_capability())?;
         let mut ctx = from_cuda(Context::new(&self.dev))?;
-        let stream = {
+        let (stream, raw_ctx) = {
             let _handle = from_cuda(ctx.enter())?;
+            // SAFETY: the context was just entered on this thread, so the query returns it.
+            let mut raw: sys::CUcontext = ptr::null_mut();
+            cu(unsafe { sys::cuCtxGetCurrent(&mut raw) })?;
             let mut s: sys::CUstream = ptr::null_mut();
             cu(unsafe {
                 sys::cuStreamCreate(&mut s, sys::CUstream_flags_enum_CU_STREAM_NON_BLOCKING)
             })?;
-            s
+            (s, raw)
         };
         Ok(Box::new(CudaDevice {
             shared: Arc::new(CudaShared {
-                ctx: UnsafeCell::new(ctx),
+                _ctx: ctx,
+                raw_ctx,
                 ctx_lock: Mutex::new(()),
                 stream,
+                sm: (sm.major, sm.minor),
+                events: Mutex::new(Vec::new()),
+                staging: Mutex::new(None),
             }),
             buffers: Arc::new(Mutex::new(SlotMap::new())),
             shaders: Arc::new(Mutex::new(SlotMap::new())),
@@ -223,8 +299,8 @@ struct CudaBuffer {
 
 struct CudaShader {
     module: sys::CUmodule,
-    // Keep the null-terminated PTX alive for the module's lifetime.
-    _ptx: Vec<u8>,
+    // Keep the module image alive for the module's lifetime.
+    _image: ModuleImage,
 }
 
 // SAFETY: CUmodule is an opaque handle; all access is serialised through ctx_lock.
@@ -255,6 +331,80 @@ struct CudaLifetimeState {
     deferred: Vec<DeferredCudaResource>,
 }
 
+// ── Pinned staging ────────────────────────────────────────────────────────────
+
+/// Bytes per pinned staging buffer. Chosen by benchmarking 4, 8 and 16 MiB on
+/// an RTX 4090 (WSL); 4 MiB was marginally best of the three (transfer rates within noise).
+const STAGING_CHUNK: usize = 4 << 20;
+
+/// Host transfers at least this large go through the pinned double buffer;
+/// smaller ones are a single synchronous driver copy.
+const STAGING_MIN: usize = 1 << 20;
+
+/// Two pinned host buffers, each with an event marking its last DMA. `pending[i]`
+/// is set while a DMA issued from `bufs[i]` may still be in flight.
+struct Staging {
+    bufs: [*mut c_void; 2],
+    events: [sys::CUevent; 2],
+    pending: [bool; 2],
+}
+
+impl Staging {
+    /// Allocate the buffers and events. The context must be current.
+    fn new() -> Result<Self> {
+        let mut st = Staging {
+            bufs: [ptr::null_mut(); 2],
+            events: [ptr::null_mut(); 2],
+            pending: [false; 2],
+        };
+        // On error `st` drops here and frees whatever was already allocated.
+        for buf in &mut st.bufs {
+            // SAFETY: writes one pinned allocation pointer into `buf`.
+            cu(unsafe {
+                sys::cuMemHostAlloc(buf as *mut *mut c_void, driver_len(STAGING_CHUNK)?, 0)
+            })?;
+        }
+        for ev in &mut st.events {
+            cu(unsafe { sys::cuEventCreate(ev, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING) })?;
+        }
+        Ok(st)
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        // SAFETY: only called with the context current (see CudaShared); null
+        // entries were never allocated and are skipped.
+        for &buf in &self.bufs {
+            if !buf.is_null() {
+                unsafe { sys::cuMemFreeHost(buf) };
+            }
+        }
+        for &ev in &self.events {
+            if !ev.is_null() {
+                unsafe { sys::cuEventDestroy_v2(ev) };
+            }
+        }
+    }
+}
+
+/// Spin on `cuEventQuery` until `ev` completes. Used instead of
+/// `cuEventSynchronize`: the context is created with blocking-sync scheduling,
+/// which would add an OS sleep to every wait. The context must be current.
+fn wait_event(ev: sys::CUevent) -> Result<()> {
+    loop {
+        // SAFETY: `ev` is a live event owned by the caller's pool or staging buffers.
+        let code = unsafe { sys::cuEventQuery(ev) };
+        if code == 0 {
+            return Ok(());
+        }
+        if code != sys::cudaError_enum_CUDA_ERROR_NOT_READY {
+            return cu(code);
+        }
+        yield_now();
+    }
+}
+
 // ── CudaDevice ────────────────────────────────────────────────────────────────
 
 /// An opened CUDA device. Provides compute-only buffer, shader, and dispatch
@@ -262,17 +412,25 @@ struct CudaLifetimeState {
 ///
 /// # Thread safety
 ///
-/// `Context` in cuda-oxide is `!Send` because `Handle` uses an `Rc`. We
-/// compensate by holding `ctx_lock` across every operation that enters the
-/// context: only one thread at a time ever touches `ctx`, and the
-/// `Rc<Handle>` is always created and destroyed within the same locked
-/// method call — it never crosses a thread boundary.
+/// `Context` in cuda-oxide is `!Send`. We compensate by holding `ctx_lock`
+/// across every operation that touches the context: only one thread at a time
+/// ever runs driver calls against it, and the context is only ever made
+/// current on the thread that holds the lock.
 struct CudaShared {
-    ctx: UnsafeCell<Context>,
+    /// Owns the CUDA context; destroyed after `Drop for CudaShared` runs.
+    _ctx: Context,
+    /// Raw handle of `_ctx`, made current via `with_current` before driver calls.
+    raw_ctx: sys::CUcontext,
     ctx_lock: Mutex<()>,
     /// Persistent compute stream — created once in `open()`, reused across all
     /// dispatches to eliminate per-kernel create/destroy overhead.
     stream: sys::CUstream,
+    /// Compute capability, used as the NVRTC target.
+    sm: (u32, u32),
+    /// Timing-disabled events recycled between submissions.
+    events: Mutex<Vec<sys::CUevent>>,
+    /// Pinned staging for large host transfers, allocated on first use.
+    staging: Mutex<Option<Staging>>,
 }
 
 // SAFETY: every context entry is serialized by ctx_lock.
@@ -280,21 +438,199 @@ unsafe impl Send for CudaShared {}
 unsafe impl Sync for CudaShared {}
 
 impl CudaShared {
-    fn with_context<F, T>(&self, f: F) -> Result<T>
-    where
-        F: for<'h> FnOnce(Rc<Handle<'h>>) -> Result<T>,
-    {
+    /// Run `f` with the context current on this thread. The context is only
+    /// re-set when the thread's current context differs, so the common path is
+    /// one `cuCtxGetCurrent`. The current context is never cleared.
+    fn with_current<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         let _guard = self.ctx_lock.lock().map_err(|_| GpuError::DeviceLost)?;
-        // SAFETY: ctx_lock is held; no other thread can enter this context.
-        let handle = from_cuda(unsafe { &mut *self.ctx.get() }.enter())?;
-        f(handle)
+        let mut current: sys::CUcontext = ptr::null_mut();
+        // SAFETY: plain thread-local query; writes one pointer.
+        cu(unsafe { sys::cuCtxGetCurrent(&mut current) })?;
+        if current != self.raw_ctx {
+            // SAFETY: raw_ctx is the live context owned by `_ctx`; ctx_lock is held.
+            cu(unsafe { sys::cuCtxSetCurrent(self.raw_ctx) })?;
+        }
+        f()
+    }
+
+    /// Take a pooled event, or create one. The context must be current.
+    fn take_event(&self) -> Result<sys::CUevent> {
+        if let Some(ev) = self.events.lock().map_err(|_| GpuError::DeviceLost)?.pop() {
+            return Ok(ev);
+        }
+        let mut ev: sys::CUevent = ptr::null_mut();
+        cu(unsafe {
+            sys::cuEventCreate(&mut ev, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING)
+        })?;
+        Ok(ev)
+    }
+
+    /// Return a finished event to the pool. The context must be current.
+    fn return_event(&self, ev: sys::CUevent) {
+        match self.events.lock() {
+            Ok(mut pool) => pool.push(ev),
+            Err(_) => {
+                unsafe { sys::cuEventDestroy_v2(ev) };
+            }
+        }
+    }
+
+    /// Record a completion event on the stream. The context must be current.
+    fn record_event(&self) -> Result<sys::CUevent> {
+        let ev = self.take_event()?;
+        if let Err(error) = cu(unsafe { sys::cuEventRecord(ev, self.stream) }) {
+            self.return_event(ev);
+            return Err(error);
+        }
+        Ok(ev)
+    }
+
+    /// Wait for everything queued on the stream, spinning rather than sleeping.
+    /// The context must be current.
+    fn sync_stream(&self) -> Result<()> {
+        let ev = self.record_event()?;
+        let waited = wait_event(ev);
+        self.return_event(ev);
+        waited
+    }
+
+    /// Copy host `src` to device address `dst`. The context must be current and
+    /// `ctx_lock` held.
+    fn htod(&self, dst: u64, src: &[u8]) -> Result<()> {
+        if src.len() < STAGING_MIN {
+            // SAFETY: src is a valid host slice of src.len() bytes; pageable
+            // memory is staged before the call returns, and we sync below.
+            cu(unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst,
+                    src.as_ptr() as *const c_void,
+                    driver_len(src.len())?,
+                    self.stream,
+                )
+            })?;
+            return self.sync_stream();
+        }
+        let mut guard = self.staging.lock().map_err(|_| GpuError::DeviceLost)?;
+        if guard.is_none() {
+            *guard = Some(Staging::new()?);
+        }
+        let st = guard.as_mut().unwrap();
+        for (i, chunk) in src.chunks(STAGING_CHUNK).enumerate() {
+            let b = i % 2;
+            if st.pending[b] {
+                // The previous DMA reading bufs[b] must finish before we overwrite it.
+                wait_event(st.events[b])?;
+                st.pending[b] = false;
+            }
+            // SAFETY: bufs[b] is a live STAGING_CHUNK-byte pinned allocation, and
+            // chunk.len() <= STAGING_CHUNK.
+            unsafe { ptr::copy_nonoverlapping(chunk.as_ptr(), st.bufs[b] as *mut u8, chunk.len()) };
+            let off = (i * STAGING_CHUNK) as u64;
+            // SAFETY: the destination range was bounds-checked by the caller.
+            cu(unsafe {
+                sys::cuMemcpyHtoDAsync_v2(
+                    dst + off,
+                    st.bufs[b] as *const c_void,
+                    driver_len(chunk.len())?,
+                    self.stream,
+                )
+            })?;
+            cu(unsafe { sys::cuEventRecord(st.events[b], self.stream) })?;
+            st.pending[b] = true;
+        }
+        // Return only once the device side is complete.
+        for (pending, &ev) in st.pending.iter_mut().zip(&st.events) {
+            if *pending {
+                wait_event(ev)?;
+                *pending = false;
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy device address `src` into host `dst`. The context must be current
+    /// and `ctx_lock` held.
+    fn dtoh(&self, src: u64, dst: &mut [u8]) -> Result<()> {
+        if dst.len() < STAGING_MIN {
+            // SAFETY: dst is a valid mutable host slice of dst.len() bytes and
+            // stays borrowed until the stream sync below.
+            cu(unsafe {
+                sys::cuMemcpyDtoHAsync_v2(
+                    dst.as_mut_ptr() as *mut c_void,
+                    src,
+                    driver_len(dst.len())?,
+                    self.stream,
+                )
+            })?;
+            return self.sync_stream();
+        }
+        let mut guard = self.staging.lock().map_err(|_| GpuError::DeviceLost)?;
+        if guard.is_none() {
+            *guard = Some(Staging::new()?);
+        }
+        let st = guard.as_mut().unwrap();
+        let total = dst.len();
+        // (offset, len) of chunk `j` within `dst`.
+        let chunk = |j: usize| {
+            let off = j * STAGING_CHUNK;
+            (off, STAGING_CHUNK.min(total - off))
+        };
+        let chunks = total.div_ceil(STAGING_CHUNK);
+        // Software pipeline: issue the DMA for chunk i, then copy chunk i-1 out
+        // of its buffer while the DMA for chunk i runs.
+        for i in 0..=chunks {
+            if i < chunks {
+                let b = i % 2;
+                let (off, len) = chunk(i);
+                if st.pending[b] {
+                    // bufs[b] still holds chunk i-2 until its DMA completes.
+                    wait_event(st.events[b])?;
+                    st.pending[b] = false;
+                }
+                // SAFETY: bufs[b] is a live STAGING_CHUNK-byte pinned allocation
+                // and len <= STAGING_CHUNK; the source range was bounds-checked.
+                cu(unsafe {
+                    sys::cuMemcpyDtoHAsync_v2(
+                        st.bufs[b],
+                        src + off as u64,
+                        driver_len(len)?,
+                        self.stream,
+                    )
+                })?;
+                cu(unsafe { sys::cuEventRecord(st.events[b], self.stream) })?;
+                st.pending[b] = true;
+            }
+            if i > 0 {
+                let j = i - 1;
+                let b = j % 2;
+                let (off, len) = chunk(j);
+                wait_event(st.events[b])?;
+                st.pending[b] = false;
+                // SAFETY: the DMA into bufs[b] completed (waited above), so the
+                // first `len` bytes are initialised and not being written.
+                let staged = unsafe { slice::from_raw_parts(st.bufs[b] as *const u8, len) };
+                dst[off..off + len].copy_from_slice(staged);
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for CudaShared {
     fn drop(&mut self) {
-        if self.ctx.get_mut().enter().is_ok() {
+        // SAFETY: `&mut self` gives exclusive access. `raw_ctx` is still alive
+        // because `_ctx` is dropped only after this body.
+        if unsafe { sys::cuCtxSetCurrent(self.raw_ctx) } == 0 {
             unsafe { sys::cuStreamSynchronize(self.stream) };
+            // Staging and pooled events are released while the context is current.
+            if let Ok(staging) = self.staging.get_mut() {
+                *staging = None;
+            }
+            if let Ok(pool) = self.events.get_mut() {
+                for ev in pool.drain(..) {
+                    unsafe { sys::cuEventDestroy_v2(ev) };
+                }
+            }
             unsafe { sys::cuStreamDestroy_v2(self.stream) };
         }
     }
@@ -308,20 +644,9 @@ pub struct CudaDevice {
     lifetime: Arc<Mutex<CudaLifetimeState>>,
 }
 
-// SAFETY: see the CudaDevice doc comment above.
+// SAFETY: see the CudaShared doc comment above.
 unsafe impl Send for CudaDevice {}
 unsafe impl Sync for CudaDevice {}
-
-impl CudaDevice {
-    /// Enter the CUDA context, run `f`, exit the context. `ctx_lock` must be
-    /// held for the lifetime of `f` to serialise cross-thread access.
-    fn with_context<F, T>(&self, f: F) -> Result<T>
-    where
-        F: for<'h> FnOnce(Rc<Handle<'h>>) -> Result<T>,
-    {
-        self.shared.with_context(f)
-    }
-}
 
 struct CudaSubmission {
     cycle_id: u64,
@@ -353,12 +678,16 @@ impl CudaSubmission {
         let Some(raw) = *event else {
             return Ok(SubmissionStatus::Complete);
         };
-        let code = self
-            .shared
-            .with_context(|_| Ok(unsafe { sys::cuEventQuery(raw) }))?;
+        // One context entry covers the query and, on completion, the pool return.
+        let code = self.shared.with_current(|| {
+            // SAFETY: `raw` is this submission's live event.
+            let code = unsafe { sys::cuEventQuery(raw) };
+            if code == 0 {
+                self.shared.return_event(raw);
+            }
+            Ok(code)
+        })?;
         if code == 0 {
-            self.shared
-                .with_context(|_| cu(unsafe { sys::cuEventDestroy_v2(raw) }))?;
             *event = None;
             self.release_in_flight();
             Ok(SubmissionStatus::Complete)
@@ -405,10 +734,11 @@ impl Drop for CudaSubmission {
             return;
         };
         // Preserve the resource-lifetime contract even if a pending token is
-        // dropped: wait for its exact stream position, then destroy the event.
-        let _ = self.shared.with_context(|_| {
-            cu(unsafe { sys::cuEventSynchronize(raw) })?;
-            cu(unsafe { sys::cuEventDestroy_v2(raw) })
+        // dropped: wait for its exact stream position, then recycle the event.
+        let _ = self.shared.with_current(|| {
+            wait_event(raw)?;
+            self.shared.return_event(raw);
+            Ok(())
         });
         self.release_in_flight();
     }
@@ -434,11 +764,11 @@ fn release_cuda_in_flight(
     for resource in deferred {
         match resource {
             DeferredCudaResource::Buffer(index, buffer) => {
-                let _ = shared.with_context(|_| cu(unsafe { sys::cuMemFree_v2(buffer.ptr) }));
+                let _ = shared.with_current(|| cu(unsafe { sys::cuMemFree_v2(buffer.ptr) }));
                 buffers.lock().unwrap().release_retired(index);
             }
             DeferredCudaResource::Shader(index, shader) => {
-                let _ = shared.with_context(|_| cu(unsafe { sys::cuModuleUnload(shader.module) }));
+                let _ = shared.with_current(|| cu(unsafe { sys::cuModuleUnload(shader.module) }));
                 shaders.lock().unwrap().release_retired(index);
             }
             DeferredCudaResource::Pipeline(index) => {
@@ -455,15 +785,13 @@ impl Drop for CudaDevice {
         let shaders: Vec<CudaShader> = self.shaders.lock().unwrap().drain().collect();
         let pipelines: Vec<CudaPipeline> = self.pipelines.lock().unwrap().drain().collect();
 
-        let _ = self.shared.with_context(|handle| {
+        let _ = self.shared.with_current(|| {
             // A device may be dropped before its submission handles. Drain
             // work before freeing the resources owned by this device.
             cu(unsafe { sys::cuStreamSynchronize(self.shared.stream) })?;
             for cb in buffers {
-                // SAFETY: ptr/len came from a DeviceBox we explicitly leaked.
-                let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
-                let db = unsafe { DeviceBox::from_raw(dp) };
-                drop(db);
+                // SAFETY: ptr came from cuMemAlloc_v2 and is freed exactly once here.
+                let _ = unsafe { sys::cuMemFree_v2(cb.ptr) };
             }
             let _ = pipelines; // CUfunction handles are owned by their modules; no explicit free.
             for cs in shaders {
@@ -488,28 +816,25 @@ impl GpuDevice for CudaDevice {
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
-        self.with_context(|handle| {
-            let db = from_cuda(DeviceBox::alloc(&handle, desc.size))?;
-            // Extract the raw device pointer before leaking so we can track it.
-            let ptr = db.as_raw();
-            let len = db.len();
-            // Prevent Drop from calling cuMemFree; we manage the allocation manually.
-            db.leak();
-            let bh = self
-                .buffers
+        self.shared.with_current(|| {
+            let mut ptr: u64 = 0;
+            // SAFETY: writes one device pointer into `ptr`.
+            cu(unsafe { sys::cuMemAlloc_v2(&mut ptr, driver_len(desc.size)?) })?;
+            self.buffers
                 .lock()
-                .map_err(|_| GpuError::DeviceLost)?
-                .insert(CudaBuffer {
-                    ptr,
-                    len,
-                    usage: desc.usage,
-                });
-            Ok(bh)
+                .map_err(|_| GpuError::DeviceLost)
+                .map(|mut buffers| {
+                    buffers.insert(CudaBuffer {
+                        ptr,
+                        len: desc.size,
+                        usage: desc.usage,
+                    })
+                })
         })
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
-        self.with_context(|handle| {
+        self.shared.with_current(|| {
             let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
             let cb = buffers
                 .get(buffer)
@@ -530,15 +855,35 @@ impl GpuDevice for CudaDevice {
             if offset + data.len() as u64 > cb.len {
                 return Err(GpuError::Backend("cuda: write out of bounds".into()));
             }
-            // SAFETY: ptr/len from our buffer table; context is current.
-            let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
-            let view = dp.subslice(offset, offset + data.len() as u64);
-            from_cuda(view.store(data))
+            self.shared.htod(cb.ptr + offset, data)
         })
     }
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
-        self.with_context(|handle| {
+        let len = usize::try_from(len).map_err(|_| {
+            GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "cuda: read length exceeds host address range".into(),
+            ))
+        })?;
+        // Bounds-check before allocating, so a bogus length errors instead of aborting.
+        let size = self
+            .buffers
+            .lock()
+            .map_err(|_| GpuError::DeviceLost)?
+            .get(buffer)
+            .map(|cb| cb.len)
+            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
+        if offset.checked_add(len as u64).is_none_or(|end| end > size) {
+            return Err(GpuError::Backend("cuda: read out of bounds".into()));
+        }
+        // Zeroed allocation is calloc-backed, so large reads do not pay a memset.
+        let mut out = vec![0u8; len];
+        self.read_buffer_into(buffer, offset, &mut out)?;
+        Ok(out)
+    }
+
+    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
+        self.shared.with_current(|| {
             let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
             let cb = buffers
                 .get(buffer)
@@ -562,41 +907,6 @@ impl GpuDevice for CudaDevice {
                         .into(),
                 )));
             }
-            if offset + len > cb.len {
-                return Err(GpuError::Backend("cuda: read out of bounds".into()));
-            }
-            // SAFETY: ptr/len from our buffer table; context is current.
-            let dp = unsafe { DevicePtr::from_raw_parts(handle, cb.ptr, cb.len) };
-            let view = dp.subslice(offset, offset + len);
-            from_cuda(view.load())
-        })
-    }
-
-    fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
-        self.with_context(|_handle| {
-            let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
-            let cb = buffers
-                .get(buffer)
-                .copied()
-                .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))?;
-            if !cb.usage.contains(BufferUsage::READBACK) {
-                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                    resource: "buffer",
-                    needed: "READBACK",
-                }));
-            }
-            if self
-                .lifetime
-                .lock()
-                .map_err(|_| GpuError::DeviceLost)?
-                .in_flight
-                != 0
-            {
-                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-                    "read_buffer_into cannot observe buffers while an asynchronous submission is pending"
-                        .into(),
-                )));
-            }
             let end = offset.checked_add(dst.len() as u64).ok_or_else(|| {
                 GpuError::InvalidUsage(UsageError::BindingMismatch(
                     "cuda: read range overflows u64".into(),
@@ -607,18 +917,7 @@ impl GpuDevice for CudaDevice {
                     format!("cuda: read range {offset}..{end} exceeds {}", cb.len),
                 )));
             }
-            let byte_count = sys::size_t::try_from(dst.len()).map_err(|_| {
-                GpuError::InvalidUsage(UsageError::BindingMismatch(
-                    "cuda: caller-owned readback exceeds driver byte-count range".into(),
-                ))
-            })?;
-            cu(unsafe {
-                sys::cuMemcpyDtoH_v2(
-                    dst.as_mut_ptr() as *mut c_void,
-                    cb.ptr + offset,
-                    byte_count,
-                )
-            })
+            self.shared.dtoh(cb.ptr + offset, dst)
         })
     }
 
@@ -630,7 +929,7 @@ impl GpuDevice for CudaDevice {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
-        self.with_context(|handle| {
+        self.shared.with_current(|| {
             let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
             if self
                 .lifetime
@@ -688,14 +987,19 @@ impl GpuDevice for CudaDevice {
             if len == 0 {
                 return Ok(());
             }
-            let src_ptr =
-                unsafe { DevicePtr::from_raw_parts(handle.clone(), src_buf.ptr, src_buf.len) };
-            let dst_ptr = unsafe { DevicePtr::from_raw_parts(handle, dst_buf.ptr, dst_buf.len) };
-            from_cuda(
-                src_ptr
-                    .subslice(src_offset, src_end)
-                    .copy_to(&dst_ptr.subslice(dst_offset, dst_end)),
-            )
+            // Device-to-device copies return before completion even through the
+            // synchronous API, so queue on our stream (ordered with the staged
+            // transfers and dispatches) and wait for it.
+            // SAFETY: both ranges were bounds-checked above and the buffers are distinct.
+            cu(unsafe {
+                sys::cuMemcpyDtoDAsync_v2(
+                    dst_buf.ptr + dst_offset,
+                    src_buf.ptr + src_offset,
+                    driver_len(len)?,
+                    self.shared.stream,
+                )
+            })?;
+            self.shared.sync_stream()
         })
     }
 
@@ -721,13 +1025,10 @@ impl GpuDevice for CudaDevice {
             }
         };
         if let Some(cb) = cb {
-            let _ = self.with_context(|handle| {
-                // SAFETY: ptr/len from our buffer table; context is current.
-                let dp = unsafe { DevicePtr::from_raw_parts(handle.clone(), cb.ptr, cb.len) };
-                let db = unsafe { DeviceBox::from_raw(dp) };
-                drop(db); // calls cuMemFree while context is current
-                Ok(())
-            });
+            // SAFETY: cb.ptr came from cuMemAlloc_v2 and is no longer in the table.
+            let _ = self
+                .shared
+                .with_current(|| cu(unsafe { sys::cuMemFree_v2(cb.ptr) }));
         }
     }
 
@@ -754,22 +1055,25 @@ impl GpuDevice for CudaDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
-        let mut ptx_vec: Vec<u8> = match desc.source {
-            ShaderSource::Ptx(ptx) => ptx.to_vec(),
-            ShaderSource::CudaSrc(src) => nvrtc_compile_to_ptx(src)?,
+        let mut image = match desc.source {
+            ShaderSource::Ptx(ptx) => ModuleImage::Ptx(ptx.to_vec()),
+            ShaderSource::CudaSrc(src) => nvrtc_compile(src, self.shared.sm)?,
             _ => {
                 return Err(GpuError::Backend(
                     "cuda: only PTX or CUDA C++ (CudaSrc) shaders are supported".into(),
                 ));
             }
         };
-        // cuModuleLoadData requires a null-terminated PTX string.
-        if ptx_vec.last() != Some(&0) {
-            ptx_vec.push(0);
+        // cuModuleLoadData requires a null-terminated PTX string. Cubin is raw.
+        if let ModuleImage::Ptx(bytes) = &mut image
+            && bytes.last() != Some(&0)
+        {
+            bytes.push(0);
         }
-        let module = self.with_context(|_handle| {
+        let module = self.shared.with_current(|| {
             let mut m: sys::CUmodule = ptr::null_mut();
-            cu(unsafe { sys::cuModuleLoadData(&mut m, ptx_vec.as_ptr() as *const c_void) })?;
+            // SAFETY: `image` outlives the call (it is moved into the shader below).
+            cu(unsafe { sys::cuModuleLoadData(&mut m, image.bytes().as_ptr() as *const c_void) })?;
             Ok(m)
         })?;
         let handle = self
@@ -778,7 +1082,7 @@ impl GpuDevice for CudaDevice {
             .map_err(|_| GpuError::DeviceLost)?
             .insert(CudaShader {
                 module,
-                _ptx: ptx_vec,
+                _image: image,
             });
         Ok(handle)
     }
@@ -805,7 +1109,9 @@ impl GpuDevice for CudaDevice {
             }
         };
         if let Some(cs) = cs {
-            let _ = self.with_context(|_handle| cu(unsafe { sys::cuModuleUnload(cs.module) }));
+            let _ = self
+                .shared
+                .with_current(|| cu(unsafe { sys::cuModuleUnload(cs.module) }));
         }
     }
 
@@ -821,7 +1127,7 @@ impl GpuDevice for CudaDevice {
         let entry = CString::new(desc.entry)
             .map_err(|_| GpuError::Backend("cuda: entry point name contains NUL byte".into()))?;
 
-        let func = self.with_context(|_handle| {
+        let func = self.shared.with_current(|| {
             let mut f: sys::CUfunction = ptr::null_mut();
             cu(unsafe { sys::cuModuleGetFunction(&mut f, module, entry.as_ptr()) })?;
             Ok(f)
@@ -901,7 +1207,7 @@ impl GpuDevice for CudaDevice {
         // submission order on the device, so a later op safely reads an
         // earlier op's output with no explicit barrier. The event recorded
         // after the final launch represents completion of the whole batch.
-        let event = self.with_context(|_handle| {
+        let event = self.shared.with_current(|| {
             for op in ops {
                 let cp = self
                     .pipelines
@@ -964,22 +1270,16 @@ impl GpuDevice for CudaDevice {
                     )
                 })?;
             }
-            let mut event: sys::CUevent = ptr::null_mut();
-            cu(unsafe {
-                sys::cuEventCreate(&mut event, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING)
-            })?;
-            if let Err(e) = cu(unsafe { sys::cuEventRecord(event, stream) }) {
-                unsafe { sys::cuEventDestroy_v2(event) };
-                return Err(e);
-            }
-            Ok(event)
+            self.shared.record_event()
         });
         let event = match event {
             Ok(event) => event,
             Err(error) => {
                 // Some earlier launches may already be queued. Drain them
                 // before releasing any concurrently retired resources.
-                let _ = self.with_context(|_| cu(unsafe { sys::cuStreamSynchronize(stream) }));
+                let _ = self
+                    .shared
+                    .with_current(|| cu(unsafe { sys::cuStreamSynchronize(stream) }));
                 release_cuda_in_flight(
                     &self.shared,
                     &self.buffers,
@@ -1012,7 +1312,7 @@ impl GpuDevice for CudaDevice {
             .lock()
             .map_err(|_| GpuError::DeviceLost)?
             .in_flight += 1;
-        let event = self.with_context(|_handle| {
+        let event = self.shared.with_current(|| {
             for op in ops {
                 match op {
                     ComputeOp::CopyBuffer(copy) => {
@@ -1137,20 +1437,14 @@ impl GpuDevice for CudaDevice {
                     }
                 }
             }
-            let mut event = ptr::null_mut();
-            cu(unsafe {
-                sys::cuEventCreate(&mut event, sys::CUevent_flags_enum_CU_EVENT_DISABLE_TIMING)
-            })?;
-            if let Err(error) = cu(unsafe { sys::cuEventRecord(event, stream) }) {
-                unsafe { sys::cuEventDestroy_v2(event) };
-                return Err(error);
-            }
-            Ok(event)
+            self.shared.record_event()
         });
         let event = match event {
             Ok(event) => event,
             Err(error) => {
-                let _ = self.with_context(|_| cu(unsafe { sys::cuStreamSynchronize(stream) }));
+                let _ = self
+                    .shared
+                    .with_current(|| cu(unsafe { sys::cuStreamSynchronize(stream) }));
                 release_cuda_in_flight(
                     &self.shared,
                     &self.buffers,
@@ -1249,6 +1543,7 @@ extern "C" __global__ void vec_add_f32(
 mod tests {
     use super::*;
     use std::mem::{size_of, size_of_val};
+    use std::thread;
 
     use zengpu_spirv::{ZslShader, zsl};
 
@@ -1992,5 +2287,96 @@ mod tests {
         device.destroy_buffer(allocated_after_first);
         device.destroy_buffer(allocated_after_completion);
         device.destroy_buffer(second_out);
+    }
+
+    /// Staged transfers: a size that is not a multiple of STAGING_CHUNK and an
+    /// odd offset, through write_buffer, read_buffer and read_buffer_into.
+    #[test]
+    fn staged_transfers_round_trip_unaligned_size_and_offset() {
+        let Some(device) = cuda_device() else { return };
+        const OFFSET: u64 = 7;
+        const LEN: usize = 3 * STAGING_CHUNK + 12345;
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: OFFSET + LEN as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create staged buffer");
+        let data: Vec<u8> = (0..LEN)
+            .map(|i| (i.wrapping_mul(31) ^ (i >> 13)) as u8)
+            .collect();
+        device
+            .write_buffer(buf, OFFSET, &data)
+            .expect("staged write");
+        assert_eq!(
+            device
+                .read_buffer(buf, OFFSET, LEN as u64)
+                .expect("staged read"),
+            data
+        );
+        let mut into = vec![0u8; LEN];
+        device
+            .read_buffer_into(buf, OFFSET, &mut into)
+            .expect("staged read_into");
+        assert_eq!(into, data);
+        device.destroy_buffer(buf);
+    }
+
+    /// The first call on a thread with no current context must still work, and
+    /// the device must remain usable from a different thread afterwards.
+    #[test]
+    fn transfers_work_from_another_thread() {
+        let Some(device) = cuda_device() else { return };
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: 4096,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create buffer");
+        let data: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                device
+                    .write_buffer(buf, 0, &data)
+                    .expect("write off-thread")
+            });
+        });
+        let back = thread::scope(|scope| {
+            scope
+                .spawn(|| device.read_buffer(buf, 0, 4096).expect("read off-thread"))
+                .join()
+                .expect("reader thread")
+        });
+        assert_eq!(back, data);
+        device.destroy_buffer(buf);
+    }
+
+    /// NVRTC should target the device's own architecture, so the module is a
+    /// cubin that loads without driver JIT.
+    #[test]
+    fn nvrtc_targets_device_architecture() {
+        let inst = CudaInstance::new();
+        if !inst.initialized {
+            return;
+        }
+        let Ok(devices) = Cuda::list_devices() else {
+            return;
+        };
+        let Some(dev) = devices.first() else {
+            return;
+        };
+        let sm = dev
+            .compute_capability()
+            .map(|v| (v.major, v.minor))
+            .expect("compute capability");
+        let image = nvrtc_compile(VEC_ADD_CUDA.as_bytes(), sm).expect("compile for device");
+        assert!(
+            matches!(image, ModuleImage::Cubin(_)),
+            "expected an sm_{}{} cubin",
+            sm.0,
+            sm.1
+        );
     }
 }
