@@ -130,13 +130,107 @@ __device__ __forceinline__ void wm_body(
         }
 }
 
-// `group` M-tiles sweep each B panel together, so B is read about once per panel.
-template <bool BF16, int WAVES_M, int WAVES_N, int TM, int TN>
+// 128-row kernel: B fetched once per block. Each wave loads its share of the step's B fragments
+// with global_load_tr into LDS in fragment order (16 B per lane, conflict-free), then reads the
+// ones it needs. This halves L2 traffic for B against per-wave loads, which bounds the kernel. K
+// steps of 32 keep the 64×64 per-wave accumulators in registers.
+#define WM_BK_S 32
+#define WM_LDS_S (WM_BK_S + 8)
+template <bool BF16, int WAVES_M, int WAVES_N, int TM, int TN, bool EDGE, bool KTAIL>
+__device__ __forceinline__ void wm_body_shared_b(
+        short* As, short* Bs, const short* __restrict__ A, const short* __restrict__ B,
+        float* __restrict__ C, unsigned int M, unsigned int N, unsigned int K,
+        unsigned int row0, unsigned int col0, float alpha) {
+    constexpr unsigned int THREADS = WAVES_M * WAVES_N * 32;
+    constexpr unsigned int AV_PER_ROW = WM_BK_S / 8;
+    constexpr unsigned int A_ROW_STEP = THREADS / AV_PER_ROW;
+    constexpr int A_VECS = TM * 16 * WAVES_M * WM_BK_S / 8 / THREADS;
+    constexpr int KS = WM_BK_S / 16;
+    constexpr int FRAG_COLS = WAVES_N * TN;
+    constexpr int FRAGS_PER_WAVE = KS * FRAG_COLS / (WAVES_M * WAVES_N);
+    const unsigned int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const unsigned int wm = wave / WAVES_N, wn = wave % WAVES_N;
+
+    const unsigned int a_c = (t % AV_PER_ROW) * 8;
+    const short* pa[A_VECS];
+    _Pragma("unroll") for (int v = 0; v < A_VECS; v++) {
+        const unsigned int r = row0 + t / AV_PER_ROW + v * A_ROW_STEP;
+        pa[v] = A + (size_t)(EDGE ? min(r, M - 1) : r) * K + a_c;
+    }
+    // Fragment f of a step is (k slice f / FRAG_COLS, column f % FRAG_COLS); this wave loads f =
+    // wave * FRAGS_PER_WAVE + q.
+    const unsigned int b_row = (lane >> 4) * 8 + (lane & 7);
+    unsigned int b_col[FRAGS_PER_WAVE], b_kk[FRAGS_PER_WAVE];
+    _Pragma("unroll") for (int q = 0; q < FRAGS_PER_WAVE; q++) {
+        const unsigned int f = wave * FRAGS_PER_WAVE + q;
+        b_kk[q] = f / FRAG_COLS;
+        const unsigned int c = col0 + (f % FRAG_COLS) * 16 + ((lane & 15) >> 3) * 8;
+        b_col[q] = EDGE ? min(c, N - 8) : c;
+    }
+
+    wm_s8 ra[A_VECS], rb[FRAGS_PER_WAVE];
+    auto load = [&](unsigned int k0) {
+        if (!KTAIL || k0 + WM_BK_S <= K) {
+            _Pragma("unroll") for (int v = 0; v < A_VECS; v++) ra[v] = *(const wm_s8*)(pa[v] + k0);
+        } else {
+            _Pragma("unroll") for (int v = 0; v < A_VECS; v++)
+                ra[v] = k0 + a_c < K ? *(const wm_s8*)(pa[v] + k0) : wm_s8{};
+        }
+        const bool tail = KTAIL && k0 + WM_BK_S > K;
+        _Pragma("unroll") for (int q = 0; q < FRAGS_PER_WAVE; q++) {
+            const unsigned int k = k0 + b_kk[q] * 16 + b_row;
+            const size_t row = (size_t)(tail ? min(k, K - 1) : k) * N;
+            rb[q] = __builtin_amdgcn_global_load_tr_b128_v8i16((wm_global_s8*)(B + row + b_col[q]));
+        }
+    };
+
+    wm_f8 acc[TM][TN];
+    _Pragma("unroll") for (int i = 0; i < TM; i++)
+        _Pragma("unroll") for (int j = 0; j < TN; j++) acc[i][j] = wm_f8{};
+    load(0);
+    for (unsigned int k0 = 0; k0 < K; k0 += WM_BK_S) {
+        _Pragma("unroll") for (int v = 0; v < A_VECS; v++) {
+            const unsigned int idx = t + v * THREADS;
+            *(wm_s8*)(As + (idx / AV_PER_ROW) * WM_LDS_S + (idx % AV_PER_ROW) * 8) = ra[v];
+        }
+        _Pragma("unroll") for (int q = 0; q < FRAGS_PER_WAVE; q++)
+            *(wm_s8*)(Bs + ((wave * FRAGS_PER_WAVE + q) * 32 + lane) * 8) = rb[q];
+        WM_LDS_BARRIER();
+        if (k0 + WM_BK_S < K) load(k0 + WM_BK_S);
+        _Pragma("unroll") for (int kk = 0; kk < KS; kk++) {
+            wm_s8 af[TM], bf[TN];
+            _Pragma("unroll") for (int i = 0; i < TM; i++)
+                af[i] = *(const wm_s8*)(As + ((wm * TM + i) * 16 + (lane & 15)) * WM_LDS_S
+                                        + kk * 16 + (lane >> 4) * 8);
+            _Pragma("unroll") for (int j = 0; j < TN; j++)
+                bf[j] = *(const wm_s8*)(Bs + ((kk * FRAG_COLS + wn * TN + j) * 32 + lane) * 8);
+            __builtin_amdgcn_sched_barrier(0);
+            _Pragma("unroll") for (int i = 0; i < TM; i++)
+                _Pragma("unroll") for (int j = 0; j < TN; j++)
+                    acc[i][j] = wm_mma<BF16>(af[i], bf[j], acc[i][j]);
+        }
+        WM_LDS_BARRIER();
+    }
+    _Pragma("unroll") for (int i = 0; i < TM; i++)
+        _Pragma("unroll") for (int j = 0; j < TN; j++) {
+            const unsigned int col = col0 + (wn * TN + j) * 16 + (lane & 15);
+            _Pragma("unroll") for (int e = 0; e < 8; e++) {
+                const unsigned int row = row0 + (wm * TM + i) * 16 + (lane >> 4) * 8 + e;
+                if (!EDGE || (row < M && col < N)) C[(size_t)row * N + col] = alpha * acc[i][j][e];
+            }
+        }
+}
+
+// `group` M-tiles sweep each B column panel together, so B is read about once per panel. SHARED_B
+// picks wm_body_shared_b over wm_body.
+template <bool BF16, int WAVES_M, int WAVES_N, int TM, int TN, bool SHARED_B>
 __device__ __forceinline__ void wm_gemm(
         const short* __restrict__ A, const short* __restrict__ B, float* __restrict__ C,
         unsigned int M, unsigned int N, unsigned int K, unsigned int group, float alpha) {
     constexpr unsigned int BM = WAVES_M * TM * 16, BN = WAVES_N * TN * 16;
-    __shared__ short As[BM * WM_LDS];
+    constexpr unsigned int BK = SHARED_B ? WM_BK_S : WM_BK;
+    __shared__ short As[BM * (SHARED_B ? WM_LDS_S : WM_LDS)];
+    __shared__ short Bs[SHARED_B ? (WM_BK_S / 16) * (BN / 16) * 256 : 1];
     const unsigned int tiles_m = (M + BM - 1) / BM, tiles_n = (N + BN - 1) / BN;
     const unsigned int pid = blockIdx.x, per_group = group * tiles_n;
     const unsigned int first_m = (pid / per_group) * group;
@@ -144,26 +238,35 @@ __device__ __forceinline__ void wm_gemm(
     const unsigned int row0 = (first_m + (pid % per_group) % gsize) * BM;
     const unsigned int col0 = ((pid % per_group) / gsize) * BN;
     const bool inner = row0 + BM <= M && col0 + BN <= N;
-    if (inner && K % WM_BK == 0)
-        wm_body<BF16, WAVES_M, WAVES_N, TM, TN, false, false>(As, A, B, C, M, N, K, row0, col0, alpha);
-    else if (inner)
-        wm_body<BF16, WAVES_M, WAVES_N, TM, TN, false, true>(As, A, B, C, M, N, K, row0, col0, alpha);
-    else
-        wm_body<BF16, WAVES_M, WAVES_N, TM, TN, true, true>(As, A, B, C, M, N, K, row0, col0, alpha);
+    if constexpr (SHARED_B) {
+        if (inner && K % BK == 0)
+            wm_body_shared_b<BF16, WAVES_M, WAVES_N, TM, TN, false, false>(As, Bs, A, B, C, M, N, K, row0, col0, alpha);
+        else if (inner)
+            wm_body_shared_b<BF16, WAVES_M, WAVES_N, TM, TN, false, true>(As, Bs, A, B, C, M, N, K, row0, col0, alpha);
+        else
+            wm_body_shared_b<BF16, WAVES_M, WAVES_N, TM, TN, true, true>(As, Bs, A, B, C, M, N, K, row0, col0, alpha);
+    } else {
+        if (inner && K % BK == 0)
+            wm_body<BF16, WAVES_M, WAVES_N, TM, TN, false, false>(As, A, B, C, M, N, K, row0, col0, alpha);
+        else if (inner)
+            wm_body<BF16, WAVES_M, WAVES_N, TM, TN, false, true>(As, A, B, C, M, N, K, row0, col0, alpha);
+        else
+            wm_body<BF16, WAVES_M, WAVES_N, TM, TN, true, true>(As, A, B, C, M, N, K, row0, col0, alpha);
+    }
 }
 
-#define WM_ENTRY(NAME, BF16, WAVES_M, WAVES_N, TM, TN)                                    \
+#define WM_ENTRY(NAME, BF16, WAVES_M, WAVES_N, TM, TN, SHARED_B)                          \
 extern "C" __global__ __launch_bounds__(WAVES_M * WAVES_N * 32) void NAME(               \
         const short* __restrict__ A, const short* __restrict__ B, float* __restrict__ C,  \
         unsigned int M, unsigned int N, unsigned int K, unsigned int group, float alpha) { \
-    wm_gemm<BF16, WAVES_M, WAVES_N, TM, TN>(A, B, C, M, N, K, group, alpha);              \
+    wm_gemm<BF16, WAVES_M, WAVES_N, TM, TN, SHARED_B>(A, B, C, M, N, K, group, alpha);    \
 }
-WM_ENTRY(hgemm_wmma_128_f16, false, 2, 4, 4, 2)
-WM_ENTRY(hgemm_wmma_128_bf16, true, 2, 4, 4, 2)
-WM_ENTRY(hgemm_wmma_64_f16, false, 1, 2, 4, 2)
-WM_ENTRY(hgemm_wmma_64_bf16, true, 1, 2, 4, 2)
-WM_ENTRY(hgemm_wmma_32_f16, false, 1, 4, 2, 2)
-WM_ENTRY(hgemm_wmma_32_bf16, true, 1, 4, 2, 2)
+WM_ENTRY(hgemm_wmma_128_f16, false, 2, 2, 4, 4, true)
+WM_ENTRY(hgemm_wmma_128_bf16, true, 2, 2, 4, 4, true)
+WM_ENTRY(hgemm_wmma_64_f16, false, 1, 2, 4, 2, false)
+WM_ENTRY(hgemm_wmma_64_bf16, true, 1, 2, 4, 2, false)
+WM_ENTRY(hgemm_wmma_32_f16, false, 1, 4, 2, 2, false)
+WM_ENTRY(hgemm_wmma_32_bf16, true, 1, 4, 2, 2, false)
 #endif
 "#;
 
@@ -184,7 +287,7 @@ pub(crate) const VARIANTS: [Variant; 3] = [
         name: "hgemm_wmma_128",
         bm: 128,
         bn: 128,
-        threads: 256,
+        threads: 128,
         speed: 1.0,
     },
     Variant {
@@ -257,7 +360,7 @@ mod tests {
 
     #[test]
     fn variants_match_their_kernels() {
-        let layouts = [(2, 4, 4, 2), (1, 2, 4, 2), (1, 4, 2, 2)];
+        let layouts = [(2, 2, 4, 4), (1, 2, 4, 2), (1, 4, 2, 2)];
         for (v, (wm, wn, tm, tn)) in VARIANTS.iter().zip(layouts) {
             assert_eq!(v.bm, wm * tm * 16, "{}", v.name);
             assert_eq!(v.bn, wn * tn * 16, "{}", v.name);
