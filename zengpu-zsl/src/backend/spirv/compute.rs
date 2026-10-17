@@ -336,6 +336,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let uses_workgroup_reduce = stmts_use_workgroup_reduce(&entry.body);
     let workgroup_reduce_len = local_size[0] * local_size[1] * local_size[2];
     let workgroup_reduce_var = if uses_workgroup_reduce {
+        if local_size[1] != 1 || local_size[2] != 1 {
+            return Err(format!(
+                "ZSL: workgroup_reduce_* requires a 1D workgroup, got local_size {local_size:?}"
+            ));
+        }
         if !workgroup_reduce_len.is_power_of_two() {
             return Err(format!(
                 "ZSL: workgroup_reduce_* requires a power-of-two workgroup thread count, got {workgroup_reduce_len}"

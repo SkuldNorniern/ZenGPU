@@ -1037,15 +1037,15 @@ int main() {{
         let msl_source = msl::lower_compute(&module)
             .expect("lower subgroup arithmetic to MSL")
             .source;
-        assert!(hip_source.contains("auto o = __shfl_xor(v, off)"));
-        assert!(hip_source.contains("auto o = __shfl_up(v, off)"));
-        assert!(hip_source.contains("fminf(v, o)"));
-        assert!(hip_source.contains("(v & o)"));
-        assert!(hip_source.contains("excl = 0.0f"));
-        assert!(hip_source.contains("excl = 0u"));
-        assert!(cuda_source.contains("__shfl_xor_sync(0xffffffffu, v, off)"));
-        assert!(cuda_source.contains("__shfl_up_sync(0xffffffffu, v, off)"));
-        assert!(cuda_source.contains("(threadIdx.x % warpSize) >= off"));
+        assert!(hip_source.contains("auto __zsl_o = __shfl_xor(__zsl_v, __zsl_off)"));
+        assert!(hip_source.contains("auto __zsl_o = __shfl_up(__zsl_v, __zsl_off)"));
+        assert!(hip_source.contains("fminf(__zsl_v, __zsl_o)"));
+        assert!(hip_source.contains("(__zsl_v & __zsl_o)"));
+        assert!(hip_source.contains("__zsl_excl = 0.0f"));
+        assert!(hip_source.contains("__zsl_excl = 0u"));
+        assert!(cuda_source.contains("__shfl_xor_sync(0xffffffffu, __zsl_v, __zsl_off)"));
+        assert!(cuda_source.contains("__shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off)"));
+        assert!(cuda_source.contains("(threadIdx.x % warpSize) >= __zsl_off"));
         assert!(msl_source.contains("simd_sum("));
         assert!(msl_source.contains("simd_min("));
         assert!(msl_source.contains("simd_max("));
@@ -1069,8 +1069,8 @@ int main() {{
             .expect("lower workgroup reduce to MSL")
             .source;
         assert!(hip_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
-        assert!(hip_source.contains("fminf(v, o)"));
-        assert!(hip_source.contains("fmaxf(v, o)"));
+        assert!(hip_source.contains("fminf(__zsl_v, __zsl_o)"));
+        assert!(hip_source.contains("fmaxf(__zsl_v, __zsl_o)"));
         assert!(hip_source.contains("__zsl_wg_reduce_f32[0]"));
         assert!(cuda_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
         assert!(cuda_source.contains("__syncthreads()"));
@@ -1109,6 +1109,171 @@ int main() {{
             msl::lower_compute(&module)
                 .err()
                 .expect("MSL must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            spirv::lower_compute(&module)
+                .expect_err("SPIR-V must reject")
+                .message
+                .contains(expected)
+        );
+    }
+
+    #[test]
+    fn mixed_sign_int_uint_ops_cast_u32_operand_on_hip_and_cuda() {
+        let source = r#"
+            @workgroup_size(64)
+            kernel mixed(a: device buffer<i32>, b: device buffer<u32>, out: device mut buffer<i32>, id: global_id) {
+                out[id.x] = a[id.x] + b[id.x]
+                if a[id.x] < b[id.x] {
+                    out[id.x] = a[id.x] - b[id.x]
+                }
+                if b[id.x] >= a[id.x] {
+                    out[id.x] = a[id.x] * b[id.x]
+                }
+            }
+        "#;
+        let module = parse_compute(source).expect("parse mixed-sign kernel");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        for src in [&hip_source, &cuda_source] {
+            assert!(src.contains("(a[gx] + ((int)(b[gx])))"));
+            assert!(src.contains("(a[gx] < ((int)(b[gx])))"));
+            assert!(src.contains("(((int)(b[gx])) >= a[gx])"));
+            assert!(!src.contains("(a[gx] + b[gx])"));
+        }
+        spirv::lower_compute(&module).expect("lower to SPIR-V");
+    }
+
+    #[test]
+    fn global_id_y_and_z_declared_for_one_dimensional_workgroups() {
+        let source = r#"
+            @workgroup_size(64)
+            kernel ids(out: device mut buffer<u32>, id: global_id) {
+                out[id.x] = id.y + id.z
+            }
+        "#;
+        let module = parse_compute(source).expect("parse global_id kernel");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        for src in [&hip_source, &cuda_source] {
+            assert!(src.contains("unsigned int gy = blockIdx.y * blockDim.y + threadIdx.y;"));
+            assert!(src.contains("unsigned int gz = blockIdx.z * blockDim.z + threadIdx.z;"));
+            assert!(src.contains("(gy + gz)"));
+        }
+    }
+
+    #[test]
+    fn subgroup_and_workgroup_templates_do_not_capture_user_locals() {
+        let source = r#"
+            @workgroup_size(64)
+            kernel shadow(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+                let v = src[id.x]
+                let o = src[id.x] + 1.0
+                let off = v * o
+                out[id.x] = subgroup_reduce_add(v + o)
+                out[id.x] = subgroup_scan_inclusive_add(off)
+                out[id.x] = workgroup_reduce_add(v)
+            }
+        "#;
+        let module = parse_compute(source).expect("parse shadowing kernel");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        for src in [&hip_source, &cuda_source] {
+            assert!(src.contains("auto __zsl_v = (v + o);"));
+            assert!(src.contains("auto __zsl_v = off;"));
+            assert!(src.contains("__zsl_wg_reduce_f32[threadIdx.x] = v;"));
+            assert!(!src.contains("auto v ="));
+            assert!(!src.contains("auto o ="));
+            assert!(!src.contains("auto off ="));
+        }
+        spirv::lower_compute(&module).expect("lower to SPIR-V");
+    }
+
+    #[test]
+    fn non_finite_f32_literals_use_builtin_constants() {
+        use crate::ir::node::{IrExpr, IrStmt};
+
+        let source = r#"
+            @workgroup_size(64)
+            kernel fill(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = 0.0
+            }
+        "#;
+        let cases = [
+            (f32::NAN, "__builtin_nanf(\"\")"),
+            (f32::INFINITY, "__builtin_inff()"),
+            (f32::NEG_INFINITY, "(-__builtin_inff())"),
+        ];
+        for (value, expected) in cases {
+            let mut module = parse_compute(source).expect("parse fill kernel");
+            let IrStmt::AssignBuffer { value: slot, .. } = &mut module.entry.body[0] else {
+                panic!("expected a buffer store as the first statement");
+            };
+            *slot = IrExpr::LitF32(value);
+            let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+            let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+            assert!(hip_source.contains(expected), "HIP: {hip_source}");
+            assert!(cuda_source.contains(expected), "CUDA: {cuda_source}");
+            assert!(!hip_source.contains("inff") || expected.contains("inff"));
+            assert!(!hip_source.contains("NaNf"));
+        }
+    }
+
+    #[test]
+    fn f32_builtins_reject_integer_operands_on_hip_and_cuda() {
+        let source = r#"
+            @workgroup_size(64)
+            kernel int_abs(src: device buffer<i32>, out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = abs(src[id.x])
+            }
+        "#;
+        let module = parse_compute(source).expect("parse integer abs kernel");
+        let expected = "abs() requires f32";
+        assert!(
+            hip::lower_compute(&module)
+                .err()
+                .expect("HIP must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            cuda::lower_compute(&module)
+                .err()
+                .expect("CUDA must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            spirv::lower_compute(&module)
+                .expect_err("SPIR-V must reject")
+                .message
+                .contains(expected)
+        );
+    }
+
+    #[test]
+    fn workgroup_reduce_rejects_multi_dimensional_workgroups() {
+        let source = r#"
+            @workgroup_size(16, 4)
+            kernel wg2d(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = workgroup_reduce_add(1.0)
+            }
+        "#;
+        let module = parse_compute(source).expect("parse 2D workgroup reduce");
+        let expected = "workgroup_reduce_* requires a 1D workgroup";
+        assert!(
+            hip::lower_compute(&module)
+                .err()
+                .expect("HIP must reject")
+                .message
+                .contains(expected)
+        );
+        assert!(
+            cuda::lower_compute(&module)
+                .err()
+                .expect("CUDA must reject")
                 .message
                 .contains(expected)
         );
