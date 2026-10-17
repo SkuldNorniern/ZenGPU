@@ -31,6 +31,7 @@
 //! `Cargo.toml`. It depends only on `zengpu-hal` and `zengpu-compute`, not
 //! on the root `zengpu` crate, so it works with any HAL-compatible backend.
 
+mod gemm_cuda;
 mod gemm_hip;
 mod gemm_skinny;
 mod gemm_tiled;
