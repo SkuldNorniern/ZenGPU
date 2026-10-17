@@ -367,6 +367,15 @@ fn compile_hip_src(
     Ok((code, origin))
 }
 
+/// Compiles `src` for `gfx` without a device and returns the code object size, so kernels can be
+/// checked for GPUs that are not installed.
+pub fn compile_for_target(src: &str, gfx: &str) -> Result<usize> {
+    let rocm = RocmVersion::runtime().min(RocmVersion::COMPILE_TIME);
+    let caps = HipCapabilities::for_family(rocm, rocm, GfxFamily::from_gfx(gfx));
+    let opts = caps.rtc_options(gfx);
+    Ok(compile_hip_src(src.as_bytes(), &opts, gfx, None)?.0.len())
+}
+
 fn evict_code(src: &[u8], opts: &[String], target: &str, disk: Option<&Path>) {
     if let Ok(mut cache) = code_cache().lock() {
         for bucket in cache.values_mut() {
