@@ -9,7 +9,7 @@ mod error;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
-use std::mem::take;
+use std::mem::{take, zeroed};
 use std::sync::{Arc, Mutex};
 use std::thread::yield_now;
 use std::time::{Duration, Instant};
@@ -421,18 +421,37 @@ enum Launch {
     },
 }
 
-#[derive(Clone, Copy)]
+/// Instantiated batch graph. The template `graph` lives beside `exec`, since parameter updates need
+/// its node handles.
+struct Replay {
+    graph: sys::CUgraph,
+    exec: sys::CUgraphExec,
+    /// One entry per op, in stream order, with the values its node was last set to.
+    nodes: Vec<(sys::CUgraphNode, Launch)>,
+}
+
+impl Replay {
+    /// Destroy exec and template. Context must be current.
+    fn destroy(self) {
+        // SAFETY: both handles came from `CudaShared::build_graph` and leave the cache here, once.
+        unsafe {
+            sys::cuGraphExecDestroy(self.exec);
+            sys::cuGraphDestroy(self.graph);
+        }
+    }
+}
+
 enum GraphEntry {
-    /// Launched once directly; the next identical batch is captured.
+    /// First sighting: launched directly. The next batch with this structure is built.
     Seen,
-    /// Instantiated graph, replayed with `cuGraphLaunch`.
-    Ready(sys::CUgraphExec),
-    /// Capture or instantiation failed; the batch is launched directly.
+    /// Instantiated graph, replayed with `cuGraphLaunch` after patching changed nodes.
+    Ready(Replay),
+    /// Build or patch failed. Always launched directly.
     Uncachable,
 }
 
-/// Per-device graph cache keyed by the exact resolved launch values. A hit replays the same kernels
-/// with the same pointers and scalars.
+/// Per-device graph cache, keyed by batch structure (see `plan_key`). A hit replays the same
+/// kernels and copies with the batch's values.
 #[derive(Default)]
 struct GraphCache {
     entries: HashMap<Vec<u64>, GraphEntry>,
@@ -443,16 +462,15 @@ impl GraphCache {
     /// Destroy all graphs and forget all entries. Context must be current.
     fn clear(&mut self) {
         for (_, entry) in self.entries.drain() {
-            if let GraphEntry::Ready(exec) = entry {
-                // SAFETY: `exec` came from cuGraphInstantiate_v2 and leaves the map here, once.
-                unsafe { sys::cuGraphExecDestroy(exec) };
+            if let GraphEntry::Ready(replay) = entry {
+                replay.destroy();
             }
         }
         self.ready = 0;
     }
 
-    /// Store an instantiated graph, evicting one at capacity. Context must be current.
-    fn insert_ready(&mut self, key: Vec<u64>, exec: sys::CUgraphExec) {
+    /// Store a built graph, evicting one at capacity. Context must be current.
+    fn insert_ready(&mut self, key: Vec<u64>, replay: Replay) {
         if self.ready >= GRAPH_MAX_READY {
             let victim = self
                 .entries
@@ -462,13 +480,20 @@ impl GraphCache {
             if let Some(victim) = victim
                 && let Some(GraphEntry::Ready(old)) = self.entries.remove(&victim)
             {
-                // SAFETY: `old` is no longer reachable through the cache.
-                unsafe { sys::cuGraphExecDestroy(old) };
+                old.destroy();
                 self.ready -= 1;
             }
         }
-        self.entries.insert(key, GraphEntry::Ready(exec));
+        self.entries.insert(key, GraphEntry::Ready(replay));
         self.ready += 1;
+    }
+
+    /// Replace `key`'s entry with `Uncachable`, destroying its graph. Context must be current.
+    fn disable(&mut self, key: Vec<u64>) {
+        if let Some(GraphEntry::Ready(replay)) = self.entries.insert(key, GraphEntry::Uncachable) {
+            replay.destroy();
+            self.ready -= 1;
+        }
     }
 
     /// Record a first sighting of `key`. Unready entries are dropped when too many build up.
@@ -481,6 +506,9 @@ impl GraphCache {
     }
 }
 
+/// Flattens a resolved batch to the values its graph topology depends on.
+///
+/// Pointers, scalars and copy addresses are patched into the nodes when they change.
 fn plan_key(plan: &[Launch]) -> Vec<u64> {
     const KERNEL_TAG: u64 = 0;
     const COPY_TAG: u64 = 1;
@@ -491,25 +519,96 @@ fn plan_key(plan: &[Launch]) -> Vec<u64> {
                 func,
                 grid,
                 block,
-                params,
                 n_params,
+                ..
             } => {
                 key.push(KERNEL_TAG);
                 key.push(*func as usize as u64);
                 key.extend(grid.iter().chain(block).map(|&v| u64::from(v)));
                 key.push(*n_params as u64);
-                key.extend(
-                    params[..*n_params]
-                        .iter()
-                        .map(|slot| u64::from_le_bytes(*slot)),
-                );
             }
-            Launch::Copy { dst, src, len } => {
-                key.extend([COPY_TAG, *dst, *src, *len as u64]);
+            Launch::Copy { len, .. } => {
+                key.extend([COPY_TAG, *len as u64]);
             }
         }
     }
     key
+}
+
+fn same_values(a: &Launch, b: &Launch) -> bool {
+    match (a, b) {
+        (
+            Launch::Kernel {
+                params: pa,
+                n_params: na,
+                ..
+            },
+            Launch::Kernel {
+                params: pb,
+                n_params: nb,
+                ..
+            },
+        ) => na == nb && pa[..*na] == pb[..*nb],
+        (
+            Launch::Copy {
+                dst: da,
+                src: sa,
+                len: la,
+            },
+            Launch::Copy {
+                dst: db,
+                src: sb,
+                len: lb,
+            },
+        ) => da == db && sa == sb && la == lb,
+        _ => false,
+    }
+}
+
+/// Pointers to the first `n_params` slots of `params`, in launch form. Valid only while
+/// `params` lives.
+fn kernel_arg_ptrs(
+    params: &mut [[u8; 8]; MAX_PARAMS],
+    n_params: usize,
+) -> [*mut c_void; MAX_PARAMS] {
+    let mut ptrs = [ptr::null_mut(); MAX_PARAMS];
+    for (arg, slot) in ptrs.iter_mut().zip(params.iter_mut()).take(n_params) {
+        *arg = slot.as_mut_ptr() as *mut c_void;
+    }
+    ptrs
+}
+
+fn kernel_node_params(
+    func: sys::CUfunction,
+    grid: [u32; 3],
+    block: [u32; 3],
+    args: *mut *mut c_void,
+) -> sys::CUDA_KERNEL_NODE_PARAMS {
+    sys::CUDA_KERNEL_NODE_PARAMS {
+        func,
+        gridDimX: grid[0],
+        gridDimY: grid[1],
+        gridDimZ: grid[2],
+        blockDimX: block[0],
+        blockDimY: block[1],
+        blockDimZ: block[2],
+        sharedMemBytes: 0,
+        kernelParams: args,
+        extra: ptr::null_mut(),
+    }
+}
+
+fn copy_node_params(dst: u64, src: u64, len: sys::size_t) -> sys::CUDA_MEMCPY3D {
+    // SAFETY: CUDA_MEMCPY3D is plain old data, and all-zero is a valid value for it.
+    let mut copy: sys::CUDA_MEMCPY3D = unsafe { zeroed() };
+    copy.srcMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = src;
+    copy.dstMemoryType = sys::CUmemorytype_enum_CU_MEMORYTYPE_DEVICE;
+    copy.dstDevice = dst;
+    copy.WidthInBytes = len;
+    copy.Height = 1;
+    copy.Depth = 1;
+    copy
 }
 
 /// Resolves ops in order until one fails. Returns the launches resolved so far along with the
@@ -614,9 +713,8 @@ impl CudaShared {
         waited
     }
 
-    /// Issues `plan` on the stream in order, for direct launches and graph capture.
-    ///
-    /// Context must be current and `ctx_lock` held.
+    /// Issues `plan` on the stream in order. The context must be current, and `ctx_lock` must
+    /// be held.
     fn issue(&self, plan: &[Launch]) -> Result<()> {
         for launch in plan {
             match *launch {
@@ -627,11 +725,7 @@ impl CudaShared {
                     mut params,
                     n_params,
                 } => {
-                    let mut kernel_params: [*mut c_void; MAX_PARAMS] =
-                        [ptr::null_mut(); MAX_PARAMS];
-                    for (i, slot) in params.iter_mut().take(n_params).enumerate() {
-                        kernel_params[i] = slot.as_mut_ptr() as *mut c_void;
-                    }
+                    let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
                     // SAFETY: each pointer aims into `params`, which lives across the call.
                     cu(unsafe {
                         sys::cuLaunchKernel(
@@ -658,76 +752,165 @@ impl CudaShared {
         Ok(())
     }
 
-    /// Records `plan` into an instantiated graph without running it.
+    /// Builds `plan` into an instantiated graph without running it.
     ///
-    /// Returns `None` if any step fails, with the capture ended. Context must be current.
-    fn capture(&self, plan: &[Launch]) -> Option<sys::CUgraphExec> {
-        // SAFETY: `stream` is this device's live stream and is not capturing.
-        cu(unsafe {
-            sys::cuStreamBeginCapture_v2(
-                self.stream,
-                sys::CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL,
-            )
-        })
-        .ok()?;
-        let recorded = self.issue(plan).is_ok();
+    /// Nodes chain in op order, matching stream order. Returns `None`, with nothing left behind, if
+    /// any step fails. The context must be current.
+    fn build_graph(&self, plan: &[Launch]) -> Option<Replay> {
         let mut graph: sys::CUgraph = ptr::null_mut();
-        // SAFETY: writes one graph handle into `graph`; this ends the capture on every path.
-        let ended = cu(unsafe { sys::cuStreamEndCapture(self.stream, &mut graph) }).is_ok();
-        if !recorded || !ended {
-            if !graph.is_null() {
-                // SAFETY: `graph` was produced by the EndCapture call above and is unused.
-                unsafe { sys::cuGraphDestroy(graph) };
-            }
+        // SAFETY: writes one graph handle into `graph`; no flags are set.
+        cu(unsafe { sys::cuGraphCreate(&mut graph, 0) }).ok()?;
+        let mut nodes = Vec::with_capacity(plan.len());
+        let added = self.add_nodes(graph, plan, &mut nodes).is_ok();
+        let mut exec: sys::CUgraphExec = ptr::null_mut();
+        // SAFETY: `graph` is complete at this point; no error-node or log output is requested.
+        let instantiated = added
+            && cu(unsafe {
+                sys::cuGraphInstantiate_v2(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0)
+            })
+            .is_ok();
+        if !instantiated {
+            // SAFETY: `graph` is not referenced again after this point.
+            unsafe { sys::cuGraphDestroy(graph) };
             return None;
         }
-        let mut exec: sys::CUgraphExec = ptr::null_mut();
-        // SAFETY: `graph` is the complete capture; no error-node or log output is requested.
-        let instantiated = cu(unsafe {
-            sys::cuGraphInstantiate_v2(&mut exec, graph, ptr::null_mut(), ptr::null_mut(), 0)
-        })
-        .is_ok();
-        // SAFETY: the template graph is not needed once instantiation has run.
-        unsafe { sys::cuGraphDestroy(graph) };
-        instantiated.then_some(exec)
+        Some(Replay { graph, exec, nodes })
     }
 
-    /// Launches `plan` for `op_count` ops. A batch is captured on its second sighting and replayed
-    /// after that.
+    /// Builds one node per op, each depending on the one before it. The context must be current.
+    fn add_nodes(
+        &self,
+        graph: sys::CUgraph,
+        plan: &[Launch],
+        nodes: &mut Vec<(sys::CUgraphNode, Launch)>,
+    ) -> Result<()> {
+        let mut prev: Option<sys::CUgraphNode> = None;
+        for launch in plan {
+            let deps = prev.as_slice();
+            let dep_count = sys::size_t::from(prev.is_some());
+            let mut node: sys::CUgraphNode = ptr::null_mut();
+            match *launch {
+                Launch::Kernel {
+                    func,
+                    grid,
+                    block,
+                    mut params,
+                    n_params,
+                } => {
+                    let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
+                    let node_params =
+                        kernel_node_params(func, grid, block, kernel_params.as_mut_ptr());
+                    // SAFETY: `deps` and `node_params` live across the call; values are copied into
+                    cu(unsafe {
+                        sys::cuGraphAddKernelNode(
+                            &mut node,
+                            graph,
+                            deps.as_ptr(),
+                            dep_count,
+                            &node_params,
+                        )
+                    })?;
+                }
+                Launch::Copy { dst, src, len } => {
+                    let copy = copy_node_params(dst, src, len);
+                    // SAFETY: `deps` and `copy` live across the call; ranges were bounds-checked
+                    cu(unsafe {
+                        sys::cuGraphAddMemcpyNode(
+                            &mut node,
+                            graph,
+                            deps.as_ptr(),
+                            dep_count,
+                            &copy,
+                            self.raw_ctx,
+                        )
+                    })?;
+                }
+            }
+            nodes.push((node, *launch));
+            prev = Some(node);
+        }
+        Ok(())
+    }
+
+    /// Brings `replay` up to `plan` (same structure) by setting only changed nodes. The exec
+    /// is updated in place, so topology and enqueued launches are unaffected. The context
+    /// must be current.
+    fn patch_nodes(&self, replay: &mut Replay, plan: &[Launch]) -> Result<()> {
+        let Replay { exec, nodes, .. } = replay;
+        debug_assert_eq!(nodes.len(), plan.len());
+        for ((node, applied), launch) in nodes.iter_mut().zip(plan) {
+            if same_values(applied, launch) {
+                continue;
+            }
+            match *launch {
+                Launch::Kernel {
+                    func,
+                    grid,
+                    block,
+                    mut params,
+                    n_params,
+                } => {
+                    let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
+                    let node_params =
+                        kernel_node_params(func, grid, block, kernel_params.as_mut_ptr());
+                    // SAFETY: `exec` and `node` belong to this graph and are live; values are
+                    cu(unsafe { sys::cuGraphExecKernelNodeSetParams(*exec, *node, &node_params) })?;
+                }
+                Launch::Copy { dst, src, len } => {
+                    let copy = copy_node_params(dst, src, len);
+                    // SAFETY: `exec` and `node` belong to this graph and are live; `copy` lives
+                    cu(unsafe {
+                        sys::cuGraphExecMemcpyNodeSetParams(*exec, *node, &copy, self.raw_ctx)
+                    })?;
+                }
+            }
+            *applied = *launch;
+        }
+        Ok(())
+    }
+
+    /// Launches `plan` for `op_count` ops.
     ///
-    /// Context must be current and `ctx_lock` held.
+    /// A structure seen before is captured on its second sighting. Later batches patch the changed
+    /// nodes and replay. The context must be current, and `ctx_lock` must be held.
     fn launch_plan(&self, plan: &[Launch], op_count: usize) -> Result<()> {
         if op_count < GRAPH_MIN_OPS || plan.is_empty() {
             return self.issue(plan);
         }
         let key = plan_key(plan);
         let mut graphs = self.graphs.lock().map_err(|_| GpuError::DeviceLost)?;
-        let entry = graphs.entries.get(&key).copied();
-        match entry {
-            Some(GraphEntry::Ready(exec)) => {
-                drop(graphs);
-                // SAFETY: `exec` is cached, so it is live; it is destroyed only under ctx_lock.
-                cu(unsafe { sys::cuGraphLaunch(exec, self.stream) })
-            }
+        match graphs.entries.get_mut(&key) {
+            Some(GraphEntry::Ready(replay)) => match self.patch_nodes(replay, plan) {
+                Ok(()) => {
+                    let exec = replay.exec;
+                    drop(graphs);
+                    // SAFETY: `exec` is cached, so it is live; it is destroyed only under ctx_lock.
+                    cu(unsafe { sys::cuGraphLaunch(exec, self.stream) })
+                }
+                Err(_) => {
+                    graphs.disable(key);
+                    drop(graphs);
+                    self.issue(plan)
+                }
+            },
             Some(GraphEntry::Uncachable) => {
                 drop(graphs);
                 self.issue(plan)
             }
             Some(GraphEntry::Seen) => {
                 drop(graphs);
-                let Some(exec) = self.capture(plan) else {
+                let Some(replay) = self.build_graph(plan) else {
                     self.graphs
                         .lock()
                         .map_err(|_| GpuError::DeviceLost)?
-                        .entries
-                        .insert(key, GraphEntry::Uncachable);
+                        .disable(key);
                     return self.issue(plan);
                 };
+                let exec = replay.exec;
                 match self.graphs.lock() {
-                    Ok(mut graphs) => graphs.insert_ready(key, exec),
+                    Ok(mut graphs) => graphs.insert_ready(key, replay),
                     Err(_) => {
-                        // SAFETY: nothing else holds `exec`; it is destroyed rather than leaked.
-                        unsafe { sys::cuGraphExecDestroy(exec) };
+                        replay.destroy();
                         return Err(GpuError::DeviceLost);
                     }
                 }
@@ -2765,5 +2948,168 @@ extern "C" __global__ void scale_add(float* out, float v, unsigned int n) {
         device.destroy_shader(shader);
         device.destroy_buffer(base);
         device.destroy_buffer(acc);
+    }
+    fn ready_graphs(device: &dyn GpuDevice) -> usize {
+        let device = device
+            .as_any()
+            .downcast_ref::<CudaDevice>()
+            .expect("cuda device");
+        device.shared.graphs.lock().unwrap().ready
+    }
+
+    #[test]
+    fn graph_replay_patches_changed_scalars() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let out = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(out, 0, &init).unwrap();
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        let mut total = 0.0f32;
+        for run in 0..6u32 {
+            let adds: Vec<f32> = (0..8u32).map(|k| (run * 10 + k) as f32).collect();
+            total += adds.iter().sum::<f32>();
+            submit_accum(&*device, pipeline, out, &adds, N as u32);
+            let expected: Vec<f32> = (0..N).map(|i| i as f32 + total).collect();
+            assert_eq!(read_f32(&*device, out, N), expected, "run {run}");
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(out);
+    }
+
+    #[test]
+    fn graph_replay_follows_changed_buffers() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let outs = [graph_buffer(&*device, size), graph_buffer(&*device, size)];
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        for &out in &outs {
+            device.write_buffer(out, 0, &init).unwrap();
+        }
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        let adds = [1.0, 2.0, 3.0, 4.0];
+        let mut totals = [0.0f32; 2];
+        for run in 0..6 {
+            let which = run % 2;
+            submit_accum(&*device, pipeline, outs[which], &adds, N as u32);
+            totals[which] += 10.0;
+            for (out, total) in outs.iter().zip(totals) {
+                let expected: Vec<f32> = (0..N).map(|i| i as f32 + total).collect();
+                assert_eq!(read_f32(&*device, *out, N), expected, "run {run}");
+            }
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for out in outs {
+            device.destroy_buffer(out);
+        }
+    }
+
+    #[test]
+    fn graph_replay_follows_changed_copy_buffers() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let mut bases = Vec::new();
+        for offset in [0.0f32, 1000.0] {
+            let base = device
+                .create_buffer(BufferDesc {
+                    size,
+                    usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                    memory: zengpu_hal::MemoryUsage::GpuOnly,
+                })
+                .unwrap();
+            let init: Vec<u8> = (0..N)
+                .flat_map(|i| (offset + i as f32).to_le_bytes())
+                .collect();
+            device.write_buffer(base, 0, &init).unwrap();
+            bases.push(base);
+        }
+        let accs = [graph_buffer(&*device, size), graph_buffer(&*device, size)];
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        const ADDS: [f32; 3] = [1.0, 2.0, 3.0];
+        for run in 0..6 {
+            let k = run % 2;
+            let slots = [accs[k].index()];
+            let scalars: Vec<[Scalar; 2]> = ADDS
+                .iter()
+                .map(|&v| [Scalar::F32(v), Scalar::U32(N as u32)])
+                .collect();
+            let copy = zengpu_hal::BufferCopyOp {
+                src: bases[k],
+                src_offset: 0,
+                dst: accs[k],
+                dst_offset: 0,
+                len: size,
+            };
+            let mut ops = vec![ComputeOp::CopyBuffer(copy)];
+            ops.extend(scalars.iter().map(|s| {
+                ComputeOp::Dispatch(zengpu_hal::DispatchOp {
+                    pipeline,
+                    bindings: Bindings {
+                        buffers: &slots,
+                        scalars: s,
+                        textures: &[],
+                        images: &[],
+                    },
+                    grid: [(N as u32).div_ceil(64), 1, 1],
+                })
+            }));
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let base_value = if k == 0 { 0.0 } else { 1000.0 };
+            let expected: Vec<f32> = (0..N).map(|i| base_value + i as f32 + 6.0).collect();
+            assert_eq!(read_f32(&*device, accs[k], N), expected, "run {run}");
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for base in bases {
+            device.destroy_buffer(base);
+        }
+        for acc in accs {
+            device.destroy_buffer(acc);
+        }
     }
 }
