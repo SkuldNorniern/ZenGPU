@@ -491,13 +491,11 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
         IrBinOp::Ne => "!=",
         IrBinOp::And => "&&",
         IrBinOp::Or => "||",
-        IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            return Err(Diagnostic::new(
-                DiagnosticCode::Unsupported,
-                "MSL backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
-                 this ZSL source is SPIR-V-only today",
-            ));
-        }
+        IrBinOp::BitAnd => "&",
+        IrBinOp::BitOr => "|",
+        IrBinOp::BitXor => "^",
+        IrBinOp::Shl => "<<",
+        IrBinOp::Shr => ">>",
     })
 }
 

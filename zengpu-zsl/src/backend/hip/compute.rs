@@ -571,17 +571,11 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 IrBinOp::Ne => "!=",
                 IrBinOp::And => "&&",
                 IrBinOp::Or => "||",
-                IrBinOp::BitAnd
-                | IrBinOp::BitOr
-                | IrBinOp::BitXor
-                | IrBinOp::Shl
-                | IrBinOp::Shr => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::Unsupported,
-                        "HIP backend: bitwise operators (&, |, ^, <<, >>) are not yet supported; \
-                         this ZSL source is SPIR-V-only today",
-                    ));
-                }
+                IrBinOp::BitAnd => "&",
+                IrBinOp::BitOr => "|",
+                IrBinOp::BitXor => "^",
+                IrBinOp::Shl => "<<",
+                IrBinOp::Shr => ">>",
             };
             format!(
                 "({} {} {})",
