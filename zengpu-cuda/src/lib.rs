@@ -303,6 +303,8 @@ struct CudaShader {
     module: sys::CUmodule,
     // Keep the module image alive for the module's lifetime.
     _image: ModuleImage,
+    /// CUDA C++ text the module was compiled from, read for kernel signatures.
+    source: Option<String>,
 }
 
 // SAFETY: CUmodule is an opaque handle; all access is serialised through ctx_lock.
@@ -315,6 +317,10 @@ unsafe impl Sync for CudaShader {}
 struct CudaPipeline {
     func: sys::CUfunction,
     block: [u32; 3],
+    /// Number of pointer parameters in the kernel signature. Zero when it was not readable.
+    ptr_params: usize,
+    /// Bit `i` is set when pointer parameter `i` may be written. See `writes_buffer`.
+    writes: u32,
 }
 
 // SAFETY: CUfunction is an opaque handle; all access is serialised through ctx_lock.
@@ -436,11 +442,18 @@ enum Launch {
         /// Each parameter takes an 8-byte slot; scalars use the low 4 bytes.
         params: [[u8; 8]; MAX_PARAMS],
         n_params: usize,
+        /// The first `n_buffers` parameters are buffer base pointers, the rest scalars.
+        n_buffers: usize,
+        /// Written-buffer bits, indexed like the buffer parameters. See `writes_buffer`.
+        writes: u32,
     },
     Copy {
         dst: u64,
         src: u64,
         len: sys::size_t,
+        /// Base pointers of the whole buffers, so a sub-range maps to its buffer.
+        dst_buf: u64,
+        src_buf: u64,
     },
 }
 
@@ -529,13 +542,49 @@ impl GraphCache {
     }
 }
 
+/// Whether pointer parameter `i` of a kernel may be written. Parameters past bit 31 are
+/// assumed to be written.
+fn writes_buffer(writes: u32, i: usize) -> bool {
+    i >= 32 || (writes >> i) & 1 != 0
+}
+
+/// Buffers a launch touches, as `(base device pointer, written)`, in parameter order.
+fn launch_accesses(launch: &Launch, out: &mut Vec<(u64, bool)>) {
+    out.clear();
+    match launch {
+        Launch::Kernel {
+            params,
+            n_buffers,
+            writes,
+            ..
+        } => {
+            for (i, slot) in params.iter().enumerate().take(*n_buffers) {
+                out.push((u64::from_le_bytes(*slot), writes_buffer(*writes, i)));
+            }
+        }
+        Launch::Copy {
+            src_buf, dst_buf, ..
+        } => {
+            out.push((*src_buf, false));
+            out.push((*dst_buf, true));
+        }
+    }
+}
+
 /// Flatten the structure of a resolved batch: everything a graph's topology depends on.
 /// Pointers, scalar values and copy addresses are left out; they are patched into the
-/// nodes when they change.
+/// nodes when they change. Buffers are replaced by their first-occurrence number in the
+/// batch, so the key also records which launches share a buffer.
 fn plan_key(plan: &[Launch]) -> Vec<u64> {
     const KERNEL_TAG: u64 = 0;
     const COPY_TAG: u64 = 1;
     let mut key = Vec::new();
+    let mut ids: HashMap<u64, u64> = HashMap::new();
+    let mut accesses = Vec::new();
+    let mut id_of = |base: u64| {
+        let next = ids.len() as u64;
+        *ids.entry(base).or_insert(next)
+    };
     for launch in plan {
         match launch {
             Launch::Kernel {
@@ -543,19 +592,138 @@ fn plan_key(plan: &[Launch]) -> Vec<u64> {
                 grid,
                 block,
                 n_params,
+                n_buffers,
+                writes,
                 ..
             } => {
                 key.push(KERNEL_TAG);
                 key.push(*func as usize as u64);
                 key.extend(grid.iter().chain(block).map(|&v| u64::from(v)));
-                key.push(*n_params as u64);
+                key.extend([*n_params as u64, *n_buffers as u64, u64::from(*writes)]);
+                launch_accesses(launch, &mut accesses);
+                key.extend(accesses.iter().map(|&(base, _)| id_of(base)));
             }
-            Launch::Copy { len, .. } => {
-                key.extend([COPY_TAG, *len as u64]);
+            Launch::Copy {
+                len,
+                dst_buf,
+                src_buf,
+                ..
+            } => {
+                key.extend([COPY_TAG, *len as u64, id_of(*src_buf), id_of(*dst_buf)]);
             }
         }
     }
     key
+}
+
+/// For each launch of `plan`, the earlier launches it must wait for. A launch depends on
+/// the last writer of every buffer it touches (RAW and WAW), and a writer also depends on
+/// every reader of its buffer since that writer (WAR). Indices are sorted and unique.
+fn launch_deps(plan: &[Launch]) -> Vec<Vec<usize>> {
+    #[derive(Default)]
+    struct Resource {
+        last_writer: Option<usize>,
+        readers: Vec<usize>,
+    }
+    let mut resources: HashMap<u64, Resource> = HashMap::new();
+    let mut accesses = Vec::new();
+    let mut all_deps = Vec::with_capacity(plan.len());
+    for (i, launch) in plan.iter().enumerate() {
+        launch_accesses(launch, &mut accesses);
+        let mut deps = Vec::new();
+        for &(base, written) in &accesses {
+            if let Some(res) = resources.get(&base) {
+                deps.extend(res.last_writer);
+                if written {
+                    deps.extend(res.readers.iter().copied());
+                }
+            }
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        all_deps.push(deps);
+        for &(base, written) in &accesses {
+            let res = resources.entry(base).or_default();
+            if written {
+                res.last_writer = Some(i);
+                res.readers.clear();
+            } else if !accesses.iter().any(|&(b, w)| b == base && w) {
+                res.readers.push(i);
+            }
+        }
+    }
+    all_deps
+}
+
+/// Parse the pointer parameters of kernel `entry` in CUDA C++ `src`. Each entry is whether
+/// that parameter may be written: a pointer is read-only only if `const` precedes its `*`.
+/// Returns None when the signature cannot be read reliably: no such kernel, or a parameter
+/// list with templates, macros, arrays or function pointers.
+fn kernel_pointer_writes(src: &str, entry: &str) -> Option<Vec<bool>> {
+    const GLOBAL: &str = "__global__";
+    let mut from = 0;
+    while let Some(pos) = src[from..].find(GLOBAL) {
+        let start = from + pos + GLOBAL.len();
+        from = start;
+        let header_end = src[start..].find('{').map_or(src.len(), |end| start + end);
+        let header = &src[start..header_end];
+        let Some(open) = find_call_open(header, entry) else {
+            continue;
+        };
+        let body = &header[open + 1..];
+        let mut depth = 0usize;
+        let close = body.char_indices().find_map(|(i, c)| match c {
+            '(' => {
+                depth += 1;
+                None
+            }
+            ')' if depth == 0 => Some(i),
+            ')' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })?;
+        let params = &body[..close];
+        if params.contains(['<', '>', '#', '[', '(']) {
+            return None;
+        }
+        let mut writes = Vec::new();
+        for param in params.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            let Some(star) = param.find('*') else {
+                continue;
+            };
+            let read_only = param[..star]
+                .split(|c: char| !is_ident_char(c))
+                .any(|word| word == "const");
+            writes.push(!read_only);
+        }
+        return Some(writes);
+    }
+    None
+}
+
+/// Byte offset of the `(` that follows the whole identifier `name` in `text`, if any.
+fn find_call_open(text: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let at = from + pos;
+        from = at + name.len();
+        let whole = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ident_char(c));
+        let rest = text[from..].trim_start();
+        if whole && rest.starts_with('(') {
+            return Some(text.len() - rest.len());
+        }
+    }
+    None
+}
+
+/// Whether `c` can appear in a C identifier.
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
 }
 
 /// Whether two launches with the same structure carry the same values.
@@ -578,11 +746,13 @@ fn same_values(a: &Launch, b: &Launch) -> bool {
                 dst: da,
                 src: sa,
                 len: la,
+                ..
             },
             Launch::Copy {
                 dst: db,
                 src: sb,
                 len: lb,
+                ..
             },
         ) => da == db && sa == sb && la == lb,
         _ => false,
@@ -757,6 +927,7 @@ impl CudaShared {
                     block,
                     mut params,
                     n_params,
+                    ..
                 } => {
                     let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
                     // SAFETY: each pointer aims into `params`, which lives across the call.
@@ -776,7 +947,7 @@ impl CudaShared {
                         )
                     })?;
                 }
-                Launch::Copy { dst, src, len } => {
+                Launch::Copy { dst, src, len, .. } => {
                     // SAFETY: both ranges were bounds-checked against their buffers when resolved.
                     cu(unsafe { sys::cuMemcpyDtoDAsync_v2(dst, src, len, self.stream) })?;
                 }
@@ -785,9 +956,10 @@ impl CudaShared {
         Ok(())
     }
 
-    /// Build `plan` into a graph and instantiate it without executing anything. The
-    /// nodes form a chain in op order, which matches stream order. Returns None, with
-    /// nothing left behind, if any step fails. The context must be current.
+    /// Build `plan` into a graph and instantiate it without executing anything. Each node
+    /// depends only on the earlier nodes it shares a buffer hazard with (see `launch_deps`),
+    /// so independent launches may run concurrently. Returns None, with nothing left behind,
+    /// if any step fails. The context must be current.
     fn build_graph(&self, plan: &[Launch]) -> Option<Replay> {
         let mut graph: sys::CUgraph = ptr::null_mut();
         // SAFETY: writes one graph handle into `graph`; no flags are set.
@@ -809,18 +981,17 @@ impl CudaShared {
         Some(Replay { graph, exec, nodes })
     }
 
-    /// Add one node per op to `graph`, each depending on the node before it, and record
-    /// the values each node is given. The context must be current.
+    /// Add one node per op to `graph`, each depending on the nodes `launch_deps` gives for
+    /// it, and record the values each node is given. The context must be current.
     fn add_nodes(
         &self,
         graph: sys::CUgraph,
         plan: &[Launch],
         nodes: &mut Vec<(sys::CUgraphNode, Launch)>,
     ) -> Result<()> {
-        let mut prev: Option<sys::CUgraphNode> = None;
-        for launch in plan {
-            let deps = prev.as_slice();
-            let dep_count = sys::size_t::from(prev.is_some());
+        for (launch, dep_ids) in plan.iter().zip(launch_deps(plan)) {
+            let deps: Vec<sys::CUgraphNode> = dep_ids.iter().map(|&j| nodes[j].0).collect();
+            let dep_count = driver_len(deps.len())?;
             let mut node: sys::CUgraphNode = ptr::null_mut();
             match *launch {
                 Launch::Kernel {
@@ -829,6 +1000,7 @@ impl CudaShared {
                     block,
                     mut params,
                     n_params,
+                    ..
                 } => {
                     let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
                     let node_params =
@@ -845,7 +1017,7 @@ impl CudaShared {
                         )
                     })?;
                 }
-                Launch::Copy { dst, src, len } => {
+                Launch::Copy { dst, src, len, .. } => {
                     let copy = copy_node_params(dst, src, len);
                     // SAFETY: `deps` and `copy` live across the call; both ranges were
                     // bounds-checked against their buffers when resolved.
@@ -862,7 +1034,6 @@ impl CudaShared {
                 }
             }
             nodes.push((node, *launch));
-            prev = Some(node);
         }
         Ok(())
     }
@@ -884,6 +1055,7 @@ impl CudaShared {
                     block,
                     mut params,
                     n_params,
+                    ..
                 } => {
                     let mut kernel_params = kernel_arg_ptrs(&mut params, n_params);
                     let node_params =
@@ -892,7 +1064,7 @@ impl CudaShared {
                     // parameter values are copied during the call.
                     cu(unsafe { sys::cuGraphExecKernelNodeSetParams(*exec, *node, &node_params) })?;
                 }
-                Launch::Copy { dst, src, len } => {
+                Launch::Copy { dst, src, len, .. } => {
                     let copy = copy_node_params(dst, src, len);
                     // SAFETY: `exec` and `node` belong to this graph and are live; `copy`
                     // lives across the call.
@@ -908,8 +1080,9 @@ impl CudaShared {
 
     /// Launch `plan` for a batch of `op_count` ops. A batch structure seen before is built
     /// into a graph on its second sighting. Later batches of that structure patch the
-    /// nodes whose values changed and replay. The context must be current and `ctx_lock`
-    /// held.
+    /// nodes whose values changed and replay. The structure includes which launches share
+    /// buffers, so a replayed graph keeps the dependencies it was built with. The context
+    /// must be current and `ctx_lock` held.
     fn launch_plan(&self, plan: &[Launch], op_count: usize) -> Result<()> {
         if op_count < GRAPH_MIN_OPS || plan.is_empty() {
             return self.issue(plan);
@@ -1330,12 +1503,21 @@ impl CudaDevice {
             params[n_params][..4].copy_from_slice(&bytes);
             n_params += 1;
         }
+        let n_buffers = op.bindings.buffers.len();
+        // Buffers beyond the signature's pointer parameters are unknown, so count them as written.
+        let writes = if n_buffers <= cp.ptr_params {
+            cp.writes
+        } else {
+            u32::MAX
+        };
         Ok(Launch::Kernel {
             func: cp.func,
             grid: op.grid,
             block: cp.block,
             params,
             n_params,
+            n_buffers,
+            writes,
         })
     }
 
@@ -1394,6 +1576,8 @@ impl CudaDevice {
             dst: dst.ptr + copy.dst_offset,
             src: src.ptr + copy.src_offset,
             len,
+            dst_buf: dst.ptr,
+            src_buf: src.ptr,
         }))
     }
 }
@@ -1651,9 +1835,13 @@ impl GpuDevice for CudaDevice {
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 
     fn create_shader(&self, desc: ShaderDesc<'_>) -> Result<ShaderHandle> {
+        let mut source = None;
         let mut image = match desc.source {
             ShaderSource::Ptx(ptx) => ModuleImage::Ptx(ptx.to_vec()),
-            ShaderSource::CudaSrc(src) => nvrtc_compile(src, self.shared.sm)?,
+            ShaderSource::CudaSrc(src) => {
+                source = str::from_utf8(src).ok().map(str::to_owned);
+                nvrtc_compile(src, self.shared.sm)?
+            }
             _ => {
                 return Err(GpuError::Backend(
                     "cuda: only PTX or CUDA C++ (CudaSrc) shaders are supported".into(),
@@ -1679,6 +1867,7 @@ impl GpuDevice for CudaDevice {
             .insert(CudaShader {
                 module,
                 _image: image,
+                source,
             });
         Ok(handle)
     }
@@ -1713,12 +1902,18 @@ impl GpuDevice for CudaDevice {
     }
 
     fn create_compute_pipeline(&self, desc: ComputePipelineDesc<'_>) -> Result<PipelineHandle> {
-        let module = self
+        let (module, signature) = self
             .shaders
             .lock()
             .map_err(|_| GpuError::DeviceLost)?
             .get(desc.shader)
-            .map(|s| s.module)
+            .map(|s| {
+                let signature = s
+                    .source
+                    .as_deref()
+                    .and_then(|src| kernel_pointer_writes(src, desc.entry));
+                (s.module, signature)
+            })
             .ok_or_else(|| GpuError::Backend("cuda: invalid shader handle".into()))?;
 
         let entry = CString::new(desc.entry)
@@ -1735,11 +1930,25 @@ impl GpuDevice for CudaDevice {
         } else {
             desc.block
         };
+        // An unreadable signature keeps `ptr_params` at zero, so every buffer counts as written.
+        let (ptr_params, writes) = signature.map_or((0, 0), |written| {
+            let mask = written
+                .iter()
+                .take(32)
+                .enumerate()
+                .fold(0u32, |mask, (i, &w)| if w { mask | 1 << i } else { mask });
+            (written.len(), mask)
+        });
         let handle = self
             .pipelines
             .lock()
             .map_err(|_| GpuError::DeviceLost)?
-            .insert(CudaPipeline { func, block });
+            .insert(CudaPipeline {
+                func,
+                block,
+                ptr_params,
+                writes,
+            });
         Ok(handle)
     }
 
@@ -2823,6 +3032,23 @@ extern "C" __global__ void scale_add(float* out, float v, unsigned int n) {
 }
 "#;
 
+    /// `copy_add` writes `in + v` to `out`; `fill` writes `v` to `out`.
+    const COPY_FILL_CUDA: &str = r#"
+extern "C" __global__ void copy_add(const float* in, float* out, float v, unsigned int n) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = in[i] + v;
+    }
+}
+
+extern "C" __global__ void fill(float* out, float v, unsigned int n) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        out[i] = v;
+    }
+}
+"#;
+
     /// Device buffer that can be read back, copied from and dispatched on.
     fn graph_buffer(device: &dyn GpuDevice, size: u64) -> BufferHandle {
         device
@@ -3219,6 +3445,309 @@ extern "C" __global__ void scale_add(float* out, float v, unsigned int n) {
         }
         for acc in accs {
             device.destroy_buffer(acc);
+        }
+    }
+
+    /// One dispatch of `pipeline` over `slots` and `scalars`, covering `n` elements.
+    fn graph_op<'a>(
+        pipeline: PipelineHandle,
+        slots: &'a [u32],
+        scalars: &'a [Scalar],
+        n: u32,
+    ) -> ComputeOp<'a> {
+        ComputeOp::Dispatch(zengpu_hal::DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: slots,
+                scalars,
+                textures: &[],
+                images: &[],
+            },
+            grid: [n.div_ceil(64), 1, 1],
+        })
+    }
+
+    #[test]
+    fn kernel_signature_reads_const_pointers_as_read_only() {
+        let zsl_style = r#"
+extern "C" __global__ __launch_bounds__(64)
+void trig(
+    const float* __restrict__ src,
+    float* __restrict__ out,
+    unsigned int len
+) {
+}
+"#;
+        assert_eq!(
+            kernel_pointer_writes(zsl_style, "trig"),
+            Some(vec![false, true])
+        );
+        let qualifiers =
+            "__global__ void k(const float* const a, float* const b, const unsigned int n) {}";
+        assert_eq!(
+            kernel_pointer_writes(qualifiers, "k"),
+            Some(vec![false, true])
+        );
+    }
+
+    #[test]
+    fn kernel_signature_matches_whole_entry_names() {
+        let two =
+            "__global__ void foo2(float* a) {}\n__global__ void foo(const float* a, float* b) {}";
+        assert_eq!(kernel_pointer_writes(two, "foo"), Some(vec![false, true]));
+        assert_eq!(kernel_pointer_writes(two, "foo2"), Some(vec![true]));
+        let suffix = "__global__ void my_foo(float* a) {}\n__global__ void foo(const float* a) {}";
+        assert_eq!(kernel_pointer_writes(suffix, "foo"), Some(vec![false]));
+    }
+
+    #[test]
+    fn kernel_signature_falls_back_when_unreadable() {
+        // Not a kernel, no such kernel, or a parameter list the scan does not model.
+        assert_eq!(kernel_pointer_writes("void k(float* a) {}", "k"), None);
+        assert_eq!(
+            kernel_pointer_writes("__global__ void k(float* a) {}", "other"),
+            None
+        );
+        assert_eq!(
+            kernel_pointer_writes("__global__ void k(Buf<float*, int> b) {}", "k"),
+            None
+        );
+        assert_eq!(
+            kernel_pointer_writes("__global__ void k(float a[], float* b) {}", "k"),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_deps_follow_buffer_hazards() {
+        // Kernel over buffers `(base, written)`, in parameter order.
+        let kernel = |bufs: &[(u64, bool)]| {
+            let mut params = [[0u8; 8]; MAX_PARAMS];
+            let mut writes = 0u32;
+            for (i, &(base, written)) in bufs.iter().enumerate() {
+                params[i] = base.to_le_bytes();
+                if written {
+                    writes |= 1 << i;
+                }
+            }
+            Launch::Kernel {
+                func: ptr::null_mut(),
+                grid: [1, 1, 1],
+                block: [1, 1, 1],
+                params,
+                n_params: bufs.len(),
+                n_buffers: bufs.len(),
+                writes,
+            }
+        };
+        let plan = [
+            kernel(&[(1, true)]),              // 0: writes A
+            kernel(&[(1, false)]),             // 1: reads A (RAW on 0)
+            kernel(&[(1, false)]),             // 2: reads A (RAW on 0)
+            kernel(&[(1, true)]),              // 3: writes A (WAW on 0, WAR on 1 and 2)
+            kernel(&[(2, true)]),              // 4: writes B, independent
+            kernel(&[(1, false), (2, false)]), // 5: reads A and B
+            kernel(&[(3, true), (3, true)]),   // 6: writes C through two parameters
+        ];
+        assert_eq!(
+            launch_deps(&plan),
+            vec![
+                vec![],
+                vec![0],
+                vec![0],
+                vec![0, 1, 2],
+                vec![],
+                vec![3, 4],
+                vec![],
+            ]
+        );
+        // Same buffer pattern, different buffers: same key. Shared buffer versus distinct: different.
+        assert_eq!(
+            plan_key(&[kernel(&[(7, false), (8, true)])]),
+            plan_key(&[kernel(&[(9, false), (5, true)])])
+        );
+        assert_ne!(
+            plan_key(&[kernel(&[(7, false), (7, true)])]),
+            plan_key(&[kernel(&[(7, false), (8, true)])])
+        );
+    }
+
+    #[test]
+    fn graph_chain_through_distinct_buffers_honours_dependencies() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        const STAGES: usize = 8;
+        let size = (N * size_of::<f32>()) as u64;
+        let bufs: Vec<BufferHandle> = (0..=STAGES).map(|_| graph_buffer(&*device, size)).collect();
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(COPY_FILL_CUDA))
+            .expect("compile copy_add");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "copy_add",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        // Stage k reads buffer k and writes buffer k + 1, so each stage waits for the one before.
+        // Every run starts from new input, so a stage that ran early would read the previous run.
+        let slots: Vec<[u32; 2]> = (0..STAGES)
+            .map(|k| [bufs[k].index(), bufs[k + 1].index()])
+            .collect();
+        let adds: Vec<[Scalar; 2]> = (0..STAGES)
+            .map(|k| [Scalar::F32((k + 1) as f32), Scalar::U32(N as u32)])
+            .collect();
+        let total: f32 = (1..=STAGES).map(|v| v as f32).sum();
+        for run in 0..4 {
+            let input: Vec<u8> = (0..N)
+                .flat_map(|i| ((run * 1000 + i) as f32).to_le_bytes())
+                .collect();
+            device.write_buffer(bufs[0], 0, &input).unwrap();
+            let ops: Vec<ComputeOp<'_>> = (0..STAGES)
+                .map(|k| graph_op(pipeline, &slots[k], &adds[k], N as u32))
+                .collect();
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let expected: Vec<f32> = (0..N).map(|i| (run * 1000 + i) as f32 + total).collect();
+            assert_eq!(read_f32(&*device, bufs[STAGES], N), expected, "run {run}");
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for buf in bufs {
+            device.destroy_buffer(buf);
+        }
+    }
+
+    #[test]
+    fn graph_replay_honours_write_after_read() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let x = graph_buffer(&*device, size);
+        let y = graph_buffer(&*device, size);
+        let z = graph_buffer(&*device, size);
+        let w = graph_buffer(&*device, size);
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(COPY_FILL_CUDA))
+            .expect("compile kernels");
+        let copy = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "copy_add",
+                block: [64, 1, 1],
+            })
+            .expect("create copy pipeline");
+        let fill = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "fill",
+                block: [64, 1, 1],
+            })
+            .expect("create fill pipeline");
+
+        // Op 0 reads X into Y, op 1 then overwrites X. Op 0 must read the old X: a run that
+        // reversed them would leave Y at 1000.
+        let (x_slot, y_slot, z_slot, w_slot) = (x.index(), y.index(), z.index(), w.index());
+        let zero = [Scalar::F32(0.0), Scalar::U32(N as u32)];
+        let thousand = [Scalar::F32(1000.0), Scalar::U32(N as u32)];
+        let two = [Scalar::F32(2.0), Scalar::U32(N as u32)];
+        let x_only = [x_slot];
+        let x_to_y = [x_slot, y_slot];
+        let x_to_z = [x_slot, z_slot];
+        let y_to_w = [y_slot, w_slot];
+        let thousands: Vec<f32> = vec![1000.0; N];
+        for run in 0..4 {
+            let old: Vec<u8> = (0..N)
+                .flat_map(|i| ((run * 100 + i) as f32).to_le_bytes())
+                .collect();
+            device.write_buffer(x, 0, &old).unwrap();
+            let ops = [
+                graph_op(copy, &x_to_y, &zero, N as u32),
+                graph_op(fill, &x_only, &thousand, N as u32),
+                graph_op(copy, &x_to_z, &two, N as u32),
+                graph_op(copy, &y_to_w, &zero, N as u32),
+            ];
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let old_values: Vec<f32> = (0..N).map(|i| (run * 100 + i) as f32).collect();
+            assert_eq!(read_f32(&*device, y, N), old_values, "run {run}: Y");
+            assert_eq!(read_f32(&*device, w, N), old_values, "run {run}: W");
+            assert_eq!(read_f32(&*device, x, N), thousands, "run {run}: X");
+            assert_eq!(read_f32(&*device, z, N), vec![1002.0; N], "run {run}: Z");
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(copy);
+        device.destroy_pipeline(fill);
+        device.destroy_shader(shader);
+        for buf in [x, y, z, w] {
+            device.destroy_buffer(buf);
+        }
+    }
+
+    #[test]
+    fn graph_replay_runs_independent_ops_exactly() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        const OPS: usize = 8;
+        let size = (N * size_of::<f32>()) as u64;
+        let ins: Vec<BufferHandle> = (0..OPS).map(|_| graph_buffer(&*device, size)).collect();
+        let outs: Vec<BufferHandle> = (0..OPS).map(|_| graph_buffer(&*device, size)).collect();
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(COPY_FILL_CUDA))
+            .expect("compile copy_add");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "copy_add",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        // Each op reads its own input and writes its own output, so no op waits for another.
+        let slots: Vec<[u32; 2]> = (0..OPS)
+            .map(|k| [ins[k].index(), outs[k].index()])
+            .collect();
+        let adds: Vec<[Scalar; 2]> = (0..OPS)
+            .map(|k| [Scalar::F32((k + 1) as f32), Scalar::U32(N as u32)])
+            .collect();
+        for run in 0..4 {
+            for (k, &input) in ins.iter().enumerate() {
+                let bytes: Vec<u8> = (0..N)
+                    .flat_map(|i| ((run * 1000 + k * 10 + i) as f32).to_le_bytes())
+                    .collect();
+                device.write_buffer(input, 0, &bytes).unwrap();
+            }
+            let ops: Vec<ComputeOp<'_>> = (0..OPS)
+                .map(|k| graph_op(pipeline, &slots[k], &adds[k], N as u32))
+                .collect();
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            for (k, &out) in outs.iter().enumerate() {
+                let expected: Vec<f32> = (0..N)
+                    .map(|i| (run * 1000 + k * 10 + i) as f32 + (k + 1) as f32)
+                    .collect();
+                assert_eq!(read_f32(&*device, out, N), expected, "run {run} op {k}");
+            }
+        }
+        assert_eq!(ready_graphs(&*device), 1);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        for buf in ins.into_iter().chain(outs) {
+            device.destroy_buffer(buf);
         }
     }
 }
