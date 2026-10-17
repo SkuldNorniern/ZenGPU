@@ -70,7 +70,7 @@ impl PinnedPool {
     }
 
     /// Frees cached blocks until at most `keep` bytes remain.
-    fn trim(&self, keep: usize) {
+    pub(crate) fn trim(&self, keep: usize) {
         let Ok(mut free) = self.0.lock() else { return };
         let mut total: usize = free.iter().map(|b| b.cap).sum();
         while total > keep {

@@ -1039,6 +1039,8 @@ impl Drop for HipCore {
             hipStreamDestroy(self.upload);
             hipStreamDestroy(self.download);
         }
+        self.pinned.trim(0);
+        alloc::wait_for_frees(Duration::from_secs(5));
     }
 }
 
