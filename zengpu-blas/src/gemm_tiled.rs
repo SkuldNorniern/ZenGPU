@@ -1,10 +1,10 @@
 //! Register-blocked f32 GEMM in ZSL, for backends that take ZSL output.
 //!
 //! Each 16×16 workgroup computes a 128×128 tile of C. Per 8-deep K slice it stages A (transposed,
-//! `at[k * 128 + m]`) and B (`bt[k * 128 + n]`) in shared memory, zero-filling past the edges. Each
+//! `at[k * 132 + m]`) and B (`bt[k * 128 + n]`) in shared memory, zero-filling past the edges. Each
 //! thread accumulates an 8×8 block in registers with a 16-element stride, so shared reads are
-//! conflict-free. ZSL has no local arrays, so the 64 accumulators are scalars `cI_J` and loads and
-//! stores are unrolled.
+//! conflict-free. A rows are padded to 132 so the transposed stores do not share a bank. ZSL has no
+//! local arrays, so the 64 accumulators are scalars `cI_J` and loads and stores are unrolled.
 
 use zengpu_spirv::{ZslShader, zsl};
 
@@ -14,7 +14,7 @@ pub(crate) const GEMM_TILED_ZSL: ZslShader = zsl!(
     push P { m: u32, n: u32, k: u32, alpha: f32 }
     @workgroup_size(16, 16)
     kernel cs_gemm_tiled(a: device buffer<f32>, b: device buffer<f32>, c: device mut buffer<f32>, p: P) {
-        shared at: array<f32, 1024>
+        shared at: array<f32, 1056>
         shared bt: array<f32, 1024>
         let tx = local_id().x
         let ty = local_id().y
@@ -93,9 +93,9 @@ pub(crate) const GEMM_TILED_ZSL: ZslShader = zsl!(
                 let ar = idx / 8
                 let ak = idx - ar * 8
                 if bm + ar < p.m && k0 + ak < p.k {
-                    at[ak * 128 + ar] = a[(bm + ar) * p.k + k0 + ak]
+                    at[ak * 132 + ar] = a[(bm + ar) * p.k + k0 + ak]
                 } else {
-                    at[ak * 128 + ar] = 0.0
+                    at[ak * 132 + ar] = 0.0
                 }
                 let bk = idx / 128
                 let bc = idx - bk * 128
@@ -107,14 +107,14 @@ pub(crate) const GEMM_TILED_ZSL: ZslShader = zsl!(
             }
             barrier()
             for q in 0..8 {
-                let a0 = at[q * 128 + ty + 0]
-                let a1 = at[q * 128 + ty + 16]
-                let a2 = at[q * 128 + ty + 32]
-                let a3 = at[q * 128 + ty + 48]
-                let a4 = at[q * 128 + ty + 64]
-                let a5 = at[q * 128 + ty + 80]
-                let a6 = at[q * 128 + ty + 96]
-                let a7 = at[q * 128 + ty + 112]
+                let a0 = at[q * 132 + ty + 0]
+                let a1 = at[q * 132 + ty + 16]
+                let a2 = at[q * 132 + ty + 32]
+                let a3 = at[q * 132 + ty + 48]
+                let a4 = at[q * 132 + ty + 64]
+                let a5 = at[q * 132 + ty + 80]
+                let a6 = at[q * 132 + ty + 96]
+                let a7 = at[q * 132 + ty + 112]
                 let b0 = bt[q * 128 + tx + 0]
                 let b1 = bt[q * 128 + tx + 16]
                 let b2 = bt[q * 128 + tx + 32]
