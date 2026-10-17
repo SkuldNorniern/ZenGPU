@@ -1,6 +1,8 @@
 #define NVRTC_STUB(name) int name(void) { return 1; }
 
 NVRTC_STUB(nvrtcCompileProgram)
+NVRTC_STUB(nvrtcGetCUBIN)
+NVRTC_STUB(nvrtcGetCUBINSize)
 NVRTC_STUB(nvrtcCreateProgram)
 NVRTC_STUB(nvrtcDestroyProgram)
 NVRTC_STUB(nvrtcGetPTX)
