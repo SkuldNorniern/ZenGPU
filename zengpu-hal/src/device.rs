@@ -11,7 +11,7 @@ use crate::desc::{
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
-use crate::submission::{CompletedSubmission, Submission};
+use crate::submission::{CompletedReadback, CompletedSubmission, ReadSubmission, Submission};
 use crate::types::{BackendPreference, Features, Format};
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
@@ -49,6 +49,37 @@ pub trait GpuDevice: Send + Sync {
 
     /// Requires `BufferUsage::READBACK`.
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// Starts an async write of `data` into `buffer`. Returns before the copy finishes. `data` is
+    /// copied on return, so the caller can reuse it. Earlier submissions using `buffer` finish
+    /// first. It is allowed while others are pending, so poll the handle.
+    ///
+    /// The default calls `write_buffer` and returns a completed handle.
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.write_buffer(buffer, offset, data)?;
+        Ok(Box::new(CompletedSubmission::new(cycle_id)))
+    }
+
+    /// Starts an async read of `buffer`. Requires `READBACK`. The read observes every earlier write
+    /// to `buffer`. Take the bytes via `into_bytes` or `read_into`, which wait if needed.
+    ///
+    /// The default calls `read_buffer` and returns a completed handle.
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        let bytes = self.read_buffer(buffer, offset, len)?;
+        Ok(Box::new(CompletedReadback::new(cycle_id, bytes)))
+    }
 
     /// Starts an async read into `dst` from `offset`. Requires `READBACK`, and the range is
     /// `offset..offset + dst.len()`.

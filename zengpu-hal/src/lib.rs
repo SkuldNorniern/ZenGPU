@@ -30,7 +30,10 @@ pub use request::{
     AdapterRequest, DeviceLimits, DeviceRequest, FormatCaps, HalCapabilities, MemoryBudget,
     TransferCaps,
 };
-pub use submission::{CompletedSubmission, GpuSubmission, Submission, SubmissionStatus};
+pub use submission::{
+    CompletedReadback, CompletedSubmission, GpuReadback, GpuSubmission, ReadSubmission, Submission,
+    SubmissionStatus,
+};
 pub use surface::WindowHandles;
 
 pub use desc::{
