@@ -24,9 +24,9 @@ use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
     BufferUsage, CompletedReadback, CompletedSubmission, ComputeOp, ComputePipelineDesc,
     DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuReadback,
-    GpuSubmission, HalCapabilities, PipelineHandle, ReadSubmission, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
-    SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
+    GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle, ReadSubmission, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 use error::{cu, from_cuda};
@@ -2263,6 +2263,21 @@ impl CudaDevice {
 impl GpuDevice for CudaDevice {
     fn backend(&self) -> BackendPreference {
         BackendPreference::Cuda
+    }
+
+    fn memory_budget(&self) -> Option<MemoryBudget> {
+        self.shared
+            .with_current(|| {
+                let (mut free, mut total) = (0, 0);
+                // SAFETY: the context is current; writes two sizes.
+                cu(unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) })?;
+                Ok(MemoryBudget {
+                    device_local: total,
+                    budget: free,
+                    usage: 0,
+                })
+            })
+            .ok()
     }
 
     fn as_any(&self) -> &dyn Any {
