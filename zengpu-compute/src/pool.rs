@@ -45,6 +45,7 @@ impl BufferPool {
         let requested = len as u64 * dtype.size_bytes() as u64;
         let allocation_size = size_class(requested);
         static NEXT_ALLOCATION: AtomicU64 = AtomicU64::new(1);
+        #[allow(deprecated)]
         let identity = NEXT_ALLOCATION
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 next.checked_add(1)
