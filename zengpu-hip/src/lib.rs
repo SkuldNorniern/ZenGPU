@@ -3424,8 +3424,8 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
         device.dispatch(pipeline, good, [0, 1, 1]).unwrap();
         device.dispatch(pipeline, good, [4, 1, 1]).unwrap();
         let raw = device.read_buffer(out, 0, 256 * 4).unwrap();
-        for (i, chunk) in raw.chunks_exact(4).enumerate() {
-            let v = u32::from_ne_bytes(chunk.try_into().unwrap());
+        for (i, chunk) in raw.as_chunks::<4>().0.iter().enumerate() {
+            let v = u32::from_ne_bytes(*chunk);
             assert_eq!(v, 7 + i as u32);
         }
         assert!(!device.is_lost());
@@ -3581,8 +3581,10 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
             .unwrap();
         let raw = device.read_buffer(outb, 0, 16).unwrap();
         let flags: Vec<u32> = raw
-            .chunks_exact(4)
-            .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_ne_bytes(*c))
             .collect();
         assert_eq!(flags, [0, 1, 2, 0]);
         device.destroy_pipeline(pipeline);

@@ -29,8 +29,10 @@ fn download(device: &dyn GpuDevice, array: &DeviceArray) -> Vec<f32> {
     device
         .read_buffer(array.buffer, 0, array.size_bytes())
         .unwrap()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -667,7 +669,9 @@ fn zsl_half_buffers_load_and_store() {
         device
             .read_buffer(a.buffer, 0, a.size_bytes())
             .unwrap()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     };
@@ -728,8 +732,10 @@ fn zsl_bitwise_ops_unpack_nibbles() {
     let got: Vec<u32> = device
         .read_buffer(out.buffer, 0, out.size_bytes())
         .unwrap()
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     for i in 0..n {
         let want = ((words[(i >> 3) as usize] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8);
