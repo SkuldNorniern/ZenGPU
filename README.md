@@ -73,16 +73,17 @@ ZSL covers compute, vertex and fragment shaders: bindless buffers
 Graphics adds swizzles, constant arrays, `vertex_index`/`frag_coord`, bindless
 texture sampling, `discard` and dual-source output. Clip space is Vulkan's (+y down) on every backend; MSL output flips y to match.
 
-Limits: no structs, modules or recursion in ZSL yet. SPIR-V lacks
-`bf16`/`f16` storage. Dispatch and readback are synchronous. Built-in kernels
-are `f32` only.
+Limits: no structs, modules or recursion in ZSL yet. Asynchronous transfer
+support and built-in kernel dtypes vary by backend; CUDA supports
+submission-based uploads and readbacks. Vulkan stores `bf16`/`f16` buffers
+as packed 32-bit words.
 
 ## Examples
 
 ```bash
 cargo run --example vec_add
 cargo run --example cube
-cargo run --release --example heavy_compute
+cargo run --release --features hip --example heavy_compute
 ```
 
 More in [`examples/`](examples/).
@@ -111,6 +112,8 @@ the selected adapter:
 ```sh
 ZENGPU_REQUIRE_METAL=1 cargo test -p zengpu-metal graphics_tests -- --test-threads=1 --nocapture
 ```
+
+Release validation and crate publishing order: [RELEASING.md](RELEASING.md).
 
 ## License
 

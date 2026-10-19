@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -31,6 +33,9 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: Assemble publishable workspace packages
+        if: runner.os == 'Linux'
+        run: cargo package --workspace --no-verify
 
   msrv:
     runs-on: ${{ matrix.os }}
