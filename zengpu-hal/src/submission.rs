@@ -1,7 +1,7 @@
 
 use std::time::Duration;
 
-use crate::Result;
+use crate::{GpuError, Result, UsageError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubmissionStatus {
@@ -101,6 +101,15 @@ impl GpuReadback for CompletedReadback {
     }
 
     fn read_into(self: Box<Self>, dst: &mut [u8]) -> Result<()> {
+        if dst.len() != self.bytes.len() {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "readback has {} bytes, destination has {}",
+                    self.bytes.len(),
+                    dst.len()
+                ),
+            )));
+        }
         dst.copy_from_slice(&self.bytes);
         Ok(())
     }
@@ -129,5 +138,15 @@ mod tests {
         let mut dst = [0u8; 2];
         readback.read_into(&mut dst).unwrap();
         assert_eq!(dst, [4, 5]);
+    }
+
+    #[test]
+    fn completed_readback_rejects_wrong_sized_destinations() {
+        for len in [0, 1, 3] {
+            let readback: ReadSubmission = Box::new(CompletedReadback::new(1, vec![4, 5]));
+            let mut dst = vec![9; len];
+            assert!(readback.read_into(&mut dst).is_err());
+            assert_eq!(dst, vec![9; len]);
+        }
     }
 }
