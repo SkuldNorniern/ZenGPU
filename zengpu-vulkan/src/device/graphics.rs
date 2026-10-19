@@ -267,6 +267,7 @@ impl VulkanDevice {
                 extent: vk::Extent2D { width, height },
                 layout: vk::ImageLayout::UNDEFINED,
                 resting: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                texture: None,
             })
     }
 
@@ -286,6 +287,7 @@ impl VulkanDevice {
                     extent: tex.extent,
                     layout: vk::ImageLayout::UNDEFINED,
                     resting: tex.resting,
+                    texture: Some(texture),
                 }),
         )
     }

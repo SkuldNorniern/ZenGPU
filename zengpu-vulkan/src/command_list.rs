@@ -19,6 +19,7 @@ use zengpu_hal::{
 
 use crate::device::{
     VulkanBuffer, VulkanDeviceInner, VulkanPipeline, VulkanQueryPool, VulkanRenderTarget,
+    VulkanTexture,
 };
 
 pub(crate) const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
@@ -180,6 +181,9 @@ pub struct VulkanCommandList {
     pub(crate) cmd: vk::CommandBuffer,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
+    /// Whether each color target's texture holds texels. Don't lock while `render_targets` is held
+    /// (`register_color_target` takes them in reverse).
+    pub(crate) textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
     pub(crate) bindless_set: vk::DescriptorSet,
@@ -202,6 +206,7 @@ impl VulkanCommandList {
         cmd: vk::CommandBuffer,
         pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
         render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
+        textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
         buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
         query_pools: Arc<Mutex<SlotMap<marker::QueryPool, VulkanQueryPool>>>,
         bindless_set: vk::DescriptorSet,
@@ -212,6 +217,7 @@ impl VulkanCommandList {
             cmd,
             pipelines,
             render_targets,
+            textures,
             buffers,
             query_pools,
             bindless_set,
@@ -321,6 +327,30 @@ impl VulkanCommandList {
                 &[barrier],
             );
         }
+    }
+    /// Per color attachment: uploaded to since the layout was last tracked. Read with one
+    /// lock at a time.
+    fn uploaded_targets(&self, color: &[ColorAttachment]) -> [bool; MAX_COLOR_ATTACHMENTS] {
+        let mut backing = [None; MAX_COLOR_ATTACHMENTS];
+        {
+            let targets = self.render_targets.lock().unwrap();
+            for (slot, att) in color.iter().enumerate() {
+                backing[slot] = targets
+                    .get(att.target)
+                    .filter(|rt| rt.layout == vk::ImageLayout::UNDEFINED)
+                    .and_then(|rt| rt.texture);
+            }
+        }
+        let mut uploaded = [false; MAX_COLOR_ATTACHMENTS];
+        if backing.iter().any(Option::is_some) {
+            let textures = self.textures.lock().unwrap();
+            for (slot, texture) in backing.into_iter().enumerate() {
+                uploaded[slot] = texture
+                    .and_then(|t| textures.get(t))
+                    .is_some_and(|tex| tex.is_ready(0, 0));
+            }
+        }
+        uploaded
     }
 
     /// `None` for a stale handle.
@@ -444,8 +474,15 @@ impl RenderCommands for VulkanCommandList {
         let mut pending_shader_read = [None; MAX_COLOR_ATTACHMENTS];
         let mut extent = vk::Extent2D::default();
         let count = desc.color.len();
+        let uploaded = self.uploaded_targets(desc.color);
         let mut targets = self.render_targets.lock().unwrap();
         for (i, att) in desc.color.iter().enumerate() {
+            if uploaded[i]
+                && let Some(rt) = targets.get_mut(att.target)
+                && rt.layout == vk::ImageLayout::UNDEFINED
+            {
+                rt.layout = rt.resting;
+            }
             if let Some((info, e)) = self.color_attachment_info(&mut targets, att) {
                 color_attachments[i] = info;
                 extent = e;
@@ -704,12 +741,23 @@ impl RenderCommands for VulkanCommandList {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
         }
         let pending = mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
+        let mut rendered = [None; MAX_COLOR_ATTACHMENTS];
         let mut targets = self.render_targets.lock().unwrap();
-        for target in pending.into_iter().flatten() {
-            if let Some(rt) = targets.get_mut(target) {
+        for (slot, target) in pending.into_iter().enumerate() {
+            if let Some(rt) = target.and_then(|t| targets.get_mut(t)) {
                 let image = rt.image;
                 rt.layout = rt.resting;
+                rendered[slot] = rt.texture;
                 self.transition_to_shader_read(image, rt.resting);
+            }
+        }
+        drop(targets);
+        if rendered.iter().any(Option::is_some) {
+            let mut textures = self.textures.lock().unwrap();
+            for texture in rendered.into_iter().flatten() {
+                if let Some(tex) = textures.get_mut(texture) {
+                    tex.mark_ready(0, 0);
+                }
             }
         }
     }

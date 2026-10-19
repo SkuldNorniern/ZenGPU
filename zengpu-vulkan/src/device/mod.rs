@@ -393,6 +393,9 @@ pub(crate) struct VulkanRenderTarget {
     pub layout: vk::ImageLayout,
     /// Layout after `sample_after`: the texture's resting layout.
     pub resting: vk::ImageLayout,
+    /// Texture behind a color target, to tell whether it holds texels (an upload may have given it
+    /// some). `None` for swapchain images and depth targets.
+    pub texture: Option<TextureHandle>,
 }
 
 pub(crate) struct VulkanQueryPool {
@@ -2560,6 +2563,63 @@ mod tests {
                 clear_round_trip(device, format);
             }
         }
+    }
+
+    /// A pass into a never-uploaded target still reads back: it marks the texture as holding
+    /// texels, so the copy does not start from `UNDEFINED`.
+    #[test]
+    fn rendered_and_uploaded_texels_survive_readback_and_load() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        let format = Format::Rgba8Unorm;
+        let pass = |target, load| {
+            let mut cmd = device.create_command_list().unwrap();
+            cmd.begin_render_pass(&RenderPassDesc {
+                color: &[ColorAttachment {
+                    target,
+                    load,
+                    store: true,
+                    sample_after: true,
+                }],
+                depth: None,
+            });
+            cmd.end_render_pass();
+            device.submit_and_wait(cmd).unwrap();
+        };
+
+        let offscreen = OffscreenTarget::new(device, format, 2, 2).unwrap();
+        pass(offscreen.target_handle(), LoadOp::Clear(CLEAR));
+        let got = read_texels(device, offscreen.texture_handle(), format, 2, 2);
+        assert_texels(format, &got, &[CLEAR; 4]);
+        pass(offscreen.target_handle(), LoadOp::Load);
+        let got = read_texels(device, offscreen.texture_handle(), format, 2, 2);
+        assert_texels(format, &got, &[CLEAR; 4]);
+        drop(offscreen);
+
+        let tex = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format,
+                usage: TextureUsage::RENDER_TARGET
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let target = device.register_color_target(tex).unwrap();
+        device.upload_texture_data(tex, &[255u8; 16]).unwrap();
+        pass(target, LoadOp::Load);
+        let got = read_texels(device, tex, format, 2, 2);
+        assert_texels(format, &got, &[[1.0; 4]; 4]);
+        device.unregister_render_target(target);
+        device.destroy_texture(tex);
     }
 
     #[test]
