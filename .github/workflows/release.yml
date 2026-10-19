@@ -7,9 +7,15 @@ on:
 
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   release:
     name: Release ZenGPU ${{ github.ref_name }}
     runs-on: ubuntu-latest
+    needs: checks
     permissions:
       contents: write
 
@@ -34,6 +40,7 @@ jobs:
 
           FEATS=$(section feat)
           FIXES=$(section fix)
+          PERF=$(section perf)
           DOCS=$(section docs)
           REFACTORS=$(section refactor)
           CI=$(section ci)
@@ -46,6 +53,7 @@ jobs:
             echo ""
             if [ -n "$FEATS" ];     then echo "### Features";      echo "$FEATS";     echo ""; fi
             if [ -n "$FIXES" ];     then echo "### Bug Fixes";     echo "$FIXES";     echo ""; fi
+            if [ -n "$PERF" ];      then echo "### Performance";   echo "$PERF";      echo ""; fi
             if [ -n "$DOCS" ];      then echo "### Documentation"; echo "$DOCS";      echo ""; fi
             if [ -n "$REFACTORS" ]; then echo "### Refactor";      echo "$REFACTORS"; echo ""; fi
             if [ -n "$CI" ];        then echo "### CI";            echo "$CI";        echo ""; fi
