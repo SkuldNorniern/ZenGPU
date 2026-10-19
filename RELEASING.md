@@ -38,7 +38,7 @@ workspace version. Publish dependencies before their consumers in this order
 1. `zen-window-handle`
 2. `zengpu-hal`, `zengpu-spv`, `zengpu-zsl`
 3. `zengpu-spirv`
-4. `zengpu-compute`, then `zengpu-blas`
+4. `zengpu-compute`
 5. `zengpu-cpu`, `zengpu-vulkan`, `zengpu-metal`, `zengpu-hip`, `zengpu-cuda`,
    `zengpu-dx12`
 6. `zengpu-conformance`

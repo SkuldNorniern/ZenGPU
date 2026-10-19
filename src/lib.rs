@@ -1,6 +1,25 @@
 //! ZenGPU: a native-first GPU runtime for Rust (graphics + general compute).
 //!
-//! # Quick start
+//! # Cargo features
+//!
+//! | Feature   | Default | Description |
+//! |-----------|---------|-------------|
+//! | `vulkan`  | yes     | Vulkan 1.2+ backend (graphics + compute). |
+//! | `metal`   | yes     | Metal backend (macOS, graphics + compute); finds nothing elsewhere. |
+//! | `compute` | yes     | Device arrays, pooled allocation, elementwise kernels. |
+//! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
+//! | `cpu`     | no      | CPU reference backend for conformance tests. |
+//! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
+//! | `dx12`    | no      | DirectX 12 backend (Windows), not yet implemented. |
+//!
+//! # Backends
+//!
+//! [`native`] is Metal on macOS, Vulkan elsewhere. One `zsl!` shader serves both
+//! through [`native::shader`].
+//! Use [`Device::as_vulkan`] for swapchain and frame-graph work, and `Device::as_cpu` for the
+//! CPU conformance oracle.
+//! Sub-crates are re-exported under [`vulkan`], [`compute`], `cpu`, `cuda`,
+//! [`metal`], `hip`, `dx12`.
 //!
 //! ```no_run
 //! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
@@ -26,31 +45,6 @@
 //! device.write_buffer(buf, 0, &[0u8; 1024]).unwrap();
 //! # }
 //! ```
-//!
-//! # Cargo features
-//!
-//! | Feature   | Default | Description |
-//! |-----------|---------|-------------|
-//! | `vulkan`  | yes     | Vulkan 1.2+ backend (graphics + compute). |
-//! | `metal`   | yes     | Metal backend (macOS, graphics + compute); finds nothing elsewhere. |
-//! | `compute` | yes     | Device arrays, pooled allocation, elementwise kernels. |
-//! | `blas`    | no      | GEMM kernel on top of `compute`. |
-//! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
-//! | `cpu`     | no      | CPU reference backend for conformance tests. |
-//! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
-//! | `dx12`    | no      | DirectX 12 backend for Windows. Not yet implemented. |
-//!
-//! # The native graphics backend
-//!
-//! [`native`] names the platform's own graphics backend as concrete types: Metal on macOS, Vulkan
-//! elsewhere. One `zsl!` shader serves both through [`native::shader`].
-//!
-//! # Backend-specific access
-//!
-//! [`Device::as_vulkan`] returns `&VulkanDevice` for swapchain / frame-graph work;
-//! `Device::as_cpu` gives access to the CPU conformance oracle. The sub-crates are re-exported
-//! under [`vulkan`], [`compute`], [`blas`], `cpu`, `cuda`, [`metal`], `hip`, `dx12` for
-//! power users who need their full surface.
 
 pub mod adapter;
 pub mod detect;
@@ -93,9 +87,6 @@ pub use zengpu_hal::{
 #[cfg(feature = "compute")]
 pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
 
-#[cfg(feature = "blas")]
-pub use zengpu_blas::GemmKernel;
-
 /// Concrete Vulkan types for windowed, backend-aware code. Most code needs only [`Instance`].
 #[cfg(feature = "vulkan")]
 pub use zengpu_vulkan::{BeginFrame, DeviceContext, Swapchain, VulkanDevice, VulkanInstance};
@@ -111,9 +102,6 @@ pub use zengpu_cpu as cpu;
 /// Device arrays, pooled allocation, and elementwise kernels.
 #[cfg(feature = "compute")]
 pub use zengpu_compute as compute;
-
-#[cfg(feature = "blas")]
-pub use zengpu_blas as blas;
 
 /// CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
 #[cfg(feature = "cuda")]
