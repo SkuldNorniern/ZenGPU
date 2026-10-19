@@ -82,6 +82,7 @@ impl VulkanSurface {
                 extent,
                 layout: vk::ImageLayout::UNDEFINED,
                 resting: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                texture: None,
             }));
         }
     }
