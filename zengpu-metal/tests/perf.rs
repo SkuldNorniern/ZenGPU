@@ -201,8 +201,10 @@ fn download(device: &dyn GpuDevice, array: &DeviceArray) -> Vec<f32> {
     device
         .read_buffer(array.buffer, 0, array.size_bytes())
         .unwrap()
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 
@@ -261,8 +263,10 @@ fn batched_ops_run_in_order() {
     let words = |b| {
         dev.read_buffer(b, 0, desc.size)
             .unwrap()
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect::<Vec<_>>()
     };
     assert!(words(data).iter().all(|&v| v == 150));
