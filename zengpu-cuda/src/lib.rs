@@ -338,6 +338,15 @@ fn cache_write(base: &Path, key: u64, image: &ModuleImage) {
     }
 }
 
+fn check_buffer_range(offset: u64, bytes: u64, capacity: u64) -> Result<()> {
+    if offset.checked_add(bytes).is_none_or(|end| end > capacity) {
+        return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+            format!("cuda: buffer range at {offset} of length {bytes} exceeds {capacity}"),
+        )));
+    }
+    Ok(())
+}
+
 /// Convert a byte count to the driver's `size_t`, failing instead of truncating.
 fn driver_len(n: impl TryInto<sys::size_t>) -> Result<sys::size_t> {
     n.try_into().map_err(|_| {
@@ -2298,9 +2307,7 @@ impl GpuDevice for CudaDevice {
                         .into(),
                 )));
             }
-            if offset + data.len() as u64 > cb.len {
-                return Err(GpuError::Backend("cuda: write out of bounds".into()));
-            }
+            check_buffer_range(offset, data.len() as u64, cb.len)?;
             self.shared.htod(cb.ptr + offset, data)
         })
     }
@@ -4889,6 +4896,16 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         assert_eq!(pinned_class(PINNED_CLASS_STEP), PINNED_CLASS_STEP);
         assert_eq!(pinned_class(PINNED_CLASS_STEP + 1), 2 * PINNED_CLASS_STEP);
         assert_eq!(pinned_class((64 << 20) - 1), 64 << 20);
+    }
+
+    #[test]
+    fn upload_bounds_reject_integer_overflow_and_accept_an_empty_tail() {
+        assert!(check_buffer_range(u64::MAX, 1, 256).is_err());
+        assert!(check_buffer_range(u64::MAX - 3, 8, u64::MAX).is_err());
+        assert!(check_buffer_range(257, 0, 256).is_err());
+        assert!(check_buffer_range(255, 2, 256).is_err());
+        assert!(check_buffer_range(256, 0, 256).is_ok());
+        assert!(check_buffer_range(255, 1, 256).is_ok());
     }
 
     #[test]
