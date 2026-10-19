@@ -56,7 +56,7 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 | DirectX 12 (`dx12`) | skeleton | skeleton | Windows |
 
 Other features: `compute` (default) for device arrays, pooling and
-elementwise kernels, `blas` for GEMM.
+elementwise kernels. GEMM and other BLAS routines live in the ZenBLAS repo.
 
 HIP loads ROCm at run time, so building needs no ROCm and an app built with
 `hip` still starts where ROCm is missing (the backend then has no adapters).
@@ -99,7 +99,7 @@ More in [`examples/`](examples/).
 
 Depend on `zengpu`. Subcrates: `zengpu-hal` (types and traits), one per
 backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-cpu`),
-`zengpu-compute`, `zengpu-blas`, `zengpu-spirv` and `zengpu-zsl` (shaders),
+`zengpu-compute`, `zengpu-spirv` and `zengpu-zsl` (shaders),
 `zengpu-spv` (SPIR-V checks), `zengpu-conformance`.
 
 ## Building

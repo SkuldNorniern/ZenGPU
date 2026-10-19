@@ -23,4 +23,3 @@ log.workspace = true
 [dev-dependencies]
 zengpu-spirv = { workspace = true, features = ["hip"] }
 zengpu-compute.workspace = true
-zengpu-blas.workspace = true

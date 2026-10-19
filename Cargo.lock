@@ -1828,7 +1828,6 @@ dependencies = [
  "raw-window-handle",
  "winit",
  "zen-window-handle",
- "zengpu-blas",
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-cuda",
@@ -1838,16 +1837,6 @@ dependencies = [
  "zengpu-metal",
  "zengpu-spirv",
  "zengpu-vulkan",
-]
-
-[[package]]
-name = "zengpu-blas"
-version = "0.0.1"
-dependencies = [
- "log",
- "zengpu-compute",
- "zengpu-hal",
- "zengpu-spirv",
 ]
 
 [[package]]
@@ -1862,7 +1851,6 @@ dependencies = [
 name = "zengpu-conformance"
 version = "0.0.1"
 dependencies = [
- "zengpu-blas",
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-hal",
@@ -1884,7 +1872,6 @@ dependencies = [
  "cc",
  "cuda-oxide",
  "log",
- "zengpu-blas",
  "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",
@@ -1910,7 +1897,6 @@ name = "zengpu-hip"
 version = "0.0.1"
 dependencies = [
  "log",
- "zengpu-blas",
  "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",

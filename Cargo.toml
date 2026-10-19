@@ -20,7 +20,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-blas", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
 
 [workspace.package]
 version = "0.0.1"
@@ -47,7 +47,6 @@ zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
 zengpu-cpu = { path = "zengpu-cpu", version = "0.0.1" }
 zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
 zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
-zengpu-blas = { path = "zengpu-blas", version = "0.0.1" }
 zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
 zengpu-spv = { path = "zengpu-spv", version = "0.0.1" }
 zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
@@ -71,8 +70,6 @@ vulkan = ["zengpu-vulkan"]
 cpu = ["zengpu-cpu"]
 # Device arrays, pooled allocation, and elementwise kernels.
 compute = ["zengpu-compute"]
-# GEMM compute kernel, on top of `compute`.
-blas = ["zengpu-blas", "compute"]
 # CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
 cuda = ["zengpu-cuda", "zengpu-spirv/cuda"]
 # Apple Metal backend (macOS, graphics + compute). Turns on ZSL's MSL output.
@@ -87,7 +84,6 @@ zengpu-hal.workspace = true
 zengpu-cpu = { workspace = true, optional = true }
 zengpu-vulkan = { workspace = true, optional = true }
 zengpu-compute = { workspace = true, optional = true }
-zengpu-blas = { workspace = true, optional = true }
 zengpu-cuda = { workspace = true, optional = true }
 zengpu-metal = { workspace = true, optional = true }
 zengpu-hip = { workspace = true, optional = true }
@@ -103,7 +99,7 @@ raw-window-handle = "0.6"
 zen-window-handle.workspace = true
 
 # Gate examples on the features they actually need so `cargo test` skips them
-# when those features are not enabled (blas is opt-in, not a default).
+# when those features are not enabled
 [[example]]
 name = "vec_add"
 required-features = ["vulkan"]
@@ -111,10 +107,6 @@ required-features = ["vulkan"]
 [[example]]
 name = "heavy_compute"
 required-features = ["hip"]
-
-[[example]]
-name = "op_graph_lower"
-required-features = ["vulkan", "blas"]
 
 [[example]]
 name = "cube"
