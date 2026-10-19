@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zengpu_hal::{
@@ -16,14 +17,20 @@ use crate::DeviceArray;
 /// Pooled [`DeviceArray`] allocator. Freed buffers return to a free list keyed by size class.
 pub struct BufferPool {
     device: Arc<dyn GpuDevice>,
-    free: Mutex<HashMap<u64, Vec<BufferHandle>>>,
+    state: Mutex<PoolState>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    free: HashMap<u64, Vec<BufferHandle>>,
+    live: HashMap<u64, (BufferHandle, u64)>,
 }
 
 impl BufferPool {
     pub fn new(device: Arc<dyn GpuDevice>) -> Self {
         Self {
             device,
-            free: Mutex::new(HashMap::new()),
+            state: Mutex::new(PoolState::default()),
         }
     }
 
@@ -37,10 +44,18 @@ impl BufferPool {
         let len = checked_len(&shape)?;
         let requested = len as u64 * dtype.size_bytes() as u64;
         let allocation_size = size_class(requested);
+        static NEXT_ALLOCATION: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_ALLOCATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| {
+                UsageError::BindingMismatch("pool allocation identities exhausted".into())
+            })?;
 
         let buffer = {
-            let mut free = self.free.lock().unwrap();
-            free.get_mut(&allocation_size).and_then(Vec::pop)
+            let mut state = self.state.lock().unwrap();
+            state.free.get_mut(&allocation_size).and_then(Vec::pop)
         };
         let buffer = match buffer {
             Some(b) => b,
@@ -54,24 +69,47 @@ impl BufferPool {
             })?,
         };
 
-        Ok(DeviceArray::with_allocation_size(
-            buffer,
-            shape,
-            dtype,
-            allocation_size,
-        ))
-    }
-
-    /// Returns `array`'s buffer to the pool for reuse in its size class. The buffer is
-    /// not destroyed.
-    pub fn free(&self, array: DeviceArray) {
-        let size = array.allocation_size_bytes();
-        self.free
+        self.state
             .lock()
             .unwrap()
-            .entry(size)
-            .or_default()
-            .push(array.buffer);
+            .live
+            .insert(identity, (buffer, allocation_size));
+        let mut array = DeviceArray::with_allocation_size(buffer, shape, dtype, allocation_size);
+        array.pool_allocation = Some(identity);
+        Ok(array)
+    }
+
+    /// Return `array`'s buffer to its size class. The buffer is not destroyed. Returning one clone
+    /// ends the allocation for every alias. Duplicate, stale and foreign returns are ignored; see
+    /// [`Self::try_free`] to diagnose them.
+    pub fn free(&self, array: DeviceArray) {
+        let _ = self.try_free(array);
+    }
+
+    /// Frees only a live allocation from this pool. The checkout identity stops an old clone from
+    /// freeing a reused buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a duplicate, stale, or foreign array.
+    pub fn try_free(&self, array: DeviceArray) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let identity = array.pool_allocation.ok_or_else(|| {
+            UsageError::BindingMismatch("array was not allocated by this pool".into())
+        })?;
+        let Some(&(buffer, size)) = state
+            .live
+            .get(&identity)
+            .filter(|(buffer, _)| *buffer == array.buffer)
+        else {
+            return Err(UsageError::BindingMismatch(
+                "array allocation is not live in this pool".into(),
+            )
+            .into());
+        };
+        state.live.remove(&identity);
+        state.free.entry(size).or_default().push(buffer);
+        Ok(())
     }
 }
 
@@ -102,8 +140,8 @@ fn size_class(size: u64) -> u64 {
 
 impl Drop for BufferPool {
     fn drop(&mut self) {
-        let mut free = self.free.lock().unwrap();
-        for buffers in free.values_mut() {
+        let mut state = self.state.lock().unwrap();
+        for buffers in state.free.values_mut() {
             for buffer in buffers.drain(..) {
                 self.device.destroy_buffer(buffer);
             }

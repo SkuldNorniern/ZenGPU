@@ -20,6 +20,7 @@ pub struct DeviceArray {
     pub stride: Vec<u32>,
     pub dtype: DType,
     allocation_size: u64,
+    pub(crate) pool_allocation: Option<u64>,
 }
 
 impl DeviceArray {
@@ -42,6 +43,7 @@ impl DeviceArray {
             stride,
             dtype,
             allocation_size,
+            pool_allocation: None,
         }
     }
 
