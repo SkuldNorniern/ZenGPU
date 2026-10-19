@@ -991,7 +991,9 @@ fn plan_key(plan: &[Launch]) -> Vec<u64> {
                 src_buf,
                 ..
             } => {
-                key.extend([COPY_TAG, *len as u64, id_of(*src_buf), id_of(*dst_buf)]);
+                #[allow(clippy::unnecessary_cast)]
+                let len = *len as u64;
+                key.extend([COPY_TAG, len, id_of(*src_buf), id_of(*dst_buf)]);
             }
         }
     }
