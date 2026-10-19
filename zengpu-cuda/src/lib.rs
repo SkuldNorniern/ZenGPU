@@ -2268,9 +2268,14 @@ impl GpuDevice for CudaDevice {
     fn memory_budget(&self) -> Option<MemoryBudget> {
         self.shared
             .with_current(|| {
-                let (mut free, mut total) = (0, 0);
-                // SAFETY: the context is current; writes two sizes.
-                cu(unsafe { sys::cuMemGetInfo_v2(&mut free, &mut total) })?;
+                let (mut free, mut total) = (0u64, 0u64);
+                // SAFETY: context is current; each pointer is 8 bytes.
+                cu(unsafe {
+                    sys::cuMemGetInfo_v2(
+                        (&raw mut free).cast::<sys::size_t>(),
+                        (&raw mut total).cast::<sys::size_t>(),
+                    )
+                })?;
                 Ok(MemoryBudget {
                     device_local: total,
                     budget: free,
