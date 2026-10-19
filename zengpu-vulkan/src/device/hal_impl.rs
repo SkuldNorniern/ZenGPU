@@ -174,6 +174,12 @@ impl GpuDevice for VulkanDevice {
         Ok(handle)
     }
 
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        let buffers = self.buffers.lock().unwrap();
+        let buffer = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        Ok(buffer.size)
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;

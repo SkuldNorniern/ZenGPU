@@ -879,6 +879,146 @@ mod devarray_elementwise_tests {
         );
         owner.try_free(reused).unwrap();
     }
+
+    #[test]
+    fn typed_array_ops_reject_foreign_stale_and_undersized_buffers() {
+        let local: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let foreign: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let kernels = ElementwiseKernels::new(&*local).unwrap();
+        let pool = BufferPool::new(local.clone());
+        let foreign_pool = BufferPool::new(foreign);
+        let wrong_device = foreign_pool.alloc(vec![64], DType::F32).unwrap();
+        let mut ops = zengpu_compute::OpList::new(&pool);
+        assert!(kernels.record_relu(&mut ops, &wrong_device).is_err());
+        assert!(ops.is_empty(), "invalid inputs must not record a dispatch");
+        let stale = pool.alloc(vec![64], DType::F32).unwrap();
+        local.destroy_buffer(stale.buffer);
+        let replacement = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(stale.buffer.index(), replacement.buffer.index());
+        assert!(kernels.record_relu(&mut ops, &stale).is_err());
+        let mut too_small = replacement.clone();
+        too_small.shape = vec![128];
+        assert!(
+            kernels
+                .record_add(&mut ops, &too_small, &too_small)
+                .is_err()
+        );
+        let mut strided = replacement.clone();
+        strided.stride = vec![2];
+        assert!(kernels.record_relu(&mut ops, &strided).is_err());
+        pool.free(replacement);
+        foreign_pool.free(wrong_device);
+        kernels.destroy(&*local);
+    }
+
+    #[test]
+    fn recorded_arrays_are_checked_again_before_dispatch() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let kernels = ElementwiseKernels::new(&*cpu).unwrap();
+        register_cpu_kernels(cpu.as_any().downcast_ref::<CpuDevice>().unwrap(), &kernels);
+        let pool = BufferPool::new(cpu.clone());
+        let input = pool.alloc(vec![64], DType::F32).unwrap();
+        let mut ops = zengpu_compute::OpList::new(&pool);
+        let output = kernels.record_relu(&mut ops, &input).unwrap();
+        cpu.destroy_buffer(input.buffer);
+        let replacement = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(replacement.buffer.index(), input.buffer.index());
+        assert!(
+            ops.run(&*cpu).is_err(),
+            "slot reuse must not hide a stale generation"
+        );
+        assert!(ops.submit(&*cpu, 7).is_err());
+        ops.clear();
+        pool.free(replacement);
+        pool.free(output);
+        kernels.destroy(&*cpu);
+    }
+
+    #[test]
+    fn an_operation_list_cannot_run_on_another_device_with_matching_slots() {
+        let first: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let second: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(first);
+        let other = BufferPool::new(second.clone());
+        let kernels = ElementwiseKernels::new(&*second).unwrap();
+        register_cpu_kernels(
+            second.as_any().downcast_ref::<CpuDevice>().unwrap(),
+            &kernels,
+        );
+        let input = pool.alloc(vec![64], DType::F32).unwrap();
+        let canary = other.alloc(vec![64], DType::F32).unwrap();
+        let target = other.alloc(vec![64], DType::F32).unwrap();
+        second.write_buffer(target.buffer, 0, &[9; 256]).unwrap();
+        let mut ops = zengpu_compute::OpList::new(&pool);
+        let output = kernels.record_relu(&mut ops, &input).unwrap();
+        assert_eq!(input.buffer.index(), canary.buffer.index());
+        assert_eq!(output.buffer.index(), target.buffer.index());
+        assert!(ops.run(&*second).is_err());
+        assert!(ops.submit(&*second, 1).is_err());
+        assert_eq!(second.read_buffer(target.buffer, 0, 256).unwrap(), [9; 256]);
+        pool.free(input);
+        pool.free(output);
+        other.free(canary);
+        other.free(target);
+        kernels.destroy(&*second);
+    }
+
+    #[test]
+    fn failed_recording_rolls_back_its_dispatches_and_scratch() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(cpu.clone());
+        let kernels = ElementwiseKernels::new(&*cpu).unwrap();
+        let spare = pool.alloc(vec![64], DType::F32).unwrap();
+        let handle = spare.buffer;
+        pool.free(spare);
+        let mut ops = zengpu_compute::OpList::new(&pool);
+        let failed: zengpu_hal::Result<()> = ops.transaction(|ops| {
+            let slot = ops.scratch(vec![64], DType::F32)?;
+            ops.dispatch(
+                kernels.relu_pipeline,
+                &[slot, slot],
+                &[Scalar::U32(64)],
+                [1, 1, 1],
+            );
+            Err(zengpu_hal::GpuError::OutOfMemory(
+                zengpu_hal::MemoryUsage::GpuOnly,
+            ))
+        });
+        assert!(failed.is_err());
+        assert!(ops.is_empty());
+        let reused = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(reused.buffer, handle);
+        cpu.destroy_buffer(reused.buffer);
+        assert!(
+            ops.run(&*cpu).is_ok(),
+            "failed buffer requirements were also removed"
+        );
+        kernels.destroy(&*cpu);
+    }
+
+    #[test]
+    fn gemm_rejects_invalid_array_storage_without_recording_work() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(cpu.clone());
+        let foreign = BufferPool::new(Arc::new(CpuDevice::new()));
+        let gemm = zengpu_blas::GemmKernel::new(&*cpu).unwrap();
+        let a = pool.alloc(vec![2, 2], DType::F32).unwrap();
+        let b = foreign.alloc(vec![2, 2], DType::F32).unwrap();
+        let mut ops = zengpu_compute::OpList::new(&pool);
+        assert!(gemm.record_sgemm(&mut ops, 1.0, &a, &b).is_err());
+        let mut oversized = a.clone();
+        oversized.shape = vec![1024, 2];
+        oversized.stride = vec![2, 1];
+        assert!(gemm.record_sgemm(&mut ops, 1.0, &oversized, &a).is_err());
+        assert!(ops.is_empty());
+        assert!(
+            ops.run(&*cpu).is_ok(),
+            "failed attempts retained no validation requirements"
+        );
+        pool.free(a);
+        foreign.free(b);
+        gemm.destroy(&*cpu);
+    }
 }
 
 #[cfg(test)]

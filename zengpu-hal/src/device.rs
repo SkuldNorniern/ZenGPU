@@ -45,6 +45,11 @@ pub trait GpuDevice: Send + Sync {
     /// The handle is generational. Contents are unspecified, so write every byte before reading it.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 
+    /// Validates the handle and returns its byte capacity. No transfer or GPU wait happens.
+    fn buffer_size(&self, _buffer: BufferHandle) -> Result<u64> {
+        Err(GpuError::Unsupported("buffer size query".into()))
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()>;
 
     /// Requires `BufferUsage::READBACK`.

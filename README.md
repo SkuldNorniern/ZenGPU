@@ -12,6 +12,13 @@ one must use `Handle::from_owned_parts(index, generation, owner)`.
 `Handle::from_parts` now creates an invalid, unowned sentinel. Raw bindless slot
 indices in `Bindings` remain local to the submitting device.
 
+Built-in array and BLAS operations validate contiguous layouts and buffer
+capacity before recording, and recheck full handles before submission. An
+`OpList` must run on its pool's underlying device. Custom HAL implementations
+must provide the nonblocking `GpuDevice::buffer_size` query to use these
+helpers. Raw slot-based dispatches can opt into full-handle checks with
+`OpList::require_buffer`.
+
 ## Quick Start
 
 ```toml

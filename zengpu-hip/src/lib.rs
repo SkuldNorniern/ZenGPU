@@ -1332,6 +1332,10 @@ impl GpuDevice for HipDevice {
         }))
     }
 
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        Ok(self.core.buffer(buffer)?.size as u64)
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let buf = self.core.buffer(buffer)?;
         self.core.ensure_idle("write_buffer")?;

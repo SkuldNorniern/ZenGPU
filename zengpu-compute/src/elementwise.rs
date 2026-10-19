@@ -109,8 +109,12 @@ impl ElementwiseKernels {
                 a.shape, b.shape
             )));
         }
+        let n = a.validate_contiguous(ops.pool().device())?;
+        b.validate_contiguous(ops.pool().device())?;
         let out = ops.pool().alloc(a.shape.clone(), DType::F32)?;
-        let n = a.len();
+        ops.require_buffer(a.buffer, a.size_bytes());
+        ops.require_buffer(b.buffer, b.size_bytes());
+        ops.require_buffer(out.buffer, out.size_bytes());
         ops.dispatch(
             self.add_pipeline,
             &[a.buffer.index(), b.buffer.index(), out.buffer.index()],
@@ -135,8 +139,10 @@ impl ElementwiseKernels {
     /// Record into `ops`. `out` is allocated now, written when the list runs.
     pub fn record_relu(&self, ops: &mut OpList<'_>, a: &DeviceArray) -> Result<DeviceArray> {
         check_f32(a.dtype, "elementwise::relu")?;
+        let n = a.validate_contiguous(ops.pool().device())?;
         let out = ops.pool().alloc(a.shape.clone(), DType::F32)?;
-        let n = a.len();
+        ops.require_buffer(a.buffer, a.size_bytes());
+        ops.require_buffer(out.buffer, out.size_bytes());
         ops.dispatch(
             self.relu_pipeline,
             &[a.buffer.index(), out.buffer.index()],
