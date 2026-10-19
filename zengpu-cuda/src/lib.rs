@@ -9,8 +9,11 @@ mod error;
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr, c_char, c_void};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::mem::{take, zeroed};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, yield_now};
 use std::time::{Duration, Instant};
@@ -301,15 +304,30 @@ fn cache_read(base: &Path, key: u64) -> Option<(ModuleImage, PathBuf)> {
 /// Write `bytes` to `path` via temp file and rename, so readers never see a partial entry. Creates
 /// parent dirs.
 fn write_entry(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
     let dir = path.parent().unwrap_or(path);
     fs::create_dir_all(dir)?;
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(format!(".tmp.{}", process::id()));
-    let tmp = PathBuf::from(tmp);
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    let (tmp, mut file) = loop {
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(
+            ".tmp.{}.{}",
+            process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        let tmp = PathBuf::from(tmp);
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    };
+    let written = file.write_all(bytes);
+    drop(file);
+    written
+        .and_then(|()| fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
 }
 
 /// Store `image` under `key`. Failures are logged, not returned: the module is already loaded.
@@ -2832,6 +2850,7 @@ extern "C" __global__ void vec_add_f32(
 mod tests {
     use super::*;
     use std::mem::{size_of, size_of_val};
+    use std::sync::Barrier;
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3851,6 +3870,31 @@ mod tests {
         ));
         assert!(cache_read(&base, 3).is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn concurrent_cache_writers_publish_whole_entries() {
+        let base = unique_dir("concurrent-writers");
+        let path = base.join("module.cubin");
+        let barrier = Barrier::new(8);
+        thread::scope(|scope| {
+            for marker in 1..=8u8 {
+                let path = &path;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    let bytes = vec![marker; 64 * 1024];
+                    barrier.wait();
+                    for _ in 0..16 {
+                        write_entry(path, &bytes).expect("publish cache entry");
+                        let got = fs::read(path).expect("read published entry");
+                        assert_eq!(got.len(), bytes.len());
+                        assert!(got.iter().all(|&byte| byte == got[0]), "partial entry");
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(&base).expect("cache dir").count(), 1);
+        fs::remove_dir_all(base).expect("remove test cache");
     }
 
     #[test]
