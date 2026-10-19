@@ -4,8 +4,8 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
     ComputePipelineHints, DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities,
-    MemoryBudget, PipelineHandle, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
-    Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
+    MemoryBudget, PipelineHandle, ReadSubmission, Result, SamplerDesc, SamplerHandle, ShaderDesc,
+    ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -52,6 +52,30 @@ impl Device {
 
     pub fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         self.inner.read_buffer(buffer, offset, len)
+    }
+
+    /// Queues an upload into `buffer` on the asynchronous path. Wait on the returned `Submission`.
+    pub fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.inner
+            .submit_write_buffer(cycle_id, buffer, offset, data)
+    }
+
+    /// Queues a readback from `buffer` on the asynchronous path. Read the bytes from the returned
+    /// `ReadSubmission` once it completes.
+    pub fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        self.inner.submit_read_buffer(cycle_id, buffer, offset, len)
     }
 
     pub fn read_buffer_into(
@@ -252,6 +276,30 @@ impl GpuDevice for Device {
         self.inner.read_buffer(buffer, offset, len)
     }
 
+    /// Queues an upload into `buffer` on the asynchronous path. Wait on the returned `Submission`.
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.inner
+            .submit_write_buffer(cycle_id, buffer, offset, data)
+    }
+
+    /// Queues a readback from `buffer` on the asynchronous path. Read the bytes from the returned
+    /// `ReadSubmission` once it completes.
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        self.inner.submit_read_buffer(cycle_id, buffer, offset, len)
+    }
+
     fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
         self.inner.read_buffer_into(buffer, offset, dst)
     }
@@ -426,5 +474,108 @@ impl GpuDevice for Device {
 
     fn supports_anisotropic_filtering(&self) -> bool {
         self.inner.supports_anisotropic_filtering()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zengpu_hal::{CompletedReadback, CompletedSubmission, GpuError, SlotMap, marker};
+
+    struct AsyncOnly;
+
+    fn unsupported<T>() -> Result<T> {
+        Err(GpuError::Unsupported(
+            "unexpected synchronous fallback".into(),
+        ))
+    }
+
+    impl GpuDevice for AsyncOnly {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn capabilities(&self) -> HalCapabilities {
+            HalCapabilities::compute_only()
+        }
+        fn create_buffer(&self, _: BufferDesc) -> Result<BufferHandle> {
+            unsupported()
+        }
+        fn buffer_size(&self, _: BufferHandle) -> Result<u64> {
+            Ok(64)
+        }
+        fn write_buffer(&self, _: BufferHandle, _: u64, _: &[u8]) -> Result<()> {
+            unsupported()
+        }
+        fn read_buffer(&self, _: BufferHandle, _: u64, _: u64) -> Result<Vec<u8>> {
+            unsupported()
+        }
+        fn destroy_buffer(&self, _: BufferHandle) {}
+        fn create_texture(&self, _: TextureDesc) -> Result<TextureHandle> {
+            unsupported()
+        }
+        fn upload_texture_data(&self, _: TextureHandle, _: &[u8]) -> Result<()> {
+            unsupported()
+        }
+        fn destroy_texture(&self, _: TextureHandle) {}
+        fn create_sampler(&self, _: SamplerDesc) -> Result<SamplerHandle> {
+            unsupported()
+        }
+        fn destroy_sampler(&self, _: SamplerHandle) {}
+        fn submit_write_buffer(
+            &self,
+            cycle: u64,
+            _: BufferHandle,
+            offset: u64,
+            data: &[u8],
+        ) -> Result<Submission> {
+            assert_eq!(offset, 3);
+            assert_eq!(data, [1, 2]);
+            Ok(Box::new(CompletedSubmission::new(cycle)))
+        }
+        fn submit_read_buffer(
+            &self,
+            cycle: u64,
+            _: BufferHandle,
+            offset: u64,
+            len: u64,
+        ) -> Result<ReadSubmission> {
+            assert_eq!((offset, len), (5, 2));
+            Ok(Box::new(CompletedReadback::new(cycle, vec![4, 5])))
+        }
+    }
+
+    #[test]
+    fn public_device_preserves_async_backend_overrides() {
+        let device = Device {
+            inner: Box::new(AsyncOnly),
+        };
+        let mut buffers = SlotMap::<marker::Buffer, ()>::new();
+        let buffer = buffers.insert(());
+        assert_eq!(device.buffer_size(buffer).expect("capacity"), 64);
+        assert_eq!(
+            device
+                .submit_write_buffer(7, buffer, 3, &[1, 2])
+                .expect("async upload")
+                .cycle_id(),
+            7
+        );
+        let read = device
+            .submit_read_buffer(8, buffer, 5, 2)
+            .expect("async read");
+        assert_eq!(read.cycle_id(), 8);
+        assert_eq!(read.into_bytes().expect("bytes"), [4, 5]);
+        let hal: &dyn GpuDevice = &device;
+        assert_eq!(hal.buffer_size(buffer).expect("HAL capacity"), 64);
+        assert_eq!(
+            hal.submit_write_buffer(9, buffer, 3, &[1, 2])
+                .expect("HAL async upload")
+                .cycle_id(),
+            9
+        );
+        let read = hal
+            .submit_read_buffer(10, buffer, 5, 2)
+            .expect("HAL async read");
+        assert_eq!(read.cycle_id(), 10);
+        assert_eq!(read.into_bytes().expect("HAL bytes"), [4, 5]);
     }
 }
