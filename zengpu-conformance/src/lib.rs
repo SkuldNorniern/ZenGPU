@@ -826,6 +826,59 @@ mod devarray_elementwise_tests {
         pool.free(input);
         kernels.destroy(&*cpu);
     }
+
+    #[test]
+    fn freeing_a_cloned_array_twice_cannot_alias_later_allocations() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(cpu.clone());
+        let array = pool.alloc(vec![64], DType::F32).unwrap();
+        pool.free(array.clone());
+        pool.free(array);
+        let first = pool.alloc(vec![64], DType::F32).unwrap();
+        let second = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_ne!(first.buffer, second.buffer);
+        cpu.write_buffer(first.buffer, 0, &[1; 256]).unwrap();
+        cpu.write_buffer(second.buffer, 0, &[2; 256]).unwrap();
+        assert_eq!(cpu.read_buffer(first.buffer, 0, 256).unwrap(), [1; 256]);
+        pool.free(first);
+        pool.free(second);
+    }
+
+    #[test]
+    fn an_old_array_alias_cannot_free_a_reused_allocation() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(cpu);
+        let array = pool.alloc(vec![64], DType::F32).unwrap();
+        let old = array.clone();
+        pool.free(array);
+        let current = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(old.buffer, current.buffer, "the buffer was reused");
+        pool.free(old);
+        let other = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_ne!(current.buffer, other.buffer);
+        pool.free(current);
+        pool.free(other);
+    }
+
+    #[test]
+    fn pools_reject_foreign_and_manually_reconstructed_arrays() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let owner = BufferPool::new(cpu.clone());
+        let other = BufferPool::new(cpu);
+        let array = owner.alloc(vec![64], DType::F32).unwrap();
+        assert!(other.try_free(array.clone()).is_err());
+        let reconstructed =
+            zengpu_compute::DeviceArray::new(array.buffer, array.shape.clone(), array.dtype);
+        assert!(owner.try_free(reconstructed).is_err());
+        let handle = array.buffer;
+        owner.try_free(array).unwrap();
+        let reused = owner.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(
+            reused.buffer, handle,
+            "failed returns did not lose the allocation"
+        );
+        owner.try_free(reused).unwrap();
+    }
 }
 
 #[cfg(test)]
