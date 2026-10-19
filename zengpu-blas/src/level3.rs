@@ -423,6 +423,16 @@ impl GemmKernel {
         a: &DeviceArray,
         b: &DeviceArray,
     ) -> Result<DeviceArray> {
+        ops.transaction(|ops| self.record_sgemm_inner(ops, alpha, a, b))
+    }
+
+    fn record_sgemm_inner(
+        &self,
+        ops: &mut OpList<'_>,
+        alpha: f32,
+        a: &DeviceArray,
+        b: &DeviceArray,
+    ) -> Result<DeviceArray> {
         let b_type = B_TYPES.iter().position(|&(dtype, _)| dtype == b.dtype);
         let a_type = B_TYPES.iter().position(|&(dtype, _)| dtype == a.dtype);
         let types_ok = match (a_type, b_type) {
@@ -458,7 +468,10 @@ impl GemmKernel {
             )));
         }
 
+        ops.validate_array(a)?;
+        ops.validate_array(b)?;
         let c = ops.pool().alloc(vec![m, n], DType::F32)?;
+        ops.require_buffer(c.buffer, c.size_bytes());
         let recorded = if let Some(hip) = &self.hip {
             Self::record_hip(hip, a_type, b_type, ops, alpha, a, b, &c, [m, n, k, mn])
         } else if let Some(cuda) = self.cuda.as_ref().filter(|_| a_type != 0) {

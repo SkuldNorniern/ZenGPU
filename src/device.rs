@@ -42,6 +42,10 @@ impl Device {
         self.inner.create_buffer(desc)
     }
 
+    pub fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        self.inner.buffer_size(buffer)
+    }
+
     pub fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         self.inner.write_buffer(buffer, offset, data)
     }
@@ -234,6 +238,10 @@ impl GpuDevice for Device {
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         self.inner.create_buffer(desc)
+    }
+
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        self.inner.buffer_size(buffer)
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {

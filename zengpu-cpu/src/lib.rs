@@ -109,6 +109,12 @@ impl GpuDevice for CpuDevice {
         Ok(self.buffers.lock().unwrap().insert(buffer))
     }
 
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        let buffers = self.buffers.lock().unwrap();
+        let buffer = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
+        Ok(buffer.data.len() as u64)
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let mut buffers = self.buffers.lock().unwrap();
         if buffers.get(buffer).is_none() {

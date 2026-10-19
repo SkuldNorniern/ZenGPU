@@ -2288,6 +2288,14 @@ impl GpuDevice for CudaDevice {
         })
     }
 
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;
+        buffers
+            .get(buffer)
+            .map(|buffer| buffer.len)
+            .ok_or_else(|| GpuError::Backend("cuda: invalid buffer handle".into()))
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         self.shared.with_current(|| {
             let buffers = self.buffers.lock().map_err(|_| GpuError::DeviceLost)?;

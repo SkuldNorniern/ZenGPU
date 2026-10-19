@@ -113,7 +113,7 @@ impl BufferPool {
     }
 }
 
-fn checked_len(shape: &[u32]) -> Result<u32> {
+pub(crate) fn checked_len(shape: &[u32]) -> Result<u32> {
     let multiply = |len: u32, &dim: &u32| -> Result<u32> {
         len.checked_mul(dim).ok_or_else(|| {
             UsageError::BindingMismatch("array shape exceeds u32 element or stride capacity".into())

@@ -840,6 +840,14 @@ impl GpuDevice for MetalDevice {
         }))
     }
 
+    fn buffer_size(&self, buffer: BufferHandle) -> Result<u64> {
+        let buffers = lock(&self.inner.buffers)?;
+        buffers
+            .get(buffer)
+            .map(|buffer| buffer.size)
+            .ok_or_else(|| GpuError::Backend("metal: invalid buffer handle".into()))
+    }
+
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         self.ensure_not_busy(buffer.index(), "write_buffer")?;
         let buffers = lock(&self.inner.buffers)?;

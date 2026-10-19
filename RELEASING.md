@@ -19,6 +19,9 @@ the crates together using a temporary local registry. This can catch packaging
 failures before any dependencies have been published. CI also checks workspace
 package assembly on Linux. Keep each crate's `LICENSE` copy in sync with the
 workspace `LICENSE`.
+When rechecking the same version locally, use a fresh `--target-dir` (for
+example `target/package-check-<run-id>`): Cargo can otherwise reuse dependency
+sources extracted from an earlier temporary registry at that path.
 
 Backend tests can return early when the driver or adapter is missing. A passing
 run on a machine without that backend does not establish hardware correctness.
