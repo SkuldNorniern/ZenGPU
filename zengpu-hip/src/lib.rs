@@ -4241,10 +4241,8 @@ extern "C" __global__ void spin(unsigned int ticks) {
     }
 
     fn floats(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+        let (words, _) = bytes.as_chunks::<4>();
+        words.iter().map(|&w| f32::from_le_bytes(w)).collect()
     }
 
     fn float_bytes(values: impl Iterator<Item = f32>) -> Vec<u8> {
