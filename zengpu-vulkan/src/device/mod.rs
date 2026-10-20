@@ -647,7 +647,7 @@ pub struct VulkanDevice {
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
     samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
-    shaders: Mutex<SlotMap<marker::Shader, vk::ShaderModule>>,
+    shaders: Mutex<SlotMap<marker::Shader, (vk::ShaderModule, bool)>>,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     /// Render targets (swapchain images, offscreen textures) that commands attach to.
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
@@ -1482,7 +1482,7 @@ impl Drop for VulkanDevice {
             unsafe { self.inner.device.destroy_sampler(s, None) };
         }
         let mut shaders = self.shaders.lock().unwrap();
-        for m in shaders.drain() {
+        for (m, _) in shaders.drain() {
             unsafe {
                 self.inner.device.destroy_shader_module(m, None);
             }
@@ -4661,16 +4661,11 @@ mod tests {
 
         let shader = dev.create_shader(FRAG_ZSL.spirv_desc()).unwrap();
         let pipeline = dev
-            .create_compute_pipeline_with(
-                ComputePipelineDesc {
-                    shader,
-                    entry: "main",
-                    block: [32, 1, 1],
-                },
-                zengpu_hal::ComputePipelineHints {
-                    subgroup_size: Some(32),
-                },
-            )
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [32, 1, 1],
+            })
             .unwrap();
         let slots: Vec<u32> = [a, b, c, out, ba, bb, ci_buf, oi, zout]
             .iter()

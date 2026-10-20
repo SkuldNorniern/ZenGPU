@@ -812,12 +812,13 @@ impl GpuDevice for VulkanDevice {
                 )
                 .map_err(|e| GpuError::ShaderCompile(format!("vkCreateShaderModule: {e}")))?
         };
-        Ok(self.shaders.lock().unwrap().insert(module))
+        let coop = uses_cooperative_matrix(words);
+        Ok(self.shaders.lock().unwrap().insert((module, coop)))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
         let mut shaders = self.shaders.lock().unwrap();
-        if let Some(m) = shaders.remove(shader) {
+        if let Some((m, _)) = shaders.remove(shader) {
             unsafe {
                 self.inner.device.destroy_shader_module(m, None);
             }
@@ -833,7 +834,7 @@ impl GpuDevice for VulkanDevice {
         desc: ComputePipelineDesc<'_>,
         hints: zengpu_hal::ComputePipelineHints,
     ) -> Result<PipelineHandle> {
-        let shader_module = {
+        let (shader_module, coop) = {
             let shaders = self.shaders.lock().unwrap();
             *shaders
                 .get(desc.shader)
@@ -863,7 +864,8 @@ impl GpuDevice for VulkanDevice {
 
         let entry = CString::new(desc.entry)
             .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
-        let required_size = hints.subgroup_size.filter(|&size| {
+        let wanted = hints.subgroup_size.or(coop.then_some(32));
+        let required_size = wanted.filter(|&size| {
             size.is_power_of_two()
                 && self
                     .inner
@@ -1088,4 +1090,21 @@ impl GpuDevice for VulkanDevice {
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
         self.submit_mixed_compute_async(cycle_id, ops)
     }
+}
+
+fn uses_cooperative_matrix(words: &[u32]) -> bool {
+    const OP_CAPABILITY: u32 = 17;
+    const COOPERATIVE_MATRIX_KHR: u32 = 6022;
+    let mut i = 5;
+    while i < words.len() {
+        let count = (words[i] >> 16) as usize;
+        if words[i] & 0xffff != OP_CAPABILITY || count < 2 {
+            return false;
+        }
+        if words.get(i + 1) == Some(&COOPERATIVE_MATRIX_KHR) {
+            return true;
+        }
+        i += count;
+    }
+    false
 }
