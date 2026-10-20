@@ -4617,4 +4617,329 @@ mod tests {
         dev.destroy_buffer(src);
         dev.destroy_buffer(out);
     }
+
+    /// Little-endian bytes of `v`, for a storage buffer.
+    fn zsl_f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_ne_bytes()).collect()
+    }
+
+    fn zsl_bytes_f32(b: &[u8]) -> Vec<f32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_ne_bytes(*c))
+            .collect()
+    }
+
+    fn zsl_bytes_u32(b: &[u8]) -> Vec<u32> {
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_ne_bytes(*c))
+            .collect()
+    }
+
+    /// Bindings: `inputs`, then `outputs` (byte sizes, zero-filled).
+    fn run_zsl(
+        dev: &dyn GpuDevice,
+        shader: &zengpu_spirv::ZslShader,
+        block: [u32; 3],
+        groups: [u32; 3],
+        inputs: &[Vec<u8>],
+        outputs: &[u64],
+        scalars: &[Scalar],
+    ) -> Vec<Vec<u8>> {
+        let shader_h = dev.create_shader(shader.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: shader_h,
+                entry: "main",
+                block,
+            })
+            .unwrap();
+        let mut bufs = Vec::new();
+        for bytes in inputs {
+            let b = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(b, 0, bytes).unwrap();
+            bufs.push(b);
+        }
+        for &size in outputs {
+            let b = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(b, 0, &vec![0u8; size as usize]).unwrap();
+            bufs.push(b);
+        }
+        let slots: Vec<u32> = bufs.iter().map(|b| b.index()).collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars,
+                textures: &[],
+                images: &[],
+            },
+            groups,
+        )
+        .unwrap();
+        let results = outputs
+            .iter()
+            .enumerate()
+            .map(|(k, &size)| dev.read_buffer(bufs[inputs.len() + k], 0, size).unwrap())
+            .collect();
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader_h);
+        for b in bufs {
+            dev.destroy_buffer(b);
+        }
+        results
+    }
+
+    #[test]
+    fn zsl_mul_add_f32_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FMA3: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel fma3(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = mul_add_f32(a[id.x], b[id.x], c[id.x])
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 1024u32;
+        let val = |i: u32, k: u32| {
+            (i.wrapping_mul(2_654_435_761).wrapping_add(k) % 2001) as f32 / 100.0 - 10.0
+        };
+        let a: Vec<f32> = (0..n).map(|i| val(i, 1)).collect();
+        let b: Vec<f32> = (0..n).map(|i| val(i, 2)).collect();
+        let c: Vec<f32> = (0..n).map(|i| val(i, 3)).collect();
+        let out = run_zsl(
+            &*dev,
+            &FMA3,
+            [64, 1, 1],
+            [n.div_ceil(64), 1, 1],
+            &[zsl_f32_bytes(&a), zsl_f32_bytes(&b), zsl_f32_bytes(&c)],
+            &[u64::from(n) * 4],
+            &[],
+        );
+        let got = zsl_bytes_f32(&out[0]);
+        for i in 0..n as usize {
+            let want = a[i].mul_add(b[i], c[i]);
+            assert_eq!(got[i].to_bits(), want.to_bits(), "fma at {i}");
+        }
+    }
+
+    #[test]
+    fn zsl_scatter_add_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const SCATTER: ZslShader = zsl!(
+            push Scatter { n: u32 }
+            @workgroup_size(256)
+            kernel scatter_add(idx: device buffer<f32>, val: device buffer<f32>, out: device mut buffer<f32>, p: Scatter, id: global_id) {
+                let i = id.x
+                if i < p.n {
+                    atomic_add(out, idx[i], val[i])
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let (n, bins) = (1000u32, 16u32);
+        let idx: Vec<f32> = (0..n).map(|i| ((i * 7) % bins) as f32).collect();
+        let val: Vec<f32> = (0..n).map(|i| (i % 5) as f32 - 2.0).collect();
+        let out = run_zsl(
+            &*dev,
+            &SCATTER,
+            [256, 1, 1],
+            [n.div_ceil(256), 1, 1],
+            &[zsl_f32_bytes(&idx), zsl_f32_bytes(&val)],
+            &[u64::from(bins) * 4],
+            &[Scalar::U32(n)],
+        );
+        let mut want = vec![0f32; bins as usize];
+        for i in 0..n as usize {
+            want[idx[i] as usize] += val[i];
+        }
+        assert_eq!(zsl_bytes_f32(&out[0]), want);
+    }
+
+    #[test]
+    fn zsl_workgroup_reduce_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const WG_REDUCE: ZslShader = zsl!(
+            push P { n: u32 }
+            @workgroup_size(256)
+            kernel workgroup_reduce(src: device buffer<f32>, out_add: device mut buffer<f32>, out_min: device mut buffer<f32>, out_max: device mut buffer<f32>, p: P, id: global_id) {
+                if group_id().x < p.n {
+                    let value = src[id.x]
+                    out_add[id.x] = workgroup_reduce_add(value)
+                    out_min[id.x] = workgroup_reduce_min(value)
+                    out_max[id.x] = workgroup_reduce_max(value)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let groups = 2u32;
+        let n = groups * 256;
+        let src: Vec<f32> = (0..n).map(|i| ((i * 37) % 61) as f32 - 30.0).collect();
+        let out = run_zsl(
+            &*dev,
+            &WG_REDUCE,
+            [256, 1, 1],
+            [groups, 1, 1],
+            &[zsl_f32_bytes(&src)],
+            &[u64::from(n) * 4; 3],
+            &[Scalar::U32(groups)],
+        );
+        let (add, min, max) = (
+            zsl_bytes_f32(&out[0]),
+            zsl_bytes_f32(&out[1]),
+            zsl_bytes_f32(&out[2]),
+        );
+        for i in 0..n as usize {
+            let g = &src[(i / 256) * 256..(i / 256 + 1) * 256];
+            let sum: f32 = g.iter().sum();
+            let lo = g.iter().copied().fold(f32::INFINITY, f32::min);
+            let hi = g.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            assert_eq!((add[i], min[i], max[i]), (sum, lo, hi), "lane {i}");
+        }
+    }
+
+    #[test]
+    fn zsl_subgroup_ops_run_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const QUERY: ZslShader = zsl!(
+            @workgroup_size(256)
+            kernel query(out_size: device mut buffer<u32>, out_id: device mut buffer<u32>, out_lane: device mut buffer<u32>, id: global_id) {
+                out_size[id.x] = subgroup_size()
+                out_id[id.x] = subgroup_id()
+                out_lane[id.x] = subgroup_local_id()
+            }
+        );
+        const PROOF: ZslShader = zsl!(
+            @workgroup_size(256)
+            kernel proof(out_reduce_add: device mut buffer<u32>, out_scan_inclusive: device mut buffer<u32>, out_scan_exclusive: device mut buffer<u32>, out_reduce_min: device mut buffer<u32>, out_reduce_max: device mut buffer<u32>, id: global_id) {
+                out_reduce_add[id.x] = subgroup_reduce_add(1u32)
+                out_scan_inclusive[id.x] = subgroup_scan_inclusive_add(1u32)
+                out_scan_exclusive[id.x] = subgroup_scan_exclusive_add(1u32)
+                out_reduce_min[id.x] = subgroup_reduce_min(subgroup_local_id())
+                out_reduce_max[id.x] = subgroup_reduce_max(subgroup_local_id())
+            }
+        );
+        const XOR: ZslShader = zsl!(
+            @workgroup_size(256)
+            kernel shuffle_xor(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = subgroup_shuffle_xor(id.x * 1.0, 1u32)
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 256u32;
+        let bytes = u64::from(n) * 4;
+        let q = run_zsl(&*dev, &QUERY, [256, 1, 1], [1, 1, 1], &[], &[bytes; 3], &[]);
+        let (size, id, lane) = (
+            zsl_bytes_u32(&q[0]),
+            zsl_bytes_u32(&q[1]),
+            zsl_bytes_u32(&q[2]),
+        );
+        let w = size[0];
+        assert!(w == 32 || w == 64, "subgroup size {w}");
+        for i in 0..n as usize {
+            assert_eq!(
+                (size[i], id[i], lane[i]),
+                (w, i as u32 / w, i as u32 % w),
+                "query at {i}"
+            );
+        }
+        let p = run_zsl(&*dev, &PROOF, [256, 1, 1], [1, 1, 1], &[], &[bytes; 5], &[]);
+        for i in 0..n as usize {
+            let l = i as u32 % w;
+            let got: Vec<u32> = p.iter().map(|o| zsl_bytes_u32(o)[i]).collect();
+            assert_eq!(got, [w, l + 1, l, 0, w - 1], "proof at {i}");
+        }
+        let x = run_zsl(&*dev, &XOR, [256, 1, 1], [1, 1, 1], &[], &[bytes], &[]);
+        for (i, v) in zsl_bytes_f32(&x[0]).into_iter().enumerate() {
+            assert_eq!(v, (i ^ 1) as f32, "shuffle_xor at {i}");
+        }
+    }
+
+    #[test]
+    fn zsl_tiled_gemm_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const GEMM: ZslShader = zsl!(
+            push Shape { m: u32, n: u32, k: u32 }
+            @workgroup_size(16, 16)
+            kernel tiled_gemm(a: device buffer<f32>, b: device buffer<f32>, c: device mut buffer<f32>, p: Shape) {
+                shared as_tile: array<f32, 256>
+                shared bs_tile: array<f32, 256>
+                let lx = local_id().x
+                let ly = local_id().y
+                let row = group_id().y * 16 + ly
+                let col = group_id().x * 16 + lx
+                let sum: f32 = 0.0
+                let tile_count = (p.k + 15) / 16
+                for tile in 0..tile_count {
+                    let ak = tile * 16 + lx
+                    let bk = tile * 16 + ly
+                    if row < p.m && ak < p.k {
+                        as_tile[ly * 16 + lx] = a[row * p.k + ak]
+                    } else {
+                        as_tile[ly * 16 + lx] = 0.0
+                    }
+                    if bk < p.k && col < p.n {
+                        bs_tile[ly * 16 + lx] = b[bk * p.n + col]
+                    } else {
+                        bs_tile[ly * 16 + lx] = 0.0
+                    }
+                    barrier()
+                    for q in 0..16 {
+                        sum = sum + as_tile[ly * 16 + q] * bs_tile[q * 16 + lx]
+                    }
+                    barrier()
+                }
+                if row < p.m && col < p.n {
+                    c[row * p.n + col] = sum
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let (m, n, k) = (32u32, 32u32, 32u32);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i * 7) % 5) as f32 - 2.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i * 3) % 7) as f32 - 3.0).collect();
+        let out = run_zsl(
+            &*dev,
+            &GEMM,
+            [16, 16, 1],
+            [n / 16, m / 16, 1],
+            &[zsl_f32_bytes(&a), zsl_f32_bytes(&b)],
+            &[u64::from(m * n) * 4],
+            &[Scalar::U32(m), Scalar::U32(n), Scalar::U32(k)],
+        );
+        let got = zsl_bytes_f32(&out[0]);
+        for r in 0..m as usize {
+            for c in 0..n as usize {
+                let want: f32 = (0..k as usize)
+                    .map(|q| a[r * k as usize + q] * b[q * n as usize + c])
+                    .sum();
+                assert_eq!(got[r * n as usize + c], want, "c[{r}][{c}]");
+            }
+        }
+    }
 }
