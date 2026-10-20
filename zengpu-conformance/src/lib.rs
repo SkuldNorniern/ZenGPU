@@ -1011,12 +1011,14 @@ mod half_buffer_tests {
     const HALF_IO_ZSL: ZslShader = zsl!(
         push P { n: u32 }
         @workgroup_size(64)
-        kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, p: P, id: global_id) {
+        kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, xf: device buffer<f32>, zh: device mut buffer<f16>, zb: device mut buffer<bf16>, p: P, id: global_id) {
             let i = id.x
             if i < p.n {
                 yh[i] = xh[i] * 2.0
                 yb[i] = xb[i] * 2.0
                 sum[i] = xh[i] + xb[i]
+                zh[i] = xf[i]
+                zb[i] = xf[i]
             }
         }
     );
@@ -1032,13 +1034,72 @@ mod half_buffer_tests {
         sign | (exp << 10) | ((b & 0x007f_ffff) >> 13) as u16
     }
 
+    /// Exact binary16 decode, infinities, NaN and -0 included.
     fn f16_value(h: u16) -> f32 {
-        if h & 0x7fff == 0 {
-            return 0.0;
+        let sign = h & 0x8000 != 0;
+        let exp = i32::from((h >> 10) & 0x1f);
+        let man = f32::from(h & 0x3ff);
+        let mag = match exp {
+            0 => man * 2f32.powi(-24),
+            31 if man == 0.0 => f32::INFINITY,
+            31 => f32::NAN,
+            _ => (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
+        };
+        if sign { -mag } else { mag }
+    }
+
+    /// Round `x` to `man` fraction bits, nearest even. Normal exponent >= `min_exp`, finite <=
+    /// `max`. `x` must not be NaN.
+    fn round_ref(x: f32, man: i32, min_exp: i32, max: f64) -> f64 {
+        let v = f64::from(x);
+        if v == 0.0 || !v.is_finite() {
+            return v;
         }
-        let sign = u32::from(h & 0x8000) << 16;
-        let exp = u32::from((h >> 10) & 0x1f) + 112;
-        f32::from_bits(sign | (exp << 23) | (u32::from(h & 0x3ff) << 13))
+        let e = (v.abs().log2().floor() as i32).max(min_exp);
+        let ulp = 2f64.powi(e - man);
+        let q = (v / ulp).round_ties_even() * ulp;
+        if q.abs() > max {
+            f64::INFINITY.copysign(v)
+        } else {
+            q
+        }
+    }
+
+    /// Store inputs: ties at both halves' precision across normal, subnormal and overflow,
+    /// then edges.
+    fn store_inputs(n: u32) -> Vec<f32> {
+        let edge = [
+            65504.0,
+            65519.0,
+            65520.0,
+            1.0e30,
+            -1.0e30,
+            2f32.powi(-24),
+            2f32.powi(-25),
+            3.0 * 2f32.powi(-25),
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            2f32.powi(-14) * (1.0 - 2f32.powi(-11)),
+            3.0e38,
+            f32::MAX,
+            1.0e-40,
+            -2.0 * 2f32.powi(-25),
+        ];
+        (0..n)
+            .map(|i| {
+                let v = if let Some(&e) = edge.get(i as usize) {
+                    return e;
+                } else if i % 2 == 0 {
+                    (1.0 + ((i % 1024) as f32 + 0.5) * 2f32.powi(-10))
+                        * 2f32.powi((i % 40) as i32 - 20)
+                } else {
+                    (1.0 + ((i % 128) as f32 + 0.5) * 2f32.powi(-7))
+                        * 2f32.powi((i % 40) as i32 - 20)
+                };
+                if i % 3 == 0 { -v } else { v }
+            })
+            .collect()
     }
 
     #[test]
@@ -1065,6 +1126,8 @@ mod half_buffer_tests {
             .iter()
             .flat_map(|&v| ((v.to_bits() >> 16) as u16).to_le_bytes())
             .collect();
+        let store_in = store_inputs(n);
+        let xf: Vec<u8> = store_in.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buffer = |size: u64| {
             vk.create_buffer(BufferDesc {
                 size,
@@ -1080,9 +1143,13 @@ mod half_buffer_tests {
             buffer(half_bytes),
             buffer(half_bytes),
             buffer(u64::from(n) * 4),
+            buffer(u64::from(n) * 4),
+            buffer(half_bytes),
+            buffer(half_bytes),
         ];
         vk.write_buffer(bufs[0], 0, &xh).unwrap();
         vk.write_buffer(bufs[1], 0, &xb).unwrap();
+        vk.write_buffer(bufs[5], 0, &xf).unwrap();
         let slots: Vec<u32> = bufs.iter().map(|b| b.index()).collect();
         vk.dispatch(
             pipeline,
@@ -1098,19 +1165,32 @@ mod half_buffer_tests {
         let halves = |i: usize| -> Vec<u16> {
             vk.read_buffer(bufs[i], 0, half_bytes)
                 .unwrap()
-                .as_chunks::<2>()
-                .0
-                .iter()
+                .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         };
-        let (yh, yb) = (halves(2), halves(3));
+        let (yh, yb, zh, zb) = (halves(2), halves(3), halves(6), halves(7));
         let sum = crate::from_bytes_f32(&vk.read_buffer(bufs[4], 0, u64::from(n) * 4).unwrap());
         for i in 0..n as usize {
             let want = 2.0 * x[i];
             assert_eq!(f16_value(yh[i]), want, "f16 at {i}");
             assert_eq!(f32::from_bits(u32::from(yb[i]) << 16), want, "bf16 at {i}");
             assert_eq!(sum[i], want, "sum at {i}");
+            let v = store_in[i];
+            let want16 = round_ref(v, 10, -14, 65504.0);
+            let want_b = round_ref(v, 7, -126, f64::from(f32::from_bits(0x7f7f_0000)));
+            let got16 = f64::from(f16_value(zh[i]));
+            let got_b = f64::from(f32::from_bits(u32::from(zb[i]) << 16));
+            assert_eq!(
+                got16.to_bits(),
+                want16.to_bits(),
+                "f16 store of {v:e} at {i}"
+            );
+            assert_eq!(
+                got_b.to_bits(),
+                want_b.to_bits(),
+                "bf16 store of {v:e} at {i}"
+            );
         }
         for b in bufs {
             vk.destroy_buffer(b);
