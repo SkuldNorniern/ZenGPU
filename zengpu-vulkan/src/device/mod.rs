@@ -3335,6 +3335,91 @@ mod tests {
         dev.destroy_texture(tex);
     }
 
+    /// Host cost of one trivial one-workgroup dispatch.
+    ///
+    /// Run with `cargo test --release -p zengpu-vulkan dispatch_overhead -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dispatch_overhead() {
+        use std::time::{Duration, Instant};
+
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const TOUCH: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel touch(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = 1.0
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        let shader = dev.create_shader(TOUCH.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let out = dev
+            .create_buffer(BufferDesc {
+                size: 4096,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let bindings = Bindings {
+            buffers: &[out.index()],
+            ..Bindings::default()
+        };
+        dev.dispatch(pipeline, bindings, [1, 1, 1]).unwrap();
+        const N: u32 = 2000;
+        let per = |d: Duration| d.as_secs_f64() * 1e6 / f64::from(N);
+
+        let t = Instant::now();
+        for _ in 0..N {
+            dev.dispatch(pipeline, bindings, [1, 1, 1]).unwrap();
+        }
+        println!(
+            "vulkan: single dispatch + sync   {:.2} us",
+            per(t.elapsed())
+        );
+
+        let ops: Vec<DispatchOp<'_>> = (0..N)
+            .map(|_| DispatchOp {
+                pipeline,
+                bindings,
+                grid: [1, 1, 1],
+            })
+            .collect();
+        let t = Instant::now();
+        let sub = dev.submit_batch(0, &ops).unwrap();
+        println!(
+            "vulkan: enqueue N dispatches (CPU) {:.2} us",
+            per(t.elapsed())
+        );
+        sub.wait(Duration::from_secs(10)).unwrap();
+
+        let t = Instant::now();
+        dev.dispatch_batch(&ops).unwrap();
+        println!(
+            "vulkan: dispatch_batch N         {:.2} us",
+            per(t.elapsed())
+        );
+
+        program_destroy(&*dev, pipeline, shader, out);
+    }
+
+    fn program_destroy(
+        dev: &dyn GpuDevice,
+        pipeline: PipelineHandle,
+        shader: ShaderHandle,
+        out: BufferHandle,
+    ) {
+        dev.destroy_buffer(out);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+    }
+
     #[test]
     fn pipeline_stats_order_tiny_and_heavy_kernels() {
         use zengpu_spirv::{ZslShader, zsl};
