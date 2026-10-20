@@ -148,6 +148,13 @@ inline float zsl_dot2_f16(uint a, uint b, float acc) {
     acc = fma(float(x.x), float(y.x), acc);
     return fma(float(x.y), float(y.y), acc);
 }
+// Rust `as` from f32: NaN -> 0, saturate at the i32 bounds, truncate.
+inline int zsl_f32_to_i32(float x) {
+    if (x != x) return 0;
+    if (x >= 2147483648.0f) return 2147483647;
+    if (x <= -2147483648.0f) return (-2147483647 - 1);
+    return int(x);
+}
 inline uint zsl_funnel_shr(uint hi, uint lo, uint s) {
     return uint(((ulong(hi) << 32) | ulong(lo)) >> (s & 31u));
 }
@@ -539,6 +546,14 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot2F16 => format!("zsl_dot2_f16({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::FunnelShr => format!("zsl_funnel_shr({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::Select => format!("select({}, {}, {})", a[2], a[1], a[0]),
+                BuiltinFn::I32 => {
+                    let f32_id = ctx.types.borrow_mut().f32_id();
+                    if expr_type(ctx, &args[0]) == f32_id {
+                        format!("zsl_f32_to_i32({})", a[0])
+                    } else {
+                        format!("int({})", a[0])
+                    }
+                }
                 BuiltinFn::BytePerm => format!("zsl_byte_perm({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
