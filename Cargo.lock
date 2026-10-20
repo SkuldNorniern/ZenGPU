@@ -1912,7 +1912,6 @@ dependencies = [
  "metal",
  "objc",
  "zen-window-handle",
- "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",
 ]

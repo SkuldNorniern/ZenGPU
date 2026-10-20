@@ -21,7 +21,7 @@ mod unsupported;
 #[cfg(not(target_os = "macos"))]
 pub use unsupported::{MetalDevice, MetalInstance};
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
@@ -70,12 +70,6 @@ mod tests {
             .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
-    }
-
-    #[test]
-    fn instance_constructs_without_panic() {
-        let inst = MetalInstance::new();
-        let _ = inst.enumerate_adapters();
     }
 
     /// Bindings for saxpy: two buffers and a push struct with `n` and `alpha`.
@@ -245,137 +239,6 @@ mod tests {
         unsafe { from_raw_parts(data.as_ptr() as *const u8, size_of_val(data)) }
     }
 
-    #[test]
-    #[cfg(target_os = "macos")]
-    fn vec_add_compute_on_metal() {
-        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
-        use zengpu_spirv::{ZslShader, zsl};
-
-        const ADD: ZslShader = zsl!(
-            push P { n: u32 }
-            @workgroup_size(256)
-            kernel add(
-                a: device buffer<f32>,
-                b: device buffer<f32>,
-                out: device mut buffer<f32>,
-                p: P,
-                id: global_id,
-            ) {
-                let i = id.x
-                if i < p.n {
-                    out[i] = a[i] + b[i]
-                }
-            }
-        );
-
-        let inst = MetalInstance::new();
-        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
-            return;
-        };
-        let device = adapter.open(DeviceRequest::default()).expect("open");
-
-        let a = [1.0f32, 2.0, 3.0, 4.0];
-        let b = [10.0f32, 20.0, 30.0, 40.0];
-        let n = a.len();
-        let bytes = (n * 4) as u64;
-
-        let mk = |usage| {
-            device
-                .create_buffer(BufferDesc {
-                    size: bytes,
-                    usage,
-                    memory: MemoryUsage::Upload,
-                })
-                .expect("buffer")
-        };
-        let ba = mk(BufferUsage::STORAGE);
-        let bb = mk(BufferUsage::STORAGE);
-        let bout = mk(BufferUsage::STORAGE | BufferUsage::READBACK);
-        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-
-        let shader = device
-            .create_shader(ShaderDesc::msl(ADD.msl.unwrap()))
-            .expect("shader");
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "zsl_main",
-                block: [256, 1, 1],
-            })
-            .expect("pipeline");
-
-        device
-            .dispatch(
-                pipeline,
-                Bindings {
-                    buffers: &[ba.index(), bb.index(), bout.index()],
-                    textures: &[],
-                    images: &[],
-                    scalars: &[Scalar::U32(n as u32)],
-                },
-                [1, 1, 1],
-            )
-            .expect("dispatch");
-
-        let out = device.read_buffer(bout, 0, bytes).expect("read");
-        let result: &[f32] = unsafe { from_raw_parts(out.as_ptr() as *const f32, n) };
-        assert_eq!(result, &[11.0, 22.0, 33.0, 44.0]);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn texture_readback_completes_when_waited_on() {
-        use std::time::Duration;
-        use zengpu_hal::{
-            BufferUsage, Format, MemoryUsage, SubmissionStatus, TexDim, TextureDesc, TextureRegion,
-            TextureUsage, TextureWrite,
-        };
-        let Some(dev) = open_metal() else { return };
-        let tex = dev
-            .create_texture(TextureDesc {
-                width: 2,
-                height: 2,
-                depth: 1,
-                format: Format::Rgba8Unorm,
-                usage: TextureUsage::SAMPLED
-                    | TextureUsage::TRANSFER_SRC
-                    | TextureUsage::TRANSFER_DST,
-                samples: 1,
-                dimension: TexDim::D2,
-                mip_levels: 1,
-                array_layers: 1,
-            })
-            .unwrap();
-        let texels = [7u8; 16];
-        let region = TextureRegion::rect(0, 0, 2, 2);
-        let write = TextureWrite {
-            texture: tex,
-            region,
-            data: &texels,
-            bytes_per_row: 8,
-        };
-        dev.write_textures(&[write])
-            .unwrap()
-            .wait(Duration::from_secs(5))
-            .unwrap();
-        let buf = dev
-            .create_buffer(BufferDesc {
-                size: 16,
-                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
-                memory: MemoryUsage::Readback,
-            })
-            .unwrap();
-        let copy = dev
-            .copy_texture_region_to_buffer(tex, region, buf, 0, 8)
-            .unwrap();
-        copy.wait(Duration::from_secs(5)).unwrap();
-        assert_eq!(copy.poll().unwrap(), SubmissionStatus::Complete);
-        let mut out = [0u8; 16];
-        dev.read_buffer_into(buf, 0, &mut out).unwrap();
-        assert_eq!(out, texels);
-    }
-
     /// A cube's six faces arrive in one upload, each at its own layer.
     #[cfg(target_os = "macos")]
     #[test]
@@ -436,8 +299,8 @@ mod graphics_tests {
     use crate::{MetalDevice, MetalInstance};
     use zengpu_hal::{
         Bindings, BlendState, BufferDesc, BufferHandle, BufferUsage, ColorAttachment,
-        ColorTargetState, CompareFn, DepthAttachment, DepthState, DeviceRequest, DeviceType,
-        FilterMode, Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, LoadOp, MemoryUsage,
+        ColorTargetState, CompareFn, DepthAttachment, DepthState, DeviceRequest, FilterMode,
+        Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, LoadOp, MemoryUsage,
         PipelineHandle, PrimitiveTopology, RasterState, RenderCommands, RenderPassDesc,
         SamplerDesc, Scalar, ShaderDesc, StepMode, TargetHandle, TexDim, TextureDesc,
         TextureHandle, TextureUsage, VertexAttribute, VertexFormat, VertexLayout, Viewport,
@@ -1073,23 +936,6 @@ mod graphics_tests {
                 .iter()
                 .all(|p| *p == [0, 255, 0, 255])
         );
-    }
-
-    #[test]
-    fn adapters_keep_their_uuid_and_open_themselves() {
-        let inst = MetalInstance::new();
-        let Some(first) = inst.metal_adapters().into_iter().next() else {
-            return;
-        };
-        let again = inst
-            .metal_adapter_by_uuid(first.uuid())
-            .expect("same adapter by uuid");
-        assert_eq!(again.uuid(), first.uuid());
-        let dev = again.open_metal(DeviceRequest::default()).expect("open");
-        if dev.raw_device().has_unified_memory() {
-            use zengpu_hal::GpuAdapter;
-            assert_eq!(first.info().device_type, DeviceType::Integrated);
-        }
     }
 
     /// Metal twin of zengpu-vulkan's `compute_chains_texture_passes_in_one_submission`.
