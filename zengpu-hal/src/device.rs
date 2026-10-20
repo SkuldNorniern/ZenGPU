@@ -6,8 +6,8 @@ use core::any::Any;
 use crate::caps::ComputeCaps;
 use crate::command::{Bindings, ComputeOp, DispatchOp};
 use crate::desc::{
-    BufferDesc, ComputePipelineDesc, ComputePipelineHints, SamplerDesc, ShaderDesc, TextureDesc,
-    TextureRegion, TextureWrite,
+    BufferDesc, ComputePipelineDesc, ComputePipelineHints, PipelineStats, SamplerDesc, ShaderDesc,
+    TextureDesc, TextureRegion, TextureWrite,
 };
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
@@ -300,6 +300,12 @@ pub trait GpuDevice: Send + Sync {
     }
 
     fn destroy_pipeline(&self, _pipeline: PipelineHandle) {}
+
+    /// `None` when unreported, or when `ComputePipelineHints::capture_stats` is not set on backends
+    /// that need it.
+    fn pipeline_stats(&self, _pipeline: PipelineHandle) -> Option<PipelineStats> {
+        None
+    }
 
     /// Dispatches a compute kernel and blocks until the GPU work completes. `submit` is the
     /// pollable, bounded version.
