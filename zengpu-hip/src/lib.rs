@@ -33,9 +33,9 @@ use zengpu_hal::{
     BufferUsage, CompletedReadback, CompletedSubmission, ComputeCaps, ComputeOp,
     ComputePipelineDesc, DType, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, GpuAdapter,
     GpuDevice, GpuError, GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget,
-    MemoryUsage, MmaShape, PipelineHandle, PowerPreference, ReadSubmission, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
-    SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
+    MemoryUsage, MmaShape, PipelineHandle, PipelineStats, PowerPreference, ReadSubmission, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 mod hip_layout {
@@ -48,6 +48,7 @@ use version::{GfxFamily, HipCapabilities, RocmVersion};
 
 pub mod workarounds;
 
+mod code_object;
 mod ffi;
 use ffi::*;
 
@@ -87,6 +88,19 @@ const HIP_MEMCPY_DEFAULT: i32 = 4;
 const HIP_HOST_MALLOC_MAPPED: u32 = 2;
 /// First `hipFunction_attribute` member, the same in every ROCm release.
 const HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: i32 = 0;
+/// `HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES`: static LDS bytes per block.
+const HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: i32 = 1;
+/// `HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES`: private (spill) bytes per lane.
+const HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES: i32 = 3;
+/// `HIP_FUNC_ATTRIBUTE_NUM_REGS`: vector registers per lane.
+const HIP_FUNC_ATTRIBUTE_NUM_REGS: i32 = 4;
+
+/// `None` if the runtime refuses the query.
+fn func_attribute(func: HipFunction, attr: i32) -> Option<u32> {
+    let mut value = 0i32;
+    let rc = unsafe { hipFuncGetAttribute(&mut value, attr, func) };
+    (rc == HIP_SUCCESS && value >= 0).then_some(value as u32)
+}
 
 const HIP_STREAM_NON_BLOCKING: u32 = 1;
 const HIP_EVENT_DISABLE_TIMING: u32 = 2;
@@ -540,6 +554,7 @@ unsafe impl Sync for HipBuffer {}
 /// Shared with pipelines, so destroying a shader does not unload code a pipeline still launches.
 struct HipModule {
     raw: HipModuleRaw,
+    sgprs: HashMap<String, u32>,
 }
 unsafe impl Send for HipModule {}
 unsafe impl Sync for HipModule {}
@@ -554,6 +569,7 @@ impl Drop for HipModule {
 struct HipPipeline {
     function: HipFunction,
     block: [u32; 3],
+    stats: PipelineStats,
     _module: Arc<HipModule>,
 }
 unsafe impl Send for HipPipeline {}
@@ -1871,7 +1887,8 @@ impl GpuDevice for HipDevice {
             rc = unsafe { hipModuleLoadData(&mut module, code.as_ptr() as *const c_void) };
         }
         self.core.check(rc, "hipModuleLoadData")?;
-        Ok(lock(&self.core.shaders)?.insert(Arc::new(HipModule { raw: module })))
+        let sgprs = code_object::sgpr_counts(&code);
+        Ok(lock(&self.core.shaders)?.insert(Arc::new(HipModule { raw: module, sgprs })))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
@@ -1933,15 +1950,9 @@ impl GpuDevice for HipDevice {
         }
         self.core.check(rc, "hipModuleGetFunction")?;
 
-        let mut kernel_max = 0;
-        let rc = unsafe {
-            hipFuncGetAttribute(
-                &mut kernel_max,
-                HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
-                func,
-            )
-        };
-        if rc == HIP_SUCCESS && kernel_max > 0 && threads > kernel_max as u64 {
+        let kernel_max =
+            func_attribute(func, HIP_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK).unwrap_or(0);
+        if kernel_max > 0 && threads > u64::from(kernel_max) {
             return Err(GpuError::PipelineCreation(format!(
                 "hip: block {block:?} has {threads} threads but kernel `{}` allows at most \
                  {kernel_max} (check its __launch_bounds__ / @workgroup_size)",
@@ -1949,11 +1960,26 @@ impl GpuDevice for HipDevice {
             )));
         }
 
+        let stats = PipelineStats {
+            vgprs: func_attribute(func, HIP_FUNC_ATTRIBUTE_NUM_REGS).unwrap_or(0),
+            sgprs: module.sgprs.get(desc.entry).copied().unwrap_or(0),
+            scratch_bytes: func_attribute(func, HIP_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES).unwrap_or(0),
+            lds_bytes: func_attribute(func, HIP_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES).unwrap_or(0),
+            max_threads: kernel_max,
+            waves_per_simd: None,
+        };
+
         Ok(lock(&self.core.pipelines)?.insert(HipPipeline {
             function: func,
             block,
+            stats,
             _module: module,
         }))
+    }
+
+    fn pipeline_stats(&self, pipeline: PipelineHandle) -> Option<PipelineStats> {
+        let pipelines = lock(&self.core.pipelines).ok()?;
+        pipelines.get(pipeline).map(|pipe| pipe.stats)
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
@@ -2143,6 +2169,53 @@ void vec_add(const float* __restrict__ a,
                 None
             }
         }
+    }
+
+    #[test]
+    fn pipeline_stats_order_tiny_heavy_and_spilling_kernels() {
+        const KERNELS: &str = r#"
+extern "C" __global__ __launch_bounds__(256) void tiny(float* x) {
+    x[threadIdx.x] = 1.0f;
+}
+extern "C" __global__ __launch_bounds__(256) void heavy(const float* __restrict__ a, float* __restrict__ out) {
+    float acc[64];
+    for (int i = 0; i < 64; ++i) acc[i] = a[threadIdx.x * 64 + i];
+    for (int r = 0; r < 4; ++r)
+        for (int i = 0; i < 64; ++i) acc[i] = acc[i] * acc[(i + 7) & 63] + 0.5f;
+    float s = 0;
+    for (int i = 0; i < 64; ++i) s += acc[i];
+    out[threadIdx.x] = s;
+}
+extern "C" __global__ __launch_bounds__(256) void spill(float* out) {
+    float acc[512];
+    for (int i = 0; i < 512; ++i) acc[i] = 0.0f;
+    for (int i = 0; i < 512; ++i) acc[(i * (int)threadIdx.x + 3) & 511] += (float)i;
+    out[threadIdx.x] = acc[(threadIdx.x * 7) & 511];
+}
+"#;
+        let Some(inst) = try_instance() else { return };
+        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let device = adapter.open(DeviceRequest::default()).unwrap();
+        let shader = device.create_shader(ShaderDesc::hip(KERNELS)).unwrap();
+        let stats = |entry: &str| {
+            let pipeline = device
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry,
+                    block: [256, 1, 1],
+                })
+                .unwrap();
+            device.pipeline_stats(pipeline).unwrap()
+        };
+        let (tiny, heavy, spill) = (stats("tiny"), stats("heavy"), stats("spill"));
+        assert!(tiny.sgprs > 0 && tiny.vgprs > 0, "{tiny:?}");
+        assert!(heavy.vgprs > tiny.vgprs && heavy.sgprs > 0, "{heavy:?}");
+        assert_eq!(tiny.scratch_bytes, 0);
+        assert!(spill.scratch_bytes > 0, "{spill:?}");
+        assert_eq!(heavy.max_threads, 256);
+        println!("hip stats: tiny {tiny:?} heavy {heavy:?} spill {spill:?}");
     }
 
     #[test]
