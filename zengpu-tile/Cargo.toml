@@ -1,0 +1,23 @@
+[package]
+name = "zengpu-tile"
+description = "ZenGPU tile layer: block-level kernels lowered to ZSL, with an O0 reference schedule."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+zengpu-hal.workspace = true
+zengpu-zslc.workspace = true
+
+[dev-dependencies]
+zengpu-hip.workspace = true
+zengpu-vulkan.workspace = true
