@@ -150,7 +150,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::env;
-    use std::time::Instant;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
 
     use zengpu_hal::{
         AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage, DeviceRequest,
@@ -732,14 +733,117 @@ mod tests {
         }
     }
 
-    /// Benchmarks each schedule with one warmup, then three timed dispatches.
+    /// Warm-up before timing: GPU clocks ramp up from idle over a few hundred ms.
+    const WARMUP: Duration = Duration::from_millis(300);
+    /// Each rep is one batch of dispatches, with one sync.
+    const REPS: usize = 10;
+    const BATCH: Duration = Duration::from_millis(20);
+
+    /// Milliseconds per dispatch.
+    #[derive(Clone, Copy)]
+    struct Timing {
+        median: f64,
+        min: f64,
+        max: f64,
+    }
+
+    fn timing(mut ms: Vec<f64>) -> Timing {
+        ms.sort_by(f64::total_cmp);
+        let n = ms.len();
+        let median = if n % 2 == 1 {
+            ms[n / 2]
+        } else {
+            (ms[n / 2 - 1] + ms[n / 2]) / 2.0
+        };
+        Timing {
+            median,
+            min: ms[0],
+            max: ms[n - 1],
+        }
+    }
+
+    /// Two single dispatches size the batch. Then `WARMUP`, then `REPS` reps of `k` dispatches, one
+    /// sync each.
+    fn time_program(
+        dev: &dyn GpuDevice,
+        program: &TileProgram,
+        handles: &[BufferHandle],
+    ) -> Timing {
+        program.dispatch_many(dev, handles, 1).unwrap();
+        let t0 = Instant::now();
+        program.dispatch_many(dev, handles, 1).unwrap();
+        let one = t0.elapsed().as_secs_f64().max(1e-6);
+        let k = ((BATCH.as_secs_f64() / one).round() as usize).max(1);
+        let warm = Instant::now();
+        while warm.elapsed() < WARMUP {
+            program.dispatch_many(dev, handles, k).unwrap();
+        }
+        let ms = (0..REPS)
+            .map(|_| {
+                let t = Instant::now();
+                program.dispatch_many(dev, handles, k).unwrap();
+                t.elapsed().as_secs_f64() * 1e3 / k as f64
+            })
+            .collect();
+        timing(ms)
+    }
+
+    /// Naive timing (`ZENGPU_TILE_BENCH_NAIVE=1`): one warm-up, three synced dispatches, wall
+    /// clock mean.
+    fn time_naive(dev: &dyn GpuDevice, program: &TileProgram, handles: &[BufferHandle]) -> f64 {
+        program.dispatch_many(dev, handles, 1).unwrap();
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            program.dispatch_many(dev, handles, 1).unwrap();
+        }
+        t0.elapsed().as_secs_f64() * 1e3 / 3.0
+    }
+
+    /// Printed once per run. A process on the GPU (e.g. `zetna serve`) shows in the PID list.
+    fn print_environment() {
+        println!("environment (rocm-smi):");
+        let Ok(out) = Command::new("rocm-smi")
+            .args(["--showclocks", "--showpower", "--showtemp", "--showpids"])
+            .output()
+        else {
+            println!("  rocm-smi unavailable");
+            return;
+        };
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            let keep = line.contains("sclk")
+                || line.contains("junction")
+                || line.contains("Power")
+                || line.trim_start().starts_with(|c: char| c.is_ascii_digit());
+            if keep {
+                println!("  {}", line.trim());
+            }
+        }
+    }
+
+    /// Benchmarks the HIP f16 GEMM schedules per shape.
     ///
-    /// Run with `cargo test -p zengpu-tile bench_f16_gemm_hip -- --ignored --nocapture`.
+    /// Run with `cargo test --release -p zengpu-tile bench_f16_gemm_hip -- --ignored --nocapture`.
+    /// Each shape tries O0 (up to 2048), scalar-staged, then mma search. The best mma config is
+    /// re-run 3x.
     #[test]
     #[ignore]
     fn bench_f16_gemm_hip() {
         let Some(dev) = hip_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Hip);
+        let naive = env::var_os("ZENGPU_TILE_BENCH_NAIVE").is_some();
+        print_environment();
+        println!(
+            "method: {}",
+            if naive {
+                "naive (step-3b: 1 warm-up, 3 single dispatches, wall clock)".to_string()
+            } else {
+                format!(
+                    "warm-up {} ms, {REPS} reps of ~{} ms batches, median/min/max per dispatch",
+                    WARMUP.as_millis(),
+                    BATCH.as_millis()
+                )
+            }
+        );
         let shapes = [
             (128, 5120, 5120),
             (128, 17408, 5120),
@@ -751,17 +855,16 @@ mod tests {
             matrix: Matrix::Scalar,
             ..Schedule::default()
         };
-        let mma = |waves: u32, stages: u32| Schedule {
+        let mma = |waves: u32| Schedule {
             matrix: Matrix::Mma,
             waves,
-            stages,
+            stages: 0,
             ..Schedule::default()
         };
         let tiles = [[64, 64], [128, 64], [128, 128]];
         let bks = [16, 32, 64];
         let waves = [4, 8];
-        println!("| M | N | K | schedule | ms | TFLOPS |");
-        println!("|---|---|---|---|---|---|");
+        let mut summary: Vec<String> = Vec::new();
         for (m, n, k) in shapes {
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
             let f16_bytes = |len: usize| -> Vec<u8> {
@@ -787,25 +890,26 @@ mod tests {
                 dev.write_buffer(h, 0, bytes).unwrap();
                 handles.push(h);
             }
-            let mut rows: Vec<(String, f64, String)> = Vec::new();
-            let mut run = |label: String, kernel: &TileKernel, sched: &Schedule| {
+            println!("\n| M | N | K | schedule | ms median | min | max | TFLOPS |");
+            println!("|---|---|---|---|---|---|---|---|");
+            let mut mma_rows: Vec<(String, f64, CompiledTile)> = Vec::new();
+            let run = |label: String, kernel: &TileKernel, sched: &Schedule| -> Option<f64> {
                 let compiled = compile_with(kernel, sched, &target).unwrap();
                 let program = compiled.load(&*dev).unwrap();
-                program.dispatch(&*dev, &handles).unwrap();
-                let iters = 3;
-                let t0 = Instant::now();
-                for _ in 0..iters {
-                    program.dispatch(&*dev, &handles).unwrap();
-                }
-                let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+                let (ms, min, max) = if naive {
+                    let ms = time_naive(&*dev, &program, &handles);
+                    (ms, ms, ms)
+                } else {
+                    let t = time_program(&*dev, &program, &handles);
+                    (t.median, t.min, t.max)
+                };
                 println!(
-                    "| {m} | {n} | {k} | {label} ({}) | {ms:.3} | {:.2} |",
+                    "| {m} | {n} | {k} | {label} ({}) | {ms:.3} | {min:.3} | {max:.3} | {:.2} |",
                     compiled.schedule_name(),
                     flops / (ms * 1e-3) / 1e12
                 );
-                let zsl = compiled.zsl().to_string();
                 program.destroy(&*dev);
-                rows.push((label, ms, zsl));
+                Some(ms)
             };
             let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
             if m.max(n).max(k) <= 2048 {
@@ -817,23 +921,73 @@ mod tests {
                     let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
                     for w in waves {
                         let label = format!("mma {}x{} bk{bk} w{w}", tile[0], tile[1]);
-                        run(label, &kernel, &mma(w, 0));
+                        let sched = mma(w);
+                        let compiled = compile_with(&kernel, &sched, &target).unwrap();
+                        if compiled.schedule_name() != "mma" {
+                            println!(
+                                "| {m} | {n} | {k} | {label} | skipped: {:?} |",
+                                compiled.notes()
+                            );
+                            continue;
+                        }
+                        let Some(ms) = run(label.clone(), &kernel, &sched) else {
+                            continue;
+                        };
+                        mma_rows.push((label, ms, compiled));
                     }
                 }
             }
+            let best = mma_rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            println!("best search: {} at {:.3} ms", best.0, best.1);
+            if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
+                println!("{}", best.2.zsl());
+            }
+            let best_kernel = best.0.clone();
+            let (tile, bk, w) = parse_label(&best_kernel);
+            let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
+            let compiled = compile_with(&kernel, &mma(w), &target).unwrap();
+            let program = compiled.load(&*dev).unwrap();
+            let mut medians = Vec::new();
+            for rep in 0..3 {
+                let t = time_program(&*dev, &program, &handles);
+                println!(
+                    "rerun {rep}: {} median {:.3} ms min {:.3} max {:.3} TFLOPS {:.2}",
+                    best_kernel,
+                    t.median,
+                    t.min,
+                    t.max,
+                    flops / (t.median * 1e-3) / 1e12
+                );
+                medians.push(t.median);
+            }
+            program.destroy(&*dev);
+            let med = timing(medians.clone());
+            summary.push(format!(
+                "| {m} x {n} x {k} | {best_kernel} | {:.3} | {:.3}..{:.3} | {:.2} |",
+                med.median,
+                med.min,
+                med.max,
+                flops / (med.median * 1e-3) / 1e12
+            ));
             for h in handles {
                 dev.destroy_buffer(h);
             }
-            let best = rows
-                .iter()
-                .filter(|r| r.0.starts_with("mma"))
-                .min_by(|a, b| a.1.total_cmp(&b.1))
-                .unwrap();
-            println!("best {m}x{n}x{k}: {} at {:.3} ms", best.0, best.1);
-            if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
-                println!("{}", best.2);
-            }
         }
+        println!(
+            "\n| M x N x K | best mma config | median ms (3 reruns) | rerun range ms | TFLOPS |"
+        );
+        println!("|---|---|---|---|---|");
+        for line in summary {
+            println!("{line}");
+        }
+    }
+
+    fn parse_label(label: &str) -> ([usize; 2], usize, u32) {
+        let parts: Vec<&str> = label.split(' ').collect();
+        let tile: Vec<usize> = parts[1].split('x').map(|v| v.parse().unwrap()).collect();
+        let bk = parts[2].trim_start_matches("bk").parse().unwrap();
+        let w = parts[3].trim_start_matches('w').parse().unwrap();
+        ([tile[0], tile[1]], bk, w)
     }
 
     const EXPECTED_GEMM_TEXT: &str = "tile v0 kernel gemm tile [32, 32]
