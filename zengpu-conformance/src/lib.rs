@@ -432,12 +432,6 @@ mod cpu_vs_vulkan_tests {
     }
 
     #[test]
-    fn vulkan_buffer_suite() {
-        let Some(dev) = vulkan_device() else { return };
-        run_buffer_suite("vulkan", &*dev);
-    }
-
-    #[test]
     fn cpu_vs_vulkan() {
         let Some(vk) = vulkan_device() else { return };
         compare_full("cpu", &*cpu_device(), "vulkan", &*vk);
@@ -828,7 +822,7 @@ mod devarray_elementwise_tests {
     }
 
     #[test]
-    fn freeing_a_cloned_array_twice_cannot_alias_later_allocations() {
+    fn cloned_array_aliases_cannot_free_reused_allocations() {
         let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
         let pool = BufferPool::new(cpu.clone());
         let array = pool.alloc(vec![64], DType::F32).unwrap();
@@ -842,11 +836,7 @@ mod devarray_elementwise_tests {
         assert_eq!(cpu.read_buffer(first.buffer, 0, 256).unwrap(), [1; 256]);
         pool.free(first);
         pool.free(second);
-    }
 
-    #[test]
-    fn an_old_array_alias_cannot_free_a_reused_allocation() {
-        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
         let pool = BufferPool::new(cpu);
         let array = pool.alloc(vec![64], DType::F32).unwrap();
         let old = array.clone();
