@@ -624,11 +624,18 @@ fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
     }
 }
 
-/// Formats an `f32` as an MSL float literal, with a decimal point.
-///
-/// `BuiltinFn::name()` already returns MSL spellings, so no separate name map is needed.
-fn msl_float(v: f32) -> String {
-    format!("{v:?}")
+/// f32 as an MSL literal, always with a decimal point. Non-finite values use the Metal math macros:
+/// `{:?}` gives `NaN`/`inf`, which MSL lacks.
+pub(super) fn msl_float(v: f32) -> String {
+    if v.is_nan() {
+        "NAN".to_string()
+    } else if v == f32::INFINITY {
+        "INFINITY".to_string()
+    } else if v == f32::NEG_INFINITY {
+        "(-INFINITY)".to_string()
+    } else {
+        format!("{v:?}")
+    }
 }
 
 #[cfg(test)]
