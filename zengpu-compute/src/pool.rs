@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn size_classes_are_power_of_two_with_minimum() {
+    fn size_classes_are_power_of_two_with_minimum_and_bounded_waste() {
         assert_eq!(size_class(0), 256);
         assert_eq!(size_class(1), 256);
         assert_eq!(size_class(255), 256);
@@ -173,10 +173,7 @@ mod tests {
         assert_eq!(size_class(257), 512);
         assert_eq!(size_class(4097), 8192);
         assert_eq!(size_class(1 << 20), 1 << 20);
-    }
 
-    #[test]
-    fn large_size_classes_waste_at_most_an_eighth() {
         let weight = 4096 * 11008 * 4;
         assert_eq!(size_class(weight), 176 << 20);
         assert_eq!(size_class((1 << 20) + 1), (1 << 20) + (1 << 17));
