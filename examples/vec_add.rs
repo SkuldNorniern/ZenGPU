@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     device.write_buffer(ha, 0, as_bytes(&a_data))?;
     device.write_buffer(hb, 0, as_bytes(&b_data))?;
 
-    let shader = device.create_shader(SHADER.spirv_desc())?;
+    let shader = device.create_shader(SHADER.spirv_desc().unwrap())?;
     let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,
         entry: "main",

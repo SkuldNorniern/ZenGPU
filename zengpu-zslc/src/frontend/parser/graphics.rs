@@ -80,6 +80,7 @@ impl<'a> Parser<'a> {
                 outputs,
             },
             types: mem::replace(&mut self.types, TypeArena::new()),
+            backends: Vec::new(),
         })
     }
 

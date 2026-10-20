@@ -53,7 +53,7 @@ use crate::ir::node::{BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
 use crate::ir::typeck::{frag_parts, type_of_compute_expr, type_of_graphics_expr};
 use crate::ir::types::TypeId;
 use crate::ir::{
-    Entry, EntryKind, GfxBuiltin, GfxInput, GfxOutput, GfxScalar, GfxSlot, GraphicsEntry,
+    Backend, Entry, EntryKind, GfxBuiltin, GfxInput, GfxOutput, GfxScalar, GfxSlot, GraphicsEntry,
     GraphicsModule, Module, Mutability, Param, ParamKind, SharedDecl,
 };
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +179,23 @@ mod tests {
     use super::*;
     use crate::backend::spirv::lower_compute;
     use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
+
+    #[test]
+    fn backends_attribute_is_recorded_and_validated() {
+        let module = parse_compute(
+            r#"
+            @workgroup_size(64)
+            @backends(hip, cuda, hip)
+            kernel k(x: device mut buffer<f32>, id: global_id) {
+                let i = id.x
+                x[i] = 1.0
+            }
+        "#,
+        )
+        .expect("parse");
+        assert_eq!(module.backends, vec![Backend::Hip, Backend::Cuda]);
+        assert!(parse_compute("@backends(vulkan)\nkernel k(id: global_id) { }").is_err());
+    }
 
     fn lower(src: &str) -> Vec<u32> {
         let module = parse_compute(src).expect("parse");

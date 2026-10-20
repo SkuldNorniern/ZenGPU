@@ -190,8 +190,8 @@ impl CubeRenderState {
             present_mode: PresentMode::Mailbox,
         };
         let surface = device.create_surface(&zen_handles(window), config)?;
-        let vertex_shader = device.create_shader(shader(&VERT_ZSL))?;
-        let fragment_shader = device.create_shader(shader(&FRAG_ZSL))?;
+        let vertex_shader = device.create_shader(shader(&VERT_ZSL)?)?;
+        let fragment_shader = device.create_shader(shader(&FRAG_ZSL)?)?;
         let pipeline = device.create_graphics_pipeline(GraphicsPipelineDesc {
             vertex_shader,
             fragment_shader,

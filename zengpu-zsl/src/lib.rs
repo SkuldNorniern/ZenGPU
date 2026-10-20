@@ -7,6 +7,8 @@ extern crate proc_macro;
 
 use proc_macro::TokenStream;
 
+use zengpu_zslc::frontend::parser::Shader;
+use zengpu_zslc::ir::Backend;
 use zengpu_zslc::ir::arena::TypeArena;
 use zengpu_zslc::ir::layout::LayoutKind;
 use zengpu_zslc::ir::reflection::{ModuleReflection, reflect_compute, reflect_graphics};
@@ -140,8 +142,129 @@ pub fn zsl(input: TokenStream) -> TokenStream {
     }
 }
 
+type Outcome<T> = Result<T, String>;
+
+struct Lowered {
+    spv: Outcome<Vec<u32>>,
+    hip: Outcome<String>,
+    msl: Outcome<String>,
+    cuda: Outcome<String>,
+}
+
+impl Lowered {
+    fn outcomes(&self) -> [(Backend, Result<(), String>); 4] {
+        [
+            (
+                Backend::Spirv,
+                self.spv.as_ref().map(|_| ()).map_err(Clone::clone),
+            ),
+            (
+                Backend::Hip,
+                self.hip.as_ref().map(|_| ()).map_err(Clone::clone),
+            ),
+            (
+                Backend::Metal,
+                self.msl.as_ref().map(|_| ()).map_err(Clone::clone),
+            ),
+            (
+                Backend::Cuda,
+                self.cuda.as_ref().map(|_| ()).map_err(Clone::clone),
+            ),
+        ]
+    }
+}
+
+/// Returns an error if a backend named in `@backends` fails to lower, or if all of them do.
+fn gate_outcomes(
+    required: &[Backend],
+    outcomes: &[(Backend, Result<(), String>)],
+) -> Result<(), String> {
+    for (backend, outcome) in outcomes {
+        if let Err(msg) = outcome
+            && required.contains(backend)
+        {
+            return Err(format!(
+                "ZSL: @backends requires `{}`, which cannot lower this shader: {msg}",
+                backend.name()
+            ));
+        }
+    }
+    if outcomes.iter().all(|(_, o)| o.is_err()) {
+        let reasons: Vec<String> = outcomes
+            .iter()
+            .filter_map(|(b, o)| o.as_ref().err().map(|m| format!("{}: {m}", b.name())))
+            .collect();
+        return Err(format!(
+            "ZSL: no enabled backend can lower this shader ({})",
+            reasons.join("; ")
+        ));
+    }
+    Ok(())
+}
+
+fn not_compiled_in(backend: Backend) -> String {
+    format!(
+        "the `{0}` backend is not compiled in; enable zengpu-spirv's `{0}` feature",
+        backend.name()
+    )
+}
+
+fn lower_all(shader: &Shader) -> Lowered {
+    let spv = if cfg!(feature = "spirv") {
+        match shader {
+            Shader::Compute(m) => backend::spirv::lower_compute(m),
+            Shader::Graphics(m) => backend::spirv::lower_graphics(m),
+        }
+        .map_err(|d| d.message)
+    } else {
+        Err(not_compiled_in(Backend::Spirv))
+    };
+
+    let hip = if cfg!(feature = "hip") {
+        match shader {
+            Shader::Compute(m) => backend::hip::lower_compute(m)
+                .map(|s| s.source)
+                .map_err(|d| d.message),
+            Shader::Graphics(_) => Err("the hip backend has no graphics lowering".into()),
+        }
+    } else {
+        Err(not_compiled_in(Backend::Hip))
+    };
+
+    let msl = if cfg!(feature = "metal") {
+        match shader {
+            Shader::Compute(m) => backend::msl::lower_compute(m)
+                .map(|s| s.source)
+                .map_err(|d| d.message),
+            Shader::Graphics(m) => backend::msl::lower_graphics(m)
+                .map(|s| s.source)
+                .map_err(|d| d.message),
+        }
+    } else {
+        Err(not_compiled_in(Backend::Metal))
+    };
+
+    let cuda = if cfg!(feature = "cuda") {
+        match shader {
+            Shader::Compute(m) => backend::cuda::lower_compute(m)
+                .map(|s| s.source)
+                .map_err(|d| d.message),
+            Shader::Graphics(_) => Err("the cuda backend has no graphics lowering".into()),
+        }
+    } else {
+        Err(not_compiled_in(Backend::Cuda))
+    };
+
+    Lowered {
+        spv,
+        hip,
+        msl,
+        cuda,
+    }
+}
+
 fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
-    use frontend::parser::{Shader, parse_zsl};
+    use frontend::parser::parse_zsl;
     let shader = parse_zsl(src).map_err(|e| format!("ZSL parse error: {}", e.msg))?;
 
     let reflection: ModuleReflection = match &shader {
@@ -152,59 +275,53 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
         Shader::Compute(m) => &m.types,
         Shader::Graphics(m) => &m.types,
     };
-
-    let spv_words = match &shader {
-        Shader::Compute(m) => backend::spirv::lower_compute(m)?,
-        Shader::Graphics(m) => backend::spirv::lower_graphics(m)?,
+    let required: &[Backend] = match &shader {
+        Shader::Compute(m) => &m.backends,
+        Shader::Graphics(m) => &m.backends,
     };
 
-    #[cfg(feature = "hip")]
-    let hip_src = match &shader {
-        Shader::Compute(m) => backend::hip::lower_compute(m)
-            .map(|shader| shader.source)
-            .unwrap_or_default(),
-        Shader::Graphics(_) => String::new(),
-    };
-    #[cfg(not(feature = "hip"))]
-    let hip_src = String::new();
-
-    #[cfg(feature = "metal")]
-    let msl_src = match &shader {
-        Shader::Compute(m) => backend::msl::lower_compute(m)
-            .map(|shader| shader.source)
-            .unwrap_or_default(),
-        Shader::Graphics(m) => backend::msl::lower_graphics(m)
-            .map(|shader| shader.source)
-            .unwrap_or_default(),
-    };
-    #[cfg(not(feature = "metal"))]
-    let msl_src = String::new();
-
-    #[cfg(feature = "cuda")]
-    let cuda_src = match &shader {
-        Shader::Compute(m) => backend::cuda::lower_compute(m)
-            .map(|shader| shader.source)
-            .unwrap_or_default(),
-        Shader::Graphics(_) => String::new(),
-    };
-    #[cfg(not(feature = "cuda"))]
-    let cuda_src = String::new();
+    let lowered = lower_all(&shader);
+    gate_outcomes(required, &lowered.outcomes())?;
 
     let mut s = String::new();
     s.push_str("::zengpu_spirv::ZslShader { spv: ");
-    s.push_str(&words_to_slice_str(&spv_words));
-    s.push_str(", hip: ");
-    push_str_lit(&mut s, &hip_src);
-    s.push_str(", msl: ");
-    push_str_lit(&mut s, &msl_src);
-    s.push_str(", cuda: ");
-    push_str_lit(&mut s, &cuda_src);
+    match &lowered.spv {
+        Ok(words) => {
+            s.push_str("Ok(");
+            s.push_str(&words_to_slice_str(words));
+            s.push(')');
+        }
+        Err(msg) => push_err(&mut s, msg),
+    }
+    for (field, text) in [
+        ("hip", &lowered.hip),
+        ("msl", &lowered.msl),
+        ("cuda", &lowered.cuda),
+    ] {
+        s.push_str(", ");
+        s.push_str(field);
+        s.push_str(": ");
+        match text {
+            Ok(src) => {
+                s.push_str("Ok(");
+                push_str_lit(&mut s, src);
+                s.push(')');
+            }
+            Err(msg) => push_err(&mut s, msg),
+        }
+    }
     s.push_str(", reflection: ");
     s.push_str(&reflection_to_slice_str(&reflection, types));
     s.push_str(" }");
 
     s.parse()
         .map_err(|_| "ZSL: generated ZslShader literal failed to parse".to_string())
+}
+
+fn push_err(s: &mut String, msg: &str) {
+    s.push_str("Err(");
+    push_str_lit(s, msg);
+    s.push(')');
 }
 
 fn words_to_slice_str(words: &[u32]) -> String {
@@ -323,4 +440,52 @@ fn compile_error_tokens(msg: &str) -> TokenStream {
     format!("::core::compile_error!{{\"{escaped}\"}}")
         .parse()
         .expect("compile_error invocation must parse")
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn ok() -> Result<(), String> {
+        Ok(())
+    }
+
+    fn err(msg: &str) -> Result<(), String> {
+        Err(msg.to_string())
+    }
+
+    #[test]
+    fn one_lowering_backend_is_enough() {
+        let outcomes = [
+            (Backend::Spirv, err("frag_get")),
+            (Backend::Hip, ok()),
+            (Backend::Metal, err("frag_get")),
+            (Backend::Cuda, err("frag_get")),
+        ];
+        assert!(gate_outcomes(&[], &outcomes).is_ok());
+    }
+
+    #[test]
+    fn required_backend_failure_is_an_error() {
+        let outcomes = [
+            (Backend::Spirv, err("frag_get")),
+            (Backend::Hip, ok()),
+            (Backend::Metal, ok()),
+            (Backend::Cuda, ok()),
+        ];
+        let msg = gate_outcomes(&[Backend::Spirv], &outcomes).expect_err("required spirv");
+        assert!(msg.contains("`spirv`") && msg.contains("frag_get"), "{msg}");
+    }
+
+    #[test]
+    fn no_lowering_backend_is_an_error() {
+        let outcomes = [
+            (Backend::Spirv, err("a")),
+            (Backend::Hip, err("b")),
+            (Backend::Metal, err("c")),
+            (Backend::Cuda, err("d")),
+        ];
+        let msg = gate_outcomes(&[], &outcomes).expect_err("nothing lowers");
+        assert!(msg.contains("hip: b") && msg.contains("cuda: d"), "{msg}");
+    }
 }

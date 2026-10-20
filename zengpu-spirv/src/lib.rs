@@ -1,8 +1,17 @@
-//! ZenGPU shader macro: compiles native ZSL to all backends at build time.
+//! Compiles native ZSL to all backends at build time.
 //!
 //! [`zsl!`] produces a [`ZslShader`] with SPIR-V (Vulkan), HIP C++ (ROCm), MSL (Metal) and CUDA C++
-//! (NVIDIA), compiled at build time from the same ZSL source. At runtime,
-//! [`ZslShader::for_backend`] picks the form for the device.
+//! (NVIDIA). Pick one at runtime with [`ZslShader::for_backend`].
+//!
+//! Each backend lowers independently. A failed lowering is an `Err` field with its diagnostic, not
+//! a build failure. `@backends(hip, cuda)` before the entry point makes the listed backends a hard
+//! build error.
+//!
+//! [`ZslShader::into_compiled`] gives a [`CompiledModule`]. A missing backend returns
+//! [`BackendUnavailable`], never a substituted artifact.
+//!
+//! `ZslShader`, `for_backend` and the current ZSL syntax are supported. A later release adds
+//! deprecation diagnostics before removing them. Prefer [`CompiledModule`] in new code.
 //!
 //! ```ignore
 //! use zengpu_spirv::{zsl, ZslShader};
@@ -16,16 +25,6 @@
 //!     }
 //! );
 //! ```
-//!
-//! [`ZslShader::into_compiled`] converts to the [`CompiledModule`] API. That API holds
-//! [`BackendArtifact`]s for any set of backends (DirectX can be added later), instead of a fixed
-//! four-field struct. A missing backend is reported as a typed [`BackendUnavailable`] error, not
-//! silently replaced with SPIR-V.
-//!
-//! `ZslShader`, [`ZslShader::for_backend`] and the current native ZSL source syntax are accepted in
-//! this release. A later release will warn on both, then remove them together in favor of
-//! [`CompiledModule`] and the ZSL syntax changes. Code should prefer `CompiledModule` over
-//! `ZslShader` where practical.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -82,65 +81,71 @@ pub struct ParamLayout {
     pub kind: ParamKind,
 }
 
-/// Compiled form of a ZSL shader, with one field per target.
-/// [`for_backend`](ZslShader::for_backend) picks one at runtime.
+/// All backends for one ZSL shader, from `zsl!`. A field is `Err` if the target has no output (not
+/// expressible, or its feature is off). Use `for_backend` at runtime.
 pub struct ZslShader {
     /// SPIR-V words for Vulkan (and any other SPIR-V consumer).
-    pub spv: &'static [u32],
+    pub spv: Result<&'static [u32], &'static str>,
     /// HIP C++ source for AMD ROCm (compiled at runtime via hipRTC).
-    pub hip: &'static str,
+    pub hip: Result<&'static str, &'static str>,
     /// Metal Shading Language source for Apple Metal.
-    pub msl: &'static str,
+    pub msl: Result<&'static str, &'static str>,
     /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
-    pub cuda: &'static str,
+    pub cuda: Result<&'static str, &'static str>,
     /// Push-constant layout and binding metadata. Buffer params come first, then scalars, as every
     /// backend builds it.
     pub reflection: &'static [ParamLayout],
 }
 
 impl ZslShader {
-    /// Returns the [`ShaderDesc`] and entry-point name for `backend`.
-    ///
-    /// Falls back to SPIR-V for any backend other than HIP, Metal or CUDA.
-    pub fn for_backend(&self, backend: BackendPreference) -> (ShaderDesc<'_>, &'static str) {
+    /// Falls back to SPIR-V for backends other than HIP, Metal or CUDA.
+    pub fn for_backend(
+        &self,
+        backend: BackendPreference,
+    ) -> HalResult<(ShaderDesc<'_>, &'static str)> {
         match backend {
-            BackendPreference::Hip => (ShaderDesc::hip(self.hip), "zsl_kernel"),
-            BackendPreference::Metal => (ShaderDesc::msl(self.msl), "zsl_main"),
-            BackendPreference::Cuda => (ShaderDesc::cuda_src(self.cuda), "zsl_kernel"),
-            _ => (self.spirv_desc(), "main"),
+            BackendPreference::Hip => Ok((ShaderDesc::hip(self.hip_src()?), "zsl_kernel")),
+            BackendPreference::Metal => Ok((ShaderDesc::msl(self.msl_src()?), "zsl_main")),
+            BackendPreference::Cuda => Ok((ShaderDesc::cuda_src(self.cuda_src()?), "zsl_kernel")),
+            _ => Ok((self.spirv_desc()?, "main")),
         }
     }
 
-    /// Creates the shader on `device` from the artifact its backend consumes (see
-    /// [`GpuDevice::backend`]).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `zengpu-spirv` was built without that backend's feature.
+    /// `Err` if there is no artifact, or its feature is off.
     pub fn create(&self, device: &dyn GpuDevice) -> HalResult<(ShaderHandle, &'static str)> {
-        let backend = device.backend();
-        let (missing, feature) = match backend {
-            BackendPreference::Hip => (self.hip.is_empty(), "hip"),
-            BackendPreference::Cuda => (self.cuda.is_empty(), "cuda"),
-            BackendPreference::Metal => (self.msl.is_empty(), "metal"),
-            _ => (self.spv.is_empty(), "spirv"),
-        };
-        if missing {
-            return Err(GpuError::ShaderCompile(format!(
-                "zsl: no {feature} artifact for the {backend:?} backend; enable the \
-                 `{feature}` feature of zengpu-spirv"
-            )));
-        }
-        let (desc, entry) = self.for_backend(backend);
+        let (desc, entry) = self.for_backend(device.backend())?;
         Ok((device.create_shader(desc)?, entry))
     }
 
     /// Convenience: SPIR-V [`ShaderDesc`] for Vulkan-only callers.
-    pub fn spirv_desc(&self) -> ShaderDesc<'_> {
-        let bytes =
-            unsafe { slice::from_raw_parts(self.spv.as_ptr() as *const u8, self.spv.len() * 4) };
-        ShaderDesc::spirv(bytes)
+    pub fn spirv_desc(&self) -> HalResult<ShaderDesc<'_>> {
+        let words = self.spirv_words()?;
+        let bytes = unsafe { slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+        Ok(ShaderDesc::spirv(bytes))
     }
+
+    pub fn spirv_words(&self) -> HalResult<&'static [u32]> {
+        self.spv.map_err(|msg| unavailable(BackendId::Spirv, msg))
+    }
+
+    pub fn hip_src(&self) -> HalResult<&'static str> {
+        self.hip.map_err(|msg| unavailable(BackendId::Hip, msg))
+    }
+
+    pub fn msl_src(&self) -> HalResult<&'static str> {
+        self.msl.map_err(|msg| unavailable(BackendId::Metal, msg))
+    }
+
+    pub fn cuda_src(&self) -> HalResult<&'static str> {
+        self.cuda.map_err(|msg| unavailable(BackendId::Cuda, msg))
+    }
+}
+
+fn unavailable(backend: BackendId, msg: &str) -> GpuError {
+    GpuError::ShaderCompile(format!(
+        "zsl: no {} artifact for this shader: {msg}",
+        backend.name()
+    ))
 }
 
 /// ZSL lowering target. Variants are ordered so `CompiledModule::artifacts` iterates stably; the
@@ -155,6 +160,17 @@ pub enum BackendId {
 }
 
 impl BackendId {
+    /// Name in `@backends(...)` and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            BackendId::Spirv => "spirv",
+            BackendId::Hip => "hip",
+            BackendId::Cuda => "cuda",
+            BackendId::Metal => "metal",
+            BackendId::Dx => "dx",
+        }
+    }
+
     /// Cargo feature for this backend's emitter, named in `BackendUnavailable`.
     pub fn required_cargo_feature(self) -> &'static str {
         match self {
@@ -225,30 +241,25 @@ impl CompiledModule {
 }
 
 impl ZslShader {
-    /// Converts to a [`CompiledModule`].
-    ///
-    /// An artifact is included only when its `ZslShader` field is non-empty. An empty `hip`, `msl`
-    /// or `cuda` field means the feature is off, or the shader is a graphics module that backend
-    /// skips. `spv` is always included.
+    /// `Err` fields have no artifact. `artifact()` reports `BackendUnavailable`.
     pub fn into_compiled(&self) -> CompiledModule {
         let mut artifacts = BTreeMap::new();
-        artifacts.insert(BackendId::Spirv, BackendArtifact::Spirv(self.spv.to_vec()));
-        if !self.hip.is_empty() {
-            artifacts.insert(
-                BackendId::Hip,
-                BackendArtifact::HipSource(self.hip.to_string()),
-            );
+        if let Ok(words) = self.spv {
+            artifacts.insert(BackendId::Spirv, BackendArtifact::Spirv(words.to_vec()));
         }
-        if !self.cuda.is_empty() {
+        if let Ok(src) = self.hip {
+            artifacts.insert(BackendId::Hip, BackendArtifact::HipSource(src.to_string()));
+        }
+        if let Ok(src) = self.cuda {
             artifacts.insert(
                 BackendId::Cuda,
-                BackendArtifact::CudaSource(self.cuda.to_string()),
+                BackendArtifact::CudaSource(src.to_string()),
             );
         }
-        if !self.msl.is_empty() {
+        if let Ok(src) = self.msl {
             artifacts.insert(
                 BackendId::Metal,
-                BackendArtifact::MetalSource(self.msl.to_string()),
+                BackendArtifact::MetalSource(src.to_string()),
             );
         }
         CompiledModule { artifacts }
@@ -321,10 +332,10 @@ mod zsl_native_tests {
                 }
             }
         );
-        assert!(!SHADER.spv.is_empty());
-        assert_eq!(SHADER.spv[0], SPIRV_MAGIC, "valid SPIR-V header");
+        assert!(!SHADER.spv.unwrap().is_empty());
+        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC, "valid SPIR-V header");
         #[cfg(feature = "hip")]
-        assert!(SHADER.hip.contains("zsl_kernel"));
+        assert!(SHADER.hip.unwrap().contains("zsl_kernel"));
     }
 
     #[test]
@@ -335,7 +346,7 @@ mod zsl_native_tests {
                 m.mvp * pos.extend(1.0)
             }
         );
-        assert_eq!(SHADER.spv[0], SPIRV_MAGIC);
+        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
     }
 
     #[test]
@@ -345,7 +356,7 @@ mod zsl_native_tests {
                 (pos, uv)
             }
         );
-        assert_eq!(SHADER.spv[0], SPIRV_MAGIC);
+        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
     }
 
     #[test]
@@ -355,7 +366,7 @@ mod zsl_native_tests {
                 color * 0.5
             }
         );
-        assert_eq!(SHADER.spv[0], SPIRV_MAGIC);
+        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
     }
 
     #[test]
@@ -372,7 +383,7 @@ mod zsl_native_tests {
                 dst[i] = src[i]
             }
         );
-        assert_eq!(SHADER.spv[0], SPIRV_MAGIC);
+        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
     }
 }
 

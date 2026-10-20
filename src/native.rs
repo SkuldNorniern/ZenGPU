@@ -29,7 +29,11 @@ pub use zengpu_vulkan::{
 #[cfg(all(not(all(target_os = "macos", feature = "metal")), feature = "vulkan"))]
 pub const BACKEND: BackendPreference = BackendPreference::Vulkan;
 
-/// Returns the native backend's artifact for `shader`: MSL on Metal, SPIR-V on Vulkan.
-pub fn shader(shader: &ZslShader) -> ShaderDesc<'_> {
-    shader.for_backend(BACKEND).0
+/// Shader descriptor in the native format: MSL on Metal, SPIR-V on Vulkan.
+///
+/// # Errors
+///
+/// Returns the backend's diagnostic if the shader has no code for this backend.
+pub fn shader(shader: &ZslShader) -> zengpu_hal::Result<ShaderDesc<'_>> {
+    shader.for_backend(BACKEND).map(|(desc, _)| desc)
 }

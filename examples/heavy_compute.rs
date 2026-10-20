@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     device.write_buffer(ba, 0, as_bytes_f32(&a_data))?;
     device.write_buffer(bb, 0, as_bytes_f32(&b_data))?;
 
-    let (shader_desc, entry) = SGEMM.for_backend(info.backend);
+    let (shader_desc, entry) = SGEMM.for_backend(info.backend)?;
     let shader = device.create_shader(shader_desc)?;
     let pipeline = device.create_compute_pipeline(ComputePipelineDesc {
         shader,

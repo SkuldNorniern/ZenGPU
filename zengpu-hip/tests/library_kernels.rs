@@ -1062,6 +1062,19 @@ const FRAG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     }
 );
 
+/// Needs `frag_get`/`frag_set`, which SPIR-V cannot express, so HIP only.
+const FRAG_GET_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel frag_get_bump(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>) {
+        let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let d = mma(fa, fb, acc)
+        let d2 = frag_set(d, 0, frag_get(d, 0) + 1.0)
+        frag_store(out, 0, 16, d2)
+    }
+);
+
 /// Lane probe, HIP only: SPIR-V's cooperative matrix mapping is opaque. Lowered with `zengpu-zslc`,
 /// not `zsl!`.
 const FRAG_PROBE: &str = r#"
@@ -1171,6 +1184,74 @@ fn zsl_frag_mma_matches_cpu() {
         pool.free(buf);
     }
     for buf in [ba, bb, ci_buf] {
+        pool.free(buf);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
+#[test]
+fn zsl_frag_get_is_hip_only_and_runs_on_hip() {
+    assert!(FRAG_GET_ZSL.spv.is_err(), "frag_get has no SPIR-V lowering");
+    let err = FRAG_GET_ZSL.spirv_desc().unwrap_err().to_string();
+    assert!(err.contains("no spirv artifact"), "{err}");
+    assert!(FRAG_GET_ZSL.msl.is_err(), "frag_get has no MSL lowering");
+
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FRAG_GET_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let halves: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let halves_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let a = upload_half(&pool, vec![256], DType::F16, &halves);
+    let b = upload_half(&pool, vec![256], DType::F16, &halves_b);
+    let c = upload(&pool, vec![256], &fc);
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            c.buffer.index(),
+            out.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    let mut bumped = 0;
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[k * 16 + n];
+            }
+            let diff = got[m * 16 + n] - s;
+            if close(diff, 1.0) {
+                bumped += 1;
+            } else {
+                assert!(close(diff, 0.0), "({m}, {n}): diff {diff}");
+            }
+        }
+    }
+    assert_eq!(bumped, 32, "one frag_set bump per lane");
+    drop(ops);
+    for buf in [a, b, c, out] {
         pool.free(buf);
     }
     device.destroy_pipeline(pipeline);

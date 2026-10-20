@@ -99,7 +99,9 @@ mod tests {
         let y: Vec<f32> = (0..n).map(|i| (i * 10) as f32).collect();
         let bx = make_f32(&*dev, &x, false);
         let by = make_f32(&*dev, &y, true);
-        let sh = dev.create_shader(ShaderDesc::msl(SAXPY.msl)).unwrap();
+        let sh = dev
+            .create_shader(ShaderDesc::msl(SAXPY.msl.unwrap()))
+            .unwrap();
         let p = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: sh,
@@ -146,7 +148,9 @@ mod tests {
         let ba = make_f32(&*dev, &a, false);
         let bb = make_f32(&*dev, &b, false);
         let bout = make_f32(&*dev, &vec![-1.0f32; n], true);
-        let sh = dev.create_shader(ShaderDesc::msl(ADD.msl)).unwrap();
+        let sh = dev
+            .create_shader(ShaderDesc::msl(ADD.msl.unwrap()))
+            .unwrap();
         let p = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: sh,
@@ -291,7 +295,7 @@ mod tests {
         device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
 
         let shader = device
-            .create_shader(ShaderDesc::msl(ADD.msl))
+            .create_shader(ShaderDesc::msl(ADD.msl.unwrap()))
             .expect("shader");
         let pipeline = device
             .create_compute_pipeline(ComputePipelineDesc {
@@ -675,10 +679,10 @@ mod graphics_tests {
         depth: Option<DepthState>,
     ) -> PipelineHandle {
         let v = dev
-            .create_shader(ShaderDesc::msl(vs.msl))
+            .create_shader(ShaderDesc::msl(vs.msl.unwrap()))
             .expect("vertex shader");
         let f = dev
-            .create_shader(ShaderDesc::msl(fs.msl))
+            .create_shader(ShaderDesc::msl(fs.msl.unwrap()))
             .expect("fragment shader");
         let p = dev
             .create_graphics_pipeline(GraphicsPipelineDesc {
@@ -1120,7 +1124,9 @@ mod graphics_tests {
 
         let Some(dev) = open() else { return };
         let pipeline = |shader: &ZslShader| {
-            let shader = dev.create_shader(ShaderDesc::msl(shader.msl)).unwrap();
+            let shader = dev
+                .create_shader(ShaderDesc::msl(shader.msl.unwrap()))
+                .unwrap();
             dev.create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "zsl_main",

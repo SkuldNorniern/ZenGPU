@@ -3257,7 +3257,9 @@ mod tests {
             .write_buffer(src, 0, &input_bytes)
             .expect("upload source");
 
-        let (shader_desc, entry) = TRIG_ZSL.for_backend(BackendPreference::Cuda);
+        let (shader_desc, entry) = TRIG_ZSL
+            .for_backend(BackendPreference::Cuda)
+            .expect("zsl cuda source");
         let shader = device.create_shader(shader_desc).expect("compile ZSL CUDA");
         let pipeline = device
             .create_compute_pipeline(ComputePipelineDesc {
@@ -3321,7 +3323,9 @@ mod tests {
         device.write_buffer(src_u, 0, &bytes_u).expect("upload u32");
         device.write_buffer(src_i, 0, &bytes_i).expect("upload i32");
 
-        let (shader_desc, entry) = TYPED_BUFFER_ZSL.for_backend(BackendPreference::Cuda);
+        let (shader_desc, entry) = TYPED_BUFFER_ZSL
+            .for_backend(BackendPreference::Cuda)
+            .expect("zsl cuda source");
         let shader = device
             .create_shader(shader_desc)
             .expect("compile typed ZSL CUDA");
@@ -3371,7 +3375,9 @@ mod tests {
         let bytes: Vec<u8> = input.iter().flat_map(|value| value.to_le_bytes()).collect();
         device.write_buffer(src, 0, &bytes).expect("upload values");
 
-        let (shader_desc, entry) = FINITE_ZSL.for_backend(BackendPreference::Cuda);
+        let (shader_desc, entry) = FINITE_ZSL
+            .for_backend(BackendPreference::Cuda)
+            .expect("zsl cuda source");
         let shader = device
             .create_shader(shader_desc)
             .expect("compile finite ZSL CUDA");
