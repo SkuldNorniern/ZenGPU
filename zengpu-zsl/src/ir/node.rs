@@ -144,6 +144,21 @@ pub enum BuiltinFn {
     /// Four-lane unsigned byte dot product, otherwise as `dot4_i8`.
     Dot4U8,
     Dot4IU8,
+    /// Per lane `(a + b) mod 2^16`, with lane 0 in bits 0-15. Compute only.
+    PkAddU16,
+    PkMulU16,
+    PkMadU16,
+    /// Per-lane f16 add, rounding to nearest even.
+    PkAddF16,
+    PkMulF16,
+    /// Per-lane fused f16 `a * b + c`.
+    PkFmaF16,
+    /// Approximate. The error is within 1e-4 of the largest term.
+    Dot2F16,
+    /// low 32 bits of `(hi:lo) >> (s & 31)`.
+    FunnelShr,
+    /// Like `__byte_perm` without sign mode. Byte i is picked by selector nibble i from `b:a`.
+    BytePerm,
     /// Subgroup index within the workgroup. A query, not a collective, so it is legal in any
     /// control flow.
     SubgroupId,
@@ -227,6 +242,15 @@ impl BuiltinFn {
             BuiltinFn::Dot4I8 => "dot4_i8",
             BuiltinFn::Dot4U8 => "dot4_u8",
             BuiltinFn::Dot4IU8 => "dot4_iu8",
+            BuiltinFn::PkAddU16 => "pk_add_u16",
+            BuiltinFn::PkMulU16 => "pk_mul_u16",
+            BuiltinFn::PkMadU16 => "pk_mad_u16",
+            BuiltinFn::PkAddF16 => "pk_add_f16",
+            BuiltinFn::PkMulF16 => "pk_mul_f16",
+            BuiltinFn::PkFmaF16 => "pk_fma_f16",
+            BuiltinFn::Dot2F16 => "dot2_f16",
+            BuiltinFn::FunnelShr => "funnel_shr",
+            BuiltinFn::BytePerm => "byte_perm",
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",

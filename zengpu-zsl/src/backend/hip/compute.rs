@@ -138,6 +138,52 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
          }\n",
     );
 
+    s.push_str(r#"
+typedef unsigned short zsl_u16x2 __attribute__((ext_vector_type(2)));
+typedef _Float16 zsl_f16x2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ unsigned int zsl_pk_add_u16(unsigned int a, unsigned int b) {
+    return __builtin_bit_cast(unsigned int, __builtin_bit_cast(zsl_u16x2, a) + __builtin_bit_cast(zsl_u16x2, b));
+}
+__device__ __forceinline__ unsigned int zsl_pk_mul_u16(unsigned int a, unsigned int b) {
+    return __builtin_bit_cast(unsigned int, __builtin_bit_cast(zsl_u16x2, a) * __builtin_bit_cast(zsl_u16x2, b));
+}
+__device__ __forceinline__ unsigned int zsl_pk_mad_u16(unsigned int a, unsigned int b, unsigned int c) {
+    return zsl_pk_add_u16(zsl_pk_mul_u16(a, b), c);
+}
+__device__ __forceinline__ unsigned int zsl_pk_add_f16(unsigned int a, unsigned int b) {
+    return __builtin_bit_cast(unsigned int, __builtin_bit_cast(zsl_f16x2, a) + __builtin_bit_cast(zsl_f16x2, b));
+}
+__device__ __forceinline__ unsigned int zsl_pk_mul_f16(unsigned int a, unsigned int b) {
+    return __builtin_bit_cast(unsigned int, __builtin_bit_cast(zsl_f16x2, a) * __builtin_bit_cast(zsl_f16x2, b));
+}
+__device__ __forceinline__ unsigned int zsl_pk_fma_f16(unsigned int a, unsigned int b, unsigned int c) {
+    return __builtin_bit_cast(unsigned int, __builtin_elementwise_fma(__builtin_bit_cast(zsl_f16x2, a), __builtin_bit_cast(zsl_f16x2, b), __builtin_bit_cast(zsl_f16x2, c)));
+}
+// v_dot2_f32_f16 (gfx11, gfx12): within 1e-4 of the largest term.
+__device__ __forceinline__ float zsl_dot2_f16(unsigned int a, unsigned int b, float acc) {
+    zsl_f16x2 x = __builtin_bit_cast(zsl_f16x2, a);
+    zsl_f16x2 y = __builtin_bit_cast(zsl_f16x2, b);
+#if defined(__GFX11__) || defined(__GFX12__)
+    return __builtin_amdgcn_fdot2(x, y, acc, false);
+#else
+    acc = acc + (float)x[0] * (float)y[0];
+    return acc + (float)x[1] * (float)y[1];
+#endif
+}
+__device__ __forceinline__ unsigned int zsl_funnel_shr(unsigned int hi, unsigned int lo, unsigned int s) {
+    return __builtin_amdgcn_alignbit(hi, lo, s);
+}
+__device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned int b, unsigned int sel) {
+    unsigned int r = 0;
+    for (unsigned int i = 0; i < 4; ++i) {
+        unsigned int k = (sel >> (4 * i)) & 7u;
+        unsigned int w = k < 4u ? a : b;
+        r |= ((w >> (8 * (k & 3u))) & 0xffu) << (8 * i);
+    }
+    return r;
+}
+"#);
+
     let threads = local_size[0] * local_size[1] * local_size[2];
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
@@ -573,6 +619,34 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::Dot4IU8 => {
                     format!("zsl_dot4_iu8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::PkAddU16 => format!("zsl_pk_add_u16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMulU16 => format!("zsl_pk_mul_u16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMadU16 => {
+                    format!(
+                        "zsl_pk_mad_u16({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::PkAddF16 => format!("zsl_pk_add_f16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMulF16 => format!("zsl_pk_mul_f16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkFmaF16 => {
+                    format!(
+                        "zsl_pk_fma_f16({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::Dot2F16 => {
+                    format!("zsl_dot2_f16({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::FunnelShr => {
+                    format!(
+                        "zsl_funnel_shr({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::BytePerm => {
+                    format!("zsl_byte_perm({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::SubgroupAny => {
                     format!("((bool)__any((int)({})))", args_s[0])
