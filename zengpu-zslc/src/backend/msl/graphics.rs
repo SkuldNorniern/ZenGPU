@@ -219,6 +219,7 @@ fn indent(s: &mut String, depth: usize) {
 
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
+        IrStmt::FragStore { .. } => return Err(super::compute::frag_unsupported("frag_store")),
         IrStmt::Let { name, init } if ctx.arrays.contains_key(name.as_str()) => {
             let (ty, len) = ctx.arrays[name.as_str()];
             indent(s, depth);
@@ -307,6 +308,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
 
 fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
+        IrExpr::FragLoad { .. } => return Err(super::compute::frag_unsupported("frag_load")),
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => super::compute::msl_float(*v),
         IrExpr::Local(n) => n.clone(),
@@ -363,6 +365,13 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", a[0], a[1]),
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::FragZeroAcc
+                | BuiltinFn::Mma
+                | BuiltinFn::FragLen
+                | BuiltinFn::FragRow
+                | BuiltinFn::FragCol
+                | BuiltinFn::FragGet
+                | BuiltinFn::FragSet => return Err(super::compute::frag_unsupported(func.name())),
                 BuiltinFn::F32 => format!("float({})", a[0]),
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }

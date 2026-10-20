@@ -83,6 +83,11 @@ pub(crate) mod op {
     pub const SELECT: u32 = 169;
     pub const KILL: u32 = 252;
     pub const COMPOSITE_EXTRACT: u32 = 81;
+    pub const CONSTANT_NULL: u32 = 46;
+    pub const TYPE_COOPERATIVE_MATRIX_KHR: u32 = 4456;
+    pub const COOPERATIVE_MATRIX_LOAD_KHR: u32 = 4457;
+    pub const COOPERATIVE_MATRIX_STORE_KHR: u32 = 4458;
+    pub const COOPERATIVE_MATRIX_MUL_ADD_KHR: u32 = 4459;
     pub const CONVERT_F_TO_U: u32 = 109;
     pub const CONVERT_F_TO_S: u32 = 110;
     pub const CONVERT_S_TO_F: u32 = 111;
@@ -132,6 +137,7 @@ pub(crate) mod op {
 #[allow(dead_code)]
 pub mod deco {
     pub const BLOCK: u32 = 2;
+    pub const ALIASED: u32 = 20;
     pub const BUFFER_BLOCK: u32 = 3;
     pub const COL_MAJOR: u32 = 5;
     pub const ARRAY_STRIDE: u32 = 6;
@@ -159,8 +165,13 @@ pub mod sc {
 }
 
 #[allow(dead_code)]
-mod cap {
+pub(crate) mod cap {
     pub const SHADER: u32 = 1;
+    pub const FLOAT16: u32 = 9;
+    pub const INT8: u32 = 39;
+    pub const STORAGE_BUFFER_16BIT_ACCESS: u32 = 4433;
+    pub const STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
+    pub const COOPERATIVE_MATRIX_KHR: u32 = 6022;
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
     pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
@@ -207,6 +218,7 @@ pub struct SpvBuilder {
     constants_globals: Vec<u32>,
     functions: Vec<u32>,
     constant_cache: HashMap<(u32, u32), Id>,
+    type_constant_cache: HashMap<(u32, u32), Id>,
 }
 
 #[allow(dead_code)]
@@ -225,6 +237,7 @@ impl SpvBuilder {
             constants_globals: Vec::new(),
             functions: Vec::new(),
             constant_cache: HashMap::new(),
+            type_constant_cache: HashMap::new(),
         }
     }
 
@@ -423,6 +436,25 @@ impl SpvBuilder {
             &mut self.types,
             op::TYPE_VECTOR,
             &[id.0, component.0, count],
+        );
+        id
+    }
+
+    /// `OpTypeCooperativeMatrixKHR`: a subgroup-scope matrix of `component`. `scope`, `rows`,
+    /// `cols` and `usage` are u32 constants.
+    pub fn type_cooperative_matrix(
+        &mut self,
+        component: Id,
+        scope: Id,
+        rows: Id,
+        cols: Id,
+        usage: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.types,
+            op::TYPE_COOPERATIVE_MATRIX_KHR,
+            &[id.0, component.0, scope.0, rows.0, cols.0, usage.0],
         );
         id
     }
@@ -636,6 +668,67 @@ impl SpvBuilder {
             &[ptr_ty.0, id.0, storage_class],
         );
         id
+    }
+
+    pub fn type_constant_u32(&mut self, ty: Id, value: u32) -> Id {
+        if let Some(&id) = self.type_constant_cache.get(&(ty.0, value)) {
+            return id;
+        }
+        let id = self.fresh_id();
+        emit(&mut self.types, op::CONSTANT, &[ty.0, id.0, value]);
+        self.type_constant_cache.insert((ty.0, value), id);
+        id
+    }
+
+    /// `OpConstantNull` of `ty` (also valid for cooperative matrices).
+    pub fn constant_null(&mut self, ty: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.constants_globals,
+            op::CONSTANT_NULL,
+            &[ty.0, id.0],
+        );
+        id
+    }
+
+    /// `OpCooperativeMatrixLoadKHR`: `layout` and `stride` are u32 values.
+    pub fn op_cooperative_matrix_load(&mut self, ty: Id, ptr: Id, layout: Id, stride: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::COOPERATIVE_MATRIX_LOAD_KHR,
+            &[ty.0, id.0, ptr.0, layout.0, stride.0],
+        );
+        id
+    }
+
+    pub fn op_cooperative_matrix_store(&mut self, ptr: Id, object: Id, layout: Id, stride: Id) {
+        emit(
+            &mut self.functions,
+            op::COOPERATIVE_MATRIX_STORE_KHR,
+            &[ptr.0, object.0, layout.0, stride.0],
+        );
+    }
+
+    /// `OpCooperativeMatrixMulAddKHR` with its `CooperativeMatrixOperands` mask (0 for float,
+    /// signedness bits for integer matrices).
+    pub fn op_cooperative_matrix_mul_add(&mut self, ty: Id, a: Id, b: Id, c: Id, flags: u32) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::COOPERATIVE_MATRIX_MUL_ADD_KHR,
+            &[ty.0, id.0, a.0, b.0, c.0, flags],
+        );
+        id
+    }
+
+    pub fn capability(&mut self, capability: u32) {
+        emit(&mut self.capabilities, op::CAPABILITY, &[capability]);
+    }
+
+    pub fn extension(&mut self, name: &str) {
+        let words = encode_string(name);
+        emit_raw(&mut self.extensions, op::EXTENSION, &words);
     }
 
     pub fn op_load(&mut self, ty: Id, ptr: Id) -> Id {

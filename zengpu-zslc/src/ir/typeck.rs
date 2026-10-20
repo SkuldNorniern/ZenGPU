@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr};
-use crate::ir::types::{ArrayLen, Type, TypeId};
+use crate::ir::types::{ArrayLen, FloatFormat, FragUse, IntWidth, Signedness, Type, TypeId};
 
 /// Symbol tables for typing a compute expression. Standalone, not shared with the parser's `Ctx`.
 #[derive(Debug, Default)]
@@ -14,6 +14,29 @@ pub struct ComputeTypeCtx {
     pub locals: HashMap<String, TypeId>,
     pub scalars: HashMap<String, TypeId>,
     pub buffers: HashMap<String, TypeId>,
+}
+
+pub fn frag_parts(arena: &TypeArena, ty: TypeId) -> Option<(TypeId, FragUse)> {
+    match arena.get(ty) {
+        Type::Frag { element, usage, .. } => Some((*element, *usage)),
+        _ => None,
+    }
+}
+
+pub fn i8_type() -> Type {
+    Type::Int {
+        width: IntWidth::W8,
+        signedness: Signedness::Signed,
+    }
+}
+
+pub fn frag16_id(arena: &mut TypeArena, element: TypeId, usage: FragUse) -> TypeId {
+    arena.intern(Type::Frag {
+        element,
+        rows: 16,
+        cols: 16,
+        usage,
+    })
 }
 
 pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut TypeArena) -> TypeId {
@@ -42,7 +65,43 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::SharedLoad { .. } => f32_id,
         IrExpr::Texel { .. } => f32_id,
         IrExpr::TexSize { .. } => u32_id,
+        IrExpr::FragLoad { ty, .. } => *ty,
         IrExpr::Builtin { func, args } => match func {
+            BuiltinFn::Mma => {
+                let int_operands = args
+                    .first()
+                    .map(|a| type_of_compute_expr(a, ctx, arena))
+                    .and_then(|t| frag_parts(arena, t))
+                    .is_some_and(|(e, _)| arena.get(e) == &i8_type());
+                let element = if int_operands { i32_id } else { f32_id };
+                frag16_id(arena, element, FragUse::Acc)
+            }
+            BuiltinFn::FragZeroAcc => frag16_id(arena, f32_id, FragUse::Acc),
+            BuiltinFn::FragSet => args
+                .first()
+                .map(|a| type_of_compute_expr(a, ctx, arena))
+                .unwrap_or(f32_id),
+            BuiltinFn::FragGet => {
+                let element = args
+                    .first()
+                    .map(|a| type_of_compute_expr(a, ctx, arena))
+                    .and_then(|t| frag_parts(arena, t))
+                    .map(|(e, _)| e);
+                match element {
+                    Some(e) if arena.get(e) == &i8_type() => i32_id,
+                    Some(e)
+                        if arena.get(e)
+                            == &Type::Float {
+                                format: FloatFormat::F16,
+                            } =>
+                    {
+                        f32_id
+                    }
+                    Some(e) => e,
+                    None => f32_id,
+                }
+            }
+            BuiltinFn::FragLen | BuiltinFn::FragRow | BuiltinFn::FragCol => u32_id,
             BuiltinFn::U32
             | BuiltinFn::SubgroupId
             | BuiltinFn::SubgroupLocalId
@@ -155,7 +214,7 @@ pub fn type_of_graphics_expr(
         },
         IrExpr::BufferLoad { .. } => f32_id,
         IrExpr::GlobalId(_) => u32_id,
-        IrExpr::SharedLoad { .. } | IrExpr::Texel { .. } => f32_id,
+        IrExpr::SharedLoad { .. } | IrExpr::Texel { .. } | IrExpr::FragLoad { .. } => f32_id,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::TexSize { .. } => u32_id,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 => u32_id,

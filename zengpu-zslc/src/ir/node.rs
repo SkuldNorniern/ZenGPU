@@ -46,6 +46,13 @@ pub enum IrExpr {
         dim: u8,
         args: Vec<IrExpr>,
     },
+    /// `ty` is the `frag<...>` type produced. See [`FragSrc`].
+    FragLoad {
+        ty: TypeId,
+        src: FragSrc,
+        offset: Box<IrExpr>,
+        ld: Box<IrExpr>,
+    },
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     Neg(Box<IrExpr>),
     Binary {
@@ -91,8 +98,22 @@ pub enum IrStmt {
         hi: IrExpr,
         body: Vec<IrStmt>,
     },
+    /// see [`FragSrc`].
+    FragStore {
+        src: FragSrc,
+        offset: IrExpr,
+        ld: IrExpr,
+        value: IrExpr,
+    },
     Eval(IrExpr),
     Discard,
+}
+
+/// A buffer param or shared array. Compute only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FragSrc {
+    Buffer(String),
+    Shared(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +226,15 @@ pub enum BuiltinFn {
     WorkgroupReduceAdd,
     WorkgroupReduceMin,
     WorkgroupReduceMax,
+    /// A zero fragment. Its type comes from the `let` annotation or the `mma` accumulator slot.
+    FragZeroAcc,
+    Mma,
+    /// `frag_len(f) -> u32` gives the number of elements each lane holds of `f`.
+    FragLen,
+    FragRow,
+    FragCol,
+    FragGet,
+    FragSet,
 }
 
 impl BuiltinFn {
@@ -272,6 +302,13 @@ impl BuiltinFn {
             BuiltinFn::WorkgroupReduceAdd => "workgroup_reduce_add",
             BuiltinFn::WorkgroupReduceMin => "workgroup_reduce_min",
             BuiltinFn::WorkgroupReduceMax => "workgroup_reduce_max",
+            BuiltinFn::FragZeroAcc => "frag_zero_acc",
+            BuiltinFn::Mma => "mma",
+            BuiltinFn::FragLen => "frag_len",
+            BuiltinFn::FragRow => "frag_row",
+            BuiltinFn::FragCol => "frag_col",
+            BuiltinFn::FragGet => "frag_get",
+            BuiltinFn::FragSet => "frag_set",
         }
     }
 }
@@ -296,6 +333,13 @@ fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
             expr_uses_subgroup_query(index) || expr_uses_subgroup_query(value)
         }
         IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_subgroup_query),
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => {
+            expr_uses_subgroup_query(offset)
+                || expr_uses_subgroup_query(ld)
+                || expr_uses_subgroup_query(value)
+        }
         IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_subgroup_query(cond)
@@ -334,6 +378,9 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
                 || lod.as_deref().is_some_and(expr_uses_subgroup_query)
         }
         IrExpr::Texel { args, .. } => args.iter().any(expr_uses_subgroup_query),
+        IrExpr::FragLoad { offset, ld, .. } => {
+            expr_uses_subgroup_query(offset) || expr_uses_subgroup_query(ld)
+        }
         IrExpr::Neg(inner) => expr_uses_subgroup_query(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_uses_subgroup_query(lhs) || expr_uses_subgroup_query(rhs)
@@ -368,6 +415,13 @@ fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
             expr_uses_workgroup_reduce(index) || expr_uses_workgroup_reduce(value)
         }
         IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => {
+            expr_uses_workgroup_reduce(offset)
+                || expr_uses_workgroup_reduce(ld)
+                || expr_uses_workgroup_reduce(value)
+        }
         IrStmt::Barrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_workgroup_reduce(cond)
@@ -408,6 +462,9 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
                 || lod.as_deref().is_some_and(expr_uses_workgroup_reduce)
         }
         IrExpr::Texel { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
+        IrExpr::FragLoad { offset, ld, .. } => {
+            expr_uses_workgroup_reduce(offset) || expr_uses_workgroup_reduce(ld)
+        }
         IrExpr::Neg(inner) => expr_uses_workgroup_reduce(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_uses_workgroup_reduce(lhs) || expr_uses_workgroup_reduce(rhs)
@@ -457,6 +514,15 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, boo
             .fold((false, false, false, false, false), |acc, e| {
                 merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(e))
             }),
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => merge_subgroup_collective_uses(
+            merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(offset),
+                expr_uses_subgroup_collectives(ld),
+            ),
+            expr_uses_subgroup_collectives(value),
+        ),
         IrStmt::Barrier | IrStmt::Discard => (false, false, false, false, false),
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
@@ -544,6 +610,10 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
                 None => uses,
             }
         }
+        IrExpr::FragLoad { offset, ld, .. } => merge_subgroup_collective_uses(
+            expr_uses_subgroup_collectives(offset),
+            expr_uses_subgroup_collectives(ld),
+        ),
         IrExpr::Binary { lhs, rhs, .. } => merge_subgroup_collective_uses(
             expr_uses_subgroup_collectives(lhs),
             expr_uses_subgroup_collectives(rhs),

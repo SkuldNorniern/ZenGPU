@@ -1900,6 +1900,7 @@ dependencies = [
  "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",
+ "zengpu-zslc",
 ]
 
 [[package]]

@@ -29,13 +29,19 @@ use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, op, sc};
 use crate::frontend::diagnostic::Diagnostic;
+use crate::ir::arena::TypeArena;
 use crate::ir::binding::{IMAGE_BINDING, TEXTURE_BINDING, ssbo_binding_for};
 use crate::ir::node::{
     BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_collectives,
     stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
+use crate::ir::typeck::frag_parts;
 use crate::ir::types::TypeId;
 use crate::ir::{EntryKind, Module, ParamKind};
+
+mod coop;
+
+use coop::Coop;
 
 pub fn lower_compute(module: &Module) -> Result<Vec<u32>, Diagnostic> {
     lower_compute_inner(module).map_err(Diagnostic::from)
@@ -372,8 +378,23 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let mut ptr_func_uvec4 = Id(0);
 
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
+    let mut coop = Coop::default();
     for (name, ty_id) in &entry.locals {
         let sty = *ty_id;
+        if frag_parts(&types, sty).is_some() {
+            let coop_ty = coop.type_of(&mut spv, &types, sty, t_u32, t_f32, t_i32)?;
+            let ptr_ty = spv.type_pointer(sc::FUNCTION, coop_ty);
+            let ptr = spv.op_variable(ptr_ty, sc::FUNCTION);
+            locals.insert(
+                name.clone(),
+                LocalVar {
+                    ptr,
+                    ty: sty,
+                    ptr_ty,
+                },
+            );
+            continue;
+        }
         let (ptr_ty_slot, spv_elem) = if sty == u32_id {
             (&mut ptr_func_u32, t_u32)
         } else if sty == i32_id {
@@ -449,6 +470,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         t_ptr_wg_f32,
         const_0_u32,
         locals,
+        coop,
+        types: types.clone(),
         t_ptr_pc_u32,
         t_ptr_pc_i32,
         t_ptr_pc_f32,
@@ -573,6 +596,9 @@ struct LowerCtx<'a> {
     t_ptr_wg_f32: Id,
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
+    coop: Coop,
+    /// Type arena clone: fragment accumulator types are interned during lowering.
+    types: TypeArena,
     t_ptr_pc_u32: Id,
     t_ptr_pc_i32: Id,
     t_ptr_pc_f32: Id,
@@ -615,14 +641,25 @@ fn has_atomic_add(stmts: &[IrStmt]) -> bool {
 #[allow(clippy::expect_used)]
 fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
     match stmt {
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => ctx.lower_frag_store(src, offset, ld, value),
         IrStmt::Let { name, init } => {
             let sty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ctx.u32_id);
-            let val = lower_expr(ctx, init)?;
             let ptr = ctx
                 .locals
                 .get(name)
                 .ok_or_else(|| format!("ZSL: undeclared local `{name}`"))?
                 .ptr;
+            if frag_parts(&ctx.types, sty).is_some() {
+                let id = ctx.frag_value_or_zero(init, sty)?;
+                ctx.spv.op_store(ptr, id);
+                return Ok(());
+            }
+            let val = lower_expr(ctx, init)?;
             let val_id = coerce(ctx, val, sty);
             ctx.spv.op_store(ptr, val_id);
             Ok(())
@@ -634,6 +671,11 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .get(name)
                 .map(|l| (l.ptr, l.ty))
                 .ok_or_else(|| format!("ZSL: `{name}` is not a declared local variable"))?;
+            if frag_parts(&ctx.types, ty).is_some() {
+                let id = ctx.frag_value_or_zero(value, ty)?;
+                ctx.spv.op_store(ptr, id);
+                return Ok(());
+            }
             let rhs = lower_expr(ctx, value)?;
             let rhs_id = coerce(ctx, rhs, ty);
             ctx.spv.op_store(ptr, rhs_id);
@@ -835,6 +877,12 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
 #[allow(clippy::expect_used)]
 fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
     match expr {
+        IrExpr::FragLoad {
+            ty,
+            src,
+            offset,
+            ld,
+        } => ctx.lower_frag_load(*ty, src, offset, ld),
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
             Ok(Val { id, ty: ctx.u32_id })
@@ -851,6 +899,11 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 .get(name)
                 .ok_or_else(|| format!("ZSL: unknown identifier `{name}`"))?;
             let (ty, ptr) = (local.ty, local.ptr);
+            if frag_parts(&ctx.types, ty).is_some() {
+                let coop_ty = ctx.frag_spv_ty(ty)?;
+                let id = ctx.spv.op_load(coop_ty, ptr);
+                return Ok(Val { id, ty });
+            }
             let spv_ty = ctx.spv_ty(ty);
             let id = ctx.spv.op_load(spv_ty, ptr);
             Ok(Val { id, ty })
@@ -1184,6 +1237,18 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
 fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Result<Val, String> {
     let name = func.name();
     match func {
+        BuiltinFn::Mma => ctx.lower_mma(args),
+        BuiltinFn::FragZeroAcc => Err(
+            "SPIR-V backend: frag_zero_acc() must initialise a frag let or assignment, or be the acc of mma"
+                .into(),
+        ),
+        BuiltinFn::FragLen
+        | BuiltinFn::FragRow
+        | BuiltinFn::FragCol
+        | BuiltinFn::FragGet
+        | BuiltinFn::FragSet => Err(format!(
+            "SPIR-V backend: {name}() is not lowered: the cooperative matrix element mapping is opaque"
+        )),
         BuiltinFn::U32 => {
             if args.len() != 1 {
                 return Err("ZSL: u32() takes 1 arg".into());

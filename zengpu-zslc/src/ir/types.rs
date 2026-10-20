@@ -91,6 +91,14 @@ pub enum TextureClass {
     Depth,
 }
 
+/// Which operand of `mma` a fragment is: `a` (MxK), `b` (KxN), or the accumulator `acc` (MxN).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FragUse {
+    A,
+    B,
+    Acc,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SamplerKind {
@@ -149,4 +157,12 @@ pub enum Type {
         texel: TypeId,
     },
     Sampler(SamplerKind),
+    /// A matrix tile owned by one subgroup, held in registers. Only locals and `let` bindings hold
+    /// it; never a buffer element or parameter.
+    Frag {
+        element: TypeId,
+        rows: u8,
+        cols: u8,
+        usage: FragUse,
+    },
 }

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -9,6 +9,8 @@ use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_re
 use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
+
+mod frag;
 
 pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     let e = &module.entry;
@@ -25,7 +27,11 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
     for (n, t) in &e.locals {
-        locals.insert(n.as_str(), hip_scalar(module.types.get(*t))?);
+        let cty = match frag::hip_frag_type(&module.types, *t) {
+            Some(cty) => cty,
+            None => hip_scalar(module.types.get(*t))?,
+        };
+        locals.insert(n.as_str(), cty);
     }
 
     let buffers: Vec<(&str, Mutability, TypeId)> = e
@@ -188,6 +194,7 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
 "#);
 
     let threads = local_size[0] * local_size[1] * local_size[2];
+    let kernel_start = s.len();
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
 
@@ -254,12 +261,16 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
         },
         types: RefCell::new(module.types.clone()),
         block_size,
+        frag_used: Cell::new(false),
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
     }
 
     s.push_str("}\n");
+    if ctx.frag_used.get() {
+        s.insert_str(kernel_start, frag::FRAG_PRELUDE);
+    }
 
     Ok(HipShader {
         source: s,
@@ -277,6 +288,7 @@ struct Ctx<'a> {
     type_ctx: ComputeTypeCtx,
     types: RefCell<TypeArena>,
     block_size: u32,
+    frag_used: Cell<bool>,
 }
 
 fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
@@ -340,6 +352,29 @@ fn indent(s: &mut String, depth: usize) {
     }
 }
 
+fn is_frag_zero_acc(e: &IrExpr) -> bool {
+    matches!(
+        e,
+        IrExpr::Builtin {
+            func: BuiltinFn::FragZeroAcc,
+            ..
+        }
+    )
+}
+
+fn is_frag_builtin(f: BuiltinFn) -> bool {
+    matches!(
+        f,
+        BuiltinFn::FragZeroAcc
+            | BuiltinFn::Mma
+            | BuiltinFn::FragLen
+            | BuiltinFn::FragRow
+            | BuiltinFn::FragCol
+            | BuiltinFn::FragGet
+            | BuiltinFn::FragSet
+    )
+}
+
 /// HIP spelling of a scalar [`Type`]. Non-scalar is an `Unsupported` diagnostic.
 fn hip_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
     match ty {
@@ -399,11 +434,33 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .copied()
                 .unwrap_or("unsigned int");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            if is_frag_zero_acc(init) {
+                let _ = writeln!(s, "{ty} {name} = {{}};");
+            } else {
+                let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            }
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            if is_frag_zero_acc(value) {
+                let ty = ctx
+                    .locals
+                    .get(name.as_str())
+                    .copied()
+                    .unwrap_or("unsigned int");
+                let _ = writeln!(s, "{name} = {ty}{{}};");
+            } else {
+                let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            }
+        }
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => {
+            indent(s, depth);
+            let _ = writeln!(s, "{}", frag::store_stmt(ctx, src, offset, ld, value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
@@ -557,6 +614,15 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("float{}({})", dim, args_s.join(", "))
         }
+        IrExpr::FragLoad {
+            ty,
+            src,
+            offset,
+            ld,
+        } => frag::load_expr(ctx, *ty, src, offset, ld)?,
+        IrExpr::Builtin { func, args } if is_frag_builtin(*func) => {
+            frag::builtin_expr(ctx, *func, args)?
+        }
         IrExpr::Builtin { func, args } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
@@ -569,6 +635,18 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 ));
             }
             match func {
+                BuiltinFn::FragZeroAcc
+                | BuiltinFn::Mma
+                | BuiltinFn::FragLen
+                | BuiltinFn::FragRow
+                | BuiltinFn::FragCol
+                | BuiltinFn::FragGet
+                | BuiltinFn::FragSet => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Internal,
+                        "fragment builtin reached the scalar builtin path",
+                    ));
+                }
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),

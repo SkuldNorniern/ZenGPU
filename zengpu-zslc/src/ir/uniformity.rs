@@ -20,7 +20,8 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
         IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
         | IrExpr::BufferLoad { .. }
-        | IrExpr::SharedLoad { .. } => false,
+        | IrExpr::SharedLoad { .. }
+        | IrExpr::FragLoad { .. } => false,
         IrExpr::Local(name) => locals.get(name).copied().unwrap_or(false),
         IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } | IrExpr::Neg(base) => {
             expr_is_uniform(base, locals)
@@ -84,6 +85,9 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     .is_some_and(expr_contains_subgroup_collective)
         }
         IrExpr::Texel { args, .. } => args.iter().any(expr_contains_subgroup_collective),
+        IrExpr::FragLoad { offset, ld, .. } => {
+            expr_contains_subgroup_collective(offset) || expr_contains_subgroup_collective(ld)
+        }
         IrExpr::Neg(inner) => expr_contains_subgroup_collective(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_contains_subgroup_collective(lhs) || expr_contains_subgroup_collective(rhs)
@@ -142,6 +146,13 @@ fn check_stmt(
             let uniform = expr_is_uniform(value, locals);
             locals.insert(name.clone(), uniform);
             Ok(())
+        }
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => {
+            reject_if_divergent(offset, divergent)?;
+            reject_if_divergent(ld, divergent)?;
+            reject_if_divergent(value, divergent)
         }
         IrStmt::AssignBuffer { index, value, .. }
         | IrStmt::AssignShared { index, value, .. }

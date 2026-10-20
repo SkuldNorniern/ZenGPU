@@ -174,7 +174,11 @@ impl<'a> Parser<'a> {
                 return self.err(format!("duplicate parameter `{pname}`"));
             }
             self.expect(&Tok::Colon, "`:` after fn parameter name")?;
-            let ty = self.parse_scalar_type()?;
+            let ty = if self.at_kw("frag") {
+                self.parse_frag_type()?
+            } else {
+                self.parse_scalar_type()?
+            };
             ctx.locals.insert(pname.clone(), ty);
             params.push(FnParamDef {
                 name: pname,
@@ -277,6 +281,9 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "`)` after barrier(")?;
             return Ok(vec![IrStmt::Barrier]);
         }
+        if self.eat_kw("frag_store") {
+            return Ok(vec![self.parse_frag_store(ctx)?]);
+        }
         if self.eat_kw("atomic_add") {
             self.expect(&Tok::LParen, "`(` after atomic_add")?;
             let buf = self.ident()?;
@@ -336,7 +343,10 @@ impl<'a> Parser<'a> {
         if self.eat(&Tok::Eq) {
             let rhs = self.parse_expr(ctx)?;
             let stmt = match lhs {
-                IrExpr::Local(name) => IrStmt::AssignLocal { name, value: rhs },
+                IrExpr::Local(name) => {
+                    self.check_frag_assign(ctx, &name, &rhs)?;
+                    IrStmt::AssignLocal { name, value: rhs }
+                }
                 IrExpr::BufferLoad { buf, index } => {
                     let Some(buffer) = ctx.buffers.get(&buf).copied() else {
                         return self.err(format!("`{buf}` is not a device buffer"));
@@ -461,15 +471,34 @@ impl<'a> Parser<'a> {
         if ctx.shared.contains_key(&name) {
             return self.err(format!("`{name}` is already a shared array"));
         }
-        let annot = if self.eat(&Tok::Colon) {
-            Some(self.parse_scalar_type()?)
-        } else {
+        let annot = if !self.eat(&Tok::Colon) {
             None
+        } else if self.at_kw("frag") {
+            Some(self.parse_frag_type()?)
+        } else {
+            Some(self.parse_scalar_type()?)
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_expr(ctx)?;
+        let is_zero_acc = matches!(
+            init,
+            IrExpr::Builtin {
+                func: BuiltinFn::FragZeroAcc,
+                ..
+            }
+        );
         let ty = match annot {
-            Some(ty) => ty,
+            Some(ty) => {
+                let init_ty = type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types);
+                let is_frag = frag_parts(&self.types, ty).is_some();
+                if is_frag && !is_zero_acc && init_ty != ty {
+                    return self.err("let initializer does not match the frag annotation");
+                }
+                ty
+            }
+            None if is_zero_acc => {
+                return self.err("frag_zero_acc() needs a frag<…, acc> annotation on its let");
+            }
             None => type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types),
         };
         ctx.locals.insert(name.clone(), ty);

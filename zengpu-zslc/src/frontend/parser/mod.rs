@@ -22,6 +22,7 @@
 
 mod compute;
 mod expr;
+mod frag;
 mod graphics;
 mod graphics_expr;
 mod inference;
@@ -48,8 +49,8 @@ use std::mem;
 
 use crate::frontend::lex::{Tok, Token, lex};
 use crate::ir::arena::TypeArena;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp};
-use crate::ir::typeck::{type_of_compute_expr, type_of_graphics_expr};
+use crate::ir::node::{BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
+use crate::ir::typeck::{frag_parts, type_of_compute_expr, type_of_graphics_expr};
 use crate::ir::types::TypeId;
 use crate::ir::{
     Entry, EntryKind, GfxBuiltin, GfxInput, GfxOutput, GfxScalar, GfxSlot, GraphicsEntry,

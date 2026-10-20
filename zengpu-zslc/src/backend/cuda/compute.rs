@@ -10,6 +10,8 @@ use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
+mod frag;
+
 pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
@@ -25,7 +27,11 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
 
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
     for (n, t) in &e.locals {
-        locals.insert(n.as_str(), cuda_scalar(module.types.get(*t))?);
+        let cty = match frag::cuda_frag_type(&module.types, *t) {
+            Some(cty) => cty,
+            None => cuda_scalar(module.types.get(*t))?,
+        };
+        locals.insert(n.as_str(), cty);
     }
 
     let buffers: Vec<(&str, Mutability, TypeId)> = e
@@ -214,6 +220,7 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
 "#);
 
     let threads = local_size[0] * local_size[1] * local_size[2];
+    let kernel_start = s.len();
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
 
@@ -286,6 +293,9 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
     }
 
     s.push_str("}\n");
+    if ctx.locals.values().any(|t| t.starts_with("nvcuda::")) {
+        s.insert_str(kernel_start, frag::FRAG_PRELUDE);
+    }
 
     Ok(CudaShader {
         source: s,
@@ -360,6 +370,19 @@ fn builtin_requires_f32(func: BuiltinFn) -> bool {
     )
 }
 
+fn is_frag_builtin(f: BuiltinFn) -> bool {
+    matches!(
+        f,
+        BuiltinFn::FragZeroAcc
+            | BuiltinFn::Mma
+            | BuiltinFn::FragLen
+            | BuiltinFn::FragRow
+            | BuiltinFn::FragCol
+            | BuiltinFn::FragGet
+            | BuiltinFn::FragSet
+    )
+}
+
 fn indent(s: &mut String, depth: usize) {
     for _ in 0..depth {
         s.push_str("    ");
@@ -425,11 +448,28 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .copied()
                 .unwrap_or("unsigned int");
             indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            if frag::is_frag_statement(init) {
+                let _ = writeln!(s, "{}", frag::let_stmt(ctx, ty, name, init)?);
+            } else {
+                let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            }
         }
         IrStmt::AssignLocal { name, value } => {
             indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            if frag::is_frag_statement(value) {
+                let _ = writeln!(s, "{}", frag::assign_stmt(ctx, name, value)?);
+            } else {
+                let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            }
+        }
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => {
+            indent(s, depth);
+            let _ = writeln!(s, "{}", frag::store_stmt(ctx, src, offset, ld, value)?);
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
@@ -583,6 +623,20 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             }
             format!("make_float{}({})", dim, args_s.join(", "))
         }
+        IrExpr::FragLoad { .. } => return Err(frag::expr_error("frag_load")),
+        IrExpr::Builtin {
+            func: func @ (BuiltinFn::FragZeroAcc | BuiltinFn::Mma),
+            ..
+        } => return Err(frag::expr_error(func.name())),
+        IrExpr::Builtin { func, .. } if is_frag_builtin(*func) => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                format!(
+                    "CUDA backend: {} has no lowering (wmma fragment element mapping is opaque)",
+                    func.name()
+                ),
+            ));
+        }
         IrExpr::Builtin { func, args } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
@@ -595,6 +649,18 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 ));
             }
             match func {
+                BuiltinFn::FragZeroAcc
+                | BuiltinFn::Mma
+                | BuiltinFn::FragLen
+                | BuiltinFn::FragRow
+                | BuiltinFn::FragCol
+                | BuiltinFn::FragGet
+                | BuiltinFn::FragSet => {
+                    return Err(Diagnostic::new(
+                        DiagnosticCode::Internal,
+                        "fragment builtin reached the scalar builtin path",
+                    ));
+                }
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::Extend => format!("make_float4({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),

@@ -26,6 +26,17 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
             name: name.clone(),
             index: Box::new(rename_expr(index, map)),
         },
+        IrExpr::FragLoad {
+            ty,
+            src,
+            offset,
+            ld,
+        } => IrExpr::FragLoad {
+            ty: *ty,
+            src: src.clone(),
+            offset: Box::new(rename_expr(offset, map)),
+            ld: Box::new(rename_expr(ld, map)),
+        },
         IrExpr::GlobalId(c) => IrExpr::GlobalId(*c),
         IrExpr::LocalId(c) => IrExpr::LocalId(*c),
         IrExpr::GroupId(c) => IrExpr::GroupId(*c),
@@ -109,6 +120,17 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
             index: rename_expr(index, map),
             value: rename_expr(value, map),
         },
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => IrStmt::FragStore {
+            src: src.clone(),
+            offset: rename_expr(offset, map),
+            ld: rename_expr(ld, map),
+            value: rename_expr(value, map),
+        },
         IrStmt::ImageStore { image, args } => IrStmt::ImageStore {
             image: image.clone(),
             args: args.iter().map(|a| rename_expr(a, map)).collect(),
@@ -137,6 +159,17 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
 /// Runs once at the end of `parse_kernel_rest` and `parse_graphics_rest`.
 pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena) -> IrExpr {
     match expr {
+        IrExpr::FragLoad {
+            ty,
+            src,
+            offset,
+            ld,
+        } => IrExpr::FragLoad {
+            ty: *ty,
+            src: src.clone(),
+            offset: Box::new(resolve_construct_types_expr(offset, types)),
+            ld: Box::new(resolve_construct_types_expr(ld, types)),
+        },
         IrExpr::LitU32(v) => IrExpr::LitU32(*v),
         IrExpr::LitF32(v) => IrExpr::LitF32(*v),
         IrExpr::Local(name) => IrExpr::Local(name.clone()),
@@ -243,6 +276,17 @@ pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena)
         IrStmt::AssignShared { name, index, value } => IrStmt::AssignShared {
             name: name.clone(),
             index: resolve_construct_types_expr(index, types),
+            value: resolve_construct_types_expr(value, types),
+        },
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => IrStmt::FragStore {
+            src: src.clone(),
+            offset: resolve_construct_types_expr(offset, types),
+            ld: resolve_construct_types_expr(ld, types),
             value: resolve_construct_types_expr(value, types),
         },
         IrStmt::ImageStore { image, args } => IrStmt::ImageStore {

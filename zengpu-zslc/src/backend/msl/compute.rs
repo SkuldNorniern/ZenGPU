@@ -279,6 +279,7 @@ fn indent(s: &mut String, depth: usize) {
 
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
+        IrStmt::FragStore { .. } => return Err(frag_unsupported("frag_store")),
         IrStmt::Let { name, init } => {
             let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("uint");
             indent(s, depth);
@@ -396,6 +397,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
 
 fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
+        IrExpr::FragLoad { .. } => return Err(frag_unsupported("frag_load")),
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => msl_float(*v),
         IrExpr::Local(n) => n.clone(),
@@ -421,6 +423,13 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::FragZeroAcc
+                | BuiltinFn::Mma
+                | BuiltinFn::FragLen
+                | BuiltinFn::FragRow
+                | BuiltinFn::FragCol
+                | BuiltinFn::FragGet
+                | BuiltinFn::FragSet => return Err(frag_unsupported(func.name())),
                 BuiltinFn::F32 => format!("float({})", a[0]),
                 BuiltinFn::Step => format!("step({}, {})", a[0], a[1]),
                 BuiltinFn::Smoothstep => format!("smoothstep({}, {}, {})", a[0], a[1], a[2]),
@@ -581,8 +590,17 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
-/// the MSL spelling of a scalar [`Type`]. non-scalar is a compiler defect,
-/// reported as `Unsupported`.
+/// MSL spelling of a scalar [`Type`]. A non-scalar here is a compiler defect.
+///
+/// Fragments are not yet lowered for MSL. `simdgroup_matrix` is 8x8, so the 16x16x16 tile needs its
+/// own lowering.
+pub(super) fn frag_unsupported(what: &str) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::Unsupported,
+        format!("MSL backend: {what} is not lowered yet (simdgroup_matrix is 8x8)"),
+    )
+}
+
 fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
         Type::Int {
@@ -597,6 +615,7 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
             format: FloatFormat::F32,
         } => Ok("float"),
         Type::Bool => Ok("bool"),
+        Type::Frag { .. } => Err(frag_unsupported("frag local")),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("MSL backend: unsupported scalar type {other:?}"),

@@ -161,6 +161,9 @@ impl<'a> Parser<'a> {
                             IrExpr::GroupId(comp)
                         });
                     }
+                    if let Some(load) = self.parse_frag_load(ctx, &name)? {
+                        return Ok(load);
+                    }
                     return self.parse_call(ctx, &name);
                 }
                 if self.eat(&Tok::Dot) {
@@ -350,7 +353,12 @@ impl<'a> Parser<'a> {
             | BuiltinFn::PkFmaF16
             | BuiltinFn::Dot2F16
             | BuiltinFn::FunnelShr
-            | BuiltinFn::BytePerm => Some(3),
+            | BuiltinFn::BytePerm
+            | BuiltinFn::Mma
+            | BuiltinFn::FragSet => Some(3),
+            BuiltinFn::FragRow | BuiltinFn::FragCol | BuiltinFn::FragGet => Some(2),
+            BuiltinFn::FragLen => Some(1),
+            BuiltinFn::FragZeroAcc => Some(0),
             _ => None,
         };
         if let Some(n) = arity
@@ -358,6 +366,7 @@ impl<'a> Parser<'a> {
         {
             return self.err(format!("{}() takes {n} args", func.name()));
         }
+        self.check_frag_call(ctx, func, &args)?;
         if matches!(
             func,
             BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize

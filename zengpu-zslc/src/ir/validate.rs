@@ -96,6 +96,10 @@ fn check_expr(
             }
             Ok(())
         }
+        IrExpr::FragLoad { offset, ld, .. } => {
+            check_expr(offset, ctx, types, bool_id)?;
+            check_expr(ld, ctx, types, bool_id)
+        }
         IrExpr::Neg(inner) => check_expr(inner, ctx, types, bool_id),
         IrExpr::ArrayLit(elems) => {
             for e in elems {
@@ -144,6 +148,13 @@ fn check_stmt(
                 check_expr(arg, ctx, types, bool_id)?;
             }
             Ok(())
+        }
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => {
+            check_expr(offset, ctx, types, bool_id)?;
+            check_expr(ld, ctx, types, bool_id)?;
+            check_expr(value, ctx, types, bool_id)
         }
         IrStmt::Barrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
