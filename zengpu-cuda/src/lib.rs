@@ -3031,6 +3031,76 @@ mod tests {
     }
 
     #[test]
+    fn buffer_offset_read_write() {
+        let Some(device) = cuda_device() else { return };
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: 512,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create_buffer");
+        let first: Vec<u8> = (0u8..128).collect();
+        let second: Vec<u8> = (128u8..=255).collect();
+        device.write_buffer(buf, 0, &first).expect("write first");
+        device
+            .write_buffer(buf, 128, &second)
+            .expect("write second");
+        let rb_first = device.read_buffer(buf, 0, 128).expect("read first");
+        let rb_second = device.read_buffer(buf, 128, 128).expect("read second");
+        assert_eq!(rb_first, first);
+        assert_eq!(rb_second, second);
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
+    fn multiple_independent_buffers() {
+        let Some(device) = cuda_device() else { return };
+        let desc = BufferDesc {
+            size: 128,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let a = device.create_buffer(desc).expect("create a");
+        let b = device.create_buffer(desc).expect("create b");
+        let c = device.create_buffer(desc).expect("create c");
+
+        let da: Vec<u8> = (0..128).map(|i| (i * 3) as u8).collect();
+        let db: Vec<u8> = (0..128).map(|i| (i * 7 + 1) as u8).collect();
+        let dc: Vec<u8> = (0..128).map(|i| (i * 11 + 5) as u8).collect();
+
+        device.write_buffer(a, 0, &da).unwrap();
+        device.write_buffer(b, 0, &db).unwrap();
+        device.write_buffer(c, 0, &dc).unwrap();
+
+        assert_eq!(device.read_buffer(a, 0, 128).unwrap(), da);
+        assert_eq!(device.read_buffer(b, 0, 128).unwrap(), db);
+        assert_eq!(device.read_buffer(c, 0, 128).unwrap(), dc);
+
+        device.destroy_buffer(a);
+        device.destroy_buffer(b);
+        device.destroy_buffer(c);
+    }
+
+    #[test]
+    fn large_buffer_round_trip() {
+        let Some(device) = cuda_device() else { return };
+        const SIZE: u64 = 16 * 1024 * 1024;
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: SIZE,
+                usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .expect("create 16 MiB buffer");
+        let data: Vec<u8> = (0..SIZE as usize).map(|i| (i ^ (i >> 8)) as u8).collect();
+        device.write_buffer(buf, 0, &data).expect("write 16 MiB");
+        let rb = device.read_buffer(buf, 0, SIZE).expect("read 16 MiB");
+        assert_eq!(rb, data, "16 MiB round-trip mismatch");
+        device.destroy_buffer(buf);
+    }
+
+    #[test]
     fn device_to_device_buffer_copy_round_trip() {
         const SIZE: usize = 4 * 1024 * 1024;
         let Some(dev) = cuda_device() else { return };
@@ -3125,6 +3195,67 @@ mod tests {
                 (got - expected[i]).abs() < 1e-4,
                 "out[{i}] = {got}, expected {}",
                 expected[i]
+            );
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(buf_a);
+        device.destroy_buffer(buf_b);
+        device.destroy_buffer(buf_out);
+    }
+
+    #[test]
+    fn cuda_source_nvrtc_vec_add() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let a: Vec<f32> = (0..N).map(|i| i as f32 * 0.25).collect();
+        let b: Vec<f32> = (0..N).map(|i| 1000.0 - i as f32 * 0.5).collect();
+        let size = (N * size_of::<f32>()) as u64;
+        let desc = BufferDesc {
+            size,
+            usage: zengpu_hal::BufferUsage::STORAGE | zengpu_hal::BufferUsage::READBACK,
+            memory: zengpu_hal::MemoryUsage::GpuOnly,
+        };
+        let buf_a = device.create_buffer(desc).expect("create a");
+        let buf_b = device.create_buffer(desc).expect("create b");
+        let buf_out = device.create_buffer(desc).expect("create output");
+
+        let a_bytes: Vec<u8> = a.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = b.iter().flat_map(|v| v.to_le_bytes()).collect();
+        device.write_buffer(buf_a, 0, &a_bytes).expect("upload a");
+        device.write_buffer(buf_b, 0, &b_bytes).expect("upload b");
+
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(VEC_ADD_CUDA))
+            .expect("compile CUDA C++ with NVRTC");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "vec_add_f32",
+                block: [256, 1, 1],
+            })
+            .expect("create NVRTC pipeline");
+        device
+            .dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[buf_a.index(), buf_b.index(), buf_out.index()],
+                    scalars: &[Scalar::U32(N as u32)],
+                    textures: &[],
+                    images: &[],
+                },
+                [(N as u32).div_ceil(256), 1, 1],
+            )
+            .expect("dispatch NVRTC kernel");
+
+        let raw = device.read_buffer(buf_out, 0, size).expect("read output");
+        for i in 0..N {
+            let got = f32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            let expected = a[i] + b[i];
+            assert!(
+                (got - expected).abs() < 1e-4,
+                "out[{i}] = {got}, expected {expected}"
             );
         }
 
@@ -3729,6 +3860,19 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    /// Without a cache base, nothing is written to disk.
+    #[test]
+    fn compile_cache_disabled_writes_nothing() {
+        let Some(device) = cuda_device() else { return };
+        let base = unique_dir("disabled");
+        let src = unique_source(VEC_ADD_CUDA);
+        let shader = as_cuda(&*device)
+            .cuda_shader(src.as_bytes(), None)
+            .expect("compile without cache");
+        run_vec_add(&*device, shader);
+        assert!(!base.exists());
+    }
+
     #[test]
     fn compile_cache_memo_serves_repeat_source() {
         let Some(device) = cuda_device() else { return };
@@ -3950,6 +4094,46 @@ extern "C" __global__ void fill(float* out, float v, unsigned int n) {
     }
 
     #[test]
+    fn graph_replay_matches_direct_launches() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let out = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(out, 0, &init).unwrap();
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        let adds = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for _ in 0..5 {
+            submit_accum(&*device, pipeline, out, &adds, N as u32);
+        }
+        let mut expected: Vec<f32> = (0..N).map(|i| i as f32 + 5.0 * 36.0).collect();
+        assert_eq!(read_f32(&*device, out, N), expected);
+
+        let changed = [100.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for _ in 0..3 {
+            submit_accum(&*device, pipeline, out, &changed, N as u32);
+        }
+        for v in &mut expected {
+            *v += 3.0 * 135.0;
+        }
+        assert_eq!(read_f32(&*device, out, N), expected);
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(out);
+    }
+
+    #[test]
     fn graph_cache_is_invalidated_when_pipeline_is_destroyed() {
         let Some(device) = cuda_device() else { return };
         const N: usize = 256;
@@ -4004,6 +4188,74 @@ extern "C" __global__ void fill(float* out, float v, unsigned int n) {
         device.destroy_buffer(out);
     }
 
+    #[test]
+    fn mixed_copy_and_dispatch_batch_replays_correctly() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 256;
+        let size = (N * size_of::<f32>()) as u64;
+        let base = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let acc = graph_buffer(&*device, size);
+        let init: Vec<u8> = (0..N).flat_map(|i| (i as f32).to_le_bytes()).collect();
+        device.write_buffer(base, 0, &init).unwrap();
+
+        let shader = device
+            .create_shader(ShaderDesc::cuda_src(ACCUM_CUDA))
+            .expect("compile accum");
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "accum",
+                block: [64, 1, 1],
+            })
+            .expect("create pipeline");
+
+        let slots = [acc.index()];
+        let scalars: Vec<[Scalar; 2]> = [1.0f32, 2.0, 3.0]
+            .iter()
+            .map(|&v| [Scalar::F32(v), Scalar::U32(N as u32)])
+            .collect();
+        let copy = zengpu_hal::BufferCopyOp {
+            src: base,
+            src_offset: 0,
+            dst: acc,
+            dst_offset: 0,
+            len: size,
+        };
+        let mut ops = vec![ComputeOp::CopyBuffer(copy)];
+        ops.extend(scalars.iter().map(|s| {
+            ComputeOp::Dispatch(zengpu_hal::DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &slots,
+                    scalars: s,
+                    textures: &[],
+                    images: &[],
+                },
+                grid: [(N as u32).div_ceil(64), 1, 1],
+            })
+        }));
+
+        let expected: Vec<f32> = (0..N).map(|i| i as f32 + 6.0).collect();
+        for _ in 0..3 {
+            device
+                .submit_compute_ops(0, &ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(read_f32(&*device, acc, N), expected);
+        }
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(base);
+        device.destroy_buffer(acc);
+    }
     fn ready_graphs(device: &dyn GpuDevice) -> usize {
         let device = device
             .as_any()
@@ -4187,7 +4439,7 @@ extern "C" __global__ void fill(float* out, float v, unsigned int n) {
     }
 
     #[test]
-    fn kernel_signature_pointer_writes() {
+    fn kernel_signature_reads_const_pointers_as_read_only() {
         let zsl_style = r#"
 extern "C" __global__ __launch_bounds__(64)
 void trig(
@@ -4207,12 +4459,20 @@ void trig(
             kernel_pointer_writes(qualifiers, "k"),
             Some(vec![false, true])
         );
+    }
+
+    #[test]
+    fn kernel_signature_matches_whole_entry_names() {
         let two =
             "__global__ void foo2(float* a) {}\n__global__ void foo(const float* a, float* b) {}";
         assert_eq!(kernel_pointer_writes(two, "foo"), Some(vec![false, true]));
         assert_eq!(kernel_pointer_writes(two, "foo2"), Some(vec![true]));
         let suffix = "__global__ void my_foo(float* a) {}\n__global__ void foo(const float* a) {}";
         assert_eq!(kernel_pointer_writes(suffix, "foo"), Some(vec![false]));
+    }
+
+    #[test]
+    fn kernel_signature_falls_back_when_unreadable() {
         assert_eq!(kernel_pointer_writes("void k(float* a) {}", "k"), None);
         assert_eq!(
             kernel_pointer_writes("__global__ void k(float* a) {}", "other"),
@@ -4522,6 +4782,38 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
     }
 
     #[test]
+    fn async_write_dispatch_read_chain_needs_no_intermediate_waits() {
+        let Some(device) = cuda_device() else { return };
+        const N: usize = 1024;
+        let size = (N * size_of::<f32>()) as u64;
+        let input = graph_buffer(&*device, size);
+        let output = graph_buffer(&*device, size);
+        let (shader, pipeline) = pipeline_for(&*device, COPY_FILL_CUDA, "copy_add");
+        let data = f32_bytes((0..N).map(|i| i as f32));
+
+        let write = device.submit_write_buffer(1, input, 0, &data).unwrap();
+        let kernel = submit_one(
+            &*device,
+            pipeline,
+            &[input, output],
+            &[Scalar::F32(2.0), Scalar::U32(N as u32)],
+            N as u32,
+        );
+        let readback = device.submit_read_buffer(2, output, 0, size).unwrap();
+        assert_eq!(readback.cycle_id(), 2);
+        let got = f32_values(&readback.into_bytes().unwrap());
+        let expected: Vec<f32> = (0..N).map(|i| i as f32 + 2.0).collect();
+        assert_eq!(got, expected);
+        write.wait(Duration::from_secs(5)).unwrap();
+        kernel.wait(Duration::from_secs(5)).unwrap();
+
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(input);
+        device.destroy_buffer(output);
+    }
+
+    #[test]
     fn async_ping_pong_chain_waits_only_on_final_readbacks() {
         let Some(device) = cuda_device() else { return };
         const N: usize = 512;
@@ -4602,6 +4894,27 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         device.destroy_shader(shader);
         device.destroy_buffer(x);
         device.destroy_buffer(y);
+    }
+
+    #[test]
+    fn async_large_write_round_trips() {
+        let Some(device) = cuda_device() else { return };
+        const SIZE: usize = 80 * 1024 * 1024 + 13;
+        let buf = device
+            .create_buffer(BufferDesc {
+                size: SIZE as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: zengpu_hal::MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..SIZE)
+            .map(|i| (i.wrapping_mul(31) % 251) as u8)
+            .collect();
+        let write = device.submit_write_buffer(0, buf, 0, &data).unwrap();
+        let readback = device.submit_read_buffer(0, buf, 0, SIZE as u64).unwrap();
+        assert!(readback.into_bytes().unwrap() == data);
+        write.wait(Duration::from_secs(10)).unwrap();
+        device.destroy_buffer(buf);
     }
 
     /// Writes asynchronously at an offset across several upload chunks, with a ragged tail.
