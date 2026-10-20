@@ -856,11 +856,11 @@ int main() {{
             }
         "#;
         let cases = [
-            (f32::NAN, "__builtin_nanf(\"\")"),
-            (f32::INFINITY, "__builtin_inff()"),
-            (f32::NEG_INFINITY, "(-__builtin_inff())"),
+            (f32::NAN, "__builtin_nanf(\"\")", "NAN"),
+            (f32::INFINITY, "__builtin_inff()", "INFINITY"),
+            (f32::NEG_INFINITY, "(-__builtin_inff())", "(-INFINITY)"),
         ];
-        for (value, expected) in cases {
+        for (value, expected, msl_expected) in cases {
             let mut module = parse_compute(source).expect("parse fill kernel");
             let IrStmt::AssignBuffer { value: slot, .. } = &mut module.entry.body[0] else {
                 panic!("expected a buffer store as the first statement");
@@ -870,6 +870,8 @@ int main() {{
             let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
             assert!(hip_source.contains(expected), "HIP: {hip_source}");
             assert!(cuda_source.contains(expected), "CUDA: {cuda_source}");
+            let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
+            assert!(msl_source.contains(msl_expected), "MSL: {msl_source}");
             assert!(!hip_source.contains("inff") || expected.contains("inff"));
             assert!(!hip_source.contains("NaNf"));
         }

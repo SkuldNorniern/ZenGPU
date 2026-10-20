@@ -308,7 +308,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
 fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
         IrExpr::LitU32(v) => format!("{v}u"),
-        IrExpr::LitF32(v) => format!("{v:?}"),
+        IrExpr::LitF32(v) => super::compute::msl_float(*v),
         IrExpr::Local(n) => n.clone(),
         IrExpr::Input(n) if ctx.builtins.contains(n.as_str()) => n.clone(),
         IrExpr::Input(n) => format!("in.{n}"),
