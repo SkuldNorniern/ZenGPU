@@ -63,6 +63,7 @@ pub(super) struct BufferSymbol {
 pub(super) struct PendingShared {
     pub(super) elem: TypeId,
     pub(super) len: u32,
+    pub(super) view_of: Option<String>,
 }
 
 pub(super) struct PendingParam {

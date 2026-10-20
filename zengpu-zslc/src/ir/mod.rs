@@ -66,6 +66,8 @@ pub struct SharedDecl {
     /// through `storage_value_type`.
     pub elem: TypeId,
     pub len: u32,
+    /// `Some(base)` for a `view`, which shares the storage of `base` but has a different `elem`.
+    pub view_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

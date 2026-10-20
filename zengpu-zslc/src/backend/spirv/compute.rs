@@ -37,7 +37,8 @@ use crate::ir::node::{
 };
 use crate::ir::typeck::frag_parts;
 use crate::ir::typeck::{
-    StorageElem, i8_type, storage_elem, storage_value_type, u8_type, u32_vec_lanes,
+    StorageElem, i8_type, storage_byte_size, storage_elem, storage_value_type, u8_type,
+    u32_vec_lanes,
 };
 use crate::ir::types::TypeId;
 use crate::ir::validate::check_uniformity;
@@ -305,6 +306,13 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     };
 
     let t_ptr_wg_f32 = spv.type_pointer(sc::WORKGROUP, t_f32);
+    let explicit = entry.shared.iter().any(|d| d.view_of.is_some());
+    if explicit {
+        spv.capability(CAP_WG_EXPLICIT_LAYOUT);
+        spv.extension("SPV_KHR_workgroup_memory_explicit_layout");
+    }
+    let mut wg_cursor = 0u32;
+    let mut base_offsets: HashMap<String, u32> = HashMap::new();
     let mut shared = HashMap::new();
     for decl in &entry.shared {
         let elem_spv = match storage_elem(&types, decl.elem) {
@@ -319,13 +327,46 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             }
             Some(StorageElem::I32) => t_i32,
             Some(StorageElem::U32 | StorageElem::Bf16) => t_u32,
-            None => return Err(format!("ZSL: unsupported shared element `{}`", decl.name)),
+            None => match u32_vec_lanes(&types, decl.elem) {
+                Some(lanes) => spv.type_vector(t_u32, u32::from(lanes)),
+                None => return Err(format!("ZSL: unsupported shared element `{}`", decl.name)),
+            },
         };
         let len = spv.constant_u32(t_u32, decl.len);
         let array_ty = spv.type_array(elem_spv, len);
-        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
-        let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
         let elem_ptr = spv.type_pointer(sc::WORKGROUP, elem_spv);
+        let var = if explicit {
+            let size = storage_byte_size(&types, decl.elem)
+                .ok_or_else(|| format!("ZSL: unsupported shared element `{}`", decl.name))?;
+            if matches!(
+                storage_elem(&types, decl.elem),
+                Some(StorageElem::F16 | StorageElem::Bf16)
+            ) {
+                spv.capability(CAP_WG_EXPLICIT_16BIT);
+            }
+            if matches!(
+                storage_elem(&types, decl.elem),
+                Some(StorageElem::I8 | StorageElem::U8)
+            ) {
+                spv.capability(CAP_WG_EXPLICIT_8BIT);
+            }
+            let offset = match &decl.view_of {
+                Some(base) => *base_offsets
+                    .get(base)
+                    .ok_or_else(|| format!("ZSL: view `{}` has no base", decl.name))?,
+                None => {
+                    wg_cursor = wg_cursor.next_multiple_of(16);
+                    let offset = wg_cursor;
+                    wg_cursor += decl.len * size;
+                    base_offsets.insert(decl.name.clone(), offset);
+                    offset
+                }
+            };
+            workgroup_block_var(&mut spv, array_ty, size, offset)
+        } else {
+            let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+            spv.global_variable(ptr_ty, sc::WORKGROUP)
+        };
         shared.insert(
             decl.name.clone(),
             SharedVar {
@@ -334,6 +375,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
                 elem_spv,
                 elem: decl.elem,
                 value_ty: storage_value_type(&mut types, decl.elem),
+                explicit,
             },
         );
     }
@@ -352,8 +394,14 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         }
         let len_const = spv.constant_u32(t_u32, workgroup_reduce_len);
         let array_ty = spv.type_array(t_f32, len_const);
-        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
-        Some(spv.global_variable(ptr_ty, sc::WORKGROUP))
+        if explicit {
+            wg_cursor = wg_cursor.next_multiple_of(16);
+            let offset = wg_cursor;
+            Some(workgroup_block_var(&mut spv, array_ty, 4, offset))
+        } else {
+            let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+            Some(spv.global_variable(ptr_ty, sc::WORKGROUP))
+        }
     } else {
         None
     };
@@ -520,6 +568,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         subgroup_vars,
         shared,
         workgroup_reduce_var,
+        workgroup_reduce_explicit: explicit,
         workgroup_reduce_len,
         t_ptr_wg_f32,
         local_size,
@@ -650,6 +699,7 @@ struct LowerCtx<'a> {
     subgroup_vars: Option<SubgroupVars>,
     shared: HashMap<String, SharedVar>,
     workgroup_reduce_var: Option<Id>,
+    workgroup_reduce_explicit: bool,
     workgroup_reduce_len: u32,
     t_ptr_wg_f32: Id,
     /// Workgroup dimensions, for the linear local index that subgroups and fragment staging are
@@ -862,7 +912,8 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ctx.u32_id);
-            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &[idx]);
+            let chain = sv.chain(ctx.const_0_u32, idx);
+            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &chain);
             let rhs = lower_expr(ctx, value)?;
             let stored = store_shared_value(ctx, sv, rhs)?;
             ctx.spv.op_store(ptr, stored);
@@ -1072,7 +1123,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ctx.u32_id);
-            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &[idx]);
+            let chain = sv.chain(ctx.const_0_u32, idx);
+            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &chain);
             let loaded = ctx.spv.op_load(sv.elem_spv, ptr);
             let id = load_shared_value(ctx, sv, loaded);
             Ok(Val {
@@ -2028,7 +2080,8 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             ctx.spv
                 .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
 
-            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+            let chain = reduce_chain(ctx, lid_x);
+            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &chain);
             ctx.spv.op_store(ptr, value.id);
 
             ctx.spv
@@ -2045,10 +2098,11 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
 
                 ctx.spv.label_with_id(true_label);
                 let lid_plus_s = ctx.spv.op_iadd(ctx.t_u32, lid_x, s_const);
-                let ptr_lo = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_x]);
+                let chain_lo = reduce_chain(ctx, lid_x);
+                let ptr_lo = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &chain_lo);
                 let ptr_hi = ctx
                     .spv
-                    .op_access_chain(ctx.t_ptr_wg_f32, var, &[lid_plus_s]);
+                    .op_access_chain(ctx.t_ptr_wg_f32, var, &reduce_chain(ctx, lid_plus_s));
                 let v_lo = ctx.spv.op_load(ctx.t_f32, ptr_lo);
                 let v_hi = ctx.spv.op_load(ctx.t_f32, ptr_hi);
                 let combined = match func {
@@ -2078,7 +2132,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let zero_const = ctx.spv.constant_u32(ctx.t_u32, 0);
             let ptr_zero = ctx
                 .spv
-                .op_access_chain(ctx.t_ptr_wg_f32, var, &[zero_const]);
+                .op_access_chain(ctx.t_ptr_wg_f32, var, &reduce_chain(ctx, zero_const));
             let result = ctx.spv.op_load(ctx.t_f32, ptr_zero);
             Ok(Val {
                 id: result,
@@ -2141,6 +2195,12 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
     }
 }
 
+/// Explicit workgroup layout (SPV_KHR_workgroup_memory_explicit_layout) and 8/16-bit access, for
+/// `view` kernels.
+const CAP_WG_EXPLICIT_LAYOUT: u32 = 4428;
+const CAP_WG_EXPLICIT_8BIT: u32 = 4429;
+const CAP_WG_EXPLICIT_16BIT: u32 = 4430;
+
 const NO_CONTRACTION: u32 = 42;
 const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
@@ -2151,6 +2211,38 @@ struct SharedVar {
     elem_spv: Id,
     elem: TypeId,
     value_ty: TypeId,
+    /// `var` is an explicit-layout Block: index through member 0.
+    explicit: bool,
+}
+
+impl SharedVar {
+    pub(super) fn chain(self, zero: Id, idx: Id) -> Vec<Id> {
+        if self.explicit {
+            vec![zero, idx]
+        } else {
+            vec![idx]
+        }
+    }
+}
+
+fn reduce_chain(ctx: &LowerCtx<'_>, idx: Id) -> Vec<Id> {
+    if ctx.workgroup_reduce_explicit {
+        vec![ctx.const_0_u32, idx]
+    } else {
+        vec![idx]
+    }
+}
+
+/// Workgroup variable at byte `offset` of an explicit-layout Block. Aliased: views may overlap.
+fn workgroup_block_var(spv: &mut SpvBuilder, array_ty: Id, stride: u32, offset: u32) -> Id {
+    spv.decorate(array_ty, deco::ARRAY_STRIDE, &[stride]);
+    let block = spv.type_struct_global(&[array_ty]);
+    spv.decorate(block, deco::BLOCK, &[]);
+    spv.member_decorate(block, 0, deco::OFFSET, &[offset]);
+    let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, block);
+    let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
+    spv.decorate(var, deco::ALIASED, &[]);
+    var
 }
 
 fn store_shared_value(ctx: &mut LowerCtx<'_>, sv: SharedVar, rhs: Val) -> Result<Id, String> {

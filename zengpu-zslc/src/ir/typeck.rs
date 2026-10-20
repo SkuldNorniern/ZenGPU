@@ -28,6 +28,18 @@ pub enum StorageElem {
     U32,
 }
 
+/// bytes per element of a shared or buffer type, `None` without a storage layout.
+pub fn storage_byte_size(arena: &TypeArena, elem: TypeId) -> Option<u32> {
+    if let Some(lanes) = u32_vec_lanes(arena, elem) {
+        return Some(4 * u32::from(lanes));
+    }
+    Some(match storage_elem(arena, elem)? {
+        StorageElem::F16 | StorageElem::Bf16 => 2,
+        StorageElem::I8 | StorageElem::U8 => 1,
+        StorageElem::F32 | StorageElem::I32 | StorageElem::U32 => 4,
+    })
+}
+
 pub fn storage_elem(arena: &TypeArena, elem: TypeId) -> Option<StorageElem> {
     Some(match arena.get(elem) {
         Type::Float {

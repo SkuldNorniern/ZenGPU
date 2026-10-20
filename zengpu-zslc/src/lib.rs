@@ -1061,6 +1061,45 @@ int main() {{
         spirv::lower_compute(&module).expect("lower bitcast_pack to SPIR-V");
     }
 
+    /// `view` over an f16 shared array: u32x4 stores, f16 loads from the base after the barrier.
+    const VIEW_MMA: &str = r#"
+        @workgroup_size(32)
+        kernel view_mma(a: device buffer<u32x4>, b: device buffer<u32x4>, c: device buffer<f32>, out: device mut buffer<f32>) {
+            shared sa: array<f16, 256>
+            shared sb: array<f16, 256>
+            view sa4: array<u32x4> = sa
+            view sb4: array<u32x4> = sb
+            let lane = local_id().x
+            sa4[lane] = a[lane]
+            sb4[lane] = b[lane]
+            barrier()
+            let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b_t(sb, 0, 16)
+            let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+            let done: frag<f32, 16, 16, acc> = mma(fa, fb, acc)
+            frag_store(out, 0, 16, done)
+        }
+    "#;
+
+    #[test]
+    fn shared_views_lower_on_all_compute_backends() {
+        let module = parse_compute(VIEW_MMA).expect("parse view_mma");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower view_mma to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower view_mma to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower view_mma to MSL")
+            .source;
+        assert!(hip_source.contains("__align__(16) unsigned short sa["));
+        assert!(hip_source.contains("uint4* sa4 = reinterpret_cast<uint4*>(sa);"));
+        assert!(cuda_source.contains("uint4* sa4 = reinterpret_cast<uint4*>(sa);"));
+        assert!(msl_source.contains("threadgroup uint4* sa4 = (threadgroup uint4*)sa;"));
+        spirv::lower_compute(&module).expect("lower view_mma to SPIR-V");
+    }
+
     const FRAG_MMA: &str = r#"
         @workgroup_size(32)
         kernel frag_mma(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
@@ -2568,7 +2607,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 32] = [
+        let kernels: [(&str, &str); 33] = [
             ("tiled_gemm", TILED_GEMM),
             ("vec_copy", VEC_COPY),
             ("typed_shared", TYPED_SHARED),
@@ -2591,6 +2630,7 @@ int main() {{
             ("workgroup_reduce_proof", WORKGROUP_REDUCE_PROOF),
             ("dot4", DOT4),
             ("bitcast_pack", BITCAST_PACK),
+            ("view_mma", VIEW_MMA),
             ("frag_mma", FRAG_MMA),
             ("frag_i8", FRAG_I8),
             ("frag_fn", FRAG_FN),

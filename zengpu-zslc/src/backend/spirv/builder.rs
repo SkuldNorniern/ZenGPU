@@ -515,6 +515,17 @@ impl SpvBuilder {
         id
     }
 
+    /// Struct over a [`Self::type_array`] array: emitted in the globals section, after its member.
+    pub fn type_struct_global(&mut self, members: &[Id]) -> Id {
+        let id = self.fresh_id();
+        let mut words = vec![id.0];
+        for m in members {
+            words.push(m.0);
+        }
+        emit_raw(&mut self.constants_globals, op::TYPE_STRUCT, &words);
+        id
+    }
+
     pub fn type_pointer(&mut self, storage_class: u32, pointee: Id) -> Id {
         let id = self.fresh_id();
         emit(
