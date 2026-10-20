@@ -43,6 +43,9 @@ pub struct Schedule {
     /// Edge and unaligned blocks use scalar loads. Needs native shared arrays, so it is off
     /// on Vulkan.
     pub vector_loads: bool,
+    /// Matrix form: k split into N groups, each writing a partial tile. A second pass sums them in
+    /// group order (deterministic). 0 or 1 means no split. f16 x f16 -> f32 only.
+    pub split_k: u32,
 }
 
 impl Schedule {
@@ -58,6 +61,7 @@ impl Schedule {
             wave_rows: 0,
             stages: 0,
             vector_loads: false,
+            split_k: 1,
         }
     }
 }
@@ -74,6 +78,7 @@ impl Default for Schedule {
             wave_rows: 0,
             stages: 0,
             vector_loads: true,
+            split_k: 1,
         }
     }
 }
@@ -227,6 +232,7 @@ fn staged_plan(
         wave_cols: 1,
         stages: 1,
         vector_loads: false,
+        split_k: 1,
     })
 }
 
@@ -266,6 +272,16 @@ fn mma_plan(
         schedule.waves as usize
     };
     let (waves, nwr, nwc) = wave_grid(bm / 16, bn / 16, want_waves, schedule.wave_rows, notes);
+    let split_k = match schedule.split_k.max(1) as usize {
+        1 => 1,
+        n if elem == (DType::F16, DType::F16, DType::F32) => n,
+        n => {
+            notes.push(format!(
+                "split_k {n} needs f16 x f16 -> f32; running unsplit"
+            ));
+            1
+        }
+    };
     let native = target.backend != BackendPreference::Vulkan;
     let operand_bytes = |d: DType| match d {
         DType::I8 => 1,
@@ -301,6 +317,7 @@ fn mma_plan(
         wave_cols: nwc,
         stages: stages as usize,
         vector_loads: schedule.vector_loads && native,
+        split_k,
     })
 }
 

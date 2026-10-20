@@ -40,6 +40,9 @@ pub(crate) struct Plan {
     /// `Mma` only: full interior blocks are staged with 16-byte global loads through `u32x4` alias
     /// params (see [`vector_stage`]).
     pub vector_loads: bool,
+    /// `Mma` only: k groups (grid `z`), each writing a partial tile to the workspace. 1 = no split;
+    /// above 1, [`reduce_zsl`] runs second.
+    pub split_k: usize,
 }
 
 impl Plan {
@@ -57,6 +60,7 @@ impl Plan {
             wave_cols: 1,
             stages: 1,
             vector_loads: false,
+            split_k: 1,
         }
     }
 }
@@ -260,7 +264,14 @@ fn vector_tensors(kernel: &TileKernel, parts: &Parts, plan: &Plan) -> Vec<usize>
     out
 }
 
-fn header(kernel: &TileKernel, workgroup: usize, aliases: &[usize], src: &mut String) {
+/// Params: one per tensor, then `u32x4` aliases, then the workspace (split-K passes).
+fn header(
+    kernel: &TileKernel,
+    workgroup: usize,
+    aliases: &[usize],
+    workspace: bool,
+    src: &mut String,
+) {
     let mut params: Vec<String> = kernel
         .tensors
         .iter()
@@ -278,6 +289,9 @@ fn header(kernel: &TileKernel, workgroup: usize, aliases: &[usize], src: &mut St
             .iter()
             .map(|&t| format!("{}: device buffer<u32x4>", alias_name(kernel, t))),
     );
+    if workspace {
+        params.push("ws: device mut buffer<f32>".to_string());
+    }
     let _ = writeln!(src, "@workgroup_size({workgroup})");
     let _ = writeln!(src, "kernel {}({}) {{", kernel.name, params.join(", "));
     let _ = writeln!(src, "let gn = group_id().x");
@@ -301,7 +315,7 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
     }
 
     let mut src = String::new();
-    header(kernel, workgroup, &[], &mut src);
+    header(kernel, workgroup, &[], false, &mut src);
     let _ = writeln!(src, "for it in 0..{iters} {{");
     let _ = writeln!(src, "let e = local_id().x + it * {workgroup}");
     let _ = writeln!(src, "if e < {tile_elems} {{");
@@ -329,7 +343,7 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
 
     let mut g = Gen::new(kernel);
     let mut src = String::new();
-    header(kernel, wg, &[], &mut src);
+    header(kernel, wg, &[], false, &mut src);
     let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
     let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
     let _ = writeln!(src, "let lid = local_id().x");
@@ -373,15 +387,20 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
     Ok(src)
 }
 
-/// Each wave owns a `WM x WN` grid of 16x16 fragments.
+/// Matrix lowering. Each wave owns a `WM x WN` grid of 16x16 accumulators: A fragments are reused
+/// across `WN`, B across `WM`. Two stages: compute one while loading the next. The epilogue goes
+/// through a shared `BM x (WN_waves * 16)` slice per fragment column.
 ///
-/// The loop has two stages: compute one while loading the next. The epilogue goes through a shared
-/// `BM x (WN_waves * 16)` slice, one per fragment column.
+/// `split_k > 1`: grid gets a z dimension. Group `z` reduces k blocks from `z * ksplit` and writes
+/// its partial tile to `ws[(z * M + row) * N + col]`, no epilogue. [`reduce_source`] sums them.
 fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
     let [bm, bn] = kernel.tile;
     let bk = parts.step;
     let wg = plan.workgroup;
+    let split = plan.split_k;
     let ksteps = parts.extent.div_ceil(bk);
+    let ksplit = ksteps.div_ceil(split);
+    let (out_m, out_n) = output_shape(kernel);
     let (nwr, nwc) = (plan.wave_rows, plan.wave_cols);
     let wm = bm / 16 / nwr;
     let wn = bn / 16 / nwc;
@@ -412,7 +431,10 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     let mut g = Gen::new(kernel);
     let mut src = String::new();
     let aliases = vector_tensors(kernel, parts, plan);
-    header(kernel, wg, &aliases, &mut src);
+    header(kernel, wg, &aliases, split > 1, &mut src);
+    if split > 1 {
+        let _ = writeln!(src, "let gz = group_id().z");
+    }
     let (view_a, view_b) = (
         plan.vector_loads && vector_stage(kernel, parts.a, parts.step),
         plan.vector_loads && vector_stage(kernel, parts.b, parts.step),
@@ -441,8 +463,15 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         }
     }
 
+    let kidx = |x: &str| {
+        if split > 1 {
+            format!("(gz * {ksplit} + {x})")
+        } else {
+            x.to_string()
+        }
+    };
     let stage = |g: &mut Gen, src: &mut String, (sa, sb): &(String, String), kt: &str| {
-        g.kt = kt.to_string();
+        g.kt = kidx(kt);
         let form = if plan.vector_loads {
             StageForm::Vector
         } else {
@@ -483,14 +512,14 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     };
 
     if !double {
-        let _ = writeln!(src, "for kt in 0..{ksteps} {{");
+        let _ = writeln!(src, "for kt in 0..{ksplit} {{");
         stage(&mut g, &mut src, &bufs[0], "kt");
         let _ = writeln!(src, "barrier()");
         compute(&mut src, &bufs[0]);
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "}}");
     } else {
-        let pairs = ksteps / 2;
+        let pairs = ksplit / 2;
         stage(&mut g, &mut src, &bufs[0], "0");
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "for kp in 0..{pairs} {{");
@@ -503,7 +532,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         compute(&mut src, &bufs[1]);
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "}}");
-        if ksteps % 2 == 1 {
+        if ksplit % 2 == 1 {
             compute(&mut src, &bufs[0]);
         }
     }
@@ -524,9 +553,20 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         let _ = writeln!(src, "let tr = e / {scw}");
         let _ = writeln!(src, "let ts = e % {scw}");
         let _ = writeln!(src, "let tc = ((ts / 16) * {wn} + {j}) * 16 + ts % 16");
-        g.values[parts.dot_out.0] = Some(format!("sc[tr * {scw} + ts]"));
-        for stmt in &kernel.body[loop_at + 1..] {
-            g.stmt(&mut src, stmt)?;
+        if split > 1 {
+            let _ = writeln!(src, "let row = gm * {bm} + tr");
+            let _ = writeln!(src, "let col = gn * {bn} + tc");
+            let _ = writeln!(src, "if row < {out_m} && col < {out_n} {{");
+            let _ = writeln!(
+                src,
+                "ws[(gz * {out_m} + row) * {out_n} + col] = sc[tr * {scw} + ts]"
+            );
+            let _ = writeln!(src, "}}");
+        } else {
+            g.values[parts.dot_out.0] = Some(format!("sc[tr * {scw} + ts]"));
+            for stmt in &kernel.body[loop_at + 1..] {
+                g.stmt(&mut src, stmt)?;
+            }
         }
         let _ = writeln!(src, "}}");
         let _ = writeln!(src, "}}");
@@ -534,6 +574,62 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     }
     let _ = writeln!(src, "}}");
     Ok(src)
+}
+
+/// Split-K second pass: sums the `split_k` partials in group order, then the epilogue. One
+/// workgroup per output tile.
+fn reduce_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
+    let [bm, bn] = kernel.tile;
+    let wg = plan.workgroup;
+    let elems = bm * bn;
+    let per = elems.div_ceil(wg);
+    let (out_m, out_n) = output_shape(kernel);
+    let split = plan.split_k;
+
+    let mut g = Gen::new(kernel);
+    g.values[parts.dot_out.0] = Some("rsum".to_string());
+    let mut src = String::new();
+    header(kernel, wg, &[], true, &mut src);
+    let _ = writeln!(src, "let lid = local_id().x");
+    let _ = writeln!(src, "for it in 0..{per} {{");
+    let _ = writeln!(src, "let e = lid + it * {wg}");
+    let _ = writeln!(src, "if e < {elems} {{");
+    let _ = writeln!(src, "let tr = e / {bn}");
+    let _ = writeln!(src, "let tc = e % {bn}");
+    let _ = writeln!(src, "let row = gm * {bm} + tr");
+    let _ = writeln!(src, "let col = gn * {bn} + tc");
+    let _ = writeln!(src, "if row < {out_m} && col < {out_n} {{");
+    let _ = writeln!(src, "let rsum: f32 = 0.0");
+    let _ = writeln!(src, "for s in 0..{split} {{");
+    let _ = writeln!(src, "rsum = rsum + ws[(s * {out_m} + row) * {out_n} + col]");
+    let _ = writeln!(src, "}}");
+    for stmt in &kernel.body[parts.loop_at + 1..] {
+        g.stmt(&mut src, stmt)?;
+    }
+    let _ = writeln!(src, "}}");
+    let _ = writeln!(src, "}}");
+    let _ = writeln!(src, "}}");
+    let _ = writeln!(src, "}}");
+    Ok(src)
+}
+
+fn output_shape(kernel: &TileKernel) -> (usize, usize) {
+    let shape = kernel
+        .tensors
+        .iter()
+        .find(|t| t.is_output)
+        .map(|t| t.shape)
+        .unwrap_or([0, 0]);
+    (shape[0], shape[1])
+}
+
+/// Reduction pass source for a split-K lowering, or `None` when unsplit.
+pub(crate) fn reduce_zsl(kernel: &TileKernel, plan: &Plan) -> Result<Option<String>, TileError> {
+    if plan.split_k <= 1 {
+        return Ok(None);
+    }
+    let parts = analyze(kernel).map_err(lower_err)?;
+    reduce_source(kernel, plan, &parts).map(Some)
 }
 
 fn lower_err(msg: String) -> TileError {

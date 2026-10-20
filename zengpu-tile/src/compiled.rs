@@ -33,6 +33,10 @@ pub struct CompiledTile {
     /// `u32x4` aliases of the tensors, after the tensor params. Each shares its
     /// tensor's host buffer.
     pub(crate) aliases: Vec<usize>,
+    /// Split-K partial workspace bytes, 0 when unsplit. Passed after the bindings.
+    pub(crate) workspace: u64,
+    /// Split-K reduction: sums the partials, then runs the epilogue.
+    pub(crate) reduce: Option<Box<CompiledTile>>,
     /// `naive`, `staged` or `mma`: the code shape the schedule resolved to.
     pub(crate) mode: &'static str,
     /// Lanes per subgroup the code needs, when it uses the matrix unit.
@@ -53,9 +57,14 @@ impl CompiledTile {
         &self.zsl
     }
 
-    /// Workgroup count per dispatch, as `[grid_n, grid_m, 1]`.
+    /// Workgroups per dispatch, `[grid_n, grid_m, split_k]`.
     pub fn grid(&self) -> [u32; 3] {
         self.grid
+    }
+
+    /// Workspace bytes, 0 when unsplit.
+    pub fn workspace_bytes(&self) -> u64 {
+        self.workspace
     }
 
     pub fn workgroup(&self) -> [u32; 3] {
@@ -128,6 +137,11 @@ impl CompiledTile {
                 grid: self.grid,
                 slots: self.bindings.len(),
                 aliases: self.aliases.clone(),
+                workspace: self.workspace,
+                reduce: match &self.reduce {
+                    Some(r) => Some(Box::new(r.load(device)?)),
+                    None => None,
+                },
             }),
             Err(e) => {
                 device.destroy_shader(shader);
@@ -137,76 +151,92 @@ impl CompiledTile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct TileProgram {
     shader: ShaderHandle,
     pipeline: PipelineHandle,
     grid: [u32; 3],
+    /// Tensor bindings. Buffers follow them, then the workspace if any.
     slots: usize,
     aliases: Vec<usize>,
+    workspace: u64,
+    reduce: Option<Box<TileProgram>>,
 }
 
 impl TileProgram {
-    /// Runs synchronously.
-    ///
-    /// `buffers` are in `bindings` order: inputs, then outputs.
+    pub fn workspace_bytes(&self) -> u64 {
+        self.workspace
+    }
+
+    /// Runs the program and waits. `buffers` follow `CompiledTile::bindings`, then the
+    /// workspace if nonzero.
     pub fn dispatch(
         &self,
         device: &dyn GpuDevice,
         buffers: &[BufferHandle],
     ) -> Result<(), TileError> {
-        if buffers.len() != self.slots {
-            return Err(TileError::Unsupported(format!(
-                "dispatch got {} buffers, kernel takes {}",
-                buffers.len(),
-                self.slots
-            )));
-        }
-        let slots = self.slot_indices(buffers);
-        let bindings = Bindings {
-            buffers: &slots,
-            ..Bindings::default()
-        };
-        gpu(device.dispatch(self.pipeline, bindings, self.grid))
+        self.dispatch_many(device, buffers, 1)
     }
 
-    /// Runs `count` dispatches in one submission, with one host wait at the end.
+    /// Runs the program `count` times as one submission with one wait. Split schedules reduce after
+    /// each main pass.
     pub fn dispatch_many(
         &self,
         device: &dyn GpuDevice,
         buffers: &[BufferHandle],
         count: usize,
     ) -> Result<(), TileError> {
-        if buffers.len() != self.slots {
-            return Err(TileError::Unsupported(format!(
-                "dispatch got {} buffers, kernel takes {}",
-                buffers.len(),
-                self.slots
-            )));
+        let passes = self.passes();
+        let slots = passes
+            .iter()
+            .map(|p| p.slot_indices(buffers))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut ops: Vec<DispatchOp<'_>> = Vec::with_capacity(count * passes.len());
+        for _ in 0..count {
+            for (pass, slots) in passes.iter().zip(&slots) {
+                ops.push(DispatchOp {
+                    pipeline: pass.pipeline,
+                    bindings: Bindings {
+                        buffers: slots,
+                        ..Bindings::default()
+                    },
+                    grid: pass.grid,
+                });
+            }
         }
-        let slots = self.slot_indices(buffers);
-        let bindings = Bindings {
-            buffers: &slots,
-            ..Bindings::default()
-        };
-        let ops: Vec<DispatchOp<'_>> = (0..count)
-            .map(|_| DispatchOp {
-                pipeline: self.pipeline,
-                bindings,
-                grid: self.grid,
-            })
-            .collect();
         gpu(device.dispatch_batch(&ops))
     }
 
+    /// The program, then its reduction pass if it has one.
+    fn passes(&self) -> Vec<&TileProgram> {
+        let mut out = vec![self];
+        if let Some(r) = &self.reduce {
+            out.push(r);
+        }
+        out
+    }
+
     /// Shader slots: bindings, aliases (reusing their tensor's buffer), then the workspace.
-    fn slot_indices(&self, buffers: &[BufferHandle]) -> Vec<u32> {
-        let mut slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+    fn slot_indices(&self, buffers: &[BufferHandle]) -> Result<Vec<u32>, TileError> {
+        let want = self.slots + usize::from(self.workspace > 0);
+        if buffers.len() != want {
+            return Err(TileError::Unsupported(format!(
+                "dispatch got {} buffers, kernel takes {want}",
+                buffers.len(),
+            )));
+        }
+        let mut slots: Vec<u32> = buffers[..self.slots].iter().map(|b| b.index()).collect();
         slots.extend(self.aliases.iter().map(|&t| buffers[t].index()));
-        slots
+        if self.workspace > 0 {
+            slots.push(buffers[self.slots].index());
+        }
+        Ok(slots)
     }
 
     pub fn destroy(self, device: &dyn GpuDevice) {
+        if let Some(r) = self.reduce {
+            r.destroy(device);
+        }
         device.destroy_pipeline(self.pipeline);
         device.destroy_shader(self.shader);
     }

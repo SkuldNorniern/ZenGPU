@@ -82,16 +82,11 @@ pub fn compile_with(
     let (plan, notes) = schedule::resolve(kernel, schedule, target);
     let zsl = lower::zsl_source(kernel, &plan)?;
     let aliases = lower::alias_tensors(kernel, &plan);
-    let module = parse_compute(&zsl).map_err(|e| {
-        TileError::Lower(format!(
-            "generated ZSL does not parse: {} (at {:?})",
-            e.msg, e.at
-        ))
-    })?;
     let [grid_m, grid_n] = kernel.grid();
-    let grid = [grid_n as u32, grid_m as u32, 1];
+    let split = plan.split_k.max(1);
+    let grid = [grid_n as u32, grid_m as u32, split as u32];
     let workgroup = plan.workgroup as u32;
-    let bindings = kernel
+    let bindings: Vec<TileBinding> = kernel
         .tensors
         .iter()
         .map(|t| TileBinding {
@@ -101,6 +96,36 @@ pub fn compile_with(
             is_output: t.is_output,
         })
         .collect();
+    let out = kernel
+        .tensors
+        .iter()
+        .find(|t| t.is_output)
+        .map_or([0, 0], |t| t.shape);
+    let workspace = (split * out[0] * out[1] * 4) as u64 * u64::from(split > 1);
+    let main = lower_backends(&zsl)?;
+    let reduce = match lower::reduce_zsl(kernel, &plan)? {
+        Some(rzsl) => {
+            let r = lower_backends(&rzsl)?;
+            Some(Box::new(CompiledTile {
+                name: format!("{}_reduce", kernel.name),
+                zsl: rzsl,
+                grid: [grid_n as u32, grid_m as u32, 1],
+                workgroup: [workgroup, 1, 1],
+                bindings: bindings.clone(),
+                mode: "reduce",
+                subgroup: None,
+                notes: Vec::new(),
+                aliases: Vec::new(),
+                workspace,
+                reduce: None,
+                spirv: r.spirv,
+                hip: r.hip,
+                cuda: r.cuda,
+                msl: r.msl,
+            }))
+        }
+        None => None,
+    };
     Ok(CompiledTile {
         name: kernel.name.clone(),
         zsl,
@@ -115,6 +140,31 @@ pub fn compile_with(
         notes,
         bindings,
         aliases,
+        workspace,
+        reduce,
+        spirv: main.spirv,
+        hip: main.hip,
+        cuda: main.cuda,
+        msl: main.msl,
+    })
+}
+
+struct Lowered {
+    spirv: Result<Vec<u32>, TileError>,
+    hip: Result<BackendSource, TileError>,
+    cuda: Result<BackendSource, TileError>,
+    msl: Result<BackendSource, TileError>,
+}
+
+/// A parse failure is an error. Backend failures are kept per field.
+fn lower_backends(zsl: &str) -> Result<Lowered, TileError> {
+    let module = parse_compute(zsl).map_err(|e| {
+        TileError::Lower(format!(
+            "generated ZSL does not parse: {} (at {:?})",
+            e.msg, e.at
+        ))
+    })?;
+    Ok(Lowered {
         spirv: backend("spirv", spirv::lower_compute(&module).map(|w| w.to_vec())),
         hip: backend(
             "hip",
@@ -535,6 +585,85 @@ mod tests {
         check_scheduled(&*dev, &target);
     }
 
+    #[test]
+    fn split_k_on_hip() {
+        let Some(dev) = hip_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Hip);
+        check_split(&*dev, &target);
+    }
+
+    #[test]
+    fn split_k_on_vulkan() {
+        let Some(dev) = vulkan_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Vulkan);
+        check_split(&*dev, &target);
+    }
+
+    /// Split-K vs reference: uneven splits, K not divisible by split * bk, empty
+    /// groups, edge tiles.
+    fn check_split(dev: &dyn GpuDevice, target: &Target) {
+        let cases = [
+            (
+                Case {
+                    input: DType::F16,
+                    out: DType::F16,
+                    m: 256,
+                    n: 256,
+                    k: 256,
+                    tile: [128, 128],
+                    bk: 32,
+                },
+                4,
+            ),
+            (
+                Case {
+                    input: DType::F16,
+                    out: DType::F16,
+                    m: 260,
+                    n: 130,
+                    k: 72,
+                    tile: [64, 64],
+                    bk: 16,
+                },
+                3,
+            ),
+            (
+                Case {
+                    input: DType::F16,
+                    out: DType::F16,
+                    m: 100,
+                    n: 70,
+                    k: 37,
+                    tile: [64, 64],
+                    bk: 16,
+                },
+                2,
+            ),
+            (
+                Case {
+                    input: DType::F16,
+                    out: DType::F16,
+                    m: 256,
+                    n: 128,
+                    k: 96,
+                    tile: [64, 64],
+                    bk: 32,
+                },
+                8,
+            ),
+        ];
+        for (case, split) in cases {
+            let sched = Schedule {
+                matrix: Matrix::Mma,
+                split_k: split,
+                ..Schedule::default()
+            };
+            let (shape, notes) = run_case(dev, target, case, &sched).unwrap();
+            assert_eq!(shape, "mma", "{notes:?}");
+            assert!(notes.is_empty(), "{notes:?}");
+        }
+    }
+
     fn check_scheduled(dev: &dyn GpuDevice, target: &Target) {
         let mma = Schedule {
             matrix: Matrix::Mma,
@@ -561,6 +690,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Main pass plus reduce pass, same bindings. Other element types run unsplit.
+    #[test]
+    fn split_k_compiles_two_passes() {
+        let target = Target::hip_gfx12();
+        let split = Schedule {
+            matrix: Matrix::Mma,
+            split_k: 4,
+            ..Schedule::default()
+        };
+        let k = gemm(DType::F16, DType::F16, 256, 256, 256, [128, 128], 32, true).unwrap();
+        let c = compile_with(&k, &split, &target).unwrap();
+        assert_eq!(c.grid()[2], 4);
+        assert_eq!(c.workspace_bytes(), 4 * 256 * 256 * 4);
+        let reduce = c.reduce.as_ref().expect("reduce pass");
+        assert!(reduce.zsl().contains("ws: device mut buffer<f32>"));
+        assert!(c.zsl().contains("let gz = group_id().z"));
+        let i8k = gemm(DType::I8, DType::I32, 256, 256, 256, [128, 128], 32, false).unwrap();
+        let c = compile_with(&i8k, &split, &target).unwrap();
+        assert_eq!(c.workspace_bytes(), 0);
+        assert!(c.notes().iter().any(|n| n.contains("split_k")));
     }
 
     /// 16-byte copies for interior blocks of aligned rows. Other shapes keep the scalar copy.
@@ -692,6 +843,16 @@ mod tests {
                 })
                 .map_err(|e| e.to_string())?;
             dev.write_buffer(h, 0, bytes).map_err(|e| e.to_string())?;
+            handles.push(h);
+        }
+        if compiled.workspace_bytes() > 0 {
+            let h = dev
+                .create_buffer(BufferDesc {
+                    size: compiled.workspace_bytes(),
+                    usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+                    memory: MemoryUsage::GpuOnly,
+                })
+                .map_err(|e| e.to_string())?;
             handles.push(h);
         }
         program.dispatch(dev, &handles).map_err(|e| e.to_string())?;
@@ -901,8 +1062,16 @@ mod tests {
         let tiles = [[64, 64], [128, 64], [128, 128]];
         let bks = [16, 32];
         let wave_splits = [(4, 0), (8, 0), (8, 4)];
+        let only: Option<(usize, usize, usize)> =
+            env::var("ZENGPU_TILE_BENCH_ONLY").ok().map(|v| {
+                let d: Vec<usize> = v.split('x').map(|x| x.parse().unwrap()).collect();
+                (d[0], d[1], d[2])
+            });
         let mut summary: Vec<String> = Vec::new();
         for (m, n, k) in shapes {
+            if only.is_some_and(|o| o != (m, n, k)) {
+                continue;
+            }
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
             let f16_bytes = |len: usize| -> Vec<u8> {
                 (0..len)
@@ -933,13 +1102,17 @@ mod tests {
             let run = |label: String, kernel: &TileKernel, sched: &Schedule| -> Option<f64> {
                 let compiled = compile_with(kernel, sched, &target).unwrap();
                 let program = compiled.load(&*dev).unwrap();
+                let (run_handles, ws) = with_workspace(&*dev, &compiled, &handles);
                 let (ms, min, max) = if naive {
-                    let ms = time_naive(&*dev, &program, &handles);
+                    let ms = time_naive(&*dev, &program, &run_handles);
                     (ms, ms, ms)
                 } else {
-                    let t = time_program(&*dev, &program, &handles);
+                    let t = time_program(&*dev, &program, &run_handles);
                     (t.median, t.min, t.max)
                 };
+                if let Some(ws) = ws {
+                    dev.destroy_buffer(ws);
+                }
                 println!(
                     "| {m} | {n} | {k} | {label} ({}) | {ms:.3} | {min:.3} | {max:.3} | {:.2} |",
                     compiled.schedule_name(),
@@ -974,12 +1147,37 @@ mod tests {
                     }
                 }
             }
+            let mut short: Vec<(String, f64)> = mma_rows
+                .iter()
+                .filter(|r| {
+                    let (tile, ..) = parse_label(&r.0);
+                    m.div_ceil(tile[0]) * n.div_ceil(tile[1]) < 128
+                })
+                .map(|r| (r.0.clone(), r.1))
+                .collect();
+            short.sort_by(|a, b| a.1.total_cmp(&b.1));
+            for (base, _) in short.iter().take(4) {
+                let (tile, bk, w, wr, _) = parse_label(base);
+                for sk in [2, 4, 8] {
+                    let label = format!("{base} k{sk}");
+                    let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
+                    let sched = Schedule {
+                        split_k: sk,
+                        ..mma(w, wr)
+                    };
+                    let compiled = compile_with(&kernel, &sched, &target).unwrap();
+                    if let Some(ms) = run(label.clone(), &kernel, &sched) {
+                        mma_rows.push((label, ms, compiled));
+                    }
+                }
+            }
             let best = mma_rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
             println!("best search: {} at {:.3} ms", best.0, best.1);
-            let (tile, bk, w, wr) = parse_label(&best.0);
+            let (tile, bk, w, wr, split) = parse_label(&best.0);
             let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
             let scalar_loads = Schedule {
                 vector_loads: false,
+                split_k: split,
                 ..mma(w, wr)
             };
             run(format!("{} scalar loads", best.0), &kernel, &scalar_loads);
@@ -987,13 +1185,18 @@ mod tests {
                 println!("{}", best.2.zsl());
             }
             let best_kernel = best.0.clone();
-            let (tile, bk, w, wr) = parse_label(&best_kernel);
+            let (tile, bk, w, wr, split) = parse_label(&best_kernel);
             let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-            let compiled = compile_with(&kernel, &mma(w, wr), &target).unwrap();
+            let sched = Schedule {
+                split_k: split,
+                ..mma(w, wr)
+            };
+            let compiled = compile_with(&kernel, &sched, &target).unwrap();
             let program = compiled.load(&*dev).unwrap();
+            let (run_handles, ws) = with_workspace(&*dev, &compiled, &handles);
             let mut medians = Vec::new();
             for rep in 0..3 {
-                let t = time_program(&*dev, &program, &handles);
+                let t = time_program(&*dev, &program, &run_handles);
                 println!(
                     "rerun {rep}: {} median {:.3} ms min {:.3} max {:.3} TFLOPS {:.2}",
                     best_kernel,
@@ -1003,6 +1206,9 @@ mod tests {
                     flops / (t.median * 1e-3) / 1e12
                 );
                 medians.push(t.median);
+            }
+            if let Some(ws) = ws {
+                dev.destroy_buffer(ws);
             }
             program.destroy(&*dev);
             let med = timing(medians.clone());
@@ -1026,13 +1232,38 @@ mod tests {
         }
     }
 
-    fn parse_label(label: &str) -> ([usize; 2], usize, u32, u32) {
+    /// Handles to run with: bindings, then the workspace when split-K. The caller destroys
+    /// the workspace.
+    fn with_workspace(
+        dev: &dyn GpuDevice,
+        compiled: &CompiledTile,
+        handles: &[BufferHandle],
+    ) -> (Vec<BufferHandle>, Option<BufferHandle>) {
+        let mut all = handles.to_vec();
+        if compiled.workspace_bytes() == 0 {
+            return (all, None);
+        }
+        let ws = dev
+            .create_buffer(BufferDesc {
+                size: compiled.workspace_bytes(),
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        all.push(ws);
+        (all, Some(ws))
+    }
+
+    fn parse_label(label: &str) -> ([usize; 2], usize, u32, u32, u32) {
         let parts: Vec<&str> = label.split(' ').collect();
         let tile: Vec<usize> = parts[1].split('x').map(|v| v.parse().unwrap()).collect();
         let bk = parts[2].trim_start_matches("bk").parse().unwrap();
         let w = parts[3].trim_start_matches('w').parse().unwrap();
         let wr = parts[4].trim_start_matches('r').parse().unwrap();
-        ([tile[0], tile[1]], bk, w, wr)
+        let split = parts
+            .get(5)
+            .map_or(1, |p| p.trim_start_matches('k').parse().unwrap());
+        ([tile[0], tile[1]], bk, w, wr, split)
     }
 
     const EXPECTED_GEMM_TEXT: &str = "tile v0 kernel gemm tile [32, 32]
