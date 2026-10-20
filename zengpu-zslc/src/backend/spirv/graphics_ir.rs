@@ -903,6 +903,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::BytePerm
         | BuiltinFn::Select
         | BuiltinFn::I32
+        | BuiltinFn::F16Round
         | BuiltinFn::SubgroupId
         | BuiltinFn::SubgroupLocalId
         | BuiltinFn::SubgroupSize

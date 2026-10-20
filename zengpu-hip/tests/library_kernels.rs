@@ -1153,6 +1153,137 @@ fn zsl_frag_ab_from_shared_matches_cpu() {
     device.destroy_shader(shader);
 }
 
+const FEATURES_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel scalar_features(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, sb: device buffer<i8>, ub: device buffer<u8>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, ob: device mut buffer<i8>, oub: device mut buffer<u8>, oh: device mut buffer<i32>, oh2: device mut buffer<i32>, ofr: device mut buffer<f32>, osel: device mut buffer<i32>, id: global_id) {
+        let i = id.x
+        ou[i] = ua[i] % 7u
+        oi[i] = ia[i] % 5
+        of[i] = fa[i] % 2.5
+        ob[i] = sb[i] + 1
+        oub[i] = ub[i] + 1
+        oh[i] = i32(fa[i] * 3.0)
+        oh2[i] = i32(ua[i])
+        ofr[i] = f16_round(fa[i])
+        osel[i] = select(ia[i] < 0, ia[i] * 2, ia[i])
+    }
+);
+
+#[test]
+fn zsl_scalar_features_match_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FEATURES_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 256usize;
+    let ua: Vec<u32> = (0..n as u32).map(|i| i * 37 + 5).collect();
+    let ia: Vec<i32> = (0..n as i32).map(|i| i * 13 - 1500).collect();
+    let fa: Vec<f32> = (0..n)
+        .map(|i| match i % 16 {
+            0 => 3.0e9,
+            1 => -3.0e9,
+            _ => i as f32 * 0.37 - 40.0,
+        })
+        .collect();
+    let sb: Vec<i8> = (0..n as i32).map(|i| (i * 7 - 500) as i8).collect();
+    let ub: Vec<u8> = (0..n).map(|i| (i * 11 % 256) as u8).collect();
+    let u32_buf = |vals: &[u32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let i32_buf = |vals: &[i32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f32_buf = |vals: &[f32]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let sb_bytes: Vec<u8> = sb.iter().map(|&v| v as u8).collect();
+    let mk = |bytes: &[u8]| {
+        let buf = pool
+            .alloc(vec![(bytes.len() as u32).div_ceil(4)], DType::U32)
+            .unwrap();
+        device.write_buffer(buf.buffer, 0, bytes).unwrap();
+        buf
+    };
+    let bufs = [
+        mk(&u32_buf(&ua)),
+        mk(&i32_buf(&ia)),
+        mk(&f32_buf(&fa)),
+        mk(&sb_bytes),
+        mk(&ub),
+    ];
+    let outs: Vec<_> = [1024usize, 1024, 1024, 256, 256, 1024, 1024, 1024, 1024]
+        .iter()
+        .map(|&size| {
+            pool.alloc(vec![(size as u32).div_ceil(4)], DType::U32)
+                .unwrap()
+        })
+        .collect();
+    let mut ops = OpList::new(&pool);
+    let slots: Vec<_> = bufs
+        .iter()
+        .chain(outs.iter())
+        .map(|b| b.buffer.index())
+        .collect();
+    ops.dispatch(pipeline, &slots, &[], [8, 1, 1]);
+    ops.run(&*device).unwrap();
+    let read = |b: &DeviceArray, len: u64| device.read_buffer(b.buffer, 0, len).unwrap();
+    let got_u32 = |b: &DeviceArray| -> Vec<u32> {
+        read(b, 1024)
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let got_i32 = |b: &DeviceArray| -> Vec<i32> {
+        read(b, 1024)
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let got_f32 = |b: &DeviceArray| -> Vec<f32> {
+        read(b, 1024)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let (ou, oi, of) = (got_u32(&outs[0]), got_i32(&outs[1]), got_f32(&outs[2]));
+    let ob = read(&outs[3], 256);
+    let oub = read(&outs[4], 256);
+    let (oh, oh2, ofr, osel) = (
+        got_i32(&outs[5]),
+        got_i32(&outs[6]),
+        got_f32(&outs[7]),
+        got_i32(&outs[8]),
+    );
+    for i in 0..n {
+        assert_eq!(ou[i], ua[i] % 7, "u32 %% at {i}");
+        assert_eq!(oi[i], ia[i] % 5, "i32 %% at {i}");
+        assert!(
+            of[i] == fa[i] % 2.5,
+            "f32 % at {i}: {} vs {}",
+            of[i],
+            fa[i] % 2.5
+        );
+        assert_eq!(ob[i] as i8, (i32::from(sb[i]) + 1) as i8, "i8 store at {i}");
+        assert_eq!(oub[i], ((u32::from(ub[i])) + 1) as u8, "u8 store at {i}");
+        assert_eq!(oh[i], (fa[i] * 3.0) as i32, "i32(f32) at {i}");
+        assert_eq!(oh2[i], ua[i] as i32, "i32(u32) at {i}");
+        let want_round = f16_bits_to_f32(f32_to_f16_bits(fa[i]));
+        assert!(
+            ofr[i] == want_round || (ofr[i].is_nan() && want_round.is_nan()),
+            "f16_round at {i}: {} vs {want_round}",
+            ofr[i]
+        );
+        let want_sel = if ia[i] < 0 { ia[i] * 2 } else { ia[i] };
+        assert_eq!(osel[i], want_sel, "select at {i}");
+    }
+    drop(ops);
+    for b in bufs.into_iter().chain(outs) {
+        pool.free(b);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
 /// Lane probe, HIP only: SPIR-V's cooperative matrix mapping is opaque. Lowered with `zengpu-zslc`,
 /// not `zsl!`.
 const FRAG_PROBE: &str = r#"

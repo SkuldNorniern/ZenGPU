@@ -554,6 +554,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot2F16 => format!("zsl_dot2_f16({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::FunnelShr => format!("zsl_funnel_shr({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::Select => format!("select({}, {}, {})", a[2], a[1], a[0]),
+                BuiltinFn::F16Round => format!("float(half({}))", a[0]),
                 BuiltinFn::I32 => {
                     let f32_id = ctx.types.borrow_mut().f32_id();
                     if expr_type(ctx, &args[0]) == f32_id {

@@ -4,6 +4,7 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "u32" => BuiltinFn::U32,
         "i32" => BuiltinFn::I32,
+        "f16_round" => BuiltinFn::F16Round,
         "f32" => BuiltinFn::F32,
         "abs" => BuiltinFn::Abs,
         "sign" => BuiltinFn::Sign,
