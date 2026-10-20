@@ -36,6 +36,7 @@ use crate::ir::node::{
     stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::frag_parts;
+use crate::ir::typeck::{i8_type, u8_type};
 use crate::ir::types::TypeId;
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -150,8 +151,19 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             None
         }
     };
+    let i8_elem = types.intern(i8_type());
+    let u8_elem = types.intern(u8_type());
+    let byte_of = |elem: TypeId| {
+        if elem == i8_elem {
+            Some(true)
+        } else if elem == u8_elem {
+            Some(false)
+        } else {
+            None
+        }
+    };
     let table_of = |elem: TypeId| {
-        if half_of(elem).is_some() {
+        if half_of(elem).is_some() || byte_of(elem).is_some() {
             u32_id
         } else {
             elem
@@ -337,6 +349,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
                     elem: *elem,
                     table: table_of(*elem),
                     half: half_of(*elem),
+                    byte: byte_of(*elem),
                 },
             )
         })
@@ -495,6 +508,8 @@ struct BufInfo {
     /// SSBO table the buffer is read through (`u32` for halves).
     table: TypeId,
     half: Option<Half>,
+    /// `Some(signed)` for an i8 (`true`) or u8 (`false`) buffer.
+    byte: Option<bool>,
 }
 
 /// A 16-bit float buffer element, stored packed two per `u32` word.
@@ -710,6 +725,18 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 let rhs = lower_expr(ctx, value)?;
                 let rhs_id = coerce(ctx, rhs, ctx.f32_id);
                 store_half(ctx, half, table, buf_idx, idx_id, rhs_id);
+                return Ok(());
+            }
+            if let Some(signed) = info.byte {
+                let want = if signed { ctx.i32_id } else { ctx.u32_id };
+                let rhs = lower_expr(ctx, value)?;
+                let rhs_id = coerce(ctx, rhs, want);
+                let bits = if signed {
+                    ctx.spv.op_bitcast(ctx.t_u32, rhs_id)
+                } else {
+                    rhs_id
+                };
+                store_byte(ctx, table, buf_idx, idx_id, bits);
                 return Ok(());
             }
             let c0 = ctx.const_0_u32;
@@ -961,6 +988,11 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             if let Some(half) = info.half {
                 let id = load_half(ctx, half, table, buf_idx, idx_id);
                 return Ok(Val { id, ty: ctx.f32_id });
+            }
+            if let Some(signed) = info.byte {
+                let id = load_byte(ctx, signed, table, buf_idx, idx_id);
+                let ty = if signed { ctx.i32_id } else { ctx.u32_id };
+                return Ok(Val { id, ty });
             }
             let c0 = ctx.const_0_u32;
             let ptr_elem =
@@ -1951,6 +1983,54 @@ fn half_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> 
     let lane = ctx.spv.op_bitwise_and(t_u32, idx, c1);
     let shift = ctx.spv.op_shift_left_logical(t_u32, lane, c4);
     (ptr, shift)
+}
+
+/// `u32` word holding byte `idx`, and its bit offset (0, 8, 16 or 24).
+fn byte_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> (Id, Id) {
+    let t_u32 = ctx.t_u32;
+    let c2 = ctx.spv.constant_u32(t_u32, 2);
+    let c3 = ctx.spv.constant_u32(t_u32, 3);
+    let c8 = ctx.spv.constant_u32(t_u32, 8);
+    let word = ctx.spv.op_shift_right_logical(t_u32, idx, c2);
+    let ptr = ctx.spv.op_access_chain(
+        table.t_ptr_elem,
+        table.var,
+        &[buf_idx, ctx.const_0_u32, word],
+    );
+    let lane = ctx.spv.op_bitwise_and(t_u32, idx, c3);
+    let shift = ctx.spv.op_shift_left_logical(t_u32, lane, c8);
+    (ptr, shift)
+}
+
+/// Sign- or zero-extended to 32 bits; no 8-bit storage feature needed.
+fn load_byte(ctx: &mut LowerCtx<'_>, signed: bool, table: SsboTable, buf_idx: Id, idx: Id) -> Id {
+    let (t_u32, t_i32) = (ctx.t_u32, ctx.t_i32);
+    let (ptr, shift) = byte_word(ctx, table, buf_idx, idx);
+    let word = ctx.spv.op_load(t_u32, ptr);
+    let count = ctx.spv.constant_u32(t_u32, 8);
+    if signed {
+        ctx.spv.op_bitfield_sextract(t_i32, word, shift, count)
+    } else {
+        ctx.spv.op_bitfield_uextract(t_u32, word, shift, count)
+    }
+}
+
+/// Two atomics (clear, then set) leave the other bytes alone under concurrent stores.
+fn store_byte(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id, value: Id) {
+    let t_u32 = ctx.t_u32;
+    let (ptr, shift) = byte_word(ctx, table, buf_idx, idx);
+    let mask = ctx.spv.constant_u32(t_u32, 0xff);
+    let all = ctx.spv.constant_u32(t_u32, u32::MAX);
+    let low = ctx.spv.op_bitwise_and(t_u32, value, mask);
+    let placed = ctx.spv.op_shift_left_logical(t_u32, low, shift);
+    let own = ctx.spv.op_shift_left_logical(t_u32, mask, shift);
+    let keep = ctx.spv.op_bitwise_xor(t_u32, own, all);
+    let scope = ctx.spv.constant_u32(t_u32, 1);
+    let relaxed = ctx.const_0_u32;
+    ctx.spv
+        .op_atomic_int(op::ATOMIC_AND, t_u32, ptr, scope, relaxed, keep);
+    ctx.spv
+        .op_atomic_int(op::ATOMIC_OR, t_u32, ptr, scope, relaxed, placed);
 }
 
 fn load_half(ctx: &mut LowerCtx<'_>, half: Half, table: SsboTable, buf_idx: Id, idx: Id) -> Id {

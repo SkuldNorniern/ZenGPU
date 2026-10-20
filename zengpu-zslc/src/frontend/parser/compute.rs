@@ -393,8 +393,14 @@ impl<'a> Parser<'a> {
                     let bf16_id = self.types.bf16_id();
                     let f16_id = self.types.f16_id();
                     let f32_id = self.types.f32_id();
+                    let i8_id = self.types.intern(i8_type());
+                    let u8_id = self.types.intern(u8_type());
                     let expected = if buffer.elem == bf16_id || buffer.elem == f16_id {
                         f32_id
+                    } else if buffer.elem == i8_id {
+                        self.types.i32_id()
+                    } else if buffer.elem == u8_id {
+                        self.types.u32_id()
                     } else {
                         buffer.elem
                     };

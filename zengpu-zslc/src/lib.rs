@@ -1133,6 +1133,37 @@ int main() {{
         assert!(parse_compute(bool_src).is_err());
     }
 
+    const BYTE_KERNEL: &str = r#"
+        @workgroup_size(32)
+        kernel byte_kernel(si: device buffer<i8>, uu: device buffer<u8>, oi: device mut buffer<i8>, ou: device mut buffer<u8>, id: global_id) {
+            let i = id.x
+            oi[i] = si[i] + 1
+            ou[i] = uu[i] + 1
+        }
+    "#;
+
+    #[test]
+    fn byte_buffers_lower_per_backend() {
+        let module = parse_compute(BYTE_KERNEL).expect("parse i8/u8 buffers");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower bytes to HIP")
+            .source;
+        assert!(hip_source.contains("signed char*") && hip_source.contains("unsigned char*"));
+        assert!(hip_source.contains("((unsigned int)("));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower bytes to CUDA")
+            .source;
+        assert!(cuda_source.contains("signed char*") && cuda_source.contains("unsigned char*"));
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower bytes to MSL")
+            .source;
+        assert!(msl_source.contains("device char*") && msl_source.contains("device uchar*"));
+        assert!(msl_source.contains("uint(uu["));
+        let words = spirv::lower_compute(&module).expect("lower bytes to SPIR-V");
+        let ops = spirv_opcodes(&words);
+        assert!(ops.contains(&202) && ops.contains(&203));
+    }
+
     const FRAG_SHARED_AB: &str = r#"
         @workgroup_size(32)
         kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {

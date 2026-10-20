@@ -49,6 +49,10 @@ pub enum ScalarKind {
     F16,
     /// A `buffer<bf16>` element (buffers only; packed two per word on Vulkan).
     Bf16,
+    /// Buffers only; packed four per `u32` word on Vulkan.
+    I8,
+    /// Buffers only; packed four per `u32` word on Vulkan.
+    U8,
     /// A graphics push-constant `mat4x4<f32>`. Never a buffer element.
     Mat4,
     /// A graphics push-constant `f32x2` param.

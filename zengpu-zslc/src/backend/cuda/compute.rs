@@ -335,6 +335,16 @@ fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
     type_of_compute_expr(expr, &ctx.type_ctx, &mut types)
 }
 
+fn buffer_is_u8(ctx: &Ctx<'_>, buf: &str) -> bool {
+    ctx.type_ctx.buffers.get(buf).is_some_and(|elem| {
+        ctx.types.borrow().get(*elem)
+            == &Type::Int {
+                width: IntWidth::W8,
+                signedness: Signedness::Unsigned,
+            }
+    })
+}
+
 fn expr_is_f32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
     let ty = expr_type_id(ctx, expr);
     ty == ctx.types.borrow_mut().f32_id()
@@ -431,6 +441,14 @@ fn cuda_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
 /// backend: round-to-nearest-even on store, zero-extend on load.
 fn cuda_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
     match ty {
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Signed,
+        } => Ok("signed char"),
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Unsigned,
+        } => Ok("unsigned char"),
         Type::Float {
             format: FloatFormat::F32,
         } => Ok("float"),
@@ -598,6 +616,8 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 format!("bf16_to_f32({inner})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
                 format!("__half2float({inner})")
+            } else if buffer_is_u8(ctx, buf) {
+                format!("((unsigned int)({inner}))")
             } else {
                 inner
             }
