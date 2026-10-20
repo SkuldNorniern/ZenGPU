@@ -1,7 +1,7 @@
 use super::*;
 use zengpu_hal::{
-    BackendPreference, ComputeCaps, DType, Format, FormatCaps, MmaShape, TextureRegion,
-    TextureWrite, TransferCaps,
+    BackendPreference, ComputeCaps, DType, Format, FormatCaps, MmaShape, PipelineStats,
+    TextureRegion, TextureWrite, TransferCaps,
 };
 
 impl GpuDevice for VulkanDevice {
@@ -934,6 +934,7 @@ impl GpuDevice for VulkanDevice {
         let entry = CString::new(desc.entry)
             .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
         let wanted = hints.subgroup_size.or(coop.then_some(32));
+        let capture = hints.capture_stats && self.inner.pipeline_executable_info;
         let required_size = wanted.filter(|&size| {
             size.is_power_of_two()
                 && self
@@ -960,6 +961,11 @@ impl GpuDevice for VulkanDevice {
             self.inner.device.create_compute_pipelines(
                 self.pipeline_cache,
                 &[vk::ComputePipelineCreateInfo {
+                    flags: if capture {
+                        vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR
+                    } else {
+                        vk::PipelineCreateFlags::empty()
+                    },
                     stage,
                     layout,
                     ..Default::default()
@@ -985,6 +991,45 @@ impl GpuDevice for VulkanDevice {
                 )))
             }
         }
+    }
+
+    fn pipeline_stats(&self, pipeline: PipelineHandle) -> Option<PipelineStats> {
+        if !self.inner.pipeline_executable_info {
+            return None;
+        }
+        let (vk_pipeline, _) = self.pipelines.lock().ok()?.get(pipeline)?.handles();
+        let loader = khr::pipeline_executable_properties::Device::new(
+            &self.inner.shared.instance,
+            &self.inner.device,
+        );
+        let executable = vk::PipelineExecutableInfoKHR {
+            pipeline: vk_pipeline,
+            executable_index: 0,
+            ..Default::default()
+        };
+        let statistics = unsafe { loader.get_pipeline_executable_statistics(&executable) }.ok()?;
+        let mut stats = PipelineStats {
+            max_threads: self.inner.limits.max_workgroup_invocations,
+            ..Default::default()
+        };
+        if statistics.is_empty() {
+            return None;
+        }
+        for stat in &statistics {
+            // SAFETY: the driver fills `value` in the variant named by `format`.
+            let raw = unsafe { stat.value.u64 };
+            let name = unsafe { CStr::from_ptr(stat.name.as_ptr()) };
+            let value = u32::try_from(raw).unwrap_or(u32::MAX);
+            match name.to_bytes() {
+                b"SGPRs" => stats.sgprs = value,
+                b"VGPRs" => stats.vgprs = value,
+                b"Scratch size" => stats.scratch_bytes = value,
+                b"LDS size" => stats.lds_bytes = value,
+                b"Subgroups per SIMD" => stats.waves_per_simd = Some(value),
+                _ => {}
+            }
+        }
+        Some(stats)
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
