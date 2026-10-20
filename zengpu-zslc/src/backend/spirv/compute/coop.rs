@@ -7,11 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::{LowerCtx, Val, coerce};
+use super::{LowerCtx, SharedVar, Val, coerce};
 use crate::backend::spirv::builder::{Id, SpvBuilder, cap, deco, sc};
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, FragSrc, IrExpr};
-use crate::ir::typeck::{frag_parts, frag16_id};
+use crate::ir::typeck::{StorageElem, frag_parts, frag16_id, storage_elem};
 use crate::ir::types::{FloatFormat, FragUse, IntWidth, Type, TypeId};
 
 const ROW_MAJOR: u32 = 0;
@@ -240,6 +240,12 @@ impl LowerCtx<'_> {
         Ok((off, stride))
     }
 
+    /// Cooperative loads cannot convert f32 to f16, so f32 shared is staged first. f16 and i8
+    /// load directly.
+    fn is_f32_shared(&self, sv: &SharedVar) -> bool {
+        storage_elem(&self.types, sv.elem) == Some(StorageElem::F32)
+    }
+
     pub(super) fn lower_frag_load(
         &mut self,
         ty: TypeId,
@@ -252,10 +258,7 @@ impl LowerCtx<'_> {
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
         if trans
             && let FragSrc::Shared(name) = src
-            && self
-                .shared
-                .get(name)
-                .is_some_and(|sv| sv.value_ty == self.f32_id)
+            && self.shared.get(name).is_some_and(|sv| self.is_f32_shared(sv))
         {
             return Err(format!(
                 "ZSL: SPIR-V frag_load_b_t from f32 shared `{name}` is not lowered (stage it as f16 first)"
@@ -263,10 +266,7 @@ impl LowerCtx<'_> {
         }
         if let FragSrc::Shared(name) = src
             && usage != FragUse::Acc
-            && self
-                .shared
-                .get(name)
-                .is_some_and(|sv| sv.value_ty == self.f32_id)
+            && self.shared.get(name).is_some_and(|sv| self.is_f32_shared(sv))
         {
             return self.lower_shared_frag_ab(name, ty, offset, ld);
         }
@@ -299,7 +299,7 @@ impl LowerCtx<'_> {
             .shared
             .get(name)
             .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
-        if sv.value_ty != self.f32_id {
+        if !self.is_f32_shared(&sv) {
             return Err(format!(
                 "ZSL: SPIR-V frag loads and stores from shared `{name}` need an f32 array"
             ));
