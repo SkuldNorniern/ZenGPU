@@ -881,6 +881,15 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::Dot4I8
         | BuiltinFn::Dot4U8
         | BuiltinFn::Dot4IU8
+        | BuiltinFn::PkAddU16
+        | BuiltinFn::PkMulU16
+        | BuiltinFn::PkMadU16
+        | BuiltinFn::PkAddF16
+        | BuiltinFn::PkMulF16
+        | BuiltinFn::PkFmaF16
+        | BuiltinFn::Dot2F16
+        | BuiltinFn::FunnelShr
+        | BuiltinFn::BytePerm
         | BuiltinFn::SubgroupId
         | BuiltinFn::SubgroupLocalId
         | BuiltinFn::SubgroupSize

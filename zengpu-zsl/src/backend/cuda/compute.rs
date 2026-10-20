@@ -116,6 +116,52 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
          }\n",
     );
 
+    s.push_str(r#"
+#include <cuda_fp16.h>
+__device__ __forceinline__ unsigned int zsl_pk_add_u16(unsigned int a, unsigned int b) {
+    return ((a & 0x7fff7fffu) + (b & 0x7fff7fffu)) ^ ((a ^ b) & 0x80008000u);
+}
+__device__ __forceinline__ unsigned int zsl_pk_mul_u16(unsigned int a, unsigned int b) {
+    return ((a * b) & 0xffffu) | (((a >> 16) * (b >> 16)) << 16);
+}
+__device__ __forceinline__ unsigned int zsl_pk_mad_u16(unsigned int a, unsigned int b, unsigned int c) {
+    return zsl_pk_add_u16(zsl_pk_mul_u16(a, b), c);
+}
+__device__ __forceinline__ __half2 zsl_h2(unsigned int x) {
+    return *reinterpret_cast<__half2 *>(&x);
+}
+__device__ __forceinline__ unsigned int zsl_u32(__half2 h) {
+    return *reinterpret_cast<unsigned int *>(&h);
+}
+__device__ __forceinline__ unsigned int zsl_pk_add_f16(unsigned int a, unsigned int b) {
+    return zsl_u32(__hadd2(zsl_h2(a), zsl_h2(b)));
+}
+__device__ __forceinline__ unsigned int zsl_pk_mul_f16(unsigned int a, unsigned int b) {
+    return zsl_u32(__hmul2(zsl_h2(a), zsl_h2(b)));
+}
+__device__ __forceinline__ unsigned int zsl_pk_fma_f16(unsigned int a, unsigned int b, unsigned int c) {
+    return zsl_u32(__hfma2(zsl_h2(a), zsl_h2(b), zsl_h2(c)));
+}
+__device__ __forceinline__ float zsl_dot2_f16(unsigned int a, unsigned int b, float acc) {
+    float2 x = __half22float2(zsl_h2(a));
+    float2 y = __half22float2(zsl_h2(b));
+    acc = fmaf(x.x, y.x, acc);
+    return fmaf(x.y, y.y, acc);
+}
+__device__ __forceinline__ unsigned int zsl_funnel_shr(unsigned int hi, unsigned int lo, unsigned int s) {
+    return __funnelshift_r(lo, hi, s);
+}
+__device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned int b, unsigned int sel) {
+    unsigned int r = 0;
+    for (unsigned int i = 0; i < 4; ++i) {
+        unsigned int k = (sel >> (4 * i)) & 7u;
+        unsigned int w = k < 4u ? a : b;
+        r |= ((w >> (8 * (k & 3u))) & 0xffu) << (8 * i);
+    }
+    return r;
+}
+"#);
+
     let threads = local_size[0] * local_size[1] * local_size[2];
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
@@ -551,6 +597,34 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::Dot4IU8 => {
                     format!("zsl_dot4_iu8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::PkAddU16 => format!("zsl_pk_add_u16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMulU16 => format!("zsl_pk_mul_u16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMadU16 => {
+                    format!(
+                        "zsl_pk_mad_u16({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::PkAddF16 => format!("zsl_pk_add_f16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkMulF16 => format!("zsl_pk_mul_f16({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::PkFmaF16 => {
+                    format!(
+                        "zsl_pk_fma_f16({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::Dot2F16 => {
+                    format!("zsl_dot2_f16({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::FunnelShr => {
+                    format!(
+                        "zsl_funnel_shr({}, {}, {})",
+                        args_s[0], args_s[1], args_s[2]
+                    )
+                }
+                BuiltinFn::BytePerm => {
+                    format!("zsl_byte_perm({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::SubgroupAny => {
                     format!("((bool)__any_sync(0xffffffffu, (int)({})))", args_s[0])

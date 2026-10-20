@@ -1280,6 +1280,44 @@ int main() {{
         spirv::lower_compute(&module).expect("lower dot4 to SPIR-V");
     }
 
+    const PACKED: &str = r#"
+        @workgroup_size(64)
+        kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, id: global_id) {
+            o1[id.x] = pk_add_u16(x[id.x], y[id.x])
+            o2[id.x] = pk_mul_u16(x[id.x], y[id.x])
+            o3[id.x] = pk_mad_u16(x[id.x], y[id.x], z[id.x])
+            o4[id.x] = pk_add_f16(x[id.x], y[id.x])
+            o5[id.x] = pk_mul_f16(x[id.x], y[id.x])
+            o6[id.x] = pk_fma_f16(x[id.x], y[id.x], z[id.x])
+            of[id.x] = dot2_f16(x[id.x], y[id.x], f[id.x])
+            o7[id.x] = funnel_shr(x[id.x], y[id.x], z[id.x])
+            o8[id.x] = byte_perm(x[id.x], y[id.x], z[id.x])
+        }
+    "#;
+
+    #[test]
+    fn packed_ops_lower_on_all_compute_backends() {
+        let module = parse_compute(PACKED).expect("parse packed ops");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower packed to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower packed to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower packed to MSL")
+            .source;
+        assert!(hip_source.contains("zsl_pk_fma_f16("));
+        assert!(hip_source.contains("zsl_dot2_f16("));
+        assert!(hip_source.contains("zsl_funnel_shr("));
+        assert!(hip_source.contains("zsl_byte_perm("));
+        assert!(cuda_source.contains("__hfma2("));
+        assert!(cuda_source.contains("__funnelshift_r("));
+        assert!(msl_source.contains("as_type<ushort2>"));
+        assert!(msl_source.contains("zsl_byte_perm("));
+        spirv::lower_compute(&module).expect("lower packed ops to SPIR-V");
+    }
+
     #[test]
     fn subgroup_query_kernel_without_use_has_no_msl_simd_params() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");

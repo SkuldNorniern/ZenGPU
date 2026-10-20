@@ -341,6 +341,23 @@ impl<'a> Parser<'a> {
         {
             return self.err(format!("{}(a, b, acc) takes 3 args", func.name()));
         }
+        let arity = match func {
+            BuiltinFn::PkAddU16
+            | BuiltinFn::PkMulU16
+            | BuiltinFn::PkAddF16
+            | BuiltinFn::PkMulF16 => Some(2),
+            BuiltinFn::PkMadU16
+            | BuiltinFn::PkFmaF16
+            | BuiltinFn::Dot2F16
+            | BuiltinFn::FunnelShr
+            | BuiltinFn::BytePerm => Some(3),
+            _ => None,
+        };
+        if let Some(n) = arity
+            && args.len() != n
+        {
+            return self.err(format!("{}() takes {n} args", func.name()));
+        }
         if matches!(
             func,
             BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize

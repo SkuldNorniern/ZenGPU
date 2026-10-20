@@ -419,3 +419,356 @@ fn zsl_dot4_matches_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// Reference for f16 operands: products and sums exact, rounded once at the end.
+mod packed_ref {
+    #[derive(Clone, Copy)]
+    enum Fin {
+        Zero(bool),
+        Num(bool, i128, i32),
+        Inf(bool),
+        Nan,
+    }
+
+    fn classify(h: u16) -> Fin {
+        let neg = h >> 15 == 1;
+        let exp = (h >> 10) & 0x1f;
+        let frac = i128::from(h & 0x3ff);
+        match exp {
+            0x1f if frac == 0 => Fin::Inf(neg),
+            0x1f => Fin::Nan,
+            0 if frac == 0 => Fin::Zero(neg),
+            0 => Fin::Num(neg, frac, -24),
+            _ => Fin::Num(neg, frac | 0x400, i32::from(exp) - 25),
+        }
+    }
+
+    fn sign(f: Fin) -> bool {
+        match f {
+            Fin::Zero(s) | Fin::Inf(s) | Fin::Num(s, ..) => s,
+            Fin::Nan => false,
+        }
+    }
+
+    fn mul(a: Fin, b: Fin) -> Fin {
+        let s = sign(a) ^ sign(b);
+        match (a, b) {
+            (Fin::Nan, _) | (_, Fin::Nan) => Fin::Nan,
+            (Fin::Inf(_), Fin::Zero(_)) | (Fin::Zero(_), Fin::Inf(_)) => Fin::Nan,
+            (Fin::Inf(_), _) | (_, Fin::Inf(_)) => Fin::Inf(s),
+            (Fin::Zero(_), _) | (_, Fin::Zero(_)) => Fin::Zero(s),
+            (Fin::Num(_, m1, e1), Fin::Num(_, m2, e2)) => Fin::Num(s, m1 * m2, e1 + e2),
+        }
+    }
+
+    fn add(a: Fin, b: Fin) -> Fin {
+        match (a, b) {
+            (Fin::Nan, _) | (_, Fin::Nan) => Fin::Nan,
+            (Fin::Inf(x), Fin::Inf(y)) => {
+                if x == y {
+                    Fin::Inf(x)
+                } else {
+                    Fin::Nan
+                }
+            }
+            (Fin::Inf(x), _) | (_, Fin::Inf(x)) => Fin::Inf(x),
+            (Fin::Zero(x), Fin::Zero(y)) => Fin::Zero(x && y),
+            (Fin::Zero(_), o) | (o, Fin::Zero(_)) => o,
+            (Fin::Num(sa, ma, ea), Fin::Num(sb, mb, eb)) => {
+                let e = ea.min(eb);
+                let va = (if sa { -ma } else { ma }) << (ea - e);
+                let vb = (if sb { -mb } else { mb }) << (eb - e);
+                let s = va + vb;
+                if s == 0 {
+                    Fin::Zero(false)
+                } else {
+                    Fin::Num(s < 0, s.abs(), e)
+                }
+            }
+        }
+    }
+
+    /// Rounds `m * 2^e` (m > 0) to nearest even.
+    fn round(neg: bool, m: u128, e: i32) -> u16 {
+        let bitlen = (128 - m.leading_zeros()) as i32;
+        let drop = (bitlen - 11).max(-24 - e);
+        let (mut q, mut qe) = if drop <= 0 {
+            (m << (-drop) as u32, e + drop)
+        } else if drop >= 127 {
+            (0, -24)
+        } else {
+            let d = drop as u32;
+            let mut q = m >> d;
+            let rem = m & ((1u128 << d) - 1);
+            let half = 1u128 << (d - 1);
+            if rem > half || (rem == half && q & 1 == 1) {
+                q += 1;
+            }
+            (q, e + drop)
+        };
+        let sign = u16::from(neg) << 15;
+        if q == 0 {
+            return sign;
+        }
+        while q >= 2048 {
+            q >>= 1;
+            qe += 1;
+        }
+        if q >= 1024 {
+            let t = qe + 10;
+            if t > 15 {
+                return sign | 0x7c00;
+            }
+            sign | (((t + 15) as u16) << 10) | (q as u16 - 1024)
+        } else {
+            sign | q as u16
+        }
+    }
+
+    fn bits(f: Fin) -> u16 {
+        match f {
+            Fin::Nan => 0x7e00,
+            Fin::Inf(s) => (u16::from(s) << 15) | 0x7c00,
+            Fin::Zero(s) => u16::from(s) << 15,
+            Fin::Num(s, m, e) => round(s, m as u128, e),
+        }
+    }
+
+    pub fn add16(a: u16, b: u16) -> u16 {
+        bits(add(classify(a), classify(b)))
+    }
+
+    pub fn mul16(a: u16, b: u16) -> u16 {
+        bits(mul(classify(a), classify(b)))
+    }
+
+    pub fn fma16(a: u16, b: u16, c: u16) -> u16 {
+        bits(add(mul(classify(a), classify(b)), classify(c)))
+    }
+
+    fn to_f32(h: u16) -> f32 {
+        match classify(h) {
+            Fin::Nan => f32::NAN,
+            Fin::Inf(s) => {
+                if s {
+                    f32::NEG_INFINITY
+                } else {
+                    f32::INFINITY
+                }
+            }
+            Fin::Zero(s) => {
+                if s {
+                    -0.0
+                } else {
+                    0.0
+                }
+            }
+            Fin::Num(s, m, e) => {
+                let v = m as f32 * 2f32.powi(e);
+                if s { -v } else { v }
+            }
+        }
+    }
+
+    /// Reference dot2 in f32: exact products, then two adds.
+    pub fn dot2(a: u32, b: u32, acc: f32) -> f32 {
+        let p0 = to_f32(a as u16) * to_f32(b as u16);
+        let p1 = to_f32((a >> 16) as u16) * to_f32((b >> 16) as u16);
+        (acc + p0) + p1
+    }
+
+    pub fn lanes(a: u32, b: u32, f: impl Fn(u16, u16) -> u16) -> u32 {
+        u32::from(f(a as u16, b as u16)) | (u32::from(f((a >> 16) as u16, (b >> 16) as u16)) << 16)
+    }
+
+    pub fn lanes3(a: u32, b: u32, c: u32, f: impl Fn(u16, u16, u16) -> u16) -> u32 {
+        u32::from(f(a as u16, b as u16, c as u16))
+            | (u32::from(f((a >> 16) as u16, (b >> 16) as u16, (c >> 16) as u16)) << 16)
+    }
+
+    /// Compares per f16 lane, bit-exact except that any NaN matches any NaN.
+    pub fn same_f16x2(got: u32, want: u32) -> bool {
+        let lane_ok = |g: u16, w: u16| {
+            let nan = |h: u16| (h & 0x7fff) > 0x7c00;
+            (nan(g) && nan(w)) || g == w
+        };
+        lane_ok(got as u16, want as u16) && lane_ok((got >> 16) as u16, (want >> 16) as u16)
+    }
+
+    pub fn pk_add_u16(a: u32, b: u32) -> u32 {
+        lanes(a, b, |x, y| x.wrapping_add(y))
+    }
+
+    pub fn pk_mul_u16(a: u32, b: u32) -> u32 {
+        lanes(a, b, |x, y| x.wrapping_mul(y))
+    }
+
+    pub fn pk_mad_u16(a: u32, b: u32, c: u32) -> u32 {
+        lanes3(a, b, c, |x, y, z| x.wrapping_mul(y).wrapping_add(z))
+    }
+
+    pub fn funnel_shr(hi: u32, lo: u32, s: u32) -> u32 {
+        ((u64::from(hi) << 32 | u64::from(lo)) >> (s & 31)) as u32
+    }
+
+    /// Reference for CUDA `__byte_perm` with the 3-bit selector and no sign mode.
+    pub fn byte_perm(a: u32, b: u32, sel: u32) -> u32 {
+        let src = u64::from(a) | (u64::from(b) << 32);
+        (0..4).fold(0u32, |out, i| {
+            let k = (sel >> (4 * i)) & 7;
+            let byte = ((src >> (8 * k)) & 0xff) as u32;
+            out | (byte << (8 * i))
+        })
+    }
+}
+
+const PACKED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32 }
+    @workgroup_size(64)
+    kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            o1[i] = pk_add_u16(x[i], y[i])
+            o2[i] = pk_mul_u16(x[i], y[i])
+            o3[i] = pk_mad_u16(x[i], y[i], z[i])
+            o4[i] = pk_add_f16(x[i], y[i])
+            o5[i] = pk_mul_f16(x[i], y[i])
+            o6[i] = pk_fma_f16(x[i], y[i], z[i])
+            of[i] = dot2_f16(x[i], y[i], f[i])
+            o7[i] = funnel_shr(x[i], y[i], z[i])
+            o8[i] = byte_perm(x[i], y[i], z[i])
+        }
+    }
+);
+
+#[test]
+fn zsl_packed_ops_match_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = PACKED_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 1024u32;
+    const F16_EDGE: [u16; 16] = [
+        0x0000, 0x8000, 0x7c00, 0xfc00, 0x7e00, 0x0001, 0x8001, 0x03ff, 0x0400, 0x7bff, 0xfbff,
+        0x3c00, 0xbc00, 0x3555, 0x4000, 0x0200,
+    ];
+    let half = |s: u32| -> u16 {
+        if s % 3 == 0 {
+            (s.wrapping_mul(0x9e37_79b9) >> 16) as u16
+        } else {
+            F16_EDGE[(s % 16) as usize]
+        }
+    };
+    let lanes = |s: u32| u32::from(half(s)) | (u32::from(half(s.wrapping_add(7919))) << 16);
+    let mut xs: Vec<u32> = (0..n).map(lanes).collect();
+    let mut ys: Vec<u32> = (0..n).map(|i| lanes(i + 4096)).collect();
+    let mut zs: Vec<u32> = (0..n)
+        .map(|i| match i % 5 {
+            0 => 0,
+            1 => 31,
+            2 => 32,
+            3 => 0x7654_3210,
+            _ => lanes(i + 8192),
+        })
+        .collect();
+    xs[0] = (xs[0] & 0xffff_0000) | 0x3c01;
+    ys[0] = (ys[0] & 0xffff_0000) | 0x3bff;
+    zs[0] = (zs[0] & 0xffff_0000) | 0x0009;
+    let fs: Vec<f32> = (0..n)
+        .map(|i| match i % 4 {
+            0 => 0.0,
+            1 => -0.0,
+            2 => i as f32 * 0.37 - 100.0,
+            _ => f32::from_bits(lanes(i + 123)),
+        })
+        .collect();
+    let mut inputs = Vec::new();
+    for data in [&xs, &ys, &zs] {
+        let b = pool.alloc(vec![n], DType::U32).unwrap();
+        let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.write_buffer(b.buffer, 0, &bytes).unwrap();
+        inputs.push(b);
+    }
+    let b = pool.alloc(vec![n], DType::F32).unwrap();
+    let bytes: Vec<u8> = fs.iter().flat_map(|w| w.to_le_bytes()).collect();
+    device.write_buffer(b.buffer, 0, &bytes).unwrap();
+    inputs.push(b);
+    let outs: Vec<_> = (0..9)
+        .map(|k| {
+            let ty = if k == 8 { DType::F32 } else { DType::U32 };
+            pool.alloc(vec![n], ty).unwrap()
+        })
+        .collect();
+    let mut ops = OpList::new(&pool);
+    let slots: Vec<u32> = inputs
+        .iter()
+        .chain(outs.iter())
+        .map(|b| b.buffer.index())
+        .collect();
+    ops.dispatch(
+        pipeline,
+        &slots,
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |b: &DeviceArray| -> Vec<u32> {
+        device
+            .read_buffer(b.buffer, 0, b.size_bytes())
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let got: Vec<Vec<u32>> = outs.iter().map(read).collect();
+    use packed_ref as r;
+    for i in 0..n as usize {
+        let (x, y, z) = (xs[i], ys[i], zs[i]);
+        let want = [
+            r::pk_add_u16(x, y),
+            r::pk_mul_u16(x, y),
+            r::pk_mad_u16(x, y, z),
+            r::lanes(x, y, r::add16),
+            r::lanes(x, y, r::mul16),
+            r::lanes3(x, y, z, r::fma16),
+            r::funnel_shr(x, y, z),
+            r::byte_perm(x, y, z),
+        ];
+        for (k, w) in want.iter().enumerate() {
+            let f16_out = (3..=5).contains(&k);
+            let ok = if f16_out {
+                r::same_f16x2(got[k][i], *w)
+            } else {
+                got[k][i] == *w
+            };
+            assert!(
+                ok,
+                "output {k} at {i}: got {:08x} want {w:08x} x={x:08x} y={y:08x} z={z:08x}",
+                got[k][i]
+            );
+        }
+        let want_f = r::dot2(x, y, fs[i]);
+        let got_f = f32::from_bits(got[8][i]);
+        let p0 = r::dot2(x & 0xffff, y & 0xffff, 0.0);
+        let p1 = r::dot2(x >> 16, y >> 16, 0.0);
+        let tol = fs[i].abs().max(p0.abs()).max(p1.abs()) * 1e-4;
+        assert!(
+            (want_f.is_nan() && got_f.is_nan())
+                || want_f.to_bits() == got_f.to_bits()
+                || (got_f - want_f).abs() <= tol,
+            "dot2_f16 at {i}: got {got_f:?} want {want_f:?} x={x:08x} y={y:08x} acc={:?}", fs[i]
+        );
+    }
+    drop(ops);
+    for b in inputs.into_iter().chain(outs) {
+        pool.free(b);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

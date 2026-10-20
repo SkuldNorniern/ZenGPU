@@ -185,14 +185,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         ssbo_tables.insert(elem_ty, SsboTable { var, t_ptr_elem });
     }
 
-    let has_f16 = buf_params
-        .iter()
-        .any(|(_, e)| half_of(*e) == Some(Half::F16));
-    let t_vec2 = if has_f16 || !tex_params.is_empty() {
-        spv.type_vector(t_f32, 2)
-    } else {
-        Id(0)
-    };
+    let t_vec2 = spv.type_vector(t_f32, 2);
     let images = if tex_params.is_empty() {
         None
     } else {
@@ -1477,6 +1470,140 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             })
         }
 
+        BuiltinFn::PkAddU16 | BuiltinFn::PkMulU16 | BuiltinFn::PkMadU16 => {
+            let want = if func == BuiltinFn::PkMadU16 { 3 } else { 2 };
+            if args.len() != want {
+                return Err(format!("ZSL: {name}() takes {want} args"));
+            }
+            let mut words = Vec::with_capacity(want);
+            for arg in args {
+                let v = lower_expr(ctx, arg)?;
+                words.push(coerce(ctx, v, ctx.u32_id));
+            }
+            let id = match func {
+                BuiltinFn::PkAddU16 => pk_add_u16(ctx, words[0], words[1]),
+                BuiltinFn::PkMulU16 => pk_mul_u16(ctx, words[0], words[1]),
+                _ => {
+                    let prod = pk_mul_u16(ctx, words[0], words[1]);
+                    pk_add_u16(ctx, prod, words[2])
+                }
+            };
+            Ok(Val { id, ty: ctx.u32_id })
+        }
+
+        BuiltinFn::PkAddF16 | BuiltinFn::PkMulF16 | BuiltinFn::PkFmaF16 => {
+            let want = if func == BuiltinFn::PkFmaF16 { 3 } else { 2 };
+            if args.len() != want {
+                return Err(format!("ZSL: {name}() takes {want} args"));
+            }
+            let mut words = Vec::with_capacity(want);
+            for arg in args {
+                let v = lower_expr(ctx, arg)?;
+                words.push(coerce(ctx, v, ctx.u32_id));
+            }
+            let t_f32 = ctx.t_f32;
+            let (alo, ahi) = f16_lanes(ctx, words[0]);
+            let (blo, bhi) = f16_lanes(ctx, words[1]);
+            let (lo, hi) = match func {
+                BuiltinFn::PkAddF16 => (
+                    ctx.spv.op_fadd(t_f32, alo, blo),
+                    ctx.spv.op_fadd(t_f32, ahi, bhi),
+                ),
+                BuiltinFn::PkMulF16 => (
+                    ctx.spv.op_fmul(t_f32, alo, blo),
+                    ctx.spv.op_fmul(t_f32, ahi, bhi),
+                ),
+                _ => {
+                    let (clo, chi) = f16_lanes(ctx, words[2]);
+                    (
+                        fma_f16_lane(ctx, alo, blo, clo),
+                        fma_f16_lane(ctx, ahi, bhi, chi),
+                    )
+                }
+            };
+            let id = f16_pack(ctx, lo, hi);
+            Ok(Val { id, ty: ctx.u32_id })
+        }
+
+        BuiltinFn::Dot2F16 => {
+            if args.len() != 3 {
+                return Err("ZSL: dot2_f16(a, b, acc) takes 3 args".into());
+            }
+            let a_val = lower_expr(ctx, &args[0])?;
+            let a = coerce(ctx, a_val, ctx.u32_id);
+            let b_val = lower_expr(ctx, &args[1])?;
+            let b = coerce(ctx, b_val, ctx.u32_id);
+            let acc_val = lower_expr(ctx, &args[2])?;
+            let acc = coerce(ctx, acc_val, ctx.f32_id);
+            let t_f32 = ctx.t_f32;
+            let (alo, ahi) = f16_lanes(ctx, a);
+            let (blo, bhi) = f16_lanes(ctx, b);
+            let p0 = ctx.spv.op_fmul(t_f32, alo, blo);
+            let s0 = ctx.spv.op_fadd(t_f32, acc, p0);
+            let p1 = ctx.spv.op_fmul(t_f32, ahi, bhi);
+            let id = ctx.spv.op_fadd(t_f32, s0, p1);
+            Ok(Val { id, ty: ctx.f32_id })
+        }
+
+        BuiltinFn::FunnelShr => {
+            if args.len() != 3 {
+                return Err("ZSL: funnel_shr(hi, lo, s) takes 3 args".into());
+            }
+            let hi_val = lower_expr(ctx, &args[0])?;
+            let hi = coerce(ctx, hi_val, ctx.u32_id);
+            let lo_val = lower_expr(ctx, &args[1])?;
+            let lo = coerce(ctx, lo_val, ctx.u32_id);
+            let s_val = lower_expr(ctx, &args[2])?;
+            let s = coerce(ctx, s_val, ctx.u32_id);
+            let t_u32 = ctx.t_u32;
+            let c1 = ctx.spv.constant_u32(t_u32, 1);
+            let c31 = ctx.spv.constant_u32(t_u32, 31);
+            let sh = ctx.spv.op_bitwise_and(t_u32, s, c31);
+            let right = ctx.spv.op_shift_right_logical(t_u32, lo, sh);
+            let inv = ctx.spv.op_isub(t_u32, c31, sh);
+            let left = ctx.spv.op_shift_left_logical(t_u32, hi, inv);
+            let left = ctx.spv.op_shift_left_logical(t_u32, left, c1);
+            let id = ctx.spv.op_bitwise_or(t_u32, right, left);
+            Ok(Val { id, ty: ctx.u32_id })
+        }
+
+        BuiltinFn::BytePerm => {
+            if args.len() != 3 {
+                return Err("ZSL: byte_perm(a, b, sel) takes 3 args".into());
+            }
+            let a_val = lower_expr(ctx, &args[0])?;
+            let a = coerce(ctx, a_val, ctx.u32_id);
+            let b_val = lower_expr(ctx, &args[1])?;
+            let b = coerce(ctx, b_val, ctx.u32_id);
+            let sel_val = lower_expr(ctx, &args[2])?;
+            let sel = coerce(ctx, sel_val, ctx.u32_id);
+            let t_u32 = ctx.t_u32;
+            let t_bool = ctx.t_bool;
+            let c3 = ctx.spv.constant_u32(t_u32, 3);
+            let c4 = ctx.spv.constant_u32(t_u32, 4);
+            let c7 = ctx.spv.constant_u32(t_u32, 7);
+            let c_ff = ctx.spv.constant_u32(t_u32, 0xff);
+            let mut out = ctx.spv.constant_u32(t_u32, 0);
+            for i in 0..4u32 {
+                let shift = ctx.spv.constant_u32(t_u32, 4 * i);
+                let raw = ctx.spv.op_shift_right_logical(t_u32, sel, shift);
+                let nib = ctx.spv.op_bitwise_and(t_u32, raw, c7);
+                let from_a = ctx.spv.op_ult(t_bool, nib, c4);
+                let word = ctx.spv.op_select(t_u32, from_a, a, b);
+                let lane = ctx.spv.op_bitwise_and(t_u32, nib, c3);
+                let bit_off = ctx.spv.op_shift_left_logical(t_u32, lane, c3);
+                let picked = ctx.spv.op_shift_right_logical(t_u32, word, bit_off);
+                let byte = ctx.spv.op_bitwise_and(t_u32, picked, c_ff);
+                let dst = ctx.spv.constant_u32(t_u32, 8 * i);
+                let placed = ctx.spv.op_shift_left_logical(t_u32, byte, dst);
+                out = ctx.spv.op_bitwise_or(t_u32, out, placed);
+            }
+            Ok(Val {
+                id: out,
+                ty: ctx.u32_id,
+            })
+        }
+
         BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown => {
             if args.len() != 2 {
                 return Err(format!("ZSL: {}(value, delta) takes 2 args", func.name()));
@@ -1672,6 +1799,7 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
     }
 }
 
+const NO_CONTRACTION: u32 = 42;
 const GLSL_PACK_HALF_2X16: u32 = 58;
 const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
@@ -1769,6 +1897,135 @@ fn dot4_lane(ctx: &mut LowerCtx<'_>, word: Id, signed: bool, lane: u32, want: Id
     } else {
         ctx.spv.op_bitcast(want, field)
     }
+}
+
+/// Unpack the two f16 lanes of `word` to f32 (exact), lane 0 first.
+fn f16_lanes(ctx: &mut LowerCtx<'_>, word: Id) -> (Id, Id) {
+    let t_f32 = ctx.t_f32;
+    let v2 = ctx
+        .spv
+        .op_ext_inst(ctx.t_vec2, ctx.glsl_ext, GLSL_UNPACK_HALF_2X16, &[word]);
+    let lo = ctx.spv.op_composite_extract(t_f32, v2, &[0]);
+    let hi = ctx.spv.op_composite_extract(t_f32, v2, &[1]);
+    (lo, hi)
+}
+
+/// Round two f32 to f16 lanes (lane 0 low), nearest even. Integer ops only: PackHalf2x16 rounds
+/// toward zero on RADV.
+fn f16_pack(ctx: &mut LowerCtx<'_>, lo: Id, hi: Id) -> Id {
+    let lo_bits = f32_to_f16_rne(ctx, lo);
+    let hi_bits = f32_to_f16_rne(ctx, hi);
+    let c16 = ctx.spv.constant_u32(ctx.t_u32, 16);
+    let high = ctx.spv.op_shift_left_logical(ctx.t_u32, hi_bits, c16);
+    ctx.spv.op_bitwise_or(ctx.t_u32, lo_bits, high)
+}
+
+/// f32 to f16 bits in a u32 low half, nearest even. Subnormals: add-2^23 trick, hardware RNE on
+/// multiples of 2^-24.
+fn f32_to_f16_rne(ctx: &mut LowerCtx<'_>, v: Id) -> Id {
+    let (t_u32, t_f32, t_bool) = (ctx.t_u32, ctx.t_f32, ctx.t_bool);
+    let k = |ctx: &mut LowerCtx<'_>, x: u32| ctx.spv.constant_u32(t_u32, x);
+    let bits = ctx.spv.op_bitcast(t_u32, v);
+    let sign_bit = k(ctx, 0x8000_0000);
+    let sign_raw = ctx.spv.op_bitwise_and(t_u32, bits, sign_bit);
+    let c16 = k(ctx, 16);
+    let sign = ctx.spv.op_shift_right_logical(t_u32, sign_raw, c16);
+    let mag_mask = k(ctx, 0x7fff_ffff);
+    let abs = ctx.spv.op_bitwise_and(t_u32, bits, mag_mask);
+    let rebias = k(ctx, 0x3800_0000);
+    let c13 = k(ctx, 13);
+    let c1 = k(ctx, 1);
+    let c_fff = k(ctx, 0xfff);
+    let shifted = ctx.spv.op_shift_right_logical(t_u32, abs, c13);
+    let odd = ctx.spv.op_bitwise_and(t_u32, shifted, c1);
+    let re = ctx.spv.op_isub(t_u32, abs, rebias);
+    let re = ctx.spv.op_iadd(t_u32, re, c_fff);
+    let re = ctx.spv.op_iadd(t_u32, re, odd);
+    let normal = ctx.spv.op_shift_right_logical(t_u32, re, c13);
+    let two24 = ctx.spv.constant_f32(t_f32, 16_777_216.0);
+    let magic = ctx.spv.constant_u32(t_u32, 0x4b00_0000);
+    let abs_f = ctx.spv.op_bitcast(t_f32, abs);
+    let scaled = ctx.spv.op_fmul(t_f32, abs_f, two24);
+    let magic_f = ctx.spv.op_bitcast(t_f32, magic);
+    let rounded = ctx.spv.op_fadd(t_f32, scaled, magic_f);
+    let rounded_bits = ctx.spv.op_bitcast(t_u32, rounded);
+    let sub = ctx.spv.op_isub(t_u32, rounded_bits, magic);
+    let min_normal = k(ctx, 0x3880_0000);
+    let huge = k(ctx, 0x4780_0000);
+    let inf = k(ctx, 0x7f80_0000);
+    let is_sub = ctx.spv.op_ult(t_bool, abs, min_normal);
+    let is_huge = ctx.spv.op_uge(t_bool, abs, huge);
+    let is_nan = ctx.spv.op_ult(t_bool, inf, abs);
+    let inf_bits = k(ctx, 0x7c00);
+    let qnan = k(ctx, 0x7e00);
+    let h = ctx.spv.op_select(t_u32, is_sub, sub, normal);
+    let h = ctx.spv.op_select(t_u32, is_huge, inf_bits, h);
+    let h = ctx.spv.op_select(t_u32, is_nan, qnan, h);
+    ctx.spv.op_bitwise_or(t_u32, sign, h)
+}
+
+/// `a * b + c` for one f16 lane, as f32 (caller packs). Round-to-odd on the f32 sum via TwoSum:
+/// nudge one ulp toward the error when nonzero and the last bit is even. Packing to f16 then rounds
+/// once, correctly (24 >= 2*11+2).
+fn fma_f16_lane(ctx: &mut LowerCtx<'_>, a: Id, b: Id, c: Id) -> Id {
+    let (t_f32, t_u32, t_bool) = (ctx.t_f32, ctx.t_u32, ctx.t_bool);
+    let zero = ctx.spv.constant_f32(t_f32, 0.0);
+    let c0 = ctx.spv.constant_u32(t_u32, 0);
+    let c1 = ctx.spv.constant_u32(t_u32, 1);
+    let c2 = ctx.spv.constant_u32(t_u32, 2);
+    let c31 = ctx.spv.constant_u32(t_u32, 31);
+    let all = ctx.spv.constant_u32(t_u32, u32::MAX);
+    let p = ctx.spv.op_fmul(t_f32, a, b);
+    let s = ctx.spv.op_fadd(t_f32, p, c);
+    let bp = ctx.spv.op_fsub(t_f32, s, p);
+    let t = ctx.spv.op_fsub(t_f32, s, bp);
+    let e1 = ctx.spv.op_fsub(t_f32, p, t);
+    let e2 = ctx.spv.op_fsub(t_f32, c, bp);
+    let err = ctx.spv.op_fadd(t_f32, e1, e2);
+    for id in [p, s, bp, t, e1, e2, err] {
+        ctx.spv.decorate(id, NO_CONTRACTION, &[]);
+    }
+    let bits = ctx.spv.op_bitcast(t_u32, s);
+    let inexact = ctx.spv.op_ford_ne(t_bool, err, zero);
+    let lsb = ctx.spv.op_bitwise_and(t_u32, bits, c1);
+    let even = ctx.spv.op_iequal(t_bool, lsb, c0);
+    let adjust = ctx.spv.op_logical_and(t_bool, inexact, even);
+    let err_pos = ctx.spv.op_ford_gt(t_bool, err, zero);
+    let sign = ctx.spv.op_shift_right_logical(t_u32, bits, c31);
+    let s_neg = ctx.spv.op_iequal(t_bool, sign, c1);
+    let pos_u = ctx.spv.op_select(t_u32, err_pos, c1, c0);
+    let neg_u = ctx.spv.op_select(t_u32, s_neg, c1, c0);
+    let flip = ctx.spv.op_bitwise_xor(t_u32, pos_u, neg_u);
+    let twice = ctx.spv.op_imul(t_u32, flip, c2);
+    let delta = ctx.spv.op_iadd(t_u32, twice, all);
+    let stepped = ctx.spv.op_iadd(t_u32, bits, delta);
+    let fixed = ctx.spv.op_select(t_u32, adjust, stepped, bits);
+    ctx.spv.op_bitcast(t_f32, fixed)
+}
+
+fn pk_add_u16(ctx: &mut LowerCtx<'_>, a: Id, b: Id) -> Id {
+    let t_u32 = ctx.t_u32;
+    let low15 = ctx.spv.constant_u32(t_u32, 0x7fff_7fff);
+    let top = ctx.spv.constant_u32(t_u32, 0x8000_8000);
+    let a_low = ctx.spv.op_bitwise_and(t_u32, a, low15);
+    let b_low = ctx.spv.op_bitwise_and(t_u32, b, low15);
+    let sum = ctx.spv.op_iadd(t_u32, a_low, b_low);
+    let ab = ctx.spv.op_bitwise_xor(t_u32, a, b);
+    let top_bits = ctx.spv.op_bitwise_and(t_u32, ab, top);
+    ctx.spv.op_bitwise_xor(t_u32, sum, top_bits)
+}
+
+fn pk_mul_u16(ctx: &mut LowerCtx<'_>, a: Id, b: Id) -> Id {
+    let t_u32 = ctx.t_u32;
+    let mask = ctx.spv.constant_u32(t_u32, 0xffff);
+    let c16 = ctx.spv.constant_u32(t_u32, 16);
+    let prod = ctx.spv.op_imul(t_u32, a, b);
+    let lo = ctx.spv.op_bitwise_and(t_u32, prod, mask);
+    let a_hi = ctx.spv.op_shift_right_logical(t_u32, a, c16);
+    let b_hi = ctx.spv.op_shift_right_logical(t_u32, b, c16);
+    let hi_prod = ctx.spv.op_imul(t_u32, a_hi, b_hi);
+    let hi = ctx.spv.op_shift_left_logical(t_u32, hi_prod, c16);
+    ctx.spv.op_bitwise_or(t_u32, lo, hi)
 }
 
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {

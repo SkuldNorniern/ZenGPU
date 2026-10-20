@@ -92,6 +92,47 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
          \x20   return acc;\n\
          }\n\n",
     );
+    s.push_str(
+        r#"
+inline uint zsl_pk_add_u16(uint a, uint b) {
+    return as_type<uint>(as_type<ushort2>(a) + as_type<ushort2>(b));
+}
+inline uint zsl_pk_mul_u16(uint a, uint b) {
+    return as_type<uint>(as_type<ushort2>(a) * as_type<ushort2>(b));
+}
+inline uint zsl_pk_mad_u16(uint a, uint b, uint c) {
+    return zsl_pk_add_u16(zsl_pk_mul_u16(a, b), c);
+}
+inline uint zsl_pk_add_f16(uint a, uint b) {
+    return as_type<uint>(as_type<half2>(a) + as_type<half2>(b));
+}
+inline uint zsl_pk_mul_f16(uint a, uint b) {
+    return as_type<uint>(as_type<half2>(a) * as_type<half2>(b));
+}
+inline uint zsl_pk_fma_f16(uint a, uint b, uint c) {
+    return as_type<uint>(fma(as_type<half2>(a), as_type<half2>(b), as_type<half2>(c)));
+}
+inline float zsl_dot2_f16(uint a, uint b, float acc) {
+    half2 x = as_type<half2>(a);
+    half2 y = as_type<half2>(b);
+    acc = fma(float(x.x), float(y.x), acc);
+    return fma(float(x.y), float(y.y), acc);
+}
+inline uint zsl_funnel_shr(uint hi, uint lo, uint s) {
+    return uint(((ulong(hi) << 32) | ulong(lo)) >> (s & 31u));
+}
+inline uint zsl_byte_perm(uint a, uint b, uint sel) {
+    uint r = 0;
+    for (uint i = 0; i < 4; ++i) {
+        uint k = (sel >> (4 * i)) & 7u;
+        uint w = k < 4u ? a : b;
+        r |= ((w >> (8 * (k & 3u))) & 0xffu) << (8 * i);
+    }
+    return r;
+}
+"#,
+    );
+
     if !bf16_buffers.is_empty() {
         s.push_str(
             "inline ushort f32_to_bf16(float x) {\n\
@@ -374,6 +415,15 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot4IU8 => {
                     format!("int(zsl_dot4({}, true, {}, false, {}))", a[0], a[1], a[2])
                 }
+                BuiltinFn::PkAddU16 => format!("zsl_pk_add_u16({}, {})", a[0], a[1]),
+                BuiltinFn::PkMulU16 => format!("zsl_pk_mul_u16({}, {})", a[0], a[1]),
+                BuiltinFn::PkMadU16 => format!("zsl_pk_mad_u16({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::PkAddF16 => format!("zsl_pk_add_f16({}, {})", a[0], a[1]),
+                BuiltinFn::PkMulF16 => format!("zsl_pk_mul_f16({}, {})", a[0], a[1]),
+                BuiltinFn::PkFmaF16 => format!("zsl_pk_fma_f16({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::Dot2F16 => format!("zsl_dot2_f16({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::FunnelShr => format!("zsl_funnel_shr({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::BytePerm => format!("zsl_byte_perm({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
                 BuiltinFn::SubgroupBallot => {
