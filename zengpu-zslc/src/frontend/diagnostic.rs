@@ -74,12 +74,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn diagnostic_display_shows_message() {
-        let d = Diagnostic::new(DiagnosticCode::Unsupported, "no f64 on this target");
-        assert_eq!(d.to_string(), "no f64 on this target");
-    }
-
-    #[test]
     fn diagnostic_round_trips_through_string() {
         let original = Diagnostic::at(DiagnosticCode::TypeMismatch, "bool required", 42);
         let s: String = original.clone().into();

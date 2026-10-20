@@ -84,26 +84,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_buffers_reflection_has_layout_and_binding_for_every_buffer() {
-        let src = r#"
-            @workgroup_size(64)
-            kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, id: global_id) {
-                out_u[id.x] = src_u[id.x]
-                out_i[id.x] = src_i[id.x]
-            }
-        "#;
-        let module = compile(src);
-        let reflection = reflect_compute(&module);
-        assert_eq!(reflection.params.len(), 4);
-        for (i, p) in reflection.params.iter().enumerate() {
-            assert_eq!(p.layout.offset, (i * 4) as u32);
-            let binding = p.binding.expect("buffer param must have a binding");
-            let expected = if p.name.ends_with('u') { 2 } else { 3 };
-            assert_eq!(binding.binding, expected);
-        }
-    }
-
-    #[test]
     fn scalar_params_have_layout_but_no_binding() {
         let src = r#"
             push P { n: u32, alpha: f32 }

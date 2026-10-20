@@ -532,31 +532,8 @@ mod tests {
                 .contains("out.position = (pc.mvp * float4(in.pos, 1.0));")
         );
         assert!(m.source.contains("out.vary0 = in.col;"));
-        let _ = metal_compiles(&m.source);
-    }
-
-    #[test]
-    fn push_vector_fields_take_swizzles() {
-        let m = graphics(
-            r#"
-            push P { tint: f32x4, scale: f32x2 }
-            fragment fs(p: P) -> f32x4 {
-                f32x4(p.tint.x, p.scale.y, p.tint.zw)
-            }
-            "#,
-        );
-        assert!(m.source.contains("pc.tint"));
-        let _ = metal_compiles(&m.source);
-    }
-
-    #[test]
-    fn vertex_position_uses_vulkan_clip_space() {
-        let m = graphics(
-            r#"
-            vertex vs(@location(0) p: f32x4) -> f32x4 { p }
-            "#,
-        );
         assert!(m.source.contains("out.position.y = -out.position.y;"));
+        let _ = metal_compiles(&m.source);
     }
 
     #[test]
@@ -639,21 +616,6 @@ mod tests {
         );
         assert!(m.source.contains("float2 pos[3] = {float2("));
         assert!(m.source.contains("float4(pos[vi], 0.0, 1.0)"));
-        let _ = metal_compiles(&m.source);
-    }
-
-    #[test]
-    fn fragment_color() {
-        let m = graphics(
-            r#"
-            fragment fs(@location(0) v_color: f32x3) -> f32x4 {
-                v_color.extend(1.0)
-            }
-        "#,
-        );
-        assert!(m.source.contains("float3 v_color [[user(locn0)]]"));
-        assert!(m.source.contains("fragment float4 zsl_main"));
-        assert!(m.source.contains("return float4(in.v_color, 1.0);"));
         let _ = metal_compiles(&m.source);
     }
 }

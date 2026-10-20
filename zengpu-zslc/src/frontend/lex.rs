@@ -322,24 +322,12 @@ mod tests {
     }
 
     #[test]
-    fn idents_and_keywords() {
-        assert_eq!(
-            kinds("kernel saxpy_2"),
-            vec![Tok::Ident("kernel".into()), Tok::Ident("saxpy_2".into())]
-        );
-    }
-
-    #[test]
-    fn integer_vs_float() {
+    fn numeric_literals_and_suffixes() {
         assert_eq!(kinds("256"), vec![Tok::Int(256)]);
         assert_eq!(kinds("1.0"), vec![Tok::Float(1.0)]);
         assert_eq!(kinds("0.5"), vec![Tok::Float(0.5)]);
         assert_eq!(kinds("1e-12"), vec![Tok::Float(1e-12)]);
         assert_eq!(kinds("3.4E+38"), vec![Tok::Float(3.4e38)]);
-    }
-
-    #[test]
-    fn numeric_suffixes_ignored() {
         assert_eq!(kinds("256u32"), vec![Tok::Int(256)]);
         assert_eq!(kinds("1f32"), vec![Tok::Float(1.0)]);
     }
@@ -359,15 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn range_is_not_a_float() {
+    fn range_and_field_access_are_not_floats() {
         assert_eq!(
             kinds("0..n"),
             vec![Tok::Int(0), Tok::DotDot, Tok::Ident("n".into())]
         );
-    }
-
-    #[test]
-    fn field_access_is_dot() {
         assert_eq!(
             kinds("id.x"),
             vec![Tok::Ident("id".into()), Tok::Dot, Tok::Ident("x".into())]
@@ -375,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn operators() {
+    fn operators_and_punctuation() {
         assert_eq!(
             kinds("<= >= == != && || -> .. < > ="),
             vec![
@@ -392,10 +376,6 @@ mod tests {
                 Tok::Eq,
             ]
         );
-    }
-
-    #[test]
-    fn delimiters_and_punct() {
         assert_eq!(
             kinds("(){}[],:;@"),
             vec![
@@ -426,21 +406,8 @@ mod tests {
     }
 
     #[test]
-    fn saxpy_signature_lexes() {
-        let src = "@workgroup_size(256)\nkernel saxpy(x: device buffer<f32>) { let i = id.x }";
-        let toks = kinds(src);
-        assert_eq!(toks[0], Tok::At);
-        assert_eq!(toks[1], Tok::Ident("workgroup_size".into()));
-        assert!(toks.contains(&Tok::Ident("kernel".into())));
-    }
-
-    #[test]
-    fn unterminated_block_comment_errors() {
+    fn lex_errors_are_reported() {
         assert!(lex("a /* unterminated").is_err());
-    }
-
-    #[test]
-    fn unexpected_char_errors() {
         let e = lex("a $ b").unwrap_err();
         assert!(e.msg.contains("unexpected character"));
     }

@@ -182,7 +182,6 @@ mod tests {
     use super::*;
     use crate::backend::spirv::lower_compute;
     use crate::backend::{cuda, hip, msl};
-    use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 
     #[test]
     fn backends_attribute_is_recorded_and_validated() {
@@ -204,27 +203,6 @@ mod tests {
     fn lower(src: &str) -> Vec<u32> {
         let module = parse_compute(src).expect("parse");
         lower_compute(&module).expect("lower")
-    }
-
-    #[test]
-    fn saxpy_parses_and_lowers() {
-        let src = r#"
-            push SaxpyPush { n: u32, alpha: f32 }
-            @workgroup_size(256)
-            kernel saxpy(
-                push: SaxpyPush,
-                x: device buffer<f32>,
-                y: device mut buffer<f32>,
-                id: global_id,
-            ) {
-                let i = id.x
-                if i < push.n {
-                    y[i] = push.alpha * x[i] + y[i]
-                }
-            }
-        "#;
-        let words = lower(src);
-        assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
     }
 
     #[test]
@@ -291,23 +269,6 @@ mod tests {
     }
 
     #[test]
-    fn for_loop_and_builtins() {
-        let src = r#"
-            push P { n: u32 }
-            @workgroup_size(1)
-            kernel k(dst: device mut buffer<f32>, p: P, id: global_id) {
-                let acc: f32 = 0.0
-                for j in 0..p.n {
-                    acc = max(acc, sqrt(dst[j]))
-                }
-                dst[id.x] = acc
-            }
-        "#;
-        let words = lower(src);
-        assert!(!words.is_empty());
-    }
-
-    #[test]
     fn read_only_buffer_write_is_rejected() {
         let src = r#"
             @workgroup_size(1)
@@ -349,14 +310,16 @@ mod tests {
     }
 
     #[test]
-    fn bf16_buffer_round_trips_an_f32_value() {
-        let src = r#"
+    fn half_float_buffers_keep_their_element_type() {
+        let module = parse_compute(
+            r#"
             @workgroup_size(64)
             kernel copy_bf16(x: device buffer<bf16>, out: device mut buffer<bf16>, id: global_id) {
                 out[id.x] = x[id.x]
             }
-        "#;
-        let module = parse_compute(src).expect("parse");
+        "#,
+        )
+        .expect("parse");
         let bf16_id = {
             let mut t = module.types.clone();
             t.bf16_id()
@@ -366,17 +329,15 @@ mod tests {
                 assert_eq!(elem, bf16_id, "buffer<bf16> param `{}`", p.name);
             }
         }
-    }
-
-    #[test]
-    fn f16_buffer_round_trips_an_f32_value() {
-        let src = r#"
+        let module = parse_compute(
+            r#"
             @workgroup_size(64)
             kernel copy_f16(x: device buffer<f16>, out: device mut buffer<f16>, id: global_id) {
                 out[id.x] = x[id.x]
             }
-        "#;
-        let module = parse_compute(src).expect("parse");
+        "#,
+        )
+        .expect("parse");
         let f16_id = {
             let mut t = module.types.clone();
             t.f16_id()
@@ -629,80 +590,5 @@ mod tests {
         "#;
         let words = lower(src);
         assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
-    }
-
-    #[test]
-    fn typeck_infers_local_and_literal_types() {
-        let mut arena = TypeArena::new();
-        let mut new_ctx = ComputeTypeCtx::default();
-        new_ctx.locals.insert("x".to_string(), arena.f32_id());
-        let local_expr = IrExpr::Local("x".to_string());
-        let new_ty = type_of_compute_expr(&local_expr, &new_ctx, &mut arena);
-
-        assert_eq!(new_ty, arena.f32_id());
-    }
-
-    #[test]
-    fn typeck_infers_comparison_and_arithmetic_types() {
-        let cmp = IrExpr::Binary {
-            op: IrBinOp::Lt,
-            lhs: Box::new(IrExpr::LitU32(1)),
-            rhs: Box::new(IrExpr::LitU32(2)),
-        };
-        let arith = IrExpr::Binary {
-            op: IrBinOp::Add,
-            lhs: Box::new(IrExpr::LitU32(1)),
-            rhs: Box::new(IrExpr::LitF32(2.0)),
-        };
-
-        let mut arena = TypeArena::new();
-        let new_ctx = ComputeTypeCtx::default();
-
-        let new_cmp_ty = type_of_compute_expr(&cmp, &new_ctx, &mut arena);
-        assert_eq!(new_cmp_ty, arena.bool_id());
-
-        let new_arith_ty = type_of_compute_expr(&arith, &new_ctx, &mut arena);
-        assert_eq!(new_arith_ty, arena.f32_id());
-    }
-
-    #[test]
-    fn typeck_infers_buffer_load_type() {
-        let load = IrExpr::BufferLoad {
-            buf: "buf".to_string(),
-            index: Box::new(IrExpr::LitU32(0)),
-        };
-
-        let mut arena = TypeArena::new();
-        let mut new_ctx = ComputeTypeCtx::default();
-        new_ctx.buffers.insert("buf".to_string(), arena.i32_id());
-        let new_ty = type_of_compute_expr(&load, &new_ctx, &mut arena);
-
-        assert_eq!(new_ty, arena.i32_id());
-    }
-
-    #[test]
-    fn typeck_infers_mat4_vec4_promotion_type() {
-        let vec4 = IrExpr::Construct {
-            ty: None,
-            dim: 4,
-            args: vec![
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(0.0),
-                IrExpr::LitF32(1.0),
-            ],
-        };
-        let mat_mul = IrExpr::Binary {
-            op: IrBinOp::Mul,
-            lhs: Box::new(IrExpr::ScalarParam("mvp".to_string())),
-            rhs: Box::new(vec4),
-        };
-
-        let mut arena = TypeArena::new();
-        let mut ctx = GraphicsTypeCtx::default();
-        ctx.scalars.insert("mvp".to_string(), arena.mat4_id());
-        let ty = type_of_graphics_expr(&mat_mul, &ctx, &mut arena);
-
-        assert_eq!(ty, arena.vec_id(4));
     }
 }

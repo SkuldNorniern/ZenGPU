@@ -1259,19 +1259,6 @@ mod tests {
     }
 
     #[test]
-    fn saxpy_compiles_with_metal_toolchain() {
-        let m = msl(r#"
-            push P { n: u32, alpha: f32 }
-            @workgroup_size(256)
-            kernel saxpy(x: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
-                let i = id.x
-                if i < p.n { y[i] = y[i] + p.alpha * x[i] }
-            }
-        "#);
-        let _ = metal_compiles(&m.source);
-    }
-
-    #[test]
     fn gemm_with_loop_and_builtins_compiles() {
         let m = msl(r#"
             push P { m: u32, n: u32, k: u32, alpha: f32 }

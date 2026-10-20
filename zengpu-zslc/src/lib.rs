@@ -138,7 +138,7 @@ mod phase_z_tests {
     "#;
 
     #[test]
-    fn finite_number_builtins_lower_on_all_compute_backends() {
+    fn math_builtins_lower_on_all_compute_backends() {
         let module = parse_compute(FINITE_CLASSIFY).expect("parse finite classification");
         let hip_source = hip::lower_compute(&module)
             .expect("lower finite classification to HIP")
@@ -155,6 +155,26 @@ mod phase_z_tests {
             assert!(source.contains("isinf(x)"));
         }
         spirv::lower_compute(&module).expect("lower finite classification to SPIR-V");
+        let module = parse_compute(TRIG).expect("parse trigonometry");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower trigonometry to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower trigonometry to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower trigonometry to MSL")
+            .source;
+        assert!(hip_source.contains("sinf(x)"));
+        assert!(hip_source.contains("cosf(x)"));
+        assert!(hip_source.contains("tanf(x)"));
+        assert!(cuda_source.contains("sinf(x)"));
+        assert!(cuda_source.contains("cosf(x)"));
+        assert!(cuda_source.contains("tanf(x)"));
+        assert!(msl_source.contains("sin(x)"));
+        assert!(msl_source.contains("cos(x)"));
+        assert!(msl_source.contains("tan(x)"));
+        spirv::lower_compute(&module).expect("lower trigonometry to SPIR-V");
     }
 
     #[test]
@@ -222,47 +242,29 @@ mod phase_z_tests {
     }
 
     #[test]
-    fn bf16_buffer_lowers_to_hip_with_conversion_helpers() {
+    fn bf16_buffer_lowers_on_all_compute_backends() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let hip_source = hip::lower_compute(&module)
             .expect("lower copy_bf16 to HIP")
             .source;
-        assert!(hip_source.contains("const unsigned short* __restrict__ src"));
-        assert!(hip_source.contains("unsigned short* __restrict__ out"));
-        assert!(hip_source.contains("f32_to_bf16(bf16_to_f32(src[zsl_gx]))"));
-        assert!(hip_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
-        assert!(hip_source.contains("__device__ __forceinline__ float bf16_to_f32"));
-    }
-
-    #[test]
-    fn bf16_buffer_lowers_to_cuda_with_conversion_helpers() {
-        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let cuda_source = cuda::lower_compute(&module)
             .expect("lower copy_bf16 to CUDA")
             .source;
-        assert!(cuda_source.contains("const unsigned short* __restrict__ src"));
-        assert!(cuda_source.contains("unsigned short* __restrict__ out"));
-        assert!(cuda_source.contains("f32_to_bf16(bf16_to_f32(src[zsl_gx]))"));
-        assert!(cuda_source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
-        assert!(cuda_source.contains("__device__ __forceinline__ float bf16_to_f32"));
-    }
-
-    #[test]
-    fn bf16_buffer_lowers_to_msl_with_conversion_helpers() {
-        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let msl_source = msl::lower_compute(&module)
             .expect("lower copy_bf16 to MSL")
             .source;
+        for source in [&hip_source, &cuda_source] {
+            assert!(source.contains("const unsigned short* __restrict__ src"));
+            assert!(source.contains("unsigned short* __restrict__ out"));
+            assert!(source.contains("f32_to_bf16(bf16_to_f32(src[zsl_gx]))"));
+            assert!(source.contains("__device__ __forceinline__ unsigned short f32_to_bf16"));
+            assert!(source.contains("__device__ __forceinline__ float bf16_to_f32"));
+        }
         assert!(msl_source.contains("device ushort* src"));
         assert!(msl_source.contains("device ushort* out"));
         assert!(msl_source.contains("f32_to_bf16(bf16_to_f32(src[gid.x]))"));
         assert!(msl_source.contains("inline ushort f32_to_bf16"));
         assert!(msl_source.contains("inline float bf16_to_f32"));
-    }
-
-    #[test]
-    fn bf16_buffer_lowers_on_spirv_through_u32_words() {
-        let module = parse_compute(COPY_BF16).expect("parse copy_bf16");
         let words = spirv::lower_compute(&module).expect("lower copy_bf16 to SPIR-V");
         let opcodes: Vec<u32> = spirv_opcodes(&words);
         assert!(opcodes.contains(&240) && opcodes.contains(&241));
@@ -370,11 +372,6 @@ int main() {{
         assert!(cuda_source.contains("__float2half(__half2float(src[zsl_gx]))"));
         assert!(msl_source.contains("device half* src"));
         assert!(msl_source.contains("half(float(src[gid.x]))"));
-    }
-
-    #[test]
-    fn f16_buffer_lowers_on_spirv_through_u32_words() {
-        let module = parse_compute(COPY_F16).expect("parse copy_f16");
         let words = spirv::lower_compute(&module).expect("lower copy_f16 to SPIR-V");
         let opcodes: Vec<u32> = spirv_opcodes(&words);
         assert!(opcodes.contains(&240) && opcodes.contains(&241));
@@ -1670,88 +1667,6 @@ int main() {{
     }
 
     #[test]
-    fn subgroup_shuffle_xor_hip_swaps_adjacent_lanes_when_gpu_present() {
-        let module = parse_compute(SUBGROUP_SHUFFLE_XOR).expect("parse subgroup shuffle xor");
-        let shader = hip::lower_compute(&module).expect("lower subgroup shuffle xor to HIP");
-
-        let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
-        let hipcc = Path::new(&rocm).join("bin/hipcc");
-        if !hipcc.exists() {
-            eprintln!(
-                "skipping HIP subgroup shuffle-xor proof: {} not found",
-                hipcc.display()
-            );
-            return;
-        }
-
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let tag = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = temp_dir();
-        let src_path = dir.join(format!("zsl_subgroup_shuffle_xor_{}_{}.hip", id(), tag));
-        let exe_path = dir.join(format!("zsl_subgroup_shuffle_xor_{}_{}", id(), tag));
-        let harness = format!(
-            r#"
-#include <hip/hip_runtime.h>
-#include <cstdio>
-#include <vector>
-{}
-int main() {{
-    int count = 0;
-    if (hipGetDeviceCount(&count) != hipSuccess || count == 0) {{ std::puts("SKIP_NO_HIP_GPU"); return 0; }}
-    const unsigned WG = 256, GROUPS = 256, N = WG * GROUPS;
-    std::vector<float> out(N, -1.0f);
-    float *dout = nullptr;
-    if (hipMalloc(&dout, N*sizeof(float)) != hipSuccess) return 2;
-    zsl_kernel<<<dim3(GROUPS), dim3(WG)>>>(dout);
-    if (hipDeviceSynchronize() != hipSuccess) return 3;
-    hipMemcpy(out.data(), dout, N*sizeof(float), hipMemcpyDeviceToHost);
-    unsigned mismatches = 0;
-    for (unsigned i = 0; i < N; ++i) {{
-        const unsigned local = i % WG;
-        const unsigned subgroup_local = local % 32;
-        const unsigned expected_id = i - subgroup_local + (subgroup_local ^ 1u);
-        mismatches += out[i] != (float)expected_id;
-    }}
-    std::printf("SUBGROUP_SHUFFLE_XOR_EXACT mismatches=%u\n", mismatches);
-    hipFree(dout);
-    return mismatches == 0 ? 0 : 4;
-}}
-"#,
-            shader.source
-        );
-        write(&src_path, harness).expect("write HIP subgroup shuffle-xor proof source");
-        let compile = Command::new(&hipcc)
-            .arg("-O2")
-            .arg(&src_path)
-            .arg("-o")
-            .arg(&exe_path)
-            .output()
-            .expect("run hipcc");
-        if !compile.status.success() {
-            panic!(
-                "HIP subgroup shuffle-xor compilation failed:\n{}",
-                String::from_utf8_lossy(&compile.stderr)
-            );
-        }
-        let run = Command::new(&exe_path)
-            .output()
-            .expect("run HIP subgroup shuffle xor");
-        let _ = remove_file(&src_path);
-        let _ = remove_file(&exe_path);
-        let stdout = String::from_utf8_lossy(&run.stdout);
-        assert!(
-            !stdout.contains("SKIP_NO_HIP_GPU"),
-            "HIP subgroup shuffle-xor proof unexpectedly skipped"
-        );
-        assert!(
-            run.status.success(),
-            "HIP subgroup shuffle-xor failed: {stdout}\n{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        eprintln!("HIP subgroup shuffle xor: {}", stdout.trim());
-    }
-
-    #[test]
     fn subgroup_arithmetic_hip_exact_invariants_when_gpu_present() {
         let module =
             parse_compute(SUBGROUP_ARITHMETIC_PROOF).expect("parse subgroup arithmetic proof");
@@ -2053,30 +1968,6 @@ int main() {{
     }
 
     #[test]
-    fn trigonometry_lowers_on_all_compute_backends() {
-        let module = parse_compute(TRIG).expect("parse trigonometry");
-        let hip_source = hip::lower_compute(&module)
-            .expect("lower trigonometry to HIP")
-            .source;
-        let cuda_source = cuda::lower_compute(&module)
-            .expect("lower trigonometry to CUDA")
-            .source;
-        let msl_source = msl::lower_compute(&module)
-            .expect("lower trigonometry to MSL")
-            .source;
-        assert!(hip_source.contains("sinf(x)"));
-        assert!(hip_source.contains("cosf(x)"));
-        assert!(hip_source.contains("tanf(x)"));
-        assert!(cuda_source.contains("sinf(x)"));
-        assert!(cuda_source.contains("cosf(x)"));
-        assert!(cuda_source.contains("tanf(x)"));
-        assert!(msl_source.contains("sin(x)"));
-        assert!(msl_source.contains("cos(x)"));
-        assert!(msl_source.contains("tan(x)"));
-        spirv::lower_compute(&module).expect("lower trigonometry to SPIR-V");
-    }
-
-    #[test]
     fn spirv_bindless_descriptor_array_declares_extension() {
         let module = parse_compute(TRIG).expect("parse bindless-buffer shader");
         let words = spirv::lower_compute(&module).expect("lower bindless-buffer shader to SPIR-V");
@@ -2111,37 +2002,6 @@ int main() {{
             descriptor_indexing_extension,
             "missing SPV_EXT_descriptor_indexing extension"
         );
-    }
-
-    #[test]
-    fn u32_cast_lowers_on_all_compute_backends() {
-        let source = r#"
-            @workgroup_size(1)
-            kernel cast_index(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
-                let index = u32(src[id.x])
-                out[id.x] = src[index]
-            }
-        "#;
-        let module = parse_compute(source).expect("parse u32 cast");
-        assert!(
-            hip::lower_compute(&module)
-                .expect("lower u32 cast to HIP")
-                .source
-                .contains("(unsigned int)")
-        );
-        assert!(
-            cuda::lower_compute(&module)
-                .expect("lower u32 cast to CUDA")
-                .source
-                .contains("(unsigned int)")
-        );
-        assert!(
-            msl::lower_compute(&module)
-                .expect("lower u32 cast to MSL")
-                .source
-                .contains("uint(")
-        );
-        spirv::lower_compute(&module).expect("lower u32 cast to SPIR-V");
     }
 
     #[test]

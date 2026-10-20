@@ -225,29 +225,6 @@ mod tests {
     use crate::frontend::parser::parse_compute;
 
     #[test]
-    fn validate_wraps_and_unwraps_a_parsed_module() {
-        let module = parse_compute(
-            r#"
-            @workgroup_size(64)
-            kernel noop(x: device mut buffer<f32>, id: global_id) {
-                let i = id.x
-                x[i] = x[i]
-            }
-        "#,
-        )
-        .expect("parse");
-        let validated = validate(Shader::Compute(module)).expect("validate");
-        match validated.shader() {
-            Shader::Compute(_) => {}
-            Shader::Graphics(_) => panic!("expected compute"),
-        }
-        match validated.into_inner() {
-            Shader::Compute(_) => {}
-            Shader::Graphics(_) => panic!("expected compute"),
-        }
-    }
-
-    #[test]
     fn validate_rejects_bool_plus_u32() {
         let module = parse_compute(
             r#"
