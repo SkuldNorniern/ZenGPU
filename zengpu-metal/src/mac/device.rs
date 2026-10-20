@@ -20,11 +20,11 @@ use objc::rc::autoreleasepool;
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeOp,
-    ComputePipelineDesc, DeviceLimits, DispatchOp, Features, Format, FormatCaps, GpuDevice,
-    GpuError, GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle, Result, SamplerDesc,
-    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
-    SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
+    BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
+    ComputeOp, ComputePipelineDesc, DType, DeviceLimits, DispatchOp, Features, Format, FormatCaps,
+    GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, MmaShape, PipelineHandle,
+    Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
+    Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
     TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
@@ -808,6 +808,29 @@ impl GpuDevice for MetalDevice {
         let float32_filtering = device.supports_family(MTLGPUFamily::Apple7)
             || device.supports_family(MTLGPUFamily::Mac2);
         convert::format_caps(format, float32_filtering)
+    }
+
+    fn compute_caps(&self) -> ComputeCaps {
+        let device = &self.inner.device;
+        let mut mma = Vec::new();
+        if device.supports_family(MTLGPUFamily::Apple7) {
+            mma.push(MmaShape {
+                m: 16,
+                n: 16,
+                k: 16,
+                a: DType::F16,
+                b: DType::F16,
+                acc: DType::F32,
+                subgroup: 32,
+            });
+        }
+        ComputeCaps {
+            subgroup_sizes: (32, 32),
+            default_subgroup: 32,
+            shared_bytes: u32::try_from(device.max_threadgroup_memory_length()).unwrap_or(u32::MAX),
+            max_workgroup: 1024,
+            mma,
+        }
     }
 
     fn limits(&self) -> DeviceLimits {

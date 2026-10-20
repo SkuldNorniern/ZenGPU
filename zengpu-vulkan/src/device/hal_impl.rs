@@ -1,6 +1,7 @@
 use super::*;
 use zengpu_hal::{
-    BackendPreference, Format, FormatCaps, TextureRegion, TextureWrite, TransferCaps,
+    BackendPreference, ComputeCaps, DType, Format, FormatCaps, MmaShape, TextureRegion,
+    TextureWrite, TransferCaps,
 };
 
 impl GpuDevice for VulkanDevice {
@@ -23,6 +24,74 @@ impl GpuDevice for VulkanDevice {
                 staged_uploads: true,
                 async_transfers: true,
             },
+        }
+    }
+
+    fn compute_caps(&self) -> ComputeCaps {
+        let inner = &self.inner;
+        let instance = &inner.shared.instance;
+        let physical = inner.physical;
+        let mut sub = vk::PhysicalDeviceSubgroupProperties::default();
+        let mut sizes = vk::PhysicalDeviceSubgroupSizeControlPropertiesEXT::default();
+        sub.p_next = &mut sizes as *mut _ as *mut c_void;
+        let mut props = vk::PhysicalDeviceProperties2 {
+            p_next: &mut sub as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+        unsafe { instance.get_physical_device_properties2(physical, &mut props) };
+        let default_subgroup = sub.subgroup_size;
+        let limits = props.properties.limits;
+        let subgroup_sizes = inner
+            .compute_subgroup_sizes
+            .unwrap_or((default_subgroup, default_subgroup));
+        let mut mma = Vec::new();
+        let (lo, hi) = subgroup_sizes;
+        if inner.coop_matrix && (lo..=hi).contains(&32) {
+            let coop = khr::cooperative_matrix::Instance::new(&inner.shared.entry, instance);
+            let shapes =
+                unsafe { coop.get_physical_device_cooperative_matrix_properties(physical) }
+                    .unwrap_or_default();
+            for p in shapes {
+                if p.scope != vk::ScopeKHR::SUBGROUP
+                    || (p.m_size, p.n_size, p.k_size) != (16, 16, 16)
+                {
+                    continue;
+                }
+                let elems = match (p.a_type, p.b_type, p.c_type, p.result_type) {
+                    (
+                        vk::ComponentTypeKHR::FLOAT16,
+                        vk::ComponentTypeKHR::FLOAT16,
+                        vk::ComponentTypeKHR::FLOAT32,
+                        vk::ComponentTypeKHR::FLOAT32,
+                    ) => (DType::F16, DType::F16, DType::F32),
+                    (
+                        vk::ComponentTypeKHR::SINT8,
+                        vk::ComponentTypeKHR::SINT8,
+                        vk::ComponentTypeKHR::SINT32,
+                        vk::ComponentTypeKHR::SINT32,
+                    ) => (DType::I8, DType::I8, DType::I32),
+                    _ => continue,
+                };
+                let shape = MmaShape {
+                    m: 16,
+                    n: 16,
+                    k: 16,
+                    a: elems.0,
+                    b: elems.1,
+                    acc: elems.2,
+                    subgroup: 32,
+                };
+                if !mma.contains(&shape) {
+                    mma.push(shape);
+                }
+            }
+        }
+        ComputeCaps {
+            subgroup_sizes,
+            default_subgroup,
+            shared_bytes: limits.max_compute_shared_memory_size,
+            max_workgroup: limits.max_compute_work_group_invocations,
+            mma,
         }
     }
 

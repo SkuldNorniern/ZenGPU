@@ -92,7 +92,7 @@ struct HipLayout {
 }
 
 /// `hipDeviceAttribute_t` members queried, in the order of the generated constants.
-const ATTR_NAMES: [&str; 11] = [
+const ATTR_NAMES: [&str; 12] = [
     "MultiprocessorCount",
     "ClockRate",
     "Integrated",
@@ -104,10 +104,11 @@ const ATTR_NAMES: [&str; 11] = [
     "MaxGridDimX",
     "MaxGridDimY",
     "MaxGridDimZ",
+    "MaxSharedMemoryPerBlock",
 ];
 
 /// ROCm 5.0 to 7.2 values, used only when the probe cannot run.
-const ATTR_DEFAULTS: [i32; ATTR_NAMES.len()] = [63, 5, 16, 87, 56, 26, 27, 28, 29, 30, 31];
+const ATTR_DEFAULTS: [i32; ATTR_NAMES.len()] = [63, 5, 16, 87, 56, 26, 27, 28, 29, 30, 31, 74];
 
 fn emit_hip_layout(rocm_path: &str, rocm_major: u32, rocm_minor: u32) {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());

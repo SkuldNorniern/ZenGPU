@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 mod adapter;
+mod caps;
 mod command;
 mod desc;
 mod device;
@@ -19,6 +20,7 @@ mod surface;
 mod types;
 
 pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
+pub use caps::{ComputeCaps, ElemType, MmaShape};
 pub use command::{Bindings, BufferCopyOp, ComputeOp, DispatchOp, Scalar};
 pub use device::GpuDevice;
 pub use graphics::{
