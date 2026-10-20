@@ -37,6 +37,9 @@ pub(crate) struct Plan {
     pub wave_rows: usize,
     pub wave_cols: usize,
     pub stages: usize,
+    /// `Mma` only: full interior blocks are staged with 16-byte global loads through `u32x4` alias
+    /// params (see [`vector_stage`]).
+    pub vector_loads: bool,
 }
 
 impl Plan {
@@ -53,6 +56,7 @@ impl Plan {
             wave_rows: 1,
             wave_cols: 1,
             stages: 1,
+            vector_loads: false,
         }
     }
 }
@@ -141,6 +145,17 @@ pub(crate) fn analyze(kernel: &TileKernel) -> Result<Parts, String> {
     })
 }
 
+/// Tensors with `u32x4` alias params, in param order. [`crate::TileProgram`] binds each alias to
+/// its tensor's host buffer.
+pub(crate) fn alias_tensors(kernel: &TileKernel, plan: &Plan) -> Vec<usize> {
+    match plan.mode {
+        Mode::Mma => analyze(kernel)
+            .map(|parts| vector_tensors(kernel, &parts, plan))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn zsl_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
     match plan.mode {
         Mode::Naive => naive_source(kernel, plan),
@@ -202,8 +217,51 @@ fn row_arg(shape0: usize, r: &str) -> String {
     }
 }
 
-fn header(kernel: &TileKernel, workgroup: usize, src: &mut String) {
-    let params: Vec<String> = kernel
+/// Elements of `dtype` in one 16-byte vector.
+fn vec_lanes(dtype: DType) -> usize {
+    match dtype {
+        DType::F16 => 8,
+        DType::I8 => 16,
+        DType::F32 | DType::I32 | DType::U32 => 4,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StageForm {
+    Rows,
+    /// Row-major. Full blocks: 16 bytes per step when [`vector_stage`] allows it, else scalar.
+    Vector,
+    /// Column-major (the layout `frag_load_b` reads).
+    Transposed,
+}
+
+/// Full blocks use 16-byte loads only if tensor and block rows are whole vectors (each row
+/// 16-byte aligned).
+fn vector_stage(kernel: &TileKernel, block: Block, cols: usize) -> bool {
+    let decl = &kernel.tensors[block.tensor.0];
+    let lanes = vec_lanes(decl.dtype);
+    decl.shape[1].is_multiple_of(lanes) && cols.is_multiple_of(lanes)
+}
+
+fn alias_name(kernel: &TileKernel, t: usize) -> String {
+    format!("b_{}_v", kernel.tensors[t].name)
+}
+
+fn vector_tensors(kernel: &TileKernel, parts: &Parts, plan: &Plan) -> Vec<usize> {
+    let mut out = Vec::new();
+    if !plan.vector_loads {
+        return out;
+    }
+    for block in [parts.a, parts.b] {
+        if vector_stage(kernel, block, parts.step) && !out.contains(&block.tensor.0) {
+            out.push(block.tensor.0);
+        }
+    }
+    out
+}
+
+fn header(kernel: &TileKernel, workgroup: usize, aliases: &[usize], src: &mut String) {
+    let mut params: Vec<String> = kernel
         .tensors
         .iter()
         .map(|t| {
@@ -215,6 +273,11 @@ fn header(kernel: &TileKernel, workgroup: usize, src: &mut String) {
             )
         })
         .collect();
+    params.extend(
+        aliases
+            .iter()
+            .map(|&t| format!("{}: device buffer<u32x4>", alias_name(kernel, t))),
+    );
     let _ = writeln!(src, "@workgroup_size({workgroup})");
     let _ = writeln!(src, "kernel {}({}) {{", kernel.name, params.join(", "));
     let _ = writeln!(src, "let gn = group_id().x");
@@ -238,7 +301,7 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
     }
 
     let mut src = String::new();
-    header(kernel, workgroup, &mut src);
+    header(kernel, workgroup, &[], &mut src);
     let _ = writeln!(src, "for it in 0..{iters} {{");
     let _ = writeln!(src, "let e = local_id().x + it * {workgroup}");
     let _ = writeln!(src, "if e < {tile_elems} {{");
@@ -266,7 +329,7 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
 
     let mut g = Gen::new(kernel);
     let mut src = String::new();
-    header(kernel, wg, &mut src);
+    header(kernel, wg, &[], &mut src);
     let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
     let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
     let _ = writeln!(src, "let lid = local_id().x");
@@ -275,8 +338,8 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
     }
 
     let _ = writeln!(src, "for kt in 0..{ksteps} {{");
-    g.stage(&mut src, "sa", parts.a, [bm, bk], false, wg);
-    g.stage(&mut src, "sb", parts.b, [bn, bk], false, wg);
+    g.stage(&mut src, "sa", parts.a, [bm, bk], StageForm::Rows, wg);
+    g.stage(&mut src, "sb", parts.b, [bn, bk], StageForm::Rows, wg);
     let _ = writeln!(src, "barrier()");
     for p in 0..per_thread {
         let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
@@ -348,10 +411,21 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
 
     let mut g = Gen::new(kernel);
     let mut src = String::new();
-    header(kernel, wg, &mut src);
+    let aliases = vector_tensors(kernel, parts, plan);
+    header(kernel, wg, &aliases, &mut src);
+    let (view_a, view_b) = (
+        plan.vector_loads && vector_stage(kernel, parts.a, parts.step),
+        plan.vector_loads && vector_stage(kernel, parts.b, parts.step),
+    );
     for (sa, sb) in &bufs {
         let _ = writeln!(src, "shared {sa}: array<{}, {}>", buffer_elem(ea), bm * bk);
         let _ = writeln!(src, "shared {sb}: array<{}, {}>", buffer_elem(eb), bk * bn);
+        if view_a {
+            let _ = writeln!(src, "view {sa}v: array<u32x4> = {sa}");
+        }
+        if view_b {
+            let _ = writeln!(src, "view {sb}v: array<u32x4> = {sb}");
+        }
     }
     let _ = writeln!(src, "shared sc: array<{fc}, {slice}>");
     let _ = writeln!(src, "let lid = local_id().x");
@@ -369,8 +443,18 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
 
     let stage = |g: &mut Gen, src: &mut String, (sa, sb): &(String, String), kt: &str| {
         g.kt = kt.to_string();
-        g.stage(src, sa, parts.a, [bm, bk], false, wg);
-        g.stage(src, sb, parts.b, [bn, bk], !native, wg);
+        let form = if plan.vector_loads {
+            StageForm::Vector
+        } else {
+            StageForm::Rows
+        };
+        g.stage(src, sa, parts.a, [bm, bk], form, wg);
+        let form_b = match (native, plan.vector_loads) {
+            (false, _) => StageForm::Transposed,
+            (true, true) => StageForm::Vector,
+            (true, false) => StageForm::Rows,
+        };
+        g.stage(src, sb, parts.b, [bn, bk], form_b, wg);
     };
     let compute = |src: &mut String, (sa, sb): &(String, String)| {
         let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
@@ -587,21 +671,21 @@ impl<'a> Gen<'a> {
         v
     }
 
-    /// Copies a `[rows, cols]` block into shared `dst` with the whole workgroup.
-    ///
-    /// With `transposed`, element (r, c) goes to `c * rows + r` (the `frag_load_b` layout).
-    /// Otherwise it goes to `r * cols + c`.
+    /// Copies the `[rows, cols]` block into shared `dst`, with the whole workgroup cooperating.
+    /// `form` is the element layout ([`StageForm`]). Full blocks are copied unmasked, partial
+    /// blocks masked.
     fn stage(
         &mut self,
         out: &mut String,
         dst: &str,
         block: Block,
         [rows, cols]: [usize; 2],
-        transposed: bool,
+        form: StageForm,
         workgroup: usize,
     ) {
         let total = rows * cols;
         let per = total.div_ceil(workgroup);
+        let transposed = form == StageForm::Transposed;
         let index = if transposed {
             format!("c * {rows} + r")
         } else {
@@ -614,21 +698,48 @@ impl<'a> Gen<'a> {
         let exact = total % workgroup == 0;
         let (ty, zero) = (scalar(decl.dtype), zero(decl.dtype));
         let _ = writeln!(out, "if {br} + {rows} <= {tr} && {bc} + {cols} <= {tc} {{");
-        let _ = writeln!(out, "for it in 0..{per} {{");
-        let _ = writeln!(out, "let e = lid + it * {workgroup}");
-        if !exact {
-            let _ = writeln!(out, "if e < {total} {{");
-        }
-        let _ = writeln!(out, "let r = e / {cols}");
-        let _ = writeln!(out, "let c = e % {cols}");
-        let v = self.name("ld");
-        let _ = writeln!(out, "let {v}: {ty} = {zero}");
-        let _ = writeln!(out, "{v} = b_{}[({br} + r) * {tc} + {bc} + c]", decl.name);
-        let _ = writeln!(out, "{dst}[{index}] = {v}");
-        if !exact {
+        if form == StageForm::Vector && vector_stage(self.kernel, block, cols) {
+            let lanes = vec_lanes(decl.dtype);
+            let cpr = cols / lanes;
+            let chunks = rows * cpr;
+            let per_v = chunks.div_ceil(workgroup);
+            let exact_v = chunks.is_multiple_of(workgroup);
+            let alias = alias_name(self.kernel, block.tensor.0);
+            let acol = affine(block.cols, &self.kt);
+            let _ = writeln!(out, "for it in 0..{per_v} {{");
+            let _ = writeln!(out, "let e = lid + it * {workgroup}");
+            if !exact_v {
+                let _ = writeln!(out, "if e < {chunks} {{");
+            }
+            let _ = writeln!(out, "let r = e / {cpr}");
+            let _ = writeln!(out, "let c8 = e % {cpr}");
+            let _ = writeln!(
+                out,
+                "let vec16: u32x4 = {alias}[({br} + r) * {} + {acol} * {cpr} + c8]",
+                tc / lanes
+            );
+            let _ = writeln!(out, "{dst}v[e] = vec16");
+            if !exact_v {
+                let _ = writeln!(out, "}}");
+            }
+            let _ = writeln!(out, "}}");
+        } else {
+            let _ = writeln!(out, "for it in 0..{per} {{");
+            let _ = writeln!(out, "let e = lid + it * {workgroup}");
+            if !exact {
+                let _ = writeln!(out, "if e < {total} {{");
+            }
+            let _ = writeln!(out, "let r = e / {cols}");
+            let _ = writeln!(out, "let c = e % {cols}");
+            let v = self.name("ld");
+            let _ = writeln!(out, "let {v}: {ty} = {zero}");
+            let _ = writeln!(out, "{v} = b_{}[({br} + r) * {tc} + {bc} + c]", decl.name);
+            let _ = writeln!(out, "{dst}[{index}] = {v}");
+            if !exact {
+                let _ = writeln!(out, "}}");
+            }
             let _ = writeln!(out, "}}");
         }
-        let _ = writeln!(out, "}}");
         let _ = writeln!(out, "}} else {{");
         let _ = writeln!(out, "for it in 0..{per} {{");
         let _ = writeln!(out, "let e = lid + it * {workgroup}");

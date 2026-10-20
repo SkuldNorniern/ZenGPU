@@ -30,6 +30,9 @@ pub struct CompiledTile {
     pub(crate) grid: [u32; 3],
     pub(crate) workgroup: [u32; 3],
     pub(crate) bindings: Vec<TileBinding>,
+    /// `u32x4` aliases of the tensors, after the tensor params. Each shares its
+    /// tensor's host buffer.
+    pub(crate) aliases: Vec<usize>,
     /// `naive`, `staged` or `mma`: the code shape the schedule resolved to.
     pub(crate) mode: &'static str,
     /// Lanes per subgroup the code needs, when it uses the matrix unit.
@@ -124,6 +127,7 @@ impl CompiledTile {
                 pipeline,
                 grid: self.grid,
                 slots: self.bindings.len(),
+                aliases: self.aliases.clone(),
             }),
             Err(e) => {
                 device.destroy_shader(shader);
@@ -133,12 +137,13 @@ impl CompiledTile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TileProgram {
     shader: ShaderHandle,
     pipeline: PipelineHandle,
     grid: [u32; 3],
     slots: usize,
+    aliases: Vec<usize>,
 }
 
 impl TileProgram {
@@ -157,7 +162,7 @@ impl TileProgram {
                 self.slots
             )));
         }
-        let slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        let slots = self.slot_indices(buffers);
         let bindings = Bindings {
             buffers: &slots,
             ..Bindings::default()
@@ -179,7 +184,7 @@ impl TileProgram {
                 self.slots
             )));
         }
-        let slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        let slots = self.slot_indices(buffers);
         let bindings = Bindings {
             buffers: &slots,
             ..Bindings::default()
@@ -192,6 +197,13 @@ impl TileProgram {
             })
             .collect();
         gpu(device.dispatch_batch(&ops))
+    }
+
+    /// Shader slots: bindings, aliases (reusing their tensor's buffer), then the workspace.
+    fn slot_indices(&self, buffers: &[BufferHandle]) -> Vec<u32> {
+        let mut slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        slots.extend(self.aliases.iter().map(|&t| buffers[t].index()));
+        slots
     }
 
     pub fn destroy(self, device: &dyn GpuDevice) {

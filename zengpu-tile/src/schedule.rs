@@ -38,6 +38,11 @@ pub struct Schedule {
     /// Matrix form: stages per operand, 1 or 2. 0 means 1, since double buffering is slower on
     /// gfx1200 (sync copy).
     pub stages: u32,
+    /// Matrix form: 16-byte global loads for full interior blocks with 16-byte aligned rows.
+    ///
+    /// Edge and unaligned blocks use scalar loads. Needs native shared arrays, so it is off
+    /// on Vulkan.
+    pub vector_loads: bool,
 }
 
 impl Schedule {
@@ -52,6 +57,7 @@ impl Schedule {
             waves: 1,
             wave_rows: 0,
             stages: 0,
+            vector_loads: false,
         }
     }
 }
@@ -67,6 +73,7 @@ impl Default for Schedule {
             waves: 4,
             wave_rows: 0,
             stages: 0,
+            vector_loads: true,
         }
     }
 }
@@ -219,6 +226,7 @@ fn staged_plan(
         wave_rows: 1,
         wave_cols: 1,
         stages: 1,
+        vector_loads: false,
     })
 }
 
@@ -292,6 +300,7 @@ fn mma_plan(
         wave_rows: nwr,
         wave_cols: nwc,
         stages: stages as usize,
+        vector_loads: schedule.vector_loads && native,
     })
 }
 
