@@ -56,7 +56,7 @@ fn check_binary_operand_types(
                 return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` currently require u32 operands".into());
             }
         }
-        Div | Lt | Le | Gt | Ge | Eq | Ne | Add | Sub | Mul => {
+        Div | Rem | Lt | Le | Gt | Ge | Eq | Ne | Add | Sub | Mul => {
             if lhs_ty == bool_id || rhs_ty == bool_id {
                 return Err(format!("ZSL: `{op:?}` does not support bool operands"));
             }

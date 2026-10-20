@@ -1045,6 +1045,32 @@ int main() {{
         assert!(format!("{err:?}").contains("integer element type"));
     }
 
+    const REM_KERNEL: &str = r#"
+        @workgroup_size(32)
+        kernel rem_kernel(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, id: global_id) {
+            let i = id.x
+            ou[i] = ua[i] % 7u
+            oi[i] = ia[i] % 5
+            of[i] = fa[i] % 2.5
+        }
+    "#;
+
+    #[test]
+    fn rem_lowers_per_backend() {
+        let module = parse_compute(REM_KERNEL).expect("parse %");
+        let hip_source = hip::lower_compute(&module).expect("lower % to HIP").source;
+        assert!(hip_source.contains("fmodf(") && hip_source.contains("%"));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower % to CUDA")
+            .source;
+        assert!(cuda_source.contains("fmodf(") && cuda_source.contains("%"));
+        let msl_source = msl::lower_compute(&module).expect("lower % to MSL").source;
+        assert!(msl_source.contains("fmod(") && msl_source.contains("%"));
+        let words = spirv::lower_compute(&module).expect("lower % to SPIR-V");
+        let ops = spirv_opcodes(&words);
+        assert!(ops.contains(&137) && ops.contains(&138) && ops.contains(&140));
+    }
+
     const FRAG_SHARED_AB: &str = r#"
         @workgroup_size(32)
         kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {

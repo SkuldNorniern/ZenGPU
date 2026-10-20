@@ -636,6 +636,8 @@ pub enum IrBinOp {
     Sub,
     Mul,
     Div,
+    /// The sign follows the dividend. Both operands must have the same type, as for `/`.
+    Rem,
     Lt,
     Le,
     Gt,

@@ -9,10 +9,11 @@ use crate::ir::node::{
     BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
     stmts_use_workgroup_reduce,
 };
-use crate::ir::typeck::frag_parts;
+use crate::ir::typeck::{ComputeTypeCtx, frag_parts, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, FragUse, IntWidth, Signedness, Type, TypeId};
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
+use std::cell::RefCell;
 
 pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     check_uniformity(module)?;
@@ -236,7 +237,20 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
         );
     }
 
+    let type_ctx = ComputeTypeCtx {
+        locals: e.locals.iter().cloned().collect(),
+        scalars: scalars
+            .iter()
+            .map(|(name, ty)| ((*name).to_string(), *ty))
+            .collect(),
+        buffers: buffers
+            .iter()
+            .map(|(name, ty)| ((*name).to_string(), *ty))
+            .collect(),
+    };
     let ctx = Ctx {
+        types: RefCell::new(module.types.clone()),
+        type_ctx,
         locals,
         frags,
         buffer_elems,
@@ -270,6 +284,8 @@ struct FragTiles {
 const TILES: usize = 4;
 
 struct Ctx<'a> {
+    type_ctx: ComputeTypeCtx,
+    types: RefCell<TypeArena>,
     locals: HashMap<&'a str, &'static str>,
     frags: HashMap<&'a str, FragTiles>,
     buffer_elems: HashMap<&'a str, &'static str>,
@@ -608,6 +624,27 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             format!("{tex}.get_{side}()")
         }
         IrExpr::Neg(e) => format!("(-{})", emit_expr(ctx, e)?),
+        IrExpr::Binary {
+            op: IrBinOp::Rem,
+            lhs,
+            rhs,
+        } => {
+            let (l, r) = (emit_expr(ctx, lhs)?, emit_expr(ctx, rhs)?);
+            let (lt, rt) = (expr_type(ctx, lhs), expr_type(ctx, rhs));
+            let (f32_id, i32_id, u32_id) = {
+                let mut types = ctx.types.borrow_mut();
+                (types.f32_id(), types.i32_id(), types.u32_id())
+            };
+            if lt == f32_id {
+                format!("fmod({l}, {r})")
+            } else if lt == i32_id && rt == u32_id {
+                format!("({l} % ((int)({r})))")
+            } else if lt == u32_id && rt == i32_id {
+                format!("(((int)({l})) % {r})")
+            } else {
+                format!("({l} % {r})")
+            }
+        }
         IrExpr::Binary { op, lhs, rhs } => {
             format!(
                 "({} {} {})",
@@ -639,12 +676,18 @@ fn component(c: u32) -> &'static str {
     }
 }
 
+fn expr_type(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
+    let mut types = ctx.types.borrow_mut();
+    type_of_compute_expr(expr, &ctx.type_ctx, &mut types)
+}
+
 fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     Ok(match op {
         IrBinOp::Add => "+",
         IrBinOp::Sub => "-",
         IrBinOp::Mul => "*",
         IrBinOp::Div => "/",
+        IrBinOp::Rem => "%",
         IrBinOp::Lt => "<",
         IrBinOp::Le => "<=",
         IrBinOp::Gt => ">",
