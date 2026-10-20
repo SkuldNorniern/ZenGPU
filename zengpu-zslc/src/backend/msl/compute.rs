@@ -138,6 +138,9 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
             "inline ushort f32_to_bf16(float x) {\n\
              \x20   uint bits = as_type<uint>(x);\n\
              \x20   uint bias = 0x7fffu + ((bits >> 16) & 1u);\n\
+             \x20   if ((bits & 0x7fffffffu) > 0x7f800000u) {\n\
+             \x20       return (ushort)((bits >> 16) | 0x40u);\n\
+             \x20   }\n\
              \x20   return (ushort)((bits + bias) >> 16);\n\
              }\n\
              inline float bf16_to_f32(ushort x) {\n\

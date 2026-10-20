@@ -101,6 +101,9 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
             "__device__ __forceinline__ unsigned short f32_to_bf16(float x) {\n\
              \x20   unsigned int bits = __float_as_uint(x);\n\
              \x20   unsigned int bias = 0x7fffu + ((bits >> 16) & 1u);\n\
+             \x20   if ((bits & 0x7fffffffu) > 0x7f800000u) {\n\
+             \x20       return (unsigned short)((bits >> 16) | 0x40u);\n\
+             \x20   }\n\
              \x20   return (unsigned short)((bits + bias) >> 16);\n\
              }\n\
              __device__ __forceinline__ float bf16_to_f32(unsigned short x) {\n\
