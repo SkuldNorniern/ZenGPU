@@ -163,6 +163,54 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
     }
     return r;
 }
+
+// device functions, not statement expressions: NVRTC rejects GNU statement expressions.
+struct ZslAddOp {
+    template <typename T> __device__ T operator()(T a, T b) const { return a + b; }
+};
+struct ZslAndOp {
+    template <typename T> __device__ T operator()(T a, T b) const { return a & b; }
+};
+struct ZslOrOp {
+    template <typename T> __device__ T operator()(T a, T b) const { return a | b; }
+};
+struct ZslMinOp {
+    template <typename T> __device__ T operator()(T a, T b) const { return a < b ? a : b; }
+    __device__ float operator()(float a, float b) const { return fminf(a, b); }
+};
+struct ZslMaxOp {
+    template <typename T> __device__ T operator()(T a, T b) const { return a > b ? a : b; }
+    __device__ float operator()(float a, float b) const { return fmaxf(a, b); }
+};
+template <typename T, typename Op> __device__ __forceinline__ T zsl_sg_xor_reduce(T v, Op op) {
+    for (unsigned int off = warpSize / 2; off > 0; off /= 2) {
+        v = op(v, __shfl_xor_sync(0xffffffffu, v, off));
+    }
+    return v;
+}
+template <typename T> __device__ __forceinline__ T zsl_sg_scan_incl_add(T v) {
+    for (unsigned int off = 1; off < warpSize; off *= 2) {
+        T o = __shfl_up_sync(0xffffffffu, v, off);
+        if ((threadIdx.x % warpSize) >= off) v = v + o;
+    }
+    return v;
+}
+template <typename T> __device__ __forceinline__ T zsl_sg_scan_excl_add(T v) {
+    T incl = zsl_sg_scan_incl_add(v);
+    T excl = __shfl_up_sync(0xffffffffu, incl, 1u);
+    if ((threadIdx.x % warpSize) == 0) excl = T(0);
+    return excl;
+}
+template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scratch, unsigned int n, float v, Op op) {
+    __syncthreads();
+    scratch[threadIdx.x] = v;
+    __syncthreads();
+    for (unsigned int s = n / 2; s > 0; s /= 2) {
+        if (threadIdx.x < s) scratch[threadIdx.x] = op(scratch[threadIdx.x], scratch[threadIdx.x + s]);
+        __syncthreads();
+    }
+    return scratch[0];
+}
 "#);
 
     let threads = local_size[0] * local_size[1] * local_size[2];
@@ -671,60 +719,34 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 | BuiltinFn::SubgroupReduceMax
                 | BuiltinFn::SubgroupReduceAnd
                 | BuiltinFn::SubgroupReduceOr => {
-                    let combine = match func {
-                        BuiltinFn::SubgroupReduceAdd => "__zsl_v + __zsl_o",
-                        BuiltinFn::SubgroupReduceMin if expr_is_f32(ctx, &args[0]) => {
-                            "fminf(__zsl_v, __zsl_o)"
-                        }
-                        BuiltinFn::SubgroupReduceMin => "(__zsl_v < __zsl_o ? __zsl_v : __zsl_o)",
-                        BuiltinFn::SubgroupReduceMax if expr_is_f32(ctx, &args[0]) => {
-                            "fmaxf(__zsl_v, __zsl_o)"
-                        }
-                        BuiltinFn::SubgroupReduceMax => "(__zsl_v > __zsl_o ? __zsl_v : __zsl_o)",
-                        BuiltinFn::SubgroupReduceAnd => "(__zsl_v & __zsl_o)",
-                        BuiltinFn::SubgroupReduceOr => "(__zsl_v | __zsl_o)",
+                    let op = match func {
+                        BuiltinFn::SubgroupReduceAdd => "ZslAddOp",
+                        BuiltinFn::SubgroupReduceMin => "ZslMinOp",
+                        BuiltinFn::SubgroupReduceMax => "ZslMaxOp",
+                        BuiltinFn::SubgroupReduceAnd => "ZslAndOp",
+                        BuiltinFn::SubgroupReduceOr => "ZslOrOp",
                         _ => unreachable!(),
                     };
-                    format!(
-                        "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = warpSize / 2; __zsl_off > 0; __zsl_off /= 2) {{ auto __zsl_o = __shfl_xor_sync(0xffffffffu, __zsl_v, __zsl_off); __zsl_v = {combine}; }} __zsl_v; }})",
-                        args_s[0]
-                    )
+                    format!("zsl_sg_xor_reduce({}, {op}())", args_s[0])
                 }
-                BuiltinFn::SubgroupScanInclusiveAdd => format!(
-                    "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = 1; __zsl_off < warpSize; __zsl_off *= 2) {{ auto __zsl_o = __shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off); if ((threadIdx.x % warpSize) >= __zsl_off) __zsl_v = __zsl_v + __zsl_o; }} __zsl_v; }})",
-                    args_s[0]
-                ),
+                BuiltinFn::SubgroupScanInclusiveAdd => {
+                    format!("zsl_sg_scan_incl_add({})", args_s[0])
+                }
                 BuiltinFn::SubgroupScanExclusiveAdd => {
-                    let zero = if expr_is_f32(ctx, &args[0]) {
-                        "0.0f"
-                    } else {
-                        "0u"
-                    };
-                    format!(
-                        "({{ auto __zsl_v = {}; for (unsigned int __zsl_off = 1; __zsl_off < warpSize; __zsl_off *= 2) {{ auto __zsl_o = __shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off); if ((threadIdx.x % warpSize) >= __zsl_off) __zsl_v = __zsl_v + __zsl_o; }} auto __zsl_incl = __zsl_v; auto __zsl_excl = __shfl_up_sync(0xffffffffu, __zsl_incl, 1u); if ((threadIdx.x % warpSize) == 0) __zsl_excl = {zero}; __zsl_excl; }})",
-                        args_s[0]
-                    )
+                    format!("zsl_sg_scan_excl_add({})", args_s[0])
                 }
                 BuiltinFn::WorkgroupReduceAdd
                 | BuiltinFn::WorkgroupReduceMin
                 | BuiltinFn::WorkgroupReduceMax => {
-                    let combine = match func {
-                        BuiltinFn::WorkgroupReduceAdd => "__zsl_v + __zsl_o",
-                        BuiltinFn::WorkgroupReduceMin => "fminf(__zsl_v, __zsl_o)",
-                        BuiltinFn::WorkgroupReduceMax => "fmaxf(__zsl_v, __zsl_o)",
+                    let op = match func {
+                        BuiltinFn::WorkgroupReduceAdd => "ZslAddOp",
+                        BuiltinFn::WorkgroupReduceMin => "ZslMinOp",
+                        BuiltinFn::WorkgroupReduceMax => "ZslMaxOp",
                         _ => unreachable!(),
                     };
-                    let mut steps = String::new();
-                    let mut s = ctx.block_size / 2;
-                    while s > 0 {
-                        steps.push_str(&format!(
-                            "if (threadIdx.x < {s}u) {{ auto __zsl_o = __zsl_wg_reduce_f32[threadIdx.x + {s}u]; auto __zsl_v = __zsl_wg_reduce_f32[threadIdx.x]; __zsl_wg_reduce_f32[threadIdx.x] = {combine}; }} __syncthreads(); "
-                        ));
-                        s /= 2;
-                    }
                     format!(
-                        "({{ __syncthreads(); __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
-                        args_s[0]
+                        "zsl_wg_reduce(__zsl_wg_reduce_f32, {}u, {}, {op}())",
+                        ctx.block_size, args_s[0]
                     )
                 }
                 BuiltinFn::SubgroupSize => "((unsigned int)warpSize)".to_string(),
