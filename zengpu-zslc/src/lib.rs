@@ -674,9 +674,10 @@ int main() {{
         assert!(hip_source.contains("(__zsl_v & __zsl_o)"));
         assert!(hip_source.contains("__zsl_excl = 0.0f"));
         assert!(hip_source.contains("__zsl_excl = 0u"));
-        assert!(cuda_source.contains("__shfl_xor_sync(0xffffffffu, __zsl_v, __zsl_off)"));
-        assert!(cuda_source.contains("__shfl_up_sync(0xffffffffu, __zsl_v, __zsl_off)"));
-        assert!(cuda_source.contains("(threadIdx.x % warpSize) >= __zsl_off"));
+        assert!(cuda_source.contains("zsl_sg_xor_reduce("));
+        assert!(cuda_source.contains("zsl_sg_scan_incl_add("));
+        assert!(cuda_source.contains("zsl_sg_scan_excl_add("));
+        assert!(!cuda_source.contains("({"), "CUDA statement expression");
         assert!(msl_source.contains("simd_sum("));
         assert!(msl_source.contains("simd_min("));
         assert!(msl_source.contains("simd_max("));
@@ -704,6 +705,7 @@ int main() {{
         assert!(hip_source.contains("fmaxf(__zsl_v, __zsl_o)"));
         assert!(hip_source.contains("__zsl_wg_reduce_f32[0]"));
         assert!(cuda_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
+        assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 256u, "));
         assert!(cuda_source.contains("__syncthreads()"));
         assert!(msl_source.contains("threadgroup float __zsl_wg_reduce_f32[256]"));
         assert!(msl_source.contains("min(v, o)"));
@@ -829,10 +831,13 @@ int main() {{
         let module = parse_compute(source).expect("parse shadowing kernel");
         let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
         let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        assert!(hip_source.contains("auto __zsl_v = (v + o);"));
+        assert!(hip_source.contains("auto __zsl_v = off;"));
+        assert!(hip_source.contains("__zsl_wg_reduce_f32[threadIdx.x] = v;"));
+        assert!(cuda_source.contains("zsl_sg_xor_reduce((v + o), ZslAddOp())"));
+        assert!(cuda_source.contains("zsl_sg_scan_incl_add(off)"));
+        assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 64u, v, ZslAddOp())"));
         for src in [&hip_source, &cuda_source] {
-            assert!(src.contains("auto __zsl_v = (v + o);"));
-            assert!(src.contains("auto __zsl_v = off;"));
-            assert!(src.contains("__zsl_wg_reduce_f32[threadIdx.x] = v;"));
             assert!(!src.contains("auto v ="));
             assert!(!src.contains("auto o ="));
             assert!(!src.contains("auto off ="));
@@ -946,9 +951,15 @@ int main() {{
     #[test]
     fn dot4_lowers_on_all_compute_backends() {
         let module = parse_compute(DOT4).expect("parse dot4");
-        let hip_source = hip::lower_compute(&module).expect("lower dot4 to HIP").source;
-        let cuda_source = cuda::lower_compute(&module).expect("lower dot4 to CUDA").source;
-        let msl_source = msl::lower_compute(&module).expect("lower dot4 to MSL").source;
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower dot4 to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower dot4 to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower dot4 to MSL")
+            .source;
         assert!(hip_source.contains("zsl_dot4_i8("));
         assert!(hip_source.contains("zsl_dot4_iu8("));
         assert!(hip_source.contains("zsl_dot4_u8("));
@@ -1992,5 +2003,177 @@ int main() {{
             let src = kernel(params, body);
             assert!(parse_compute(&src).is_err(), "accepted:\n{src}");
         }
+    }
+
+    /// Loads NVRTC via `dlopen`, with no link-time dependency.
+    mod nvrtc {
+        use std::ffi::{CString, c_char, c_int, c_void};
+        use std::ptr::{null, null_mut};
+
+        #[cfg_attr(target_os = "linux", link(name = "dl"))]
+        unsafe extern "C" {
+            fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+        }
+
+        type Create = unsafe extern "C" fn(
+            *mut *mut c_void,
+            *const c_char,
+            *const c_char,
+            c_int,
+            *const *const c_char,
+            *const *const c_char,
+        ) -> c_int;
+        type Compile = unsafe extern "C" fn(*mut c_void, c_int, *const *const c_char) -> c_int;
+        type LogSize = unsafe extern "C" fn(*mut c_void, *mut usize) -> c_int;
+        type Log = unsafe extern "C" fn(*mut c_void, *mut c_char) -> c_int;
+        type Destroy = unsafe extern "C" fn(*mut *mut c_void) -> c_int;
+
+        pub struct Nvrtc {
+            create: Create,
+            compile: Compile,
+            log_size: LogSize,
+            log: Log,
+            destroy: Destroy,
+        }
+
+        impl Nvrtc {
+            pub fn open(path: &str) -> Option<Self> {
+                let c_path = CString::new(path).ok()?;
+                // SAFETY: plain library load; the handle is never closed.
+                let handle = unsafe { dlopen(c_path.as_ptr(), 2) };
+                if handle.is_null() {
+                    return None;
+                }
+                let sym = |name: &str| {
+                    let c_name = CString::new(name).ok()?;
+                    // SAFETY: symbol looked up by name in the loaded library.
+                    let p = unsafe { dlsym(handle, c_name.as_ptr()) };
+                    (!p.is_null()).then_some(p)
+                };
+                // SAFETY: each symbol has the NVRTC C signature declared above.
+                unsafe {
+                    Some(Self {
+                        create: std::mem::transmute::<*mut c_void, Create>(sym(
+                            "nvrtcCreateProgram",
+                        )?),
+                        compile: std::mem::transmute::<*mut c_void, Compile>(sym(
+                            "nvrtcCompileProgram",
+                        )?),
+                        log_size: std::mem::transmute::<*mut c_void, LogSize>(sym(
+                            "nvrtcGetProgramLogSize",
+                        )?),
+                        log: std::mem::transmute::<*mut c_void, Log>(sym("nvrtcGetProgramLog")?),
+                        destroy: std::mem::transmute::<*mut c_void, Destroy>(sym(
+                            "nvrtcDestroyProgram",
+                        )?),
+                    })
+                }
+            }
+
+            /// Returns the NVRTC log on failure.
+            pub fn compile(
+                &self,
+                name: &str,
+                src: &str,
+                arch: &str,
+                include: &str,
+            ) -> Result<(), String> {
+                let c_src = CString::new(src).map_err(|e| e.to_string())?;
+                let c_name = CString::new(name).map_err(|e| e.to_string())?;
+                let opts = [
+                    CString::new(format!("--gpu-architecture={arch}"))
+                        .map_err(|e| e.to_string())?,
+                    CString::new(format!("-I{include}")).map_err(|e| e.to_string())?,
+                    CString::new("-default-device").map_err(|e| e.to_string())?,
+                ];
+                let opt_ptrs: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
+                let mut prog: *mut c_void = null_mut();
+                // SAFETY: pointers valid for the call. program destroyed on every path
+                unsafe {
+                    let created = (self.create)(
+                        &mut prog,
+                        c_src.as_ptr(),
+                        c_name.as_ptr(),
+                        0,
+                        null(),
+                        null(),
+                    );
+                    if created != 0 {
+                        return Err(format!("nvrtcCreateProgram returned {created}"));
+                    }
+                    let rc = (self.compile)(prog, opt_ptrs.len() as c_int, opt_ptrs.as_ptr());
+                    let mut size = 0usize;
+                    (self.log_size)(prog, &mut size);
+                    let mut log = vec![0u8; size.max(1)];
+                    (self.log)(prog, log.as_mut_ptr().cast::<c_char>());
+                    (self.destroy)(&mut prog);
+                    if rc == 0 {
+                        Ok(())
+                    } else {
+                        let end = log.iter().position(|&b| b == 0).unwrap_or(log.len());
+                        Err(String::from_utf8_lossy(&log[..end]).into_owned())
+                    }
+                }
+            }
+        }
+    }
+
+    /// Compiles every ZSL kernel const for compute_70 and compute_80.
+    ///
+    /// Skipped unless `ZENGPU_NVRTC` (libnvrtc.so path) and `ZENGPU_CUDA_INCLUDE` (CUDA headers)
+    /// are set.
+    #[test]
+    fn lowered_cuda_kernels_compile_with_nvrtc() {
+        let (Ok(lib), Ok(include)) = (var("ZENGPU_NVRTC"), var("ZENGPU_CUDA_INCLUDE")) else {
+            return;
+        };
+        let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
+        let kernels: [(&str, &str); 20] = [
+            ("tiled_gemm", TILED_GEMM),
+            ("scatter_add", SCATTER_ADD),
+            ("trig", TRIG),
+            ("typed_buffers", TYPED_BUFFERS),
+            ("copy_bf16", COPY_BF16),
+            ("copy_f16", COPY_F16),
+            ("finite_classify", FINITE_CLASSIFY),
+            ("mul_add_f32", MUL_ADD_F32),
+            ("subgroup_query", SUBGROUP_QUERY),
+            ("subgroup_vote", SUBGROUP_VOTE),
+            ("subgroup_ballot", SUBGROUP_BALLOT),
+            ("subgroup_exchange", SUBGROUP_EXCHANGE),
+            ("subgroup_shuffle_xor", SUBGROUP_SHUFFLE_XOR),
+            ("subgroup_arithmetic", SUBGROUP_ARITHMETIC),
+            ("subgroup_arithmetic_proof", SUBGROUP_ARITHMETIC_PROOF),
+            ("workgroup_reduce", WORKGROUP_REDUCE),
+            ("workgroup_reduce_proof", WORKGROUP_REDUCE_PROOF),
+            ("dot4", DOT4),
+            ("packed", PACKED),
+            ("texel_kernel", TEXEL_KERNEL),
+        ];
+        let mut failures = Vec::new();
+        let mut checked = 0;
+        for (name, src) in kernels {
+            let module = parse_compute(src).expect("parse kernel constant");
+            let text = match cuda::lower_compute(&module) {
+                Ok(shader) => shader.source,
+                Err(diag) => {
+                    eprintln!("NVRTC skips {name}: {diag:?}");
+                    continue;
+                }
+            };
+            for arch in ["compute_70", "compute_80"] {
+                checked += 1;
+                if let Err(log) = nvrtc.compile(name, &text, arch, &include) {
+                    failures.push(format!("{name} {arch}:\n{log}"));
+                }
+            }
+        }
+        eprintln!("NVRTC: {} of {checked} compilations failed", failures.len());
+        assert!(
+            failures.is_empty(),
+            "NVRTC rejected:\n{}",
+            failures.join("\n")
+        );
     }
 }
