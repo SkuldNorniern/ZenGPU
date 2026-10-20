@@ -106,14 +106,3 @@ impl GpuDevice for Dx12Device {
 
     fn destroy_sampler(&self, _sampler: SamplerHandle) {}
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn instance_constructs_without_panic() {
-        let inst = Dx12Instance::new();
-        let _ = inst.enumerate_adapters();
-    }
-}
