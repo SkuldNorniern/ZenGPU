@@ -865,15 +865,16 @@ mod tests {
             matrix: Matrix::Scalar,
             ..Schedule::default()
         };
-        let mma = |waves: u32| Schedule {
+        let mma = |waves: u32, wave_rows: u32| Schedule {
             matrix: Matrix::Mma,
             waves,
+            wave_rows,
             stages: 0,
             ..Schedule::default()
         };
         let tiles = [[64, 64], [128, 64], [128, 128]];
-        let bks = [16, 32, 64];
-        let waves = [4, 8];
+        let bks = [16, 32];
+        let wave_splits = [(4, 0), (8, 0), (8, 4)];
         let mut summary: Vec<String> = Vec::new();
         for (m, n, k) in shapes {
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
@@ -929,9 +930,9 @@ mod tests {
             for tile in tiles {
                 for bk in bks {
                     let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-                    for w in waves {
-                        let label = format!("mma {}x{} bk{bk} w{w}", tile[0], tile[1]);
-                        let sched = mma(w);
+                    for (w, wr) in wave_splits {
+                        let label = format!("mma {}x{} bk{bk} w{w} r{wr}", tile[0], tile[1]);
+                        let sched = mma(w, wr);
                         let compiled = compile_with(&kernel, &sched, &target).unwrap();
                         if compiled.schedule_name() != "mma" {
                             println!(
@@ -953,9 +954,9 @@ mod tests {
                 println!("{}", best.2.zsl());
             }
             let best_kernel = best.0.clone();
-            let (tile, bk, w) = parse_label(&best_kernel);
+            let (tile, bk, w, wr) = parse_label(&best_kernel);
             let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-            let compiled = compile_with(&kernel, &mma(w), &target).unwrap();
+            let compiled = compile_with(&kernel, &mma(w, wr), &target).unwrap();
             let program = compiled.load(&*dev).unwrap();
             let mut medians = Vec::new();
             for rep in 0..3 {
@@ -992,12 +993,13 @@ mod tests {
         }
     }
 
-    fn parse_label(label: &str) -> ([usize; 2], usize, u32) {
+    fn parse_label(label: &str) -> ([usize; 2], usize, u32, u32) {
         let parts: Vec<&str> = label.split(' ').collect();
         let tile: Vec<usize> = parts[1].split('x').map(|v| v.parse().unwrap()).collect();
         let bk = parts[2].trim_start_matches("bk").parse().unwrap();
         let w = parts[3].trim_start_matches('w').parse().unwrap();
-        ([tile[0], tile[1]], bk, w)
+        let wr = parts[4].trim_start_matches('r').parse().unwrap();
+        ([tile[0], tile[1]], bk, w, wr)
     }
 
     const EXPECTED_GEMM_TEXT: &str = "tile v0 kernel gemm tile [32, 32]
