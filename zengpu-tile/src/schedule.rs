@@ -2,7 +2,7 @@
 //! requests fall back, with reasons in `crate::CompiledTile::notes`. Fallback order: `Mma`, then
 //! `Staged` scalar, then `Naive` (the O0 reference).
 
-use zengpu_hal::BackendPreference;
+use zengpu_hal::{BackendPreference, ComputeCaps};
 
 use crate::ir::{DType, TileKernel};
 use crate::lower::{self, Mode, Parts, Plan};
@@ -83,6 +83,33 @@ impl Target {
             lds_bytes: 65536,
             has_mma_f16: true,
             has_mma_i8: true,
+        }
+    }
+
+    /// Subgroup 32 if the device runs it (the matrix form needs it), else the default. Shared
+    /// memory and 16x16x16 f16 and i8 shapes at that subgroup.
+    pub fn from_caps(backend: BackendPreference, caps: &ComputeCaps) -> Self {
+        let (lo, hi) = caps.subgroup_sizes;
+        let wave = if (lo..=hi).contains(&32) {
+            32
+        } else {
+            caps.default_subgroup
+        };
+        let has = |a: zengpu_hal::DType, acc: zengpu_hal::DType| {
+            caps.mma.iter().any(|s| {
+                (s.m, s.n, s.k) == (16, 16, 16)
+                    && s.a == a
+                    && s.b == a
+                    && s.acc == acc
+                    && s.subgroup == wave
+            })
+        };
+        Target {
+            backend,
+            wave_size: wave,
+            lds_bytes: caps.shared_bytes,
+            has_mma_f16: has(zengpu_hal::DType::F16, zengpu_hal::DType::F32),
+            has_mma_i8: has(zengpu_hal::DType::I8, zengpu_hal::DType::I32),
         }
     }
 
