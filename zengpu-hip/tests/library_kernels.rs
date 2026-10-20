@@ -4,6 +4,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::env;
+use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -2258,11 +2261,11 @@ fn zsl_one_buffer_two_element_types_matches_cpu() {
 
 /// Zetna kernel sources; comparison tests skip without `ZETNA_HIP_DIR`.
 fn zetna_hip_source(files: &[&str]) -> Option<String> {
-    let dir = std::env::var_os("ZETNA_HIP_DIR")?;
+    let dir = env::var_os("ZETNA_HIP_DIR")?;
     let mut src = String::new();
     for f in files {
-        let path = std::path::Path::new(&dir).join(f);
-        src.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")));
+        let path = Path::new(&dir).join(f);
+        src.push_str(&fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")));
         src.push('\n');
     }
     Some(src)
@@ -2291,18 +2294,18 @@ fn hip_time_ms(
             .collect();
         device.dispatch_batch(&ops).unwrap();
     };
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     batch(1);
     batch(1);
     let one = t0.elapsed().as_secs_f64().max(1e-6);
     let k = ((0.02 / one).round() as usize).max(1);
-    let warm = std::time::Instant::now();
+    let warm = Instant::now();
     while warm.elapsed().as_secs_f64() < 0.3 {
         batch(k);
     }
     let mut ms: Vec<f64> = (0..10)
         .map(|_| {
-            let t = std::time::Instant::now();
+            let t = Instant::now();
             batch(k);
             t.elapsed().as_secs_f64() * 1e3 / k as f64
         })
