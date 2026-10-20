@@ -14,10 +14,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parses a buffer element type: the scalars plus `bf16`.
+    /// Buffer element type: scalars plus `bf16`, which is storage-only (never a local, param or
+    /// push field).
     ///
-    /// `bf16` is storage-only. It is valid as a buffer element, never as a local, param or
-    /// push field.
+    /// `u32x2` and `u32x4` are 8- and 16-byte views of a `buffer<u32>`. Allocations must be
+    /// whole elements.
     pub(super) fn parse_buffer_elem_type(&mut self) -> Result<TypeId, ParseError> {
         let name = self.ident()?;
         match name.as_str() {
@@ -28,8 +29,10 @@ impl<'a> Parser<'a> {
             "f16" => Ok(self.types.f16_id()),
             "i8" => Ok(self.types.intern(i8_type())),
             "u8" => Ok(self.types.intern(u8_type())),
+            "u32x2" => Ok(self.types.u32_vec_id(2)),
+            "u32x4" => Ok(self.types.u32_vec_id(4)),
             other => self.err(format!(
-                "unsupported buffer element type `{other}`; use u32, i32, f32, bf16, f16, i8, or u8"
+                "unsupported buffer element type `{other}`; use u32, i32, f32, bf16, f16, i8, u8, u32x2, or u32x4"
             )),
         }
     }

@@ -6,7 +6,9 @@ use crate::backend::cuda::{CudaShader, ENTRY};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
-use crate::ir::typeck::{ComputeTypeCtx, StorageElem, storage_elem, type_of_compute_expr};
+use crate::ir::typeck::{
+    ComputeTypeCtx, StorageElem, storage_elem, type_of_compute_expr, u32_vec_lanes,
+};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
@@ -461,6 +463,8 @@ fn cuda_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
             format: FloatFormat::F32,
         } => Ok("float"),
         Type::Bool => Ok("bool"),
+        Type::Vector { lanes: 2, .. } => Ok("uint2"),
+        Type::Vector { lanes: 4, .. } => Ok("uint4"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("CUDA backend: unsupported scalar type {other:?}"),
@@ -486,6 +490,8 @@ fn cuda_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
         Type::Float {
             format: FloatFormat::Bf16,
         } => Ok("unsigned short"),
+        Type::Vector { lanes: 2, .. } => Ok("uint2"),
+        Type::Vector { lanes: 4, .. } => Ok("uint4"),
         Type::Float {
             format: FloatFormat::F16,
         } => Ok("__half"),
@@ -692,12 +698,14 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 "kernels with texture params are rejected before emission",
             ));
         }
-        IrExpr::Construct { dim, args, .. } => {
+        IrExpr::Construct { ty, dim, args } => {
             let mut args_s = Vec::with_capacity(args.len());
             for a in args {
                 args_s.push(emit_expr(ctx, a)?);
             }
-            format!("make_float{}({})", dim, args_s.join(", "))
+            let u32_vec = ty.is_some_and(|t| u32_vec_lanes(&ctx.types.borrow(), t).is_some());
+            let prefix = if u32_vec { "make_uint" } else { "make_float" };
+            format!("{prefix}{}({})", dim, args_s.join(", "))
         }
         IrExpr::FragLoad { .. } => return Err(frag::expr_error("frag_load")),
         IrExpr::Builtin {

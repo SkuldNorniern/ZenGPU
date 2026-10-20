@@ -375,6 +375,17 @@ impl<'a> Parser<'a> {
             let stmt = match lhs {
                 IrExpr::Local(name) => {
                     self.check_frag_assign(ctx, &name, &rhs)?;
+                    if let Some(&local_ty) = ctx.locals.get(&name) {
+                        let rhs_ty = type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types);
+                        if (u32_vec_lanes(&self.types, local_ty).is_some()
+                            || u32_vec_lanes(&self.types, rhs_ty).is_some())
+                            && rhs_ty != local_ty
+                        {
+                            return self.err(format!(
+                                "assignment to `{name}` has a different vector type"
+                            ));
+                        }
+                    }
                     IrStmt::AssignLocal { name, value: rhs }
                 }
                 IrExpr::BufferLoad { buf, index } => {
@@ -518,6 +529,8 @@ impl<'a> Parser<'a> {
             None
         } else if self.at_kw("frag") {
             Some(self.parse_frag_type()?)
+        } else if self.at_kw("u32x2") || self.at_kw("u32x4") {
+            Some(self.parse_buffer_elem_type()?)
         } else {
             Some(self.parse_scalar_type()?)
         };
@@ -536,6 +549,9 @@ impl<'a> Parser<'a> {
                 let is_frag = frag_parts(&self.types, ty).is_some();
                 if is_frag && !is_zero_acc && init_ty != ty {
                     return self.err("let initializer does not match the frag annotation");
+                }
+                if u32_vec_lanes(&self.types, ty).is_some() && init_ty != ty {
+                    return self.err("let initializer does not match the vector annotation");
                 }
                 ty
             }
