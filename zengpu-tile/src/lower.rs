@@ -27,10 +27,8 @@ pub(crate) struct Plan {
     pub waves: usize,
     /// Lanes per wave the code assumes (`Mma` only; 0 otherwise).
     pub wave_size: usize,
-    /// Staging for `Mma` only.
-    ///
-    /// Without native shared arrays (Vulkan), f16 stages as f32, and B stages K x
-    /// N for `frag_load_b`.
+    /// `Mma` only: stage in the element type. B read with `frag_load_b_t` from its N x K block.
+    /// Without it f16 stages as f32 and B as K x N for `frag_load_b`.
     pub native_shared: bool,
     /// `Mma` only: `wave_rows * wave_cols = waves`. Stages per operand: 1, or 2 for
     /// double buffering.
@@ -43,6 +41,8 @@ pub(crate) struct Plan {
     /// `Mma` only: k groups (grid `z`), each writing a partial tile to the workspace. 1 = no split;
     /// above 1, [`reduce_zsl`] runs second.
     pub split_k: usize,
+    /// `Mma` only: `@waves_per_eu(min, max)` for the compiler, or none.
+    pub waves_per_eu: Option<(u32, u32)>,
 }
 
 impl Plan {
@@ -61,6 +61,7 @@ impl Plan {
             stages: 1,
             vector_loads: false,
             split_k: 1,
+            waves_per_eu: None,
         }
     }
 }
@@ -270,6 +271,7 @@ fn header(
     workgroup: usize,
     aliases: &[usize],
     workspace: bool,
+    waves_per_eu: Option<(u32, u32)>,
     src: &mut String,
 ) {
     let mut params: Vec<String> = kernel
@@ -293,6 +295,9 @@ fn header(
         params.push("ws: device mut buffer<f32>".to_string());
     }
     let _ = writeln!(src, "@workgroup_size({workgroup})");
+    if let Some((min, max)) = waves_per_eu {
+        let _ = writeln!(src, "@waves_per_eu({min}, {max})");
+    }
     let _ = writeln!(src, "kernel {}({}) {{", kernel.name, params.join(", "));
     let _ = writeln!(src, "let gn = group_id().x");
     let _ = writeln!(src, "let gm = group_id().y");
@@ -315,7 +320,7 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
     }
 
     let mut src = String::new();
-    header(kernel, workgroup, &[], false, &mut src);
+    header(kernel, workgroup, &[], false, None, &mut src);
     let _ = writeln!(src, "for it in 0..{iters} {{");
     let _ = writeln!(src, "let e = local_id().x + it * {workgroup}");
     let _ = writeln!(src, "if e < {tile_elems} {{");
@@ -343,7 +348,7 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
 
     let mut g = Gen::new(kernel);
     let mut src = String::new();
-    header(kernel, wg, &[], false, &mut src);
+    header(kernel, wg, &[], false, None, &mut src);
     let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
     let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
     let _ = writeln!(src, "let lid = local_id().x");
@@ -431,7 +436,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     let mut g = Gen::new(kernel);
     let mut src = String::new();
     let aliases = vector_tensors(kernel, parts, plan);
-    header(kernel, wg, &aliases, split > 1, &mut src);
+    header(kernel, wg, &aliases, split > 1, plan.waves_per_eu, &mut src);
     if split > 1 {
         let _ = writeln!(src, "let gz = group_id().z");
     }
@@ -589,7 +594,7 @@ fn reduce_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
     let mut g = Gen::new(kernel);
     g.values[parts.dot_out.0] = Some("rsum".to_string());
     let mut src = String::new();
-    header(kernel, wg, &[], true, &mut src);
+    header(kernel, wg, &[], true, None, &mut src);
     let _ = writeln!(src, "let lid = local_id().x");
     let _ = writeln!(src, "for it in 0..{per} {{");
     let _ = writeln!(src, "let e = lid + it * {wg}");

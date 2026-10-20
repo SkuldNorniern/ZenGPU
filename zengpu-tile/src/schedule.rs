@@ -38,14 +38,15 @@ pub struct Schedule {
     /// Matrix form: stages per operand, 1 or 2. 0 means 1, since double buffering is slower on
     /// gfx1200 (sync copy).
     pub stages: u32,
-    /// Matrix form: 16-byte global loads for full interior blocks with 16-byte aligned rows.
-    ///
-    /// Edge and unaligned blocks use scalar loads. Needs native shared arrays, so it is off
-    /// on Vulkan.
+    /// Matrix form: 16-byte loads for full interior blocks if rows are 16-byte aligned, else
+    /// scalar. Vulkan needs an explicit workgroup layout.
     pub vector_loads: bool,
     /// Matrix form: k split into N groups, each writing a partial tile. A second pass sums them in
     /// group order (deterministic). 0 or 1 means no split. f16 x f16 -> f32 only.
     pub split_k: u32,
+    /// Matrix form only: `@waves_per_eu(min, max)` trades occupancy for fewer spills. `None` leaves
+    /// the choice to the compiler.
+    pub waves_per_eu: Option<(u32, u32)>,
 }
 
 impl Schedule {
@@ -62,6 +63,7 @@ impl Schedule {
             stages: 0,
             vector_loads: false,
             split_k: 1,
+            waves_per_eu: None,
         }
     }
 }
@@ -79,6 +81,7 @@ impl Default for Schedule {
             stages: 0,
             vector_loads: true,
             split_k: 1,
+            waves_per_eu: None,
         }
     }
 }
@@ -233,6 +236,7 @@ fn staged_plan(
         stages: 1,
         vector_loads: false,
         split_k: 1,
+        waves_per_eu: None,
     })
 }
 
@@ -282,10 +286,9 @@ fn mma_plan(
             1
         }
     };
-    let native = target.backend != BackendPreference::Vulkan;
     let operand_bytes = |d: DType| match d {
         DType::I8 => 1,
-        DType::F16 if native => 2,
+        DType::F16 => 2,
         _ => 4,
     };
     let stage_bytes =
@@ -312,12 +315,13 @@ fn mma_plan(
         workgroup: waves * wave,
         waves,
         wave_size: wave,
-        native_shared: native,
+        native_shared: true,
         wave_rows: nwr,
         wave_cols: nwc,
         stages: stages as usize,
-        vector_loads: schedule.vector_loads && native,
+        vector_loads: schedule.vector_loads,
         split_k,
+        waves_per_eu: schedule.waves_per_eu,
     })
 }
 

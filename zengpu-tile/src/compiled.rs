@@ -1,7 +1,7 @@
 
 use zengpu_hal::{
     BackendPreference, Bindings, BufferHandle, ComputePipelineDesc, ComputePipelineHints,
-    DispatchOp, GpuDevice, PipelineHandle, ShaderDesc, ShaderHandle,
+    DispatchOp, GpuDevice, PipelineHandle, PipelineStats, ShaderDesc, ShaderHandle,
 };
 
 use crate::TileError;
@@ -129,12 +129,13 @@ impl CompiledTile {
         };
         let hints = ComputePipelineHints {
             subgroup_size: self.subgroup,
-            capture_stats: false,
+            capture_stats: true,
         };
         match device.create_compute_pipeline_with(desc, hints) {
             Ok(pipeline) => Ok(TileProgram {
                 shader,
                 pipeline,
+                stats: device.pipeline_stats(pipeline),
                 grid: self.grid,
                 slots: self.bindings.len(),
                 aliases: self.aliases.clone(),
@@ -156,6 +157,8 @@ impl CompiledTile {
 pub struct TileProgram {
     shader: ShaderHandle,
     pipeline: PipelineHandle,
+    /// Main pass resource report, if the device gives one.
+    stats: Option<PipelineStats>,
     grid: [u32; 3],
     /// Tensor bindings. Buffers follow them, then the workspace if any.
     slots: usize,
@@ -165,6 +168,11 @@ pub struct TileProgram {
 }
 
 impl TileProgram {
+    /// `None` on a device without a report.
+    pub fn stats(&self) -> Option<PipelineStats> {
+        self.stats
+    }
+
     pub fn workspace_bytes(&self) -> u64 {
         self.workspace
     }

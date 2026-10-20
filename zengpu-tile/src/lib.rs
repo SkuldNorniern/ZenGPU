@@ -734,6 +734,44 @@ mod tests {
         assert!(!zsl.contains("u32x4"), "K = 37 must take the scalar path");
     }
 
+    /// The occupancy hint reaches the ZSL header and HIP launch bounds. Vulkan stages f16 natively
+    /// and uses 16-byte loads like HIP.
+    #[test]
+    fn occupancy_hint_and_native_vulkan_staging() {
+        let kernel = gemm(DType::F16, DType::F16, 256, 256, 256, [128, 128], 32, true).unwrap();
+        let sched = Schedule {
+            matrix: Matrix::Mma,
+            waves_per_eu: Some((1, 2)),
+            ..Schedule::default()
+        };
+        let hip = compile_with(&kernel, &sched, &Target::hip_gfx12()).unwrap();
+        assert!(hip.zsl().contains("@waves_per_eu(1, 2)"), "{}", hip.zsl());
+        assert!(
+            hip.hip()
+                .unwrap()
+                .text
+                .contains("amdgpu_waves_per_eu(1, 2)")
+        );
+
+        let vulkan = Target {
+            backend: BackendPreference::Vulkan,
+            ..Target::hip_gfx12()
+        };
+        let plain = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let vk = compile_with(&kernel, &plain, &vulkan).unwrap();
+        assert_eq!(vk.schedule_name(), "mma", "{:?}", vk.notes());
+        assert!(vk.zsl().contains("shared sa: array<f16, "), "{}", vk.zsl());
+        assert!(
+            vk.zsl().contains("b_a_v: device buffer<u32x4>"),
+            "{}",
+            vk.zsl()
+        );
+        assert!(!vk.zsl().contains("@waves_per_eu"));
+    }
+
     /// Exact binary16 bits for small integers, quarters and zero.
     fn f16_bits(x: f32) -> u16 {
         if x == 0.0 {
@@ -1016,16 +1054,291 @@ mod tests {
         }
     }
 
-    /// Benchmarks the HIP f16 GEMM schedules per shape.
+    #[derive(Clone, Copy, Debug)]
+    struct MmaCfg {
+        tile: [usize; 2],
+        bk: usize,
+        waves: u32,
+        rows: u32,
+        split: u32,
+        /// `@waves_per_eu(1, 2)`: trade occupancy for fewer spills.
+        wpe: bool,
+    }
+
+    impl MmaCfg {
+        fn label(&self) -> String {
+            let mut s = format!(
+                "mma {}x{} bk{} w{} r{}",
+                self.tile[0], self.tile[1], self.bk, self.waves, self.rows
+            );
+            if self.split > 1 {
+                s += &format!(" k{}", self.split);
+            }
+            if self.wpe {
+                s += " wpe";
+            }
+            s
+        }
+
+        fn schedule(&self) -> Schedule {
+            Schedule {
+                matrix: Matrix::Mma,
+                waves: self.waves,
+                wave_rows: self.rows,
+                stages: 0,
+                split_k: self.split,
+                waves_per_eu: self.wpe.then_some((1, 2)),
+                ..Schedule::default()
+            }
+        }
+
+        fn kernel(&self, (m, n, k): (usize, usize, usize)) -> TileKernel {
+            gemm(DType::F16, DType::F16, m, n, k, self.tile, self.bk, true).unwrap()
+        }
+    }
+
+    /// One timed config. Nonzero scratch bytes means the kernel spills.
+    struct Measured {
+        label: String,
+        ms: f64,
+        scratch: u32,
+        cfg: Option<MmaCfg>,
+        compiled: CompiledTile,
+    }
+
+    /// Splits of waves into rows, as `(waves, wave rows)`, tried. 0 rows is auto. Eight waves as 4
+    /// rows of 2x4 fragments beat auto on 128x128.
+    const WAVE_SPLITS: [(u32, u32); 3] = [(4, 0), (8, 0), (8, 4)];
+
+    fn hip_grid() -> Vec<MmaCfg> {
+        let mut grid = Vec::new();
+        for tile in [[64, 64], [128, 64], [128, 128]] {
+            for bk in [16, 32] {
+                for (waves, rows) in WAVE_SPLITS {
+                    grid.push(MmaCfg {
+                        tile,
+                        bk,
+                        waves,
+                        rows,
+                        split: 1,
+                        wpe: false,
+                    });
+                }
+            }
+        }
+        grid
+    }
+
+    /// Vulkan grid: same tiles at k step 16, two wave splits. Small to keep the bench short.
+    fn vulkan_grid() -> Vec<MmaCfg> {
+        let mut grid = Vec::new();
+        for tile in [[64, 64], [128, 64], [128, 128]] {
+            for (waves, rows) in [(4, 0), (8, 4)] {
+                grid.push(MmaCfg {
+                    tile,
+                    bk: 16,
+                    waves,
+                    rows,
+                    split: 1,
+                    wpe: false,
+                });
+            }
+        }
+        grid
+    }
+
+    fn shape_buffers(dev: &dyn GpuDevice, (m, n, k): (usize, usize, usize)) -> Vec<BufferHandle> {
+        let f16_bytes = |len: usize| -> Vec<u8> {
+            (0..len)
+                .flat_map(|i| f16_bits(((i * 7 + 3) % 9) as f32 - 4.0).to_le_bytes())
+                .collect()
+        };
+        let inputs = [
+            f16_bytes(m * k),
+            f16_bytes(n * k),
+            vec![0u8; n * 4],
+            vec![0u8; m * n * 2],
+        ];
+        inputs
+            .iter()
+            .map(|bytes| {
+                let h = dev
+                    .create_buffer(BufferDesc {
+                        size: bytes.len() as u64,
+                        usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+                        memory: MemoryUsage::GpuOnly,
+                    })
+                    .unwrap();
+                dev.write_buffer(h, 0, bytes).unwrap();
+                h
+            })
+            .collect()
+    }
+
+    /// `None` when the schedule does not resolve to `want` (the row says why).
+    #[allow(clippy::too_many_arguments)]
+    fn measure(
+        dev: &dyn GpuDevice,
+        target: &Target,
+        backend: &str,
+        shape: (usize, usize, usize),
+        label: &str,
+        kernel: &TileKernel,
+        sched: &Schedule,
+        handles: &[BufferHandle],
+        naive: bool,
+    ) -> Option<Measured> {
+        let (m, n, k) = shape;
+        let flops = 2.0 * m as f64 * n as f64 * k as f64;
+        let compiled = compile_with(kernel, sched, target).unwrap();
+        if compiled.schedule_name() != "mma" && sched.matrix == Matrix::Mma {
+            println!(
+                "| {m} | {n} | {k} | {backend} {label} | skipped: {:?} |",
+                compiled.notes()
+            );
+            return None;
+        }
+        let program = compiled.load(dev).unwrap();
+        let stats = program.stats();
+        let (vgprs, scratch) = stats.map_or((0, 0), |s| (s.vgprs, s.scratch_bytes));
+        let (run_handles, ws) = with_workspace(dev, &compiled, handles);
+        let (ms, min, max) = if naive {
+            let ms = time_naive(dev, &program, &run_handles);
+            (ms, ms, ms)
+        } else {
+            let t = time_program(dev, &program, &run_handles);
+            (t.median, t.min, t.max)
+        };
+        if let Some(ws) = ws {
+            dev.destroy_buffer(ws);
+        }
+        let spill = if scratch > 0 { " SPILL" } else { "" };
+        println!(
+            "| {m} | {n} | {k} | {backend} {label} ({}) | {ms:.3} | {min:.3} | {max:.3} | {:.2} | {vgprs} / {scratch}{spill} |",
+            compiled.schedule_name(),
+            flops / (ms * 1e-3) / 1e12
+        );
+        program.destroy(dev);
+        Some(Measured {
+            label: label.to_string(),
+            ms,
+            scratch,
+            cfg: None,
+            compiled,
+        })
+    }
+
+    /// Fastest non-spilling config. Spilling configs appear in the table but are never picked.
+    fn pick_best(rows: &[Measured]) -> Option<&Measured> {
+        rows.iter()
+            .filter(|r| r.scratch == 0)
+            .min_by(|a, b| a.ms.total_cmp(&b.ms))
+    }
+
+    /// Times `grid`, then tries split-K variants of the four fastest unsplit configs whose tiles
+    /// leave the GPU short.
+    #[allow(clippy::too_many_arguments)]
+    fn search(
+        dev: &dyn GpuDevice,
+        target: &Target,
+        backend: &str,
+        shape: (usize, usize, usize),
+        grid: &[MmaCfg],
+        splits: &[u32],
+        handles: &[BufferHandle],
+        naive: bool,
+    ) -> Vec<Measured> {
+        let (m, n, _) = shape;
+        let mut rows = Vec::new();
+        for cfg in grid {
+            let label = cfg.label();
+            let kernel = cfg.kernel(shape);
+            if let Some(mut row) = measure(
+                dev,
+                target,
+                backend,
+                shape,
+                &label,
+                &kernel,
+                &cfg.schedule(),
+                handles,
+                naive,
+            ) {
+                row.cfg = Some(*cfg);
+                rows.push(row);
+            }
+        }
+        let spilled: Vec<MmaCfg> = rows
+            .iter()
+            .filter(|r| r.scratch > 0)
+            .filter_map(|r| r.cfg)
+            .filter(|c| !c.wpe && c.tile[0] * c.tile[1] >= 128 * 64)
+            .collect();
+        for base in spilled {
+            let cfg = MmaCfg { wpe: true, ..base };
+            let kernel = cfg.kernel(shape);
+            if let Some(mut row) = measure(
+                dev,
+                target,
+                backend,
+                shape,
+                &cfg.label(),
+                &kernel,
+                &cfg.schedule(),
+                handles,
+                naive,
+            ) {
+                row.cfg = Some(cfg);
+                rows.push(row);
+            }
+        }
+        if splits.is_empty() {
+            return rows;
+        }
+        let mut short: Vec<(MmaCfg, f64)> = rows
+            .iter()
+            .filter(|r| r.scratch == 0)
+            .filter_map(|r| r.cfg.map(|c| (c, r.ms)))
+            .filter(|(c, _)| m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]) < 128)
+            .collect();
+        short.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for (base, _) in short.into_iter().take(4) {
+            for &sk in splits {
+                let cfg = MmaCfg { split: sk, ..base };
+                let kernel = cfg.kernel(shape);
+                if let Some(mut row) = measure(
+                    dev,
+                    target,
+                    backend,
+                    shape,
+                    &cfg.label(),
+                    &kernel,
+                    &cfg.schedule(),
+                    handles,
+                    naive,
+                ) {
+                    row.cfg = Some(cfg);
+                    rows.push(row);
+                }
+            }
+        }
+        rows
+    }
+
+    /// Benchmarks the f16 GEMM schedules per shape.
     ///
-    /// Run with `cargo test --release -p zengpu-tile bench_f16_gemm_hip -- --ignored --nocapture`.
-    /// Each shape tries O0 (up to 2048), scalar-staged, then mma search. The best mma config is
-    /// re-run 3x.
+    /// Run with `cargo test --release -p zengpu-tile bench_f16_gemm -- --ignored --nocapture`. Each
+    /// shape tries HIP O0 (up to 2048), scalar-staged, and mma search. Vulkan gets a smaller mma
+    /// search. Spilling configs print SPILL and are never picked. The best HIP config is re-run 3x
+    /// for spread.
     #[test]
     #[ignore]
-    fn bench_f16_gemm_hip() {
-        let Some(dev) = hip_device() else { return };
-        let target = caps_target(&*dev, BackendPreference::Hip);
+    fn bench_f16_gemm() {
+        let hip = hip_device();
+        let vulkan = vulkan_device();
+        if hip.is_none() && vulkan.is_none() {
+            return;
+        }
         let naive = env::var_os("ZENGPU_TILE_BENCH_NAIVE").is_some();
         print_environment();
         println!(
@@ -1048,184 +1361,152 @@ mod tests {
             (2048, 2048, 2048),
             (4096, 4096, 4096),
         ];
-        let scalar = Schedule {
-            matrix: Matrix::Scalar,
-            ..Schedule::default()
-        };
-        let mma = |waves: u32, wave_rows: u32| Schedule {
-            matrix: Matrix::Mma,
-            waves,
-            wave_rows,
-            stages: 0,
-            ..Schedule::default()
-        };
-        let tiles = [[64, 64], [128, 64], [128, 128]];
-        let bks = [16, 32];
-        let wave_splits = [(4, 0), (8, 0), (8, 4)];
         let only: Option<(usize, usize, usize)> =
             env::var("ZENGPU_TILE_BENCH_ONLY").ok().map(|v| {
                 let d: Vec<usize> = v.split('x').map(|x| x.parse().unwrap()).collect();
                 (d[0], d[1], d[2])
             });
         let mut summary: Vec<String> = Vec::new();
-        for (m, n, k) in shapes {
-            if only.is_some_and(|o| o != (m, n, k)) {
+        for shape in shapes {
+            if only.is_some_and(|o| o != shape) {
                 continue;
             }
+            let (m, n, k) = shape;
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
-            let f16_bytes = |len: usize| -> Vec<u8> {
-                (0..len)
-                    .flat_map(|i| f16_bits(((i * 7 + 3) % 9) as f32 - 4.0).to_le_bytes())
-                    .collect()
-            };
-            let inputs = [
-                f16_bytes(m * k),
-                f16_bytes(n * k),
-                vec![0u8; n * 4],
-                vec![0u8; m * n * 2],
-            ];
-            let mut handles = Vec::new();
-            for bytes in &inputs {
-                let h = dev
-                    .create_buffer(BufferDesc {
-                        size: bytes.len() as u64,
-                        usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
-                        memory: MemoryUsage::GpuOnly,
-                    })
-                    .unwrap();
-                dev.write_buffer(h, 0, bytes).unwrap();
-                handles.push(h);
-            }
-            println!("\n| M | N | K | schedule | ms median | min | max | TFLOPS |");
-            println!("|---|---|---|---|---|---|---|---|");
-            let mut mma_rows: Vec<(String, f64, CompiledTile)> = Vec::new();
-            let run = |label: String, kernel: &TileKernel, sched: &Schedule| -> Option<f64> {
-                let compiled = compile_with(kernel, sched, &target).unwrap();
-                let program = compiled.load(&*dev).unwrap();
-                let (run_handles, ws) = with_workspace(&*dev, &compiled, &handles);
-                let (ms, min, max) = if naive {
-                    let ms = time_naive(&*dev, &program, &run_handles);
-                    (ms, ms, ms)
-                } else {
-                    let t = time_program(&*dev, &program, &run_handles);
-                    (t.median, t.min, t.max)
+            println!(
+                "\n| M | N | K | schedule | ms median | min | max | TFLOPS | VGPR / scratch |"
+            );
+            println!("|---|---|---|---|---|---|---|---|---|");
+
+            if let Some(dev) = &hip {
+                let dev: &dyn GpuDevice = &**dev;
+                let target = caps_target(dev, BackendPreference::Hip);
+                let handles = shape_buffers(dev, shape);
+                let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+                if m.max(n).max(k) <= 2048 {
+                    measure(
+                        dev,
+                        &target,
+                        "hip",
+                        shape,
+                        "O0",
+                        &base,
+                        &Schedule::o0(),
+                        &handles,
+                        naive,
+                    );
+                }
+                let scalar = Schedule {
+                    matrix: Matrix::Scalar,
+                    ..Schedule::default()
                 };
-                if let Some(ws) = ws {
-                    dev.destroy_buffer(ws);
-                }
-                println!(
-                    "| {m} | {n} | {k} | {label} ({}) | {ms:.3} | {min:.3} | {max:.3} | {:.2} |",
-                    compiled.schedule_name(),
-                    flops / (ms * 1e-3) / 1e12
+                measure(
+                    dev,
+                    &target,
+                    "hip",
+                    shape,
+                    "scalar-tiled 64x64x16",
+                    &base,
+                    &scalar,
+                    &handles,
+                    naive,
                 );
-                program.destroy(&*dev);
-                Some(ms)
-            };
-            let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
-            if m.max(n).max(k) <= 2048 {
-                run("O0".into(), &base, &Schedule::o0());
-            }
-            run("scalar-tiled 64x64x16".into(), &base, &scalar);
-            for tile in tiles {
-                for bk in bks {
-                    let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-                    for (w, wr) in wave_splits {
-                        let label = format!("mma {}x{} bk{bk} w{w} r{wr}", tile[0], tile[1]);
-                        let sched = mma(w, wr);
-                        let compiled = compile_with(&kernel, &sched, &target).unwrap();
-                        if compiled.schedule_name() != "mma" {
-                            println!(
-                                "| {m} | {n} | {k} | {label} | skipped: {:?} |",
-                                compiled.notes()
-                            );
-                            continue;
-                        }
-                        let Some(ms) = run(label.clone(), &kernel, &sched) else {
-                            continue;
-                        };
-                        mma_rows.push((label, ms, compiled));
-                    }
-                }
-            }
-            let mut short: Vec<(String, f64)> = mma_rows
-                .iter()
-                .filter(|r| {
-                    let (tile, ..) = parse_label(&r.0);
-                    m.div_ceil(tile[0]) * n.div_ceil(tile[1]) < 128
-                })
-                .map(|r| (r.0.clone(), r.1))
-                .collect();
-            short.sort_by(|a, b| a.1.total_cmp(&b.1));
-            for (base, _) in short.iter().take(4) {
-                let (tile, bk, w, wr, _) = parse_label(base);
-                for sk in [2, 4, 8] {
-                    let label = format!("{base} k{sk}");
-                    let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-                    let sched = Schedule {
-                        split_k: sk,
-                        ..mma(w, wr)
+                let rows = search(
+                    dev,
+                    &target,
+                    "hip",
+                    shape,
+                    &hip_grid(),
+                    &[2, 4, 8],
+                    &handles,
+                    naive,
+                );
+                if let Some(best) = pick_best(&rows) {
+                    let cfg = best.cfg.unwrap();
+                    println!("best search: {} at {:.3} ms", best.label, best.ms);
+                    let kernel = cfg.kernel(shape);
+                    let scalar_loads = Schedule {
+                        vector_loads: false,
+                        ..cfg.schedule()
                     };
-                    let compiled = compile_with(&kernel, &sched, &target).unwrap();
-                    if let Some(ms) = run(label.clone(), &kernel, &sched) {
-                        mma_rows.push((label, ms, compiled));
+                    measure(
+                        dev,
+                        &target,
+                        "hip",
+                        shape,
+                        &format!("{} scalar loads", best.label),
+                        &kernel,
+                        &scalar_loads,
+                        &handles,
+                        naive,
+                    );
+                    if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
+                        println!("{}", best.compiled.zsl());
                     }
+                    let compiled = compile_with(&kernel, &cfg.schedule(), &target).unwrap();
+                    let program = compiled.load(dev).unwrap();
+                    let (run_handles, ws) = with_workspace(dev, &compiled, &handles);
+                    let mut medians = Vec::new();
+                    for rep in 0..3 {
+                        let t = time_program(dev, &program, &run_handles);
+                        println!(
+                            "rerun {rep}: {} median {:.3} ms min {:.3} max {:.3} TFLOPS {:.2}",
+                            best.label,
+                            t.median,
+                            t.min,
+                            t.max,
+                            flops / (t.median * 1e-3) / 1e12
+                        );
+                        medians.push(t.median);
+                    }
+                    if let Some(ws) = ws {
+                        dev.destroy_buffer(ws);
+                    }
+                    program.destroy(dev);
+                    let med = timing(medians);
+                    summary.push(format!(
+                        "| {m} x {n} x {k} | hip {} | {:.3} | {:.3}..{:.3} | {:.2} |",
+                        best.label,
+                        med.median,
+                        med.min,
+                        med.max,
+                        flops / (med.median * 1e-3) / 1e12
+                    ));
+                }
+                for h in handles {
+                    dev.destroy_buffer(h);
                 }
             }
-            let best = mma_rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
-            println!("best search: {} at {:.3} ms", best.0, best.1);
-            let (tile, bk, w, wr, split) = parse_label(&best.0);
-            let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-            let scalar_loads = Schedule {
-                vector_loads: false,
-                split_k: split,
-                ..mma(w, wr)
-            };
-            run(format!("{} scalar loads", best.0), &kernel, &scalar_loads);
-            if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
-                println!("{}", best.2.zsl());
-            }
-            let best_kernel = best.0.clone();
-            let (tile, bk, w, wr, split) = parse_label(&best_kernel);
-            let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
-            let sched = Schedule {
-                split_k: split,
-                ..mma(w, wr)
-            };
-            let compiled = compile_with(&kernel, &sched, &target).unwrap();
-            let program = compiled.load(&*dev).unwrap();
-            let (run_handles, ws) = with_workspace(&*dev, &compiled, &handles);
-            let mut medians = Vec::new();
-            for rep in 0..3 {
-                let t = time_program(&*dev, &program, &run_handles);
-                println!(
-                    "rerun {rep}: {} median {:.3} ms min {:.3} max {:.3} TFLOPS {:.2}",
-                    best_kernel,
-                    t.median,
-                    t.min,
-                    t.max,
-                    flops / (t.median * 1e-3) / 1e12
+
+            if let Some(dev) = &vulkan {
+                let dev: &dyn GpuDevice = &**dev;
+                let target = caps_target(dev, BackendPreference::Vulkan);
+                let handles = shape_buffers(dev, shape);
+                let rows = search(
+                    dev,
+                    &target,
+                    "vulkan",
+                    shape,
+                    &vulkan_grid(),
+                    &[],
+                    &handles,
+                    naive,
                 );
-                medians.push(t.median);
-            }
-            if let Some(ws) = ws {
-                dev.destroy_buffer(ws);
-            }
-            program.destroy(&*dev);
-            let med = timing(medians.clone());
-            summary.push(format!(
-                "| {m} x {n} x {k} | {best_kernel} | {:.3} | {:.3}..{:.3} | {:.2} |",
-                med.median,
-                med.min,
-                med.max,
-                flops / (med.median * 1e-3) / 1e12
-            ));
-            for h in handles {
-                dev.destroy_buffer(h);
+                if let Some(best) = pick_best(&rows) {
+                    println!("best vulkan search: {} at {:.3} ms", best.label, best.ms);
+                    summary.push(format!(
+                        "| {m} x {n} x {k} | vulkan {} | {:.3} | single run | {:.2} |",
+                        best.label,
+                        best.ms,
+                        flops / (best.ms * 1e-3) / 1e12
+                    ));
+                }
+                for h in handles {
+                    dev.destroy_buffer(h);
+                }
             }
         }
-        println!(
-            "\n| M x N x K | best mma config | median ms (3 reruns) | rerun range ms | TFLOPS |"
-        );
+        println!("\n| M x N x K | best config | median ms | rerun range ms / note | TFLOPS |");
         println!("|---|---|---|---|---|");
         for line in summary {
             println!("{line}");
@@ -1252,18 +1533,6 @@ mod tests {
             .unwrap();
         all.push(ws);
         (all, Some(ws))
-    }
-
-    fn parse_label(label: &str) -> ([usize; 2], usize, u32, u32, u32) {
-        let parts: Vec<&str> = label.split(' ').collect();
-        let tile: Vec<usize> = parts[1].split('x').map(|v| v.parse().unwrap()).collect();
-        let bk = parts[2].trim_start_matches("bk").parse().unwrap();
-        let w = parts[3].trim_start_matches('w').parse().unwrap();
-        let wr = parts[4].trim_start_matches('r').parse().unwrap();
-        let split = parts
-            .get(5)
-            .map_or(1, |p| p.trim_start_matches('k').parse().unwrap());
-        ([tile[0], tile[1]], bk, w, wr, split)
     }
 
     const EXPECTED_GEMM_TEXT: &str = "tile v0 kernel gemm tile [32, 32]
