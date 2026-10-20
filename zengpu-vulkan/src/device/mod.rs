@@ -4314,7 +4314,7 @@ mod tests {
         const PACKED_ZSL: ZslShader = zsl!(
             push P { n: u32 }
             @workgroup_size(64)
-            kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, p: P, id: global_id) {
+            kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, o9: device mut buffer<u32>, o10: device mut buffer<u32>, p: P, id: global_id) {
                 let i = id.x
                 if i < p.n {
                     o1[i] = pk_add_u16(x[i], y[i])
@@ -4326,6 +4326,8 @@ mod tests {
                     o7[i] = funnel_shr(x[i], y[i], z[i])
                     o8[i] = byte_perm(x[i], y[i], z[i])
                     of[i] = dot2_f16(x[i], y[i], f[i])
+                    o9[i] = pk_mul_f16(x[i], 0x3c003c00u32)
+                    o10[i] = pk_add_u16(x[i], 0x3c003c00u32) + (-2147483648) + 0b1010 + 0o17 + 0xffffffffu32
                 }
             }
         );
@@ -4386,7 +4388,9 @@ mod tests {
                 buf
             })
             .collect();
-        let outs: Vec<_> = (0..9).map(|_| dev.create_buffer(output).unwrap()).collect();
+        let outs: Vec<_> = (0..11)
+            .map(|_| dev.create_buffer(output).unwrap())
+            .collect();
 
         let shader = dev.create_shader(PACKED_ZSL.spirv_desc()).unwrap();
         let pipeline = dev
@@ -4420,6 +4424,19 @@ mod tests {
         use packed_ref as r;
         for i in 0..n as usize {
             let (x, y, z) = (xs[i], ys[i], zs[i]);
+            assert!(
+                r::same_f16x2(got[9][i], r::lanes(x, 0x3c00_3c00, r::mul16)),
+                "pk_mul_f16 with a hex literal at {i}: x={x:08x}"
+            );
+            assert_eq!(
+                got[10][i],
+                r::pk_add_u16(x, 0x3c00_3c00)
+                    .wrapping_add(0x8000_0000)
+                    .wrapping_add(10)
+                    .wrapping_add(15)
+                    .wrapping_add(0xffff_ffff),
+                "literal expression at {i}"
+            );
             let want = [
                 r::pk_add_u16(x, y),
                 r::pk_mul_u16(x, y),

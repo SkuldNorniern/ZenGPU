@@ -63,6 +63,69 @@ pub struct LexError {
     pub at: usize,
 }
 
+fn radix_prefix(bytes: &[u8], i: usize) -> Option<u32> {
+    if bytes.get(i) != Some(&b'0') {
+        return None;
+    }
+    match bytes.get(i + 1)? {
+        b'x' | b'X' => Some(16),
+        b'b' | b'B' => Some(2),
+        b'o' | b'O' => Some(8),
+        _ => None,
+    }
+}
+
+/// `_` may separate digits in numeric literals.
+///
+/// Only the `u...` and `i...` suffixes apply. Hex digits include `b`, `e` and `f`, so `0x1f32` is
+/// one number.
+fn lex_radix_int(src: &str, start: usize, radix: u32) -> Result<(u64, usize), LexError> {
+    let bytes = src.as_bytes();
+    let n = bytes.len();
+    let mut i = start + 2;
+    while i < n && (bytes[i] == b'_' || (bytes[i] as char).is_digit(radix)) {
+        i += 1;
+    }
+    let digits: String = src[start + 2..i].chars().filter(|&c| c != '_').collect();
+    if digits.is_empty() {
+        return Err(LexError {
+            msg: "integer literal has no digits".into(),
+            at: start,
+        });
+    }
+    if i < n && (bytes[i] == b'u' || bytes[i] == b'i') {
+        i += 1;
+        while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+    }
+    if i < n && bytes[i].is_ascii_alphanumeric() {
+        return Err(LexError {
+            msg: format!("invalid digit in base-{radix} integer literal"),
+            at: i,
+        });
+    }
+    let v = u64::from_str_radix(&digits, radix).map_err(|_| LexError {
+        msg: format!(
+            "integer literal `{}` does not fit in 32 bits",
+            &src[start..i]
+        ),
+        at: start,
+    })?;
+    Ok((checked_u32(v, start)?, i))
+}
+
+/// Values are 32-bit. Wider literals truncate silently.
+fn checked_u32(v: u64, at: usize) -> Result<u64, LexError> {
+    if v > u64::from(u32::MAX) {
+        return Err(LexError {
+            msg: format!("integer literal {v} does not fit in 32 bits"),
+            at,
+        });
+    }
+    Ok(v)
+}
+
 pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
     let bytes = src.as_bytes();
     let n = bytes.len();
@@ -120,6 +183,15 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
         }
 
         if c.is_ascii_digit() {
+            if let Some(radix) = radix_prefix(bytes, i) {
+                let (v, end) = lex_radix_int(src, i, radix)?;
+                out.push(Token {
+                    tok: Tok::Int(v),
+                    span: Span { start: i, end },
+                });
+                i = end;
+                continue;
+            }
             let start = i;
             i += 1;
             while i < n && bytes[i].is_ascii_digit() {
@@ -169,10 +241,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     at: start,
                 })?)
             } else {
-                Tok::Int(text.parse::<u64>().map_err(|_| LexError {
+                let v = text.parse::<u64>().map_err(|_| LexError {
                     msg: format!("invalid integer literal `{text}`"),
                     at: start,
-                })?)
+                })?;
+                Tok::Int(checked_u32(v, start)?)
             };
             out.push(Token {
                 tok,
@@ -267,6 +340,20 @@ mod tests {
     fn numeric_suffixes_ignored() {
         assert_eq!(kinds("256u32"), vec![Tok::Int(256)]);
         assert_eq!(kinds("1f32"), vec![Tok::Float(1.0)]);
+    }
+
+    #[test]
+    fn radix_literals() {
+        assert_eq!(kinds("0x3c003c00u32"), vec![Tok::Int(0x3c00_3c00)]);
+        assert_eq!(kinds("0xFFFF_FFFFu32"), vec![Tok::Int(0xffff_ffff)]);
+        assert_eq!(kinds("0x1f32"), vec![Tok::Int(0x1f32)]);
+        assert_eq!(kinds("0b1010i32"), vec![Tok::Int(10)]);
+        assert_eq!(kinds("0o17"), vec![Tok::Int(15)]);
+        assert_eq!(kinds("0u32"), vec![Tok::Int(0)]);
+        assert!(lex("0x").is_err());
+        assert!(lex("0b102").is_err());
+        assert!(lex("4294967296").is_err());
+        assert!(lex("0x1_0000_0000").is_err());
     }
 
     #[test]
