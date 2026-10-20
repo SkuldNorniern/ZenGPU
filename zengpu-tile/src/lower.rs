@@ -27,6 +27,11 @@ pub(crate) struct Plan {
     pub waves: usize,
     /// Lanes per wave the code assumes (`Mma` only; 0 otherwise).
     pub wave_size: usize,
+    /// Staging for `Mma` only.
+    ///
+    /// Without native shared arrays (Vulkan), f16 stages as f32, and B stages K x
+    /// N for `frag_load_b`.
+    pub native_shared: bool,
 }
 
 impl Plan {
@@ -39,6 +44,7 @@ impl Plan {
             workgroup,
             waves: 1,
             wave_size: 0,
+            native_shared: false,
         }
     }
 }
@@ -258,15 +264,31 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
     };
     let mut src = String::new();
     header(kernel, wg, &mut src);
-    let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
-    let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
+    let native = mma && plan.native_shared;
+    let (ea, eb) = if native {
+        (parts.a_dtype, parts.b_dtype)
+    } else {
+        let scalar_staged = |d: DType| if d == DType::F16 { DType::F32 } else { d };
+        if mma {
+            (scalar_staged(parts.a_dtype), scalar_staged(parts.b_dtype))
+        } else {
+            (DType::F32, DType::F32)
+        }
+    };
+    let acc = kernel.values[parts.dot_out.0].dtype;
+    let _ = writeln!(src, "shared sa: array<{}, {}>", buffer_elem(ea), bm * bk);
+    let _ = writeln!(src, "shared sb: array<{}, {}>", buffer_elem(eb), bk * bn);
     if mma {
-        let _ = writeln!(src, "shared sc: array<f32, {elems}>");
+        let _ = writeln!(src, "shared sc: array<{}, {elems}>", buffer_elem(acc));
         let _ = writeln!(src, "let lid = local_id().x");
         let _ = writeln!(src, "let wv = lid / {}", plan.wave_size);
         for j in 0..frags_per_wave {
             let _ = writeln!(src, "let f{j}: u32 = wv + {}", j * waves);
-            let _ = writeln!(src, "let c{j}: frag<f32, 16, 16, acc> = frag_zero_acc()");
+            let _ = writeln!(
+                src,
+                "let c{j}: frag<{}, 16, 16, acc> = frag_zero_acc()",
+                buffer_elem(acc)
+            );
         }
     } else {
         let _ = writeln!(src, "let lid = local_id().x");
@@ -277,20 +299,26 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
 
     let _ = writeln!(src, "for kt in 0..{ksteps} {{");
     g.stage(&mut src, "sa", parts.a, [bm, bk], false, wg);
-    g.stage(&mut src, "sb", parts.b, [bn, bk], mma, wg);
+    g.stage(&mut src, "sb", parts.b, [bn, bk], mma && !native, wg);
     let _ = writeln!(src, "barrier()");
     if mma {
         let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
         for j in 0..frags_per_wave {
             let _ = writeln!(
                 src,
-                "let fa{j}: frag<f16, 16, 16, a> = frag_load_a(sa, (f{j} / {fn_cols}) * {} + kq * 16, {bk})",
-                16 * bk
+                "let fa{j}: frag<{ea}, 16, 16, a> = frag_load_a(sa, (f{j} / {fn_cols}) * {} + kq * 16, {bk})",
+                16 * bk,
+                ea = buffer_elem(parts.a_dtype),
             );
+            let fb = if native {
+                format!("frag_load_b_t(sb, (f{j} % {fn_cols}) * {} + kq * 16, {bk})", 16 * bk)
+            } else {
+                format!("frag_load_b(sb, kq * {} + (f{j} % {fn_cols}) * 16, {bn})", 16 * bn)
+            };
             let _ = writeln!(
                 src,
-                "let fb{j}: frag<f16, 16, 16, b> = frag_load_b(sb, kq * {} + (f{j} % {fn_cols}) * 16, {bn})",
-                16 * bn
+                "let fb{j}: frag<{}, 16, 16, b> = {fb}",
+                buffer_elem(parts.b_dtype)
             );
             let _ = writeln!(src, "c{j} = mma(fa{j}, fb{j}, c{j})");
         }

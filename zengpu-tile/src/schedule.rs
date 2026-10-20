@@ -205,6 +205,7 @@ fn staged_plan(
         workgroup: waves * wave,
         waves: 1,
         wave_size: wave,
+        native_shared: false,
     })
 }
 
@@ -215,15 +216,20 @@ fn mma_plan(
     waves: usize,
     notes: &mut Vec<String>,
 ) -> Result<Plan, String> {
-    if !target.has_mma_f16 {
-        return Err("target has no f16 matrix unit".to_string());
-    }
     let acc = kernel.values[parts.dot_out.0].dtype;
-    if (parts.a_dtype, parts.b_dtype, acc) != (DType::F16, DType::F16, DType::F32) {
-        return Err(format!(
-            "dot is {} x {} -> {acc}; the matrix unit runs f16 x f16 -> f32",
-            parts.a_dtype, parts.b_dtype
-        ));
+    let elem = (parts.a_dtype, parts.b_dtype, acc);
+    let (has, want) = match elem {
+        (DType::F16, DType::F16, DType::F32) => (target.has_mma_f16, "f16"),
+        (DType::I8, DType::I8, DType::I32) => (target.has_mma_i8, "i8"),
+        _ => {
+            return Err(format!(
+                "dot is {} x {} -> {acc}; the matrix unit runs f16 x f16 -> f32 and i8 x i8 -> i32",
+                parts.a_dtype, parts.b_dtype
+            ));
+        }
+    };
+    if !has {
+        return Err(format!("target has no {want} matrix unit"));
     }
     let [bm, bn] = kernel.tile;
     let bk = parts.step;
@@ -255,5 +261,6 @@ fn mma_plan(
         workgroup: waves * wave,
         waves,
         wave_size: wave,
+        native_shared: target.backend != BackendPreference::Vulkan,
     })
 }

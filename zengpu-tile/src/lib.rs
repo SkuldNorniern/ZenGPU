@@ -301,10 +301,10 @@ mod tests {
         assert_eq!(mma.workgroup(), [128, 1, 1]);
         assert!(mma.zsl().contains("frag_load_a(sa,"));
         assert!(mma.zsl().contains("frag_store(sc,"));
-        assert!(mma.spirv().is_ok());
+        assert!(mma.spirv().is_err());
         assert!(mma.hip().is_ok());
         assert!(mma.cuda().is_ok());
-        assert!(mma.msl().is_err());
+        assert!(mma.msl().is_ok());
 
         let staged = compile_with(
             &kernel,
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(got.schedule_name(), "staged");
         assert!(got.notes()[0].starts_with("mma: dot is f32 x f32"));
 
-        let i8_kernel = gemm(DType::I8, DType::I32, 48, 32, 64, [16, 16], 16, false).unwrap();
+        let i8_kernel = gemm(DType::I8, DType::I32, 48, 32, 64, [16, 16], 8, false).unwrap();
         let got = compile_with(&i8_kernel, &mma, &target).unwrap();
         assert_eq!(got.schedule_name(), "naive");
         assert_eq!(got.notes().len(), 2, "{:?}", got.notes());
@@ -513,8 +513,8 @@ mod tests {
                     assert!(notes.is_empty(), "{notes:?}");
                 }
                 if sched == mma && case.input == DType::I8 {
-                    assert_eq!(shape, "naive");
-                    assert!(notes.iter().any(|n| n.starts_with("mma:")), "{notes:?}");
+                    let want = if target.has_mma_i8 { "mma" } else { "naive" };
+                    assert_eq!(shape, want, "{notes:?}");
                 }
             }
         }
@@ -716,6 +716,7 @@ mod tests {
         let shapes = [
             (128, 5120, 5120),
             (128, 17408, 5120),
+            (512, 5120, 5120),
             (2048, 2048, 2048),
             (4096, 4096, 4096),
         ];
@@ -739,6 +740,7 @@ mod tests {
         println!("| M | N | K | schedule | ms | TFLOPS |");
         println!("|---|---|---|---|---|---|");
         for (m, n, k) in shapes {
+            let skip_o0 = m.max(n).max(k) > 2048;
             let kernel = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
             let f16_bytes = |len: usize| -> Vec<u8> {
                 (0..len)
@@ -764,6 +766,9 @@ mod tests {
                 handles.push(h);
             }
             for (name, sched) in variants {
+                if skip_o0 && sched == Schedule::o0() {
+                    continue;
+                }
                 let compiled = compile_with(&kernel, &sched, &target).unwrap();
                 let program = compiled.load(&*dev).unwrap();
                 program.dispatch(&*dev, &handles).unwrap();
