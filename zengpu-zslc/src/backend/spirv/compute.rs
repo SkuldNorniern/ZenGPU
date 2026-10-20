@@ -17,6 +17,7 @@ mod glsl_op {
     pub const POW: u32 = 26;
     pub const EXP: u32 = 27;
     pub const ROUND_EVEN: u32 = 2;
+    pub const INVERSE_SQRT: u32 = 32;
     pub const LOG: u32 = 28;
     pub const SQRT: u32 = 31;
     pub const F_MIN: u32 = 37;
@@ -1534,6 +1535,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
         | BuiltinFn::Tan
         | BuiltinFn::Log
         | BuiltinFn::Sqrt
+        | BuiltinFn::Rsqrt
         | BuiltinFn::Floor
         | BuiltinFn::Ceil
         | BuiltinFn::Fract => {
@@ -1555,6 +1557,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 BuiltinFn::Tan => glsl_op::TAN,
                 BuiltinFn::Log => glsl_op::LOG,
                 BuiltinFn::Sqrt => glsl_op::SQRT,
+                BuiltinFn::Rsqrt => glsl_op::INVERSE_SQRT,
                 BuiltinFn::Floor => glsl_op::FLOOR,
                 BuiltinFn::Ceil => glsl_op::CEIL,
                 BuiltinFn::Fract => glsl_op::FRACT,

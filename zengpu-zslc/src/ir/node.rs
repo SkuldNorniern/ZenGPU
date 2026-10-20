@@ -156,6 +156,8 @@ pub enum BuiltinFn {
     IsFinite,
     Log,
     Sqrt,
+    /// Reciprocal square root. Uses `rsqrtf` on HIP and CUDA.
+    Rsqrt,
     Floor,
     Ceil,
     Fract,
@@ -285,6 +287,7 @@ impl BuiltinFn {
             BuiltinFn::IsFinite => "isfinite",
             BuiltinFn::Log => "log",
             BuiltinFn::Sqrt => "sqrt",
+            BuiltinFn::Rsqrt => "rsqrt",
             BuiltinFn::Floor => "floor",
             BuiltinFn::Ceil => "ceil",
             BuiltinFn::Fract => "fract",
