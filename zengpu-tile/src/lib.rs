@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(mma.workgroup(), [128, 1, 1]);
         assert!(mma.zsl().contains("frag_load_a(sa"));
         assert!(mma.zsl().contains("frag_store(sc,"));
-        assert!(mma.spirv().is_err());
+        assert!(mma.spirv().is_ok());
         assert!(mma.hip().is_ok());
         assert!(mma.cuda().is_ok());
         assert!(mma.msl().is_ok());
