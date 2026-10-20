@@ -1872,7 +1872,6 @@ dependencies = [
  "cc",
  "cuda-oxide",
  "log",
- "zengpu-compute",
  "zengpu-hal",
  "zengpu-spirv",
 ]
