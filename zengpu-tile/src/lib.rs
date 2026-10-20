@@ -81,6 +81,7 @@ pub fn compile_with(
 ) -> Result<CompiledTile, TileError> {
     let (plan, notes) = schedule::resolve(kernel, schedule, target);
     let zsl = lower::zsl_source(kernel, &plan)?;
+    let aliases = lower::alias_tensors(kernel, &plan);
     let module = parse_compute(&zsl).map_err(|e| {
         TileError::Lower(format!(
             "generated ZSL does not parse: {} (at {:?})",
@@ -113,6 +114,7 @@ pub fn compile_with(
         subgroup: (plan.mode == lower::Mode::Mma).then_some(plan.wave_size as u32),
         notes,
         bindings,
+        aliases,
         spirv: backend("spirv", spirv::lower_compute(&module).map(|w| w.to_vec())),
         hip: backend(
             "hip",
@@ -542,8 +544,12 @@ mod tests {
             matrix: Matrix::Scalar,
             ..Schedule::default()
         };
+        let scalar_loads = Schedule {
+            vector_loads: false,
+            ..mma
+        };
         for case in SCHEDULED {
-            for sched in [Schedule::o0(), staged, mma] {
+            for sched in [Schedule::o0(), staged, mma, scalar_loads] {
                 let (shape, notes) = run_case(dev, target, case, &sched).unwrap();
                 if sched == mma && case.input == DType::F16 {
                     assert_eq!(shape, "mma", "{}x{}x{}", case.m, case.n, case.k);
@@ -555,6 +561,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 16-byte copies for interior blocks of aligned rows. Other shapes keep the scalar copy.
+    #[test]
+    fn vector_loads_follow_alignment() {
+        let mma = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let target = Target::hip_gfx12();
+        let aligned = gemm(DType::F16, DType::F16, 256, 256, 256, [128, 128], 32, true).unwrap();
+        let zsl = compile_with(&aligned, &mma, &target)
+            .unwrap()
+            .zsl()
+            .to_string();
+        assert!(zsl.contains("b_a_v: device buffer<u32x4>"), "{zsl}");
+        assert!(zsl.contains("view sav: array<u32x4> = sa"), "{zsl}");
+        let odd = gemm(DType::F16, DType::F16, 100, 70, 37, [64, 64], 16, true).unwrap();
+        let zsl = compile_with(&odd, &mma, &target).unwrap().zsl().to_string();
+        assert!(!zsl.contains("u32x4"), "K = 37 must take the scalar path");
     }
 
     /// Exact binary16 bits for small integers, quarters and zero.
@@ -950,6 +976,13 @@ mod tests {
             }
             let best = mma_rows.iter().min_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
             println!("best search: {} at {:.3} ms", best.0, best.1);
+            let (tile, bk, w, wr) = parse_label(&best.0);
+            let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
+            let scalar_loads = Schedule {
+                vector_loads: false,
+                ..mma(w, wr)
+            };
+            run(format!("{} scalar loads", best.0), &kernel, &scalar_loads);
             if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
                 println!("{}", best.2.zsl());
             }
