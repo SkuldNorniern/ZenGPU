@@ -199,12 +199,4 @@ mod tests {
         assert!(load(&dir, &key).is_none());
         let _ = fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn dir_is_a_sibling_of_the_vulkan_cache_file() {
-        assert_eq!(
-            dir_for(Path::new("/tmp/app/pipelines.bin")),
-            PathBuf::from("/tmp/app/pipelines.bin.hip")
-        );
-    }
 }

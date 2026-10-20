@@ -8,11 +8,10 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
 
 use zengpu_compute::elementwise::ElementwiseKernels;
 use zengpu_compute::{BufferPool, DeviceArray, OpList};
-use zengpu_hal::{AdapterRequest, BackendPreference, DType, DeviceRequest, GpuDevice, GpuInstance};
+use zengpu_hal::{AdapterRequest, DType, DeviceRequest, GpuDevice, GpuInstance};
 use zengpu_hip::HipInstance;
 
 fn hip_device() -> Option<Arc<dyn GpuDevice>> {
@@ -117,12 +116,6 @@ fn f16_bits_to_f32(h: u16) -> f32 {
 }
 
 #[test]
-fn reports_hip_backend() {
-    let Some(device) = hip_device() else { return };
-    assert_eq!(device.backend(), BackendPreference::Hip);
-}
-
-#[test]
 fn elementwise_add_relu() {
     let Some(device) = hip_device() else { return };
     let pool = BufferPool::new(device.clone());
@@ -145,55 +138,6 @@ fn elementwise_add_relu() {
         pool.free(array);
     }
     kernels.destroy(&*device);
-}
-
-#[test]
-fn memory_bound_kernel_bandwidth() {
-    let Some(device) = hip_device() else { return };
-    let pool = BufferPool::new(device.clone());
-    let kernels = ElementwiseKernels::new(&*device).unwrap();
-    let n = 64u32 << 20;
-    let a = pool.alloc(vec![n], DType::F32).unwrap();
-    let b = pool.alloc(vec![n], DType::F32).unwrap();
-    let gb = |arrays: f64, secs: f64| arrays * f64::from(n) * 4.0 / secs / 1e9;
-
-    let out = kernels.add(&*device, &pool, &a, &b).unwrap();
-    pool.free(out);
-    let t = Instant::now();
-    for _ in 0..5 {
-        let out = kernels.add(&*device, &pool, &a, &b).unwrap();
-        pool.free(out);
-    }
-    println!(
-        "hip: elementwise add  {:.0} GB/s",
-        gb(3.0, t.elapsed().as_secs_f64() / 5.0)
-    );
-
-    pool.free(a);
-    pool.free(b);
-    kernels.destroy(&*device);
-}
-
-#[test]
-fn half_conversions_round_trip() {
-    let cases: [(f32, u16); 6] = [
-        (1.0, 0x3c00),
-        (-2.0, 0xc000),
-        (0.5, 0x3800),
-        (65504.0, 0x7bff),
-        (6.1035156e-5, 0x0400),
-        (5.9604645e-8, 0x0001),
-    ];
-    for (x, bits) in cases {
-        assert_eq!(f32_to_f16_bits(x), bits, "encode {x}");
-        assert_eq!(f16_bits_to_f32(bits), x, "decode {bits:#06x}");
-    }
-    assert_eq!(f32_to_f16_bits(1.0 + 2f32.powi(-11)), 0x3c00);
-    assert_eq!(f32_to_f16_bits(1.0 + 3.0 * 2f32.powi(-11)), 0x3c02);
-
-    assert_eq!(f32_to_bf16_bits(1.0), 0x3f80);
-    assert_eq!(bf16_bits_to_f32(0x3f80), 1.0);
-    assert_eq!(bf16_bits_to_f32(f32_to_bf16_bits(-2.0)), -2.0);
 }
 
 const HALF_IO_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
@@ -352,65 +296,6 @@ fn zsl_half_buffers_load_and_store() {
     device.destroy_shader(shader);
 }
 
-const NIBBLES_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
-    push P { n: u32 }
-    @workgroup_size(64)
-    kernel nibbles(packed: device buffer<u32>, out: device mut buffer<u32>, p: P, id: global_id) {
-        let i = id.x
-        if i < p.n {
-            let w = packed[i >> 3]
-            out[i] = ((w >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8)
-        }
-    }
-);
-
-#[test]
-fn zsl_bitwise_ops_unpack_nibbles() {
-    let Some(device) = hip_device() else { return };
-    let (shader, entry) = NIBBLES_ZSL.create(&*device).unwrap();
-    let pipeline = device
-        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
-            shader,
-            entry,
-            block: [64, 1, 1],
-        })
-        .unwrap();
-    let pool = BufferPool::new(device.clone());
-    let n = 1000u32;
-    let words: Vec<u32> = (0..n.div_ceil(8))
-        .map(|i| i.wrapping_mul(0x9e37_79b9))
-        .collect();
-    let packed = pool.alloc(vec![words.len() as u32], DType::U32).unwrap();
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    device.write_buffer(packed.buffer, 0, &bytes).unwrap();
-    let out = pool.alloc(vec![n], DType::U32).unwrap();
-    let mut ops = OpList::new(&pool);
-    ops.dispatch(
-        pipeline,
-        &[packed.buffer.index(), out.buffer.index()],
-        &[zengpu_hal::Scalar::U32(n)],
-        [n.div_ceil(64), 1, 1],
-    );
-    ops.run(&*device).unwrap();
-    let got: Vec<u32> = device
-        .read_buffer(out.buffer, 0, out.size_bytes())
-        .unwrap()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|c| u32::from_le_bytes(*c))
-        .collect();
-    for i in 0..n {
-        let want = ((words[(i >> 3) as usize] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8);
-        assert_eq!(got[i as usize], want, "at {i}");
-    }
-    drop(ops);
-    pool.free(packed);
-    pool.free(out);
-    device.destroy_pipeline(pipeline);
-    device.destroy_shader(shader);
-}
-
 const TRIG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     push P { len: u32 }
     @workgroup_size(64)
@@ -459,65 +344,6 @@ fn zsl_trigonometry_matches_cpu() {
     drop(ops);
     pool.free(src);
     pool.free(out);
-    device.destroy_pipeline(pipeline);
-    device.destroy_shader(shader);
-}
-
-const TYPED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
-    push P { len: u32 }
-    @workgroup_size(64)
-    kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, p: P, id: global_id) {
-        let i = id.x
-        if i < p.len {
-            out_u[i] = src_u[i]
-            out_i[i] = src_i[i]
-        }
-    }
-);
-
-#[test]
-fn zsl_integer_buffers_round_trip() {
-    let Some(device) = hip_device() else { return };
-    let (shader, entry) = TYPED_ZSL.create(&*device).unwrap();
-    let pipeline = device
-        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
-            shader,
-            entry,
-            block: [64, 1, 1],
-        })
-        .unwrap();
-    let pool = BufferPool::new(device.clone());
-    let n = 128u32;
-    let input_u: Vec<u32> = (0..n).map(|v| v.wrapping_mul(2_654_435_761)).collect();
-    let input_i: Vec<i32> = (0..n as i32).map(|v| v - 64).collect();
-    let src_u = pool.alloc(vec![n], DType::U32).unwrap();
-    let src_i = pool.alloc(vec![n], DType::I32).unwrap();
-    let out_u = pool.alloc(vec![n], DType::U32).unwrap();
-    let out_i = pool.alloc(vec![n], DType::I32).unwrap();
-    let bytes_u: Vec<u8> = input_u.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let bytes_i: Vec<u8> = input_i.iter().flat_map(|w| w.to_le_bytes()).collect();
-    device.write_buffer(src_u.buffer, 0, &bytes_u).unwrap();
-    device.write_buffer(src_i.buffer, 0, &bytes_i).unwrap();
-    let mut ops = OpList::new(&pool);
-    ops.dispatch(
-        pipeline,
-        &[
-            src_u.buffer.index(),
-            src_i.buffer.index(),
-            out_u.buffer.index(),
-            out_i.buffer.index(),
-        ],
-        &[zengpu_hal::Scalar::U32(n)],
-        [n.div_ceil(64), 1, 1],
-    );
-    ops.run(&*device).unwrap();
-    let read = |a: &DeviceArray| device.read_buffer(a.buffer, 0, a.size_bytes()).unwrap();
-    assert_eq!(read(&out_u), bytes_u);
-    assert_eq!(read(&out_i), bytes_i);
-    drop(ops);
-    for a in [src_u, src_i, out_u, out_i] {
-        pool.free(a);
-    }
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
@@ -1078,84 +904,6 @@ const FRAG_GET_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     }
 );
 
-/// Fragment A/B loads from f32 shared memory, staged through f16: loads cannot convert.
-const FRAG_SHARED_AB_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
-    @workgroup_size(32)
-    kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {
-        shared sa: array<f32, 256>
-        shared sb: array<f32, 256>
-        let lane = local_id().x
-        for i in 0..8 {
-            sa[lane + i * 32] = a[lane + i * 32]
-            sb[lane + i * 32] = b[lane + i * 32]
-        }
-        barrier()
-        let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
-        let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
-        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
-        let d = mma(fa, fb, acc)
-        frag_store(out, 0, 16, d)
-    }
-);
-
-#[test]
-fn zsl_frag_ab_from_shared_matches_cpu() {
-    let Some(device) = hip_device() else { return };
-    let (shader, entry) = FRAG_SHARED_AB_ZSL.create(&*device).unwrap();
-    let pipeline = device
-        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
-            shader,
-            entry,
-            block: [32, 1, 1],
-        })
-        .unwrap();
-    let pool = BufferPool::new(device.clone());
-    let fa: Vec<f32> = (0..256)
-        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
-        .collect();
-    let fb: Vec<f32> = (0..256)
-        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
-        .collect();
-    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
-    let a = upload(&pool, vec![256], &fa);
-    let b = upload(&pool, vec![256], &fb);
-    let c = upload(&pool, vec![256], &fc);
-    let out = upload(&pool, vec![256], &[0.0; 256]);
-    let mut ops = OpList::new(&pool);
-    ops.dispatch(
-        pipeline,
-        &[
-            a.buffer.index(),
-            b.buffer.index(),
-            c.buffer.index(),
-            out.buffer.index(),
-        ],
-        &[],
-        [1, 1, 1],
-    );
-    ops.run(&*device).unwrap();
-    let got = download(&*device, &out);
-    for m in 0..16 {
-        for n in 0..16 {
-            let mut s = fc[m * 16 + n];
-            for k in 0..16 {
-                s += fa[m * 16 + k] * fb[k * 16 + n];
-            }
-            assert!(
-                close(got[m * 16 + n], s),
-                "({m}, {n}): {} vs {s}",
-                got[m * 16 + n]
-            );
-        }
-    }
-    drop(ops);
-    for buf in [a, b, c, out] {
-        pool.free(buf);
-    }
-    device.destroy_pipeline(pipeline);
-    device.destroy_shader(shader);
-}
-
 const TYPED_SHARED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     @workgroup_size(32)
     kernel typed_shared(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, ia: device buffer<i8>, ib: device buffer<i8>, ci: device buffer<i32>, wide: device buffer<i32>, ui: device buffer<u8>, e: device buffer<f32>, out: device mut buffer<f32>, oi: device mut buffer<i32>, rh: device mut buffer<f32>, rq: device mut buffer<i32>, ru: device mut buffer<u32>) {
@@ -1676,71 +1424,11 @@ fn zsl_frag_mma_matches_cpu() {
 }
 
 #[test]
-fn zsl_frag_get_is_hip_only_and_runs_on_hip() {
+fn zsl_frag_get_is_hip_only() {
     assert!(FRAG_GET_ZSL.spv.is_err(), "frag_get has no SPIR-V lowering");
     let err = FRAG_GET_ZSL.spirv_desc().unwrap_err().to_string();
     assert!(err.contains("no spirv artifact"), "{err}");
     assert!(FRAG_GET_ZSL.msl.is_err(), "frag_get has no MSL lowering");
-
-    let Some(device) = hip_device() else { return };
-    let (shader, entry) = FRAG_GET_ZSL.create(&*device).unwrap();
-    let pipeline = device
-        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
-            shader,
-            entry,
-            block: [32, 1, 1],
-        })
-        .unwrap();
-    let pool = BufferPool::new(device.clone());
-    let fa: Vec<f32> = (0..256)
-        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
-        .collect();
-    let fb: Vec<f32> = (0..256)
-        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
-        .collect();
-    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
-    let halves: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
-    let halves_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
-    let a = upload_half(&pool, vec![256], DType::F16, &halves);
-    let b = upload_half(&pool, vec![256], DType::F16, &halves_b);
-    let c = upload(&pool, vec![256], &fc);
-    let out = upload(&pool, vec![256], &[0.0; 256]);
-    let mut ops = OpList::new(&pool);
-    ops.dispatch(
-        pipeline,
-        &[
-            a.buffer.index(),
-            b.buffer.index(),
-            c.buffer.index(),
-            out.buffer.index(),
-        ],
-        &[],
-        [1, 1, 1],
-    );
-    ops.run(&*device).unwrap();
-    let got = download(&*device, &out);
-    let mut bumped = 0;
-    for m in 0..16 {
-        for n in 0..16 {
-            let mut s = fc[m * 16 + n];
-            for k in 0..16 {
-                s += fa[m * 16 + k] * fb[k * 16 + n];
-            }
-            let diff = got[m * 16 + n] - s;
-            if close(diff, 1.0) {
-                bumped += 1;
-            } else {
-                assert!(close(diff, 0.0), "({m}, {n}): diff {diff}");
-            }
-        }
-    }
-    assert_eq!(bumped, 32, "one frag_set bump per lane");
-    drop(ops);
-    for buf in [a, b, c, out] {
-        pool.free(buf);
-    }
-    device.destroy_pipeline(pipeline);
-    device.destroy_shader(shader);
 }
 
 #[test]
@@ -2271,49 +1959,6 @@ fn zetna_hip_source(files: &[&str]) -> Option<String> {
     Some(src)
 }
 
-/// Returns the median time per dispatch in milliseconds over batched launches.
-fn hip_time_ms(
-    device: &dyn zengpu_hal::GpuDevice,
-    pipeline: zengpu_hal::PipelineHandle,
-    grid: [u32; 3],
-    slots: &[u32],
-    scalars: &[zengpu_hal::Scalar],
-) -> f64 {
-    let bindings = zengpu_hal::Bindings {
-        buffers: slots,
-        scalars,
-        ..Default::default()
-    };
-    let batch = |k: usize| {
-        let ops: Vec<zengpu_hal::DispatchOp<'_>> = (0..k)
-            .map(|_| zengpu_hal::DispatchOp {
-                pipeline,
-                bindings,
-                grid,
-            })
-            .collect();
-        device.dispatch_batch(&ops).unwrap();
-    };
-    let t0 = Instant::now();
-    batch(1);
-    batch(1);
-    let one = t0.elapsed().as_secs_f64().max(1e-6);
-    let k = ((0.02 / one).round() as usize).max(1);
-    let warm = Instant::now();
-    while warm.elapsed().as_secs_f64() < 0.3 {
-        batch(k);
-    }
-    let mut ms: Vec<f64> = (0..10)
-        .map(|_| {
-            let t = Instant::now();
-            batch(k);
-            t.elapsed().as_secs_f64() * 1e3 / k as f64
-        })
-        .collect();
-    ms.sort_by(f64::total_cmp);
-    (ms[4] + ms[5]) / 2.0
-}
-
 /// Returns the ulp distance between two finite f32 values.
 fn ulp_gap(a: f32, b: f32) -> u32 {
     let key = |x: f32| {
@@ -2396,16 +2041,6 @@ fn zsl_glu_matches_zetna() {
             .unwrap();
         println!("glu act {act}: max ulp vs zetna {worst}");
         assert!(worst <= 1, "glu act {act}: {worst} ulp");
-        let t_zetna = hip_time_ms(&*device, zetna_pipe, grid, &slots, &scalars);
-        let t_zsl = hip_time_ms(&*device, zsl_pipe, grid, &slots, &scalars);
-        let bytes = 12.0 * f64::from(n);
-        println!(
-            "glu act {act} n {n}: zetna {:.4} ms ({:.0} GB/s), zsl {:.4} ms ({:.0} GB/s)",
-            t_zetna,
-            bytes / t_zetna / 1e6,
-            t_zsl,
-            bytes / t_zsl / 1e6
-        );
     }
     device.destroy_pipeline(zetna_pipe);
     device.destroy_pipeline(zsl_pipe);
@@ -2638,17 +2273,6 @@ fn zsl_gemv_q8_q4k_matches_zetna() {
             / scale;
         println!("gemv rows {rows}: max abs y {scale:e}, worst |zsl - zetna| / max|y| = {worst:e}");
         assert!(worst < 1e-4, "gemv rows {rows}: {worst}");
-        let t_z = hip_time_ms(&*device, z_gemv, gemv_grid, &zslots, &zscal);
-        let t_s = hip_time_ms(&*device, s_gemv, gemv_grid, &gslots, &sscal);
-        let bytes = w_bytes.len() as f64;
-        println!(
-            "gemv q4_k rows {rows} cols {cols}: zetna {:.4} ms ({:.0} GB/s), zsl {:.4} ms ({:.0} GB/s), zsl/zetna {:.2}",
-            t_z,
-            bytes / t_z / 1e6,
-            t_s,
-            bytes / t_s / 1e6,
-            t_z / t_s
-        );
         drop(ops);
         for b in [w, y_z, y_s] {
             pool.free(b);

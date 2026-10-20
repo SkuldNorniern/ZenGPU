@@ -29,6 +29,7 @@ fn per_iter(start: Instant, n: u32) -> Duration {
 }
 
 #[test]
+#[ignore = "host overhead bench; run with --ignored --nocapture"]
 fn overheads() {
     let Some(dev) = device() else { return };
 
