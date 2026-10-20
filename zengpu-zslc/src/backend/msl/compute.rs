@@ -377,6 +377,10 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 format!("f32_to_bf16({val})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
                 format!("half({val})")
+            } else if ctx.buffer_elems.get(buf.as_str()) == Some(&"char") {
+                format!("char({val})")
+            } else if ctx.buffer_elems.get(buf.as_str()) == Some(&"uchar") {
+                format!("uchar({val})")
             } else {
                 val
             };
@@ -493,6 +497,10 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 format!("bf16_to_f32({inner})")
             } else if ctx.f16_buffers.contains(buf.as_str()) {
                 format!("float({inner})")
+            } else if ctx.buffer_elems.get(buf.as_str()) == Some(&"char") {
+                format!("int({inner})")
+            } else if ctx.buffer_elems.get(buf.as_str()) == Some(&"uchar") {
+                format!("uint({inner})")
             } else {
                 inner
             }
@@ -1009,6 +1017,14 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
 /// backends: round-to-nearest-even on store, zero-extend on load.
 fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Signed,
+        } => Ok("char"),
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Unsigned,
+        } => Ok("uchar"),
         Type::Float {
             format: FloatFormat::F32,
         } => Ok("float"),

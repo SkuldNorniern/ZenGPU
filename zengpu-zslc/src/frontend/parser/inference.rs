@@ -88,6 +88,14 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str 
         Type::Float {
             format: FloatFormat::Bf16,
         } => "bf16",
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Signed,
+        } => "i8",
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Unsigned,
+        } => "u8",
         Type::Float {
             format: FloatFormat::F16,
         } => "f16",

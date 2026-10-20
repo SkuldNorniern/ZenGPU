@@ -30,6 +30,14 @@ pub fn i8_type() -> Type {
     }
 }
 
+/// Loads widen to `u32`.
+pub fn u8_type() -> Type {
+    Type::Int {
+        width: IntWidth::W8,
+        signedness: Signedness::Unsigned,
+    }
+}
+
 pub fn frag16_id(arena: &mut TypeArena, element: TypeId, usage: FragUse) -> TypeId {
     arena.intern(Type::Frag {
         element,
@@ -58,6 +66,10 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             let elem = ctx.buffers.get(buf).copied().unwrap_or(f32_id);
             if elem == bf16_id || elem == f16_id {
                 f32_id
+            } else if arena.get(elem) == &i8_type() {
+                i32_id
+            } else if arena.get(elem) == &u8_type() {
+                u32_id
             } else {
                 elem
             }

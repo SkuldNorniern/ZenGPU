@@ -50,7 +50,9 @@ use std::mem;
 use crate::frontend::lex::{Tok, Token, lex};
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
-use crate::ir::typeck::{frag_parts, type_of_compute_expr, type_of_graphics_expr};
+use crate::ir::typeck::{
+    frag_parts, i8_type, type_of_compute_expr, type_of_graphics_expr, u8_type,
+};
 use crate::ir::types::TypeId;
 use crate::ir::{
     Backend, Entry, EntryKind, GfxBuiltin, GfxInput, GfxOutput, GfxScalar, GfxSlot, GraphicsEntry,
