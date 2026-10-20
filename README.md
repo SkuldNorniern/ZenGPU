@@ -80,6 +80,13 @@ ZSL covers compute, vertex and fragment shaders: bindless buffers
 Graphics adds swizzles, constant arrays, `vertex_index`/`frag_coord`, bindless
 texture sampling, `discard` and dual-source output. Clip space is Vulkan's (+y down) on every backend; MSL output flips y to match.
 
+A kernel may bind one host buffer to two params of different element types
+(for example `buffer<f16>` and `buffer<u32x4>`). The backends do not track that
+aliasing, so put a `barrier()` between a write through one param and a read
+through the other. A `view` declared in a kernel body (`view v: array<u32x4> = s`)
+reinterprets shared array `s` as `u32`, `u32x2` or `u32x4` elements over the same
+bytes. On Vulkan that needs `VK_KHR_workgroup_memory_explicit_layout`.
+
 Limits: no structs, modules or recursion in ZSL yet. Asynchronous transfer
 support and built-in kernel dtypes vary by backend; CUDA supports
 submission-based uploads and readbacks. Vulkan stores `bf16`/`f16` buffers

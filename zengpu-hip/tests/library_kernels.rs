@@ -2199,3 +2199,59 @@ fn zsl_shared_view_mma_matches_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// One buffer, two params: `x` written as u32x4, `xh` read as f16 after a barrier.
+const ALIAS_BUF_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel alias_buf(src: device buffer<u32x4>, x: device mut buffer<u32x4>, xh: device buffer<f16>, out: device mut buffer<f32>, id: global_id) {
+        x[id.x] = src[id.x]
+        barrier()
+        for j in 0..8 {
+            out[id.x * 8 + j] = xh[id.x * 8 + j]
+        }
+    }
+);
+
+#[test]
+fn zsl_one_buffer_two_element_types_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = ALIAS_BUF_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let vals: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let bits: Vec<u16> = vals.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let src = upload_half(&pool, vec![256], DType::F16, &bits);
+    let x = upload_half(&pool, vec![256], DType::F16, &[0; 256]);
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            src.buffer.index(),
+            x.buffer.index(),
+            x.buffer.index(),
+            out.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    for (h, (&g, &v)) in got.iter().zip(&vals).enumerate() {
+        assert_eq!(g, v, "half {h}");
+    }
+    drop(ops);
+    for arr in [src, x, out] {
+        pool.free(arr);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

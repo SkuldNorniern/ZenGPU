@@ -482,10 +482,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             indent(s, depth);
             if ctx.has_images {
                 s.push_str(
-                    "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_texture);\n",
+                    "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device | mem_flags::mem_texture);\n",
                 );
             } else {
-                s.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+                s.push_str(
+                    "threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);\n",
+                );
             }
         }
         IrStmt::If { cond, then, else_ } => {
