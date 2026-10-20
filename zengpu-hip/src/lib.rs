@@ -3584,6 +3584,96 @@ extern "C" __global__ void spin(unsigned int ticks) {
         dev.destroy_shader(shader);
     }
 
+    /// Above 64 MiB with an odd tail, so staged transfers split into several chunks.
+    #[test]
+    fn big_buffer_round_trips() {
+        let Some(device) = open_device() else { return };
+        let len = (96 << 20) + 12;
+        let data: Vec<u8> = (0..len).map(|i| (i * 31 % 253) as u8).collect();
+        let buf = rw_buffer(device.as_ref(), len as u64);
+        device.write_buffer(buf, 0, &data).unwrap();
+        assert!(device.read_buffer(buf, 0, len as u64).unwrap() == data);
+        let mut tail = [0u8; 4096];
+        device
+            .read_buffer_into(buf, (len - 4096) as u64, &mut tail)
+            .unwrap();
+        assert_eq!(&tail[..], &data[len - 4096..]);
+        device.destroy_buffer(buf);
+    }
+
+    /// Small integer inputs keep every product and sum exact, so results match bit for bit. The
+    /// odd size runs every edge guard; 128 x 128 x 64 fills whole tiles.
+    #[test]
+    fn sgemm_opt_matches_cpu() {
+        let Some(device) = open_device() else { return };
+        let device = device.as_ref();
+        let shader = device
+            .create_shader(ShaderDesc::hip(SGEMM_OPT_SRC))
+            .unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "sgemm_opt",
+                block: [16, 16, 1],
+            })
+            .unwrap();
+        for (m, n, k) in [(67usize, 45usize, 33usize), (128, 128, 64)] {
+            let a: Vec<f32> = (0..m * k).map(|i| (i * 7 % 9) as f32 - 4.0).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i * 5 % 7) as f32 - 3.0).collect();
+            let want: Vec<f32> = (0..m * n)
+                .map(|i| (0..k).map(|p| a[i / n * k + p] * b[p * n + i % n]).sum())
+                .collect();
+            let (ba, bb, bc) = (
+                rw_buffer(device, (m * k * 4) as u64),
+                rw_buffer(device, (k * n * 4) as u64),
+                rw_buffer(device, (m * n * 4) as u64),
+            );
+            device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
+            device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
+            let scalars = [m, n, k].map(|d| Scalar::U32(d as u32));
+            let bindings = Bindings {
+                buffers: &[ba.index(), bb.index(), bc.index()],
+                textures: &[],
+                images: &[],
+                scalars: &scalars,
+            };
+            let grid = [n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1];
+            device.dispatch(pipeline, bindings, grid).unwrap();
+            let got = floats(&device.read_buffer(bc, 0, (m * n * 4) as u64).unwrap());
+            assert_eq!(got, want, "{m} x {n} x {k}");
+            for buf in [ba, bb, bc] {
+                device.destroy_buffer(buf);
+            }
+        }
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+    }
+
+    #[test]
+    fn oom_leaves_device_usable() {
+        let Some(device) = open_device() else { return };
+        let hip = device.as_any().downcast_ref::<HipDevice>().unwrap();
+        if hip.device_info().integrated {
+            return;
+        }
+        let total = device.memory_budget().unwrap().device_local;
+        let err = device
+            .create_buffer(BufferDesc {
+                size: total * 2,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .expect_err("allocation twice the size of VRAM");
+        assert!(matches!(err, GpuError::OutOfMemory(_)), "{err:?}");
+        assert!(!device.is_lost());
+
+        let data: Vec<u8> = (0..=255).collect();
+        let buf = rw_buffer(device.as_ref(), data.len() as u64);
+        device.write_buffer(buf, 0, &data).unwrap();
+        assert_eq!(device.read_buffer(buf, 0, data.len() as u64).unwrap(), data);
+        device.destroy_buffer(buf);
+    }
+
     /// ZSL kernels lowered for HIP, checked against CPU references and Zetna kernels.
     mod zsl {
         use std::env;
