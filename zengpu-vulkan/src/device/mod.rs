@@ -4839,6 +4839,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zsl_native_shared_frags_run_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const NATIVE_SHARED_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel native_shared(a: device buffer<f32>, b: device buffer<f32>, ia: device buffer<i8>, ib: device buffer<i8>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+                shared sa: array<f16, 256>
+                shared sb: array<f16, 256>
+                shared qa: array<i8, 256>
+                shared qb: array<i8, 256>
+                let lane = local_id().x
+                for i in 0..8 {
+                    sa[lane + i * 32] = a[lane + i * 32]
+                    sb[lane + i * 32] = b[lane + i * 32]
+                    qa[lane + i * 32] = ia[lane + i * 32]
+                    qb[lane + i * 32] = ib[lane + i * 32]
+                }
+                barrier()
+                let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b_t(sb, 0, 16)
+                let zacc: frag<f32, 16, 16, acc> = frag_zero_acc()
+                let d = mma(fa, fb, zacc)
+                frag_store(out, 0, 16, d)
+                let ga: frag<i8, 16, 16, a> = frag_load_a(qa, 0, 16)
+                let gb: frag<i8, 16, 16, b> = frag_load_b_t(qb, 0, 16)
+                let izero: frag<i32, 16, 16, acc> = frag_zero_acc()
+                let di = mma(ga, gb, izero)
+                frag_store(oi, 0, 16, di)
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let fa: Vec<f32> = (0..256).map(|i| ((i * 7 + 3) % 9 - 4) as f32).collect();
+        let fb: Vec<f32> = (0..256).map(|i| ((i * 5 + 1) % 9 - 4) as f32).collect();
+        let ia: Vec<i8> = (0..256).map(|i| ((i * 7 + 3) % 9 - 4) as i8).collect();
+        let ib: Vec<i8> = (0..256).map(|i| ((i * 5 + 1) % 11 - 5) as i8).collect();
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i8_bytes = |v: &[i8]| -> Vec<u8> { v.iter().map(|&x| x as u8).collect() };
+        let make = |data: &[u8], usage: BufferUsage| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size: data.len() as u64,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let a = make(&f32_bytes(&fa), input);
+        let b = make(&f32_bytes(&fb), input);
+        let ba = make(&i8_bytes(&ia), input);
+        let bb = make(&i8_bytes(&ib), input);
+        let out = make(&[0u8; 1024], output);
+        let oi = make(&[0u8; 1024], output);
+
+        let shader = dev
+            .create_shader(NATIVE_SHARED_ZSL.spirv_desc().unwrap())
+            .unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        let slots: Vec<u32> = [a, b, ba, bb, out, oi].iter().map(|b| b.index()).collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let got: Vec<f32> = dev
+            .read_buffer(out, 0, 1024)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let got_i: Vec<i32> = dev
+            .read_buffer(oi, 0, 1024)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for m in 0..16 {
+            for n in 0..16 {
+                let (mut s, mut si) = (0f32, 0i32);
+                for k in 0..16 {
+                    s += fa[m * 16 + k] * fb[n * 16 + k];
+                    si += i32::from(ia[m * 16 + k]) * i32::from(ib[n * 16 + k]);
+                }
+                let at = m * 16 + n;
+                assert_eq!(got[at], s, "native f16 frag at ({m}, {n})");
+                assert_eq!(got_i[at], si, "native i8 frag at ({m}, {n})");
+            }
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [a, b, ba, bb, out, oi] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
     /// `C = A*B + C` on one 16x16x16 tile, f16 and packed i8. Needs those configs (RADV gfx12).
     #[test]
     fn zsl_frag_mma_runs_through_vulkan() {
