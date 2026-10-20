@@ -29,8 +29,8 @@ use std::thread::{sleep, yield_now};
 use std::time::{Duration, Instant};
 
 use zengpu_hal::{
-    AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, CompletedReadback, CompletedSubmission, ComputeCaps, ComputeOp,
+    AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferCopyOp, BufferDesc,
+    BufferHandle, BufferUsage, CompletedReadback, CompletedSubmission, ComputeCaps, ComputeOp,
     ComputePipelineDesc, DType, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, GpuAdapter,
     GpuDevice, GpuError, GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget,
     MemoryUsage, MmaShape, PipelineHandle, PipelineStats, PowerPreference, ReadSubmission, Result,
@@ -686,11 +686,26 @@ impl HipCore {
         unsafe { self.check(hipStreamSynchronize(self.stream), "hipStreamSynchronize") }
     }
 
-    fn ensure_idle(&self, op: &str) -> Result<()> {
-        if lock(&self.lifetime)?.in_flight != 0 {
-            return Err(binding_error(format!(
-                "{op} cannot run while an asynchronous submission is pending"
-            )));
+    /// Blocks until queued work on `touched` is done, leaving unrelated work pending. Writes wait
+    /// for every lane's last access; reads wait only for the last write.
+    fn settle(&self, touched: &[(usize, bool)]) -> Result<()> {
+        self.activate()?;
+        let events: Vec<Arc<OwnedEvent>> = {
+            let lifetime = lock(&self.lifetime)?;
+            let mut events = Vec::new();
+            for &(ptr, written) in touched {
+                let Some(hazard) = lifetime.hazards.get(&ptr) else {
+                    continue;
+                };
+                if written {
+                    events.extend(hazard.last_access.iter().flatten().cloned());
+                }
+                events.extend(hazard.last_write.as_ref().map(|(_, e)| Arc::clone(e)));
+            }
+            events
+        };
+        for event in events {
+            unsafe { self.check(hipEventSynchronize(event.0), "hipEventSynchronize")? };
         }
         Ok(())
     }
@@ -1455,53 +1470,6 @@ impl HipDevice {
             other => other,
         })
     }
-
-    fn copy_host_to_device(&self, buf: HipBuffer, offset: usize, data: &[u8]) -> Result<()> {
-        let core = &self.core;
-        unsafe {
-            core.check(
-                hipMemcpyAsync(
-                    (buf.ptr as *mut u8).add(offset) as *mut c_void,
-                    data.as_ptr() as *const c_void,
-                    data.len(),
-                    buf.copy_kind(HIP_MEMCPY_H2D),
-                    core.stream,
-                ),
-                "hipMemcpyAsync H→D",
-            )?;
-        }
-        core.synchronize()
-    }
-
-    fn copy_device_to_host(&self, buf: HipBuffer, offset: usize, dst: &mut [u8]) -> Result<()> {
-        let core = &self.core;
-        unsafe {
-            core.check(
-                hipMemcpyAsync(
-                    dst.as_mut_ptr() as *mut c_void,
-                    (buf.ptr as *const u8).add(offset) as *const c_void,
-                    dst.len(),
-                    buf.copy_kind(HIP_MEMCPY_D2H),
-                    core.stream,
-                ),
-                "hipMemcpyAsync D→H",
-            )?;
-        }
-        core.synchronize()
-    }
-
-    fn readable(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<(HipBuffer, usize)> {
-        let buf = self.core.buffer(buffer)?;
-        if !buf.usage.contains(BufferUsage::READBACK) {
-            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                resource: "buffer",
-                needed: "READBACK",
-            }));
-        }
-        self.core.ensure_idle("read_buffer")?;
-        let offset = checked_range(offset, len, buf.size, "read")?;
-        Ok((buf, offset))
-    }
 }
 
 impl GpuDevice for HipDevice {
@@ -1623,33 +1591,18 @@ impl GpuDevice for HipDevice {
     }
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
-        let buf = self.core.buffer(buffer)?;
-        self.core.ensure_idle("write_buffer")?;
-        let offset = checked_range(offset, data.len() as u64, buf.size, "write")?;
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.core.activate()?;
-        self.copy_host_to_device(buf, offset, data)
+        self.submit_write_buffer(0, buffer, offset, data)?
+            .wait(Duration::MAX)
     }
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let (buf, offset) = self.readable(buffer, offset, len)?;
-        let mut out = vec![0u8; len as usize];
-        if len != 0 {
-            self.core.activate()?;
-            self.copy_device_to_host(buf, offset, &mut out)?;
-        }
-        Ok(out)
+        self.submit_read_buffer(0, buffer, offset, len)?
+            .into_bytes()
     }
 
     fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
-        let (buf, offset) = self.readable(buffer, offset, dst.len() as u64)?;
-        if dst.is_empty() {
-            return Ok(());
-        }
-        self.core.activate()?;
-        self.copy_device_to_host(buf, offset, dst)
+        self.submit_read_buffer(0, buffer, offset, dst.len() as u64)?
+            .read_into(dst)
     }
 
     fn copy_buffer(
@@ -1660,11 +1613,17 @@ impl GpuDevice for HipDevice {
         dst_offset: u64,
         len: u64,
     ) -> Result<()> {
-        self.core.ensure_idle("copy_buffer")?;
-        self.core.activate()?;
-        self.core
-            .enqueue_copy(src, src_offset, dst, dst_offset, len)?;
-        self.core.synchronize()
+        self.submit_compute_ops(
+            0,
+            &[ComputeOp::CopyBuffer(BufferCopyOp {
+                src,
+                src_offset,
+                dst,
+                dst_offset,
+                len,
+            })],
+        )?
+        .wait(Duration::MAX)
     }
 
     fn device_ordinal(&self) -> i32 {
@@ -1731,8 +1690,8 @@ impl GpuDevice for HipDevice {
         let src_buf = src_device.core.buffer(src)?;
         checked_range(0, bytes, dst_buf.size, "peer copy destination")?;
         checked_range(0, bytes, src_buf.size, "peer copy source")?;
-        self.core.ensure_idle("copy_from_peer")?;
-        src_device.core.ensure_idle("copy_from_peer")?;
+        self.core.settle(&[(dst_buf.ptr as usize, true)])?;
+        src_device.core.settle(&[(src_buf.ptr as usize, false)])?;
         if bytes == 0 {
             return Ok(());
         }
@@ -3923,7 +3882,6 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
         ];
         let submission = device.submit_compute_ops(42, &ops).unwrap();
         assert_eq!(submission.cycle_id(), 42);
-        assert!(device.read_buffer(dst, 0, 4).is_err());
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
         device.destroy_buffer(src);
@@ -4444,6 +4402,79 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         }
         device.destroy_shader(shader);
         device.destroy_shader(slow_shader);
+        device.destroy_buffer(x);
+        device.destroy_buffer(y);
+    }
+
+    /// The two timing-sensitive write tests share one GPU, and HIP calls from one can stall the
+    /// other's copy, so they run one at a time.
+    static WRITE_TIMING: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn write_to_idle_buffer_does_not_wait_for_busy_one() {
+        let _serial = WRITE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(device) = open_device() else { return };
+        let device = &*device;
+        const N: usize = 1 << 16;
+        let size = (N * 4) as u64;
+        let (busy, idle, scratch) = (
+            rw_buffer(device, size),
+            rw_buffer(device, size),
+            rw_buffer(device, size),
+        );
+        let (shader, slow) = kernel(device, COPY_SRC, "slow_copy");
+        let spin = dispatch(
+            device,
+            slow,
+            &[busy, scratch],
+            &[Scalar::U32(64), Scalar::U32(4_000_000_000)],
+            64,
+        );
+        let payload = float_bytes((0..N).map(|i| i as f32 * 0.5));
+        device.write_buffer(idle, 0, &payload).unwrap();
+        assert_eq!(
+            spin.poll().unwrap(),
+            SubmissionStatus::Pending,
+            "write waited for an unrelated kernel"
+        );
+        assert_eq!(device.read_buffer(idle, 0, size).unwrap(), payload);
+        spin.wait(Duration::from_secs(30)).unwrap();
+        device.destroy_pipeline(slow);
+        device.destroy_shader(shader);
+        device.destroy_buffer(busy);
+        device.destroy_buffer(idle);
+        device.destroy_buffer(scratch);
+    }
+
+    #[test]
+    fn write_to_busy_buffer_waits_for_its_kernel() {
+        let _serial = WRITE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(device) = open_device() else { return };
+        let device = &*device;
+        const N: usize = 1 << 16;
+        let size = (N * 4) as u64;
+        let (x, y) = (rw_buffer(device, size), rw_buffer(device, size));
+        let (shader, slow) = kernel(device, COPY_SRC, "slow_copy");
+        let first = float_bytes((0..N).map(|i| i as f32));
+        device.write_buffer(x, 0, &first).unwrap();
+        let spin = dispatch(
+            device,
+            slow,
+            &[x, y],
+            &[Scalar::U32(64), Scalar::U32(4_000_000_000)],
+            64,
+        );
+        let second = float_bytes((0..N).map(|i| -(i as f32)));
+        device.write_buffer(x, 0, &second).unwrap();
+        assert_eq!(
+            spin.poll().unwrap(),
+            SubmissionStatus::Complete,
+            "write did not wait for the kernel reading its target"
+        );
+        assert_eq!(device.read_buffer(x, 0, size).unwrap(), second);
+        assert_eq!(device.read_buffer(y, 0, 256).unwrap(), first[..256]);
+        device.destroy_pipeline(slow);
+        device.destroy_shader(shader);
         device.destroy_buffer(x);
         device.destroy_buffer(y);
     }
