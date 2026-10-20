@@ -67,6 +67,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::TexSize { .. } => u32_id,
         IrExpr::FragLoad { ty, .. } => *ty,
         IrExpr::Builtin { func, args } => match func {
+            BuiltinFn::I32 => i32_id,
             BuiltinFn::Select => args
                 .get(1)
                 .map(|a| type_of_compute_expr(a, ctx, arena))

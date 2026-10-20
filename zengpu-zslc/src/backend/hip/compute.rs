@@ -152,6 +152,13 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     s.push_str(r#"
 typedef unsigned short zsl_u16x2 __attribute__((ext_vector_type(2)));
 typedef _Float16 zsl_f16x2 __attribute__((ext_vector_type(2)));
+// Rust `as` from f32: NaN -> 0, saturate at the i32 bounds, truncate.
+__device__ __forceinline__ int zsl_f32_to_i32(float x) {
+    if (x != x) return 0;
+    if (x >= 2147483648.0f) return 2147483647;
+    if (x <= -2147483648.0f) return (-2147483647 - 1);
+    return (int)x;
+}
 __device__ __forceinline__ unsigned int zsl_select(bool c, unsigned int a, unsigned int b) { return c ? a : b; }
 __device__ __forceinline__ int zsl_select(bool c, int a, int b) { return c ? a : b; }
 __device__ __forceinline__ float zsl_select(bool c, float a, float b) { return c ? a : b; }
@@ -728,6 +735,13 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::Select => {
                     format!("zsl_select({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::I32 => {
+                    if expr_is_f32(ctx, &args[0]) {
+                        format!("zsl_f32_to_i32({})", args_s[0])
+                    } else {
+                        format!("((int)({}))", args_s[0])
+                    }
                 }
                 BuiltinFn::FunnelShr => {
                     format!(

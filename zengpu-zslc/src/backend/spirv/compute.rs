@@ -1146,6 +1146,25 @@ fn lower_texel(
     Ok(Val { id, ty: ctx.f32_id })
 }
 
+/// Rust `as` semantics: NaN -> 0, saturate, truncate. Replaced before `OpConvertFToS`, which is
+/// undefined for NaN and out-of-range.
+fn f32_to_i32(ctx: &mut LowerCtx<'_>, x: Id) -> Id {
+    let (t_f32, t_i32, t_bool) = (ctx.t_f32, ctx.t_i32, ctx.t_bool);
+    let zero_f = ctx.spv.constant_f32(t_f32, 0.0);
+    let two31 = ctx.spv.constant_f32(t_f32, 2147483648.0);
+    let below_two31 = ctx.spv.constant_f32(t_f32, 2147483520.0);
+    let min_f = ctx.spv.constant_f32(t_f32, -2147483648.0);
+    let i_max = ctx.spv.constant_u32(t_i32, 0x7fff_ffff);
+    let is_nan = ctx.spv.op_is_nan(t_bool, x);
+    let hi = ctx.spv.op_ford_ge(t_bool, x, two31);
+    let x0 = ctx.spv.op_select(t_f32, is_nan, zero_f, x);
+    let x1 = ctx.spv.op_select(t_f32, hi, below_two31, x0);
+    let lo = ctx.spv.op_ford_le(t_bool, x1, min_f);
+    let x2 = ctx.spv.op_select(t_f32, lo, min_f, x1);
+    let converted = ctx.spv.op_convert_f_to_s(t_i32, x2);
+    ctx.spv.op_select(t_i32, hi, i_max, converted)
+}
+
 fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Result<Val, String> {
     match op {
         IrBinOp::Add => binary_arith(ctx, lhs, rhs, SpvBuilder::op_fadd, SpvBuilder::op_iadd),
@@ -1269,6 +1288,25 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
         | BuiltinFn::FragSet => Err(format!(
             "SPIR-V backend: {name}() is not lowered: the cooperative matrix element mapping is opaque"
         )),
+        BuiltinFn::I32 => {
+            if args.len() != 1 {
+                return Err("ZSL: i32() takes 1 arg".into());
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let id = if v.ty == ctx.f32_id {
+                f32_to_i32(ctx, v.id)
+            } else if v.ty == ctx.u32_id {
+                ctx.spv.op_bitcast(ctx.t_i32, v.id)
+            } else if v.ty == ctx.i32_id {
+                v.id
+            } else {
+                return Err("ZSL: i32() takes an f32, u32 or i32 value".into());
+            };
+            Ok(Val {
+                id,
+                ty: ctx.i32_id,
+            })
+        }
         BuiltinFn::U32 => {
             if args.len() != 1 {
                 return Err("ZSL: u32() takes 1 arg".into());

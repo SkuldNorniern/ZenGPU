@@ -130,6 +130,8 @@ pub enum TexelOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     U32,
+    /// f32 to i32 truncates, maps NaN to 0 and saturates. u32 to i32 reinterprets the bits.
+    I32,
     F32,
     Step,
     Smoothstep,
@@ -284,6 +286,7 @@ impl BuiltinFn {
             BuiltinFn::FunnelShr => "funnel_shr",
             BuiltinFn::BytePerm => "byte_perm",
             BuiltinFn::Select => "select",
+            BuiltinFn::I32 => "i32",
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",

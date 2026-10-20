@@ -369,6 +369,18 @@ impl<'a> Parser<'a> {
             return self.err(format!("{}() takes {n} args", func.name()));
         }
         self.check_frag_call(ctx, func, &args)?;
+        if func == BuiltinFn::I32 {
+            let tc = ctx.type_ctx();
+            let arg = type_of_compute_expr(&args[0], &tc, &mut self.types);
+            let ok = [
+                self.types.f32_id(),
+                self.types.u32_id(),
+                self.types.i32_id(),
+            ];
+            if !ok.contains(&arg) {
+                return self.err("i32(x) takes an f32, u32 or i32 value");
+            }
+        }
         if func == BuiltinFn::Select {
             let tc = ctx.type_ctx();
             let cond = type_of_compute_expr(&args[0], &tc, &mut self.types);
