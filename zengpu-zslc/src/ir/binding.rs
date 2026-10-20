@@ -2,6 +2,7 @@
 //! `zengpu-vulkan/src/device/mod.rs`. Shared with `backend::spirv::compute`.
 
 use crate::ir::arena::TypeArena;
+use crate::ir::typeck::{i8_type, u8_type};
 use crate::ir::types::TypeId;
 use crate::ir::{GraphicsEntry, GraphicsModule, Module, ParamKind};
 
@@ -17,7 +18,12 @@ pub struct BindingInfo {
 pub fn ssbo_binding_for(elem: TypeId, types: &mut TypeArena) -> u32 {
     if elem == types.f32_id() {
         0
-    } else if elem == types.u32_id() || elem == types.f16_id() || elem == types.bf16_id() {
+    } else if elem == types.u32_id()
+        || elem == types.f16_id()
+        || elem == types.bf16_id()
+        || elem == types.intern(i8_type())
+        || elem == types.intern(u8_type())
+    {
         2
     } else if elem == types.i32_id() {
         3
