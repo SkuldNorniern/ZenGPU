@@ -74,6 +74,21 @@ pub fn storage_value_type(arena: &mut TypeArena, elem: TypeId) -> TypeId {
     }
 }
 
+pub fn u32_vec_lanes(arena: &TypeArena, ty: TypeId) -> Option<u8> {
+    match arena.get(ty) {
+        Type::Vector { element, lanes }
+            if arena.get(*element)
+                == &Type::Int {
+                    width: IntWidth::W32,
+                    signedness: Signedness::Unsigned,
+                } =>
+        {
+            Some(*lanes)
+        }
+        _ => None,
+    }
+}
+
 pub fn frag_parts(arena: &TypeArena, ty: TypeId) -> Option<(TypeId, FragUse)> {
     match arena.get(ty) {
         Type::Frag { element, usage, .. } => Some((*element, *usage)),
@@ -129,6 +144,14 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::Texel { .. } => f32_id,
         IrExpr::TexSize { .. } => u32_id,
         IrExpr::FragLoad { ty, .. } => *ty,
+        IrExpr::FieldAccess { base, .. } => {
+            let base_ty = type_of_compute_expr(base, ctx, arena);
+            match arena.get(base_ty) {
+                Type::Vector { element, .. } => *element,
+                _ => u32_id,
+            }
+        }
+        IrExpr::Construct { ty, .. } => ty.unwrap_or(u32_id),
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::I32 => i32_id,
             BuiltinFn::F16Round => f32_id,

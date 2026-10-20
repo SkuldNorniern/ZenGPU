@@ -78,6 +78,12 @@ impl TypeArena {
         self.intern(Type::Vector { element, lanes })
     }
 
+    /// 8 or 16 bytes per buffer element.
+    pub fn u32_vec_id(&mut self, lanes: u8) -> TypeId {
+        let element = self.u32_id();
+        self.intern(Type::Vector { element, lanes })
+    }
+
     /// Column-major storage.
     pub fn mat4_id(&mut self) -> TypeId {
         let element = self.f32_id();

@@ -36,7 +36,9 @@ use crate::ir::node::{
     stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::frag_parts;
-use crate::ir::typeck::{StorageElem, i8_type, storage_elem, storage_value_type, u8_type};
+use crate::ir::typeck::{
+    StorageElem, i8_type, storage_elem, storage_value_type, u8_type, u32_vec_lanes,
+};
 use crate::ir::types::TypeId;
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -108,6 +110,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let t_u32 = spv.type_int(32, false);
     let t_i32 = spv.type_int(32, true);
     let t_f32 = spv.type_float(32);
+    let t_uvec2 = spv.type_vector(t_u32, 2);
     let t_uvec3 = spv.type_vector(t_u32, 3);
     let t_uvec4 = spv.type_vector(t_u32, 4);
 
@@ -171,7 +174,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     };
     let mut ssbo_tables: HashMap<TypeId, SsboTable> = HashMap::new();
     for (_, elem) in &buf_params {
-        let elem_ty = table_of(*elem);
+        let elem_ty = if u32_vec_lanes(&types, *elem).is_some() {
+            u32_id
+        } else {
+            table_of(*elem)
+        };
         if ssbo_tables.contains_key(&elem_ty) {
             continue;
         }
@@ -371,7 +378,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
                 BufInfo {
                     pc_index: i as u32,
                     elem: *elem,
-                    table: table_of(*elem),
+                    table: if u32_vec_lanes(&types, *elem).is_some() {
+                        u32_id
+                    } else {
+                        table_of(*elem)
+                    },
                     half: half_of(*elem),
                     byte: byte_of(*elem),
                 },
@@ -414,6 +425,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let mut ptr_func_i32 = Id(0);
     let mut ptr_func_f32 = Id(0);
     let mut ptr_func_bool = Id(0);
+    let mut ptr_func_uvec2 = Id(0);
     let mut ptr_func_uvec4 = Id(0);
 
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
@@ -440,8 +452,10 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             (&mut ptr_func_i32, t_i32)
         } else if sty == f32_id {
             (&mut ptr_func_f32, t_f32)
-        } else if sty == bitset128_id {
+        } else if sty == bitset128_id || u32_vec_lanes(&types, sty) == Some(4) {
             (&mut ptr_func_uvec4, t_uvec4)
+        } else if u32_vec_lanes(&types, sty) == Some(2) {
+            (&mut ptr_func_uvec2, t_uvec2)
         } else {
             (&mut ptr_func_bool, t_bool)
         };
@@ -488,6 +502,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         t_u32,
         t_i32,
         t_f32,
+        t_uvec2,
         t_uvec3,
         t_uvec4,
         t_vec2,
@@ -614,6 +629,7 @@ struct LowerCtx<'a> {
     t_u32: Id,
     t_i32: Id,
     t_f32: Id,
+    t_uvec2: Id,
     t_uvec3: Id,
     t_uvec4: Id,
     /// `vec2<f32>`, declared only when an f16 buffer or a texture needs it.
@@ -660,7 +676,11 @@ impl LowerCtx<'_> {
         } else if tid == self.bitset128_id {
             self.t_uvec4
         } else {
-            self.t_bool
+            match u32_vec_lanes(&self.types, tid) {
+                Some(2) => self.t_uvec2,
+                Some(4) => self.t_uvec4,
+                _ => self.t_bool,
+            }
         }
     }
 }
@@ -745,6 +765,15 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
+            if let Some(lanes) = u32_vec_lanes(&ctx.types, info.elem) {
+                let (var, t_ptr) = ctx.coop.vec_view(ctx.spv, ctx.t_u32, lanes);
+                let rhs = lower_expr(ctx, value)?;
+                let rhs_id = coerce(ctx, rhs, info.elem);
+                let c0 = ctx.const_0_u32;
+                let ptr = ctx.spv.op_access_chain(t_ptr, var, &[buf_idx, c0, idx_id]);
+                ctx.spv.op_store(ptr, rhs_id);
+                return Ok(());
+            }
             if let Some(half) = info.half {
                 let rhs = lower_expr(ctx, value)?;
                 let rhs_id = coerce(ctx, rhs, ctx.f32_id);
@@ -1010,6 +1039,14 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
             let idx_val = lower_expr(ctx, index)?;
             let idx_id = coerce(ctx, idx_val, ctx.u32_id);
+            if let Some(lanes) = u32_vec_lanes(&ctx.types, info.elem) {
+                let (var, t_ptr) = ctx.coop.vec_view(ctx.spv, ctx.t_u32, lanes);
+                let c0 = ctx.const_0_u32;
+                let ptr = ctx.spv.op_access_chain(t_ptr, var, &[buf_idx, c0, idx_id]);
+                let elem_ty = ctx.spv_ty(info.elem);
+                let id = ctx.spv.op_load(elem_ty, ptr);
+                return Ok(Val { id, ty: info.elem });
+            }
             if let Some(half) = info.half {
                 let id = load_half(ctx, half, table, buf_idx, idx_id);
                 return Ok(Val { id, ty: ctx.f32_id });
@@ -1107,8 +1144,30 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             lower_binary(ctx, *op, lhs, rhs)
         }
 
+        IrExpr::FieldAccess { base, component } => {
+            let b = lower_expr(ctx, base)?;
+            let lanes = u32_vec_lanes(&ctx.types, b.ty)
+                .ok_or_else(|| "ZSL: field access on a non-vector value".to_string())?;
+            if u32::from(lanes) <= *component {
+                return Err(format!("ZSL: u32x{lanes} has no component {component}"));
+            }
+            let id = ctx.spv.op_composite_extract(ctx.t_u32, b.id, &[*component]);
+            Ok(Val { id, ty: ctx.u32_id })
+        }
+        IrExpr::Construct {
+            ty: Some(ty), args, ..
+        } if u32_vec_lanes(&ctx.types, *ty).is_some() => {
+            let mut parts = Vec::with_capacity(args.len());
+            for arg in args {
+                let v = lower_expr(ctx, arg)?;
+                parts.push(coerce(ctx, v, ctx.u32_id));
+            }
+            let vec_ty = ctx.spv_ty(*ty);
+            let id = ctx.spv.op_composite_construct(vec_ty, &parts);
+            Ok(Val { id, ty: *ty })
+        }
+
         IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
         | IrExpr::ArrayLit(_)

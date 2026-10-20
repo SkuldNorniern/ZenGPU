@@ -4951,6 +4951,105 @@ mod tests {
         }
     }
 
+    /// `u32x4` buffer elements on SPIR-V. Scalar tail past the last full vector.
+    #[test]
+    fn zsl_u32x4_copy_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const VEC_COPY_ZSL: ZslShader = zsl!(
+            push P { n: u32, tail: u32 }
+            @workgroup_size(64)
+            kernel vec_copy(src: device buffer<u32x4>, out: device mut buffer<u32x4>, words: device buffer<u32>, out_words: device mut buffer<u32>, p: P, id: global_id) {
+                if id.x < p.n {
+                    let v = src[id.x]
+                    out[id.x] = u32x4(v.w, v.z, v.y + v.x, v.x)
+                }
+                if id.x < p.tail {
+                    out_words[p.n * 4 + id.x] = words[p.n * 4 + id.x]
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let (n, tail) = (5u32, 3u32);
+        let words: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let src_words: Vec<u32> = (0..20u32)
+            .map(|i| i.wrapping_mul(40_503) ^ 0x9e37)
+            .collect();
+        let as_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let make = |data: &[u8], usage: BufferUsage| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size: data.len() as u64,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let src = make(&as_bytes(&src_words), input);
+        let wbuf = make(&as_bytes(&words), input);
+        let out = make(&as_bytes(&[0u32; 20]), output);
+        let out_words = make(&as_bytes(&[0u32; 32]), output);
+
+        let shader = dev
+            .create_shader(VEC_COPY_ZSL.spirv_desc().unwrap())
+            .unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let slots: Vec<u32> = [src, out, wbuf, out_words]
+            .iter()
+            .map(|b| b.index())
+            .collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(n), Scalar::U32(tail)],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let read = |b: zengpu_hal::BufferHandle, count: usize| -> Vec<u32> {
+            dev.read_buffer(b, 0, (count * 4) as u64)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let got = read(out, 20);
+        for i in 0..n as usize {
+            let v = &src_words[i * 4..i * 4 + 4];
+            let want = [v[3], v[2], v[1].wrapping_add(v[0]), v[0]];
+            assert_eq!(&got[i * 4..i * 4 + 4], &want, "vector {i}");
+        }
+        let got_words = read(out_words, 32);
+        let tail_start = (n * 4) as usize;
+        for i in 0..tail as usize {
+            assert_eq!(
+                got_words[tail_start + i],
+                words[tail_start + i],
+                "tail word {i}"
+            );
+        }
+        assert!(got_words[..tail_start].iter().all(|&w| w == 0));
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [src, wbuf, out, out_words] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
     /// `C = A*B + C` on one 16x16x16 tile, f16 and packed i8. Needs those configs (RADV gfx12).
     #[test]
     fn zsl_frag_mma_runs_through_vulkan() {

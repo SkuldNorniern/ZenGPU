@@ -100,6 +100,8 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str 
         Type::Float {
             format: FloatFormat::F16,
         } => "f16",
+        Type::Vector { lanes: 2, .. } => "u32x2",
+        Type::Vector { lanes: 4, .. } => "u32x4",
         _ => "unsupported",
     }
 }

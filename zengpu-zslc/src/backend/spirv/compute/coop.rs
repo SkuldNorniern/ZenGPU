@@ -33,6 +33,7 @@ pub(super) struct Coop {
     t_i8: Option<Id>,
     /// Aliased views of the u32 table, keyed by element width in bits.
     views: HashMap<u32, (Id, Id)>,
+    vec_views: HashMap<u8, (Id, Id)>,
     /// Workgroup f16 staging array for `frag_load_a|b`: the variable and its pointer type.
     stage: Option<(Id, Id)>,
 }
@@ -156,21 +157,37 @@ impl Coop {
                 Some("SPV_KHR_8bit_storage"),
             );
         }
-        let t_ra = spv.type_runtime_array(t_elem);
-        spv.decorate(t_ra, deco::ARRAY_STRIDE, &[stride]);
-        let t_struct = spv.type_struct(&[t_ra]);
-        spv.decorate(t_struct, deco::BLOCK, &[]);
-        spv.member_decorate(t_struct, 0, deco::OFFSET, &[0]);
-        let t_ra_struct = spv.type_runtime_array(t_struct);
-        let t_ptr_ra = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
-        let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_elem);
-        let var = spv.global_variable(t_ptr_ra, sc::STORAGE_BUFFER);
-        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
-        spv.decorate(var, deco::BINDING, &[U32_TABLE_BINDING]);
-        spv.decorate(var, deco::ALIASED, &[]);
-        self.views.insert(bits, (var, t_ptr_elem));
-        (var, t_ptr_elem)
+        let view = alias_u32_table(spv, t_elem, stride);
+        self.views.insert(bits, view);
+        view
     }
+
+    pub(super) fn vec_view(&mut self, spv: &mut SpvBuilder, t_u32: Id, lanes: u8) -> (Id, Id) {
+        if let Some(&v) = self.vec_views.get(&lanes) {
+            return v;
+        }
+        let t_elem = spv.type_vector(t_u32, u32::from(lanes));
+        let view = alias_u32_table(spv, t_elem, 4 * u32::from(lanes));
+        self.vec_views.insert(lanes, view);
+        view
+    }
+}
+
+/// Aliased SSBO at the u32 binding. `stride` is the element size in bytes.
+fn alias_u32_table(spv: &mut SpvBuilder, t_elem: Id, stride: u32) -> (Id, Id) {
+    let t_ra = spv.type_runtime_array(t_elem);
+    spv.decorate(t_ra, deco::ARRAY_STRIDE, &[stride]);
+    let t_struct = spv.type_struct(&[t_ra]);
+    spv.decorate(t_struct, deco::BLOCK, &[]);
+    spv.member_decorate(t_struct, 0, deco::OFFSET, &[0]);
+    let t_ra_struct = spv.type_runtime_array(t_struct);
+    let t_ptr_ra = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
+    let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_elem);
+    let var = spv.global_variable(t_ptr_ra, sc::STORAGE_BUFFER);
+    spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+    spv.decorate(var, deco::BINDING, &[U32_TABLE_BINDING]);
+    spv.decorate(var, deco::ALIASED, &[]);
+    (var, t_ptr_elem)
 }
 
 impl LowerCtx<'_> {
@@ -258,7 +275,10 @@ impl LowerCtx<'_> {
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
         if trans
             && let FragSrc::Shared(name) = src
-            && self.shared.get(name).is_some_and(|sv| self.is_f32_shared(sv))
+            && self
+                .shared
+                .get(name)
+                .is_some_and(|sv| self.is_f32_shared(sv))
         {
             return Err(format!(
                 "ZSL: SPIR-V frag_load_b_t from f32 shared `{name}` is not lowered (stage it as f16 first)"
@@ -266,7 +286,10 @@ impl LowerCtx<'_> {
         }
         if let FragSrc::Shared(name) = src
             && usage != FragUse::Acc
-            && self.shared.get(name).is_some_and(|sv| self.is_f32_shared(sv))
+            && self
+                .shared
+                .get(name)
+                .is_some_and(|sv| self.is_f32_shared(sv))
         {
             return self.lower_shared_frag_ab(name, ty, offset, ld);
         }

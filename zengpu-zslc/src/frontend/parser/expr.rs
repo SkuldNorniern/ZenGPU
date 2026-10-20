@@ -5,6 +5,41 @@ impl<'a> Parser<'a> {
         self.parse_or(ctx)
     }
 
+    /// Vectors are rejected in arithmetic and comparisons. They are accepted in loads, stores, lets
+    /// and fields.
+    fn reject_vector_operands(
+        &mut self,
+        ctx: &Ctx,
+        operands: [&IrExpr; 2],
+    ) -> Result<(), ParseError> {
+        let tc = ctx.type_ctx();
+        for operand in operands {
+            let ty = type_of_compute_expr(operand, &tc, &mut self.types);
+            if u32_vec_lanes(&self.types, ty).is_some() {
+                return self.err(
+                    "vector values (u32x2, u32x4) only support loads, stores, lets, and field access",
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn vector_component(&self, field: &str, lanes: u8) -> Result<u32, ParseError> {
+        let comp = match field {
+            "x" => 0,
+            "y" => 1,
+            "z" => 2,
+            "w" if lanes == 4 => 3,
+            other => {
+                return self.err(format!("u32x{lanes} has no field `.{other}`"));
+            }
+        };
+        if comp >= u32::from(lanes) {
+            return self.err(format!("u32x{lanes} has no field `.{field}`"));
+        }
+        Ok(comp)
+    }
+
     pub(super) fn parse_or(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
         let mut lhs = self.parse_and(ctx)?;
         while self.eat(&Tok::OrOr) {
@@ -36,6 +71,7 @@ impl<'a> Parser<'a> {
         };
         self.pos += 1;
         let rhs = self.parse_bitor(ctx)?;
+        self.reject_vector_operands(ctx, [&lhs, &rhs])?;
         Ok(bin(op, lhs, rhs))
     }
 
@@ -91,6 +127,7 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_mul(ctx)?;
+            self.reject_vector_operands(ctx, [&lhs, &rhs])?;
             lhs = bin(op, lhs, rhs);
         }
         Ok(lhs)
@@ -107,6 +144,7 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_unary(ctx)?;
+            self.reject_vector_operands(ctx, [&lhs, &rhs])?;
             lhs = bin(op, lhs, rhs);
         }
         Ok(lhs)
@@ -191,16 +229,37 @@ impl<'a> Parser<'a> {
                         };
                         return Ok(IrExpr::GlobalId(comp));
                     }
+                    if let Some(&ty) = ctx.locals.get(&name)
+                        && let Some(lanes) = u32_vec_lanes(&self.types, ty)
+                    {
+                        let component = self.vector_component(&field, lanes)?;
+                        return Ok(IrExpr::FieldAccess {
+                            base: Box::new(IrExpr::Local(name)),
+                            component,
+                        });
+                    }
                     return self.err(format!("unknown field access on `{name}`"));
                 }
                 if self.eat(&Tok::LBracket) {
                     let index = self.parse_expr(ctx)?;
                     self.expect(&Tok::RBracket, "`]`")?;
-                    if ctx.buffers.contains_key(&name) {
-                        return Ok(IrExpr::BufferLoad {
+                    if let Some(buffer) = ctx.buffers.get(&name) {
+                        let lanes = u32_vec_lanes(&self.types, buffer.elem);
+                        let load = IrExpr::BufferLoad {
                             buf: name,
                             index: Box::new(index),
-                        });
+                        };
+                        if let Some(lanes) = lanes
+                            && self.eat(&Tok::Dot)
+                        {
+                            let field = self.ident()?;
+                            let component = self.vector_component(&field, lanes)?;
+                            return Ok(IrExpr::FieldAccess {
+                                base: Box::new(load),
+                                component,
+                            });
+                        }
+                        return Ok(load);
                     }
                     if ctx.shared.contains_key(&name) {
                         let idx_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
@@ -316,7 +375,37 @@ impl<'a> Parser<'a> {
     }
 
     pub(super) fn parse_call(&mut self, ctx: &Ctx, name: &str) -> Result<IrExpr, ParseError> {
+        let vec_lanes = match name {
+            "u32x2" => Some(2u8),
+            "u32x4" => Some(4u8),
+            _ => None,
+        };
         self.expect(&Tok::LParen, "`(`")?;
+        if let Some(lanes) = vec_lanes {
+            let mut args = Vec::new();
+            while !self.eat(&Tok::RParen) {
+                args.push(self.parse_expr(ctx)?);
+                self.eat(&Tok::Comma);
+                if self.peek().is_none() {
+                    return self.err("unterminated call arguments");
+                }
+            }
+            if args.len() != usize::from(lanes) {
+                return self.err(format!("u32x{lanes}(…) takes {lanes} u32 lanes"));
+            }
+            let tc = ctx.type_ctx();
+            for arg in &args {
+                if type_of_compute_expr(arg, &tc, &mut self.types) != self.types.u32_id() {
+                    return self.err(format!("u32x{lanes}(…) lanes must be u32"));
+                }
+            }
+            let ty = self.types.u32_vec_id(lanes);
+            return Ok(IrExpr::Construct {
+                ty: Some(ty),
+                dim: lanes,
+                args,
+            });
+        }
         let mut args = Vec::new();
         while !self.eat(&Tok::RParen) {
             args.push(self.parse_expr(ctx)?);
@@ -369,6 +458,18 @@ impl<'a> Parser<'a> {
             return self.err(format!("{}() takes {n} args", func.name()));
         }
         self.check_frag_call(ctx, func, &args)?;
+        {
+            let tc = ctx.type_ctx();
+            for arg in &args {
+                let ty = type_of_compute_expr(arg, &tc, &mut self.types);
+                if u32_vec_lanes(&self.types, ty).is_some() {
+                    return self.err(format!(
+                        "{}() does not take vector values (u32x2, u32x4)",
+                        func.name()
+                    ));
+                }
+            }
+        }
         if func == BuiltinFn::I32 {
             let tc = ctx.type_ctx();
             let arg = type_of_compute_expr(&args[0], &tc, &mut self.types);

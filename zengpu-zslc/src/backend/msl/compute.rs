@@ -9,7 +9,7 @@ use crate::ir::node::{
     BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
     stmts_use_workgroup_reduce,
 };
-use crate::ir::typeck::{ComputeTypeCtx, frag_parts, type_of_compute_expr};
+use crate::ir::typeck::{ComputeTypeCtx, frag_parts, type_of_compute_expr, u32_vec_lanes};
 use crate::ir::types::{FloatFormat, FragUse, IntWidth, Signedness, Type, TypeId};
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -706,13 +706,28 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 emit_expr(ctx, rhs)?
             )
         }
+        IrExpr::FieldAccess { base, component: c } => {
+            format!("{}.{}", emit_expr(ctx, base)?, component(*c))
+        }
+        IrExpr::Construct { ty, dim, args } => {
+            let is_u32_vec = ty.is_some_and(|t| u32_vec_lanes(&ctx.types.borrow(), t).is_some());
+            if !is_u32_vec {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::Internal,
+                    "MSL compute backend: only u32x2 and u32x4 constructors reach compute",
+                ));
+            }
+            let mut args_s = Vec::with_capacity(args.len());
+            for a in args {
+                args_s.push(emit_expr(ctx, a)?);
+            }
+            format!("uint{}({})", dim, args_s.join(", "))
+        }
         IrExpr::Input(_)
-        | IrExpr::FieldAccess { .. }
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
         | IrExpr::ArrayLit(_)
-        | IrExpr::Index { .. }
-        | IrExpr::Construct { .. } => {
+        | IrExpr::Index { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL compute backend: graphics-only IR node in a compute module",
@@ -725,7 +740,8 @@ fn component(c: u32) -> &'static str {
     match c {
         0 => "x",
         1 => "y",
-        _ => "z",
+        2 => "z",
+        _ => "w",
     }
 }
 
@@ -1065,6 +1081,8 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
         } => Ok("float"),
         Type::Bool => Ok("bool"),
         Type::Frag { .. } => Err(frag_unsupported("frag local")),
+        Type::Vector { lanes: 2, .. } => Ok("uint2"),
+        Type::Vector { lanes: 4, .. } => Ok("uint4"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("MSL backend: unsupported scalar type {other:?}"),
@@ -1093,6 +1111,8 @@ fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
         Type::Float {
             format: FloatFormat::F16,
         } => Ok("half"),
+        Type::Vector { lanes: 2, .. } => Ok("uint2"),
+        Type::Vector { lanes: 4, .. } => Ok("uint4"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,

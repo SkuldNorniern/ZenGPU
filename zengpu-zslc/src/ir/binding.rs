@@ -2,7 +2,7 @@
 //! `zengpu-vulkan/src/device/mod.rs`. Shared with `backend::spirv::compute`.
 
 use crate::ir::arena::TypeArena;
-use crate::ir::typeck::{i8_type, u8_type};
+use crate::ir::typeck::{i8_type, u8_type, u32_vec_lanes};
 use crate::ir::types::TypeId;
 use crate::ir::{GraphicsEntry, GraphicsModule, Module, ParamKind};
 
@@ -27,6 +27,8 @@ pub fn ssbo_binding_for(elem: TypeId, types: &mut TypeArena) -> u32 {
         2
     } else if elem == types.i32_id() {
         3
+    } else if u32_vec_lanes(types, elem).is_some() {
+        2
     } else {
         unreachable!("unsupported compute buffer element")
     }

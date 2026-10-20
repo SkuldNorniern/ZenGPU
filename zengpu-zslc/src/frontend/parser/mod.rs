@@ -52,6 +52,7 @@ use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
 use crate::ir::typeck::{
     frag_parts, i8_type, storage_value_type, type_of_compute_expr, type_of_graphics_expr, u8_type,
+    u32_vec_lanes,
 };
 use crate::ir::types::TypeId;
 use crate::ir::{

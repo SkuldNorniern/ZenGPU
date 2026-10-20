@@ -215,8 +215,8 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
                 .as_ref()
                 .map(|l| Box::new(resolve_construct_types_expr(l, types))),
         },
-        IrExpr::Construct { dim, args, .. } => IrExpr::Construct {
-            ty: Some(types.vec_id(*dim)),
+        IrExpr::Construct { ty, dim, args } => IrExpr::Construct {
+            ty: Some(ty.unwrap_or_else(|| types.vec_id(*dim))),
             dim: *dim,
             args: args
                 .iter()

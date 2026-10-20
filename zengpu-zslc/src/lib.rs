@@ -100,6 +100,20 @@ mod phase_z_tests {
         }
     "#;
 
+    const VEC_COPY: &str = r#"
+        push P { n: u32, tail: u32 }
+        @workgroup_size(64)
+        kernel vec_copy(src: device buffer<u32x4>, out: device mut buffer<u32x4>, words: device buffer<u32>, out_words: device mut buffer<u32>, push: P, id: global_id) {
+            if id.x < push.n {
+                let v = src[id.x]
+                out[id.x] = u32x4(v.w, v.z, v.y + v.x, v.x)
+            }
+            if id.x < push.tail {
+                out_words[push.n * 4 + id.x] = words[push.n * 4 + id.x]
+            }
+        }
+    "#;
+
     const COPY_F16: &str = r#"
         @workgroup_size(64)
         kernel copy_f16(src: device buffer<f16>, out: device mut buffer<f16>, id: global_id) {
@@ -168,6 +182,43 @@ mod phase_z_tests {
         assert!(msl_source.contains("device uint* out_u"));
         assert!(msl_source.contains("device int* out_i"));
         spirv::lower_compute(&module).expect("lower typed buffers to SPIR-V");
+    }
+
+    #[test]
+    fn u32x4_buffers_lower_on_all_compute_backends() {
+        let module = parse_compute(VEC_COPY).expect("parse vec copy");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower vec copy to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower vec copy to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower vec copy to MSL")
+            .source;
+        assert!(hip_source.contains("const uint4* __restrict__ src"));
+        assert!(hip_source.contains("uint4* __restrict__ out"));
+        assert!(hip_source.contains("uint4(v.w, v.z, (v.y + v.x), v.x)"));
+        assert!(cuda_source.contains("const uint4* __restrict__ src"));
+        assert!(cuda_source.contains("make_uint4(v.w, v.z, (v.y + v.x), v.x)"));
+        assert!(msl_source.contains("device uint4* src"));
+        assert!(msl_source.contains("uint4(v.w, v.z, (v.y + v.x), v.x)"));
+        spirv::lower_compute(&module).expect("lower vec copy to SPIR-V");
+    }
+
+    #[test]
+    fn u32x4_arithmetic_is_rejected_at_parse() {
+        let err = parse_compute(
+            r#"
+            @workgroup_size(64)
+            kernel k(src: device buffer<u32x4>, out: device mut buffer<u32>, id: global_id) {
+                let v = src[id.x]
+                out[id.x] = v + 1
+            }
+        "#,
+        )
+        .expect_err("vector arithmetic is not supported");
+        assert!(err.msg.contains("vector values"), "{}", err.msg);
     }
 
     #[test]
@@ -2478,8 +2529,9 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 30] = [
+        let kernels: [(&str, &str); 31] = [
             ("tiled_gemm", TILED_GEMM),
+            ("vec_copy", VEC_COPY),
             ("typed_shared", TYPED_SHARED),
             ("frag_load_b_t", FRAG_LOAD_B_T),
             ("scatter_add", SCATTER_ADD),

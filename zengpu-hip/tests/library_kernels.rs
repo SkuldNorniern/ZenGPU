@@ -1838,3 +1838,91 @@ fn zsl_frag_probe_maps_lanes() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// Vector copy shader over `u32x4` elements, with a scalar tail past the last full vector.
+const VEC_COPY_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32, tail: u32 }
+    @workgroup_size(64)
+    kernel vec_copy(src: device buffer<u32x4>, out: device mut buffer<u32x4>, words: device buffer<u32>, out_words: device mut buffer<u32>, p: P, id: global_id) {
+        if id.x < p.n {
+            let v = src[id.x]
+            out[id.x] = u32x4(v.w, v.z, v.y + v.x, v.x)
+        }
+        if id.x < p.tail {
+            out_words[p.n * 4 + id.x] = words[p.n * 4 + id.x]
+        }
+    }
+);
+
+#[test]
+fn zsl_u32x4_copy_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = VEC_COPY_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let (n, tail) = (5u32, 3u32);
+    let words: Vec<u32> = (0..32u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+    let src_words: Vec<u32> = (0..20u32)
+        .map(|i| i.wrapping_mul(40_503) ^ 0x9e37)
+        .collect();
+    let as_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let src = pool.alloc(vec![20], DType::U32).unwrap();
+    device
+        .write_buffer(src.buffer, 0, &as_bytes(&src_words))
+        .unwrap();
+    let wbuf = pool.alloc(vec![32], DType::U32).unwrap();
+    device
+        .write_buffer(wbuf.buffer, 0, &as_bytes(&words))
+        .unwrap();
+    let out = pool.alloc(vec![20], DType::U32).unwrap();
+    device
+        .write_buffer(out.buffer, 0, &as_bytes(&[0u32; 20]))
+        .unwrap();
+    let out_words = pool.alloc(vec![32], DType::U32).unwrap();
+    device
+        .write_buffer(out_words.buffer, 0, &as_bytes(&[0u32; 32]))
+        .unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            src.buffer.index(),
+            out.buffer.index(),
+            wbuf.buffer.index(),
+            out_words.buffer.index(),
+        ],
+        &[zengpu_hal::Scalar::U32(n), zengpu_hal::Scalar::U32(tail)],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |b: &DeviceArray, count: usize| -> Vec<u32> {
+        device
+            .read_buffer(b.buffer, 0, (count * 4) as u64)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let got = read(&out, 20);
+    for i in 0..n as usize {
+        let v = &src_words[i * 4..i * 4 + 4];
+        let want = [v[3], v[2], v[1].wrapping_add(v[0]), v[0]];
+        assert_eq!(&got[i * 4..i * 4 + 4], &want, "vector {i}");
+    }
+    let got_words = read(&out_words, 32);
+    let tail_start = (n * 4) as usize;
+    for i in 0..tail as usize {
+        assert_eq!(
+            got_words[tail_start + i],
+            words[tail_start + i],
+            "tail word {i}"
+        );
+    }
+    assert!(got_words[..tail_start].iter().all(|&w| w == 0));
+}
