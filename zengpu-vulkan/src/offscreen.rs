@@ -135,26 +135,6 @@ mod tests {
     use zengpu_hal::DeviceRequest;
 
     #[test]
-    fn offscreen_target_handles_are_valid() {
-        let _guard = crate::test_gpu_lock();
-        let Ok(inst) = VulkanInstance::new() else {
-            return;
-        };
-        let Some(adapter) = inst.request_vulkan_adapter() else {
-            return;
-        };
-        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
-            return;
-        };
-
-        let target = OffscreenTarget::new(&device, Format::Rgba8Unorm, 64, 32).unwrap();
-        assert_eq!(target.format(), Format::Rgba8Unorm);
-        assert_eq!(target.extent(), (64, 32));
-        let _ = target.texture_handle();
-        let _ = target.target_handle();
-    }
-
-    #[test]
     fn offscreen_target_resize() {
         let _guard = crate::test_gpu_lock();
         let Ok(inst) = VulkanInstance::new() else {

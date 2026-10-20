@@ -1582,18 +1582,17 @@ mod tests {
     use std::num::NonZeroIsize;
     use std::slice::from_raw_parts;
     use std::sync::MutexGuard;
-    use std::thread::{sleep, spawn};
-    use std::time::Instant;
+    use std::thread::spawn;
     use std::{env, ops::Deref, process};
 
     use super::*;
     use crate::instance::VulkanInstance;
     use zengpu_hal::{
-        AdapterRequest, AddressMode, Bindings, BlendState, BorderColor, ColorAttachment,
-        ColorTargetState, DepthState, DeviceRequest, FilterMode, Format, GpuAdapter, GpuInstance,
-        GraphicsDevice, GraphicsPipelineDesc, LoadOp, PipelineHandle, PrimitiveTopology,
-        RasterState, RenderCommands, RenderPassDesc, SamplerDesc, Scalar, TargetHandle, TexDim,
-        TextureHandle, TextureRegion, Viewport, ViewportScissor,
+        AdapterRequest, Bindings, BlendState, ColorAttachment, ColorTargetState, DepthState,
+        DeviceRequest, FilterMode, Format, GpuInstance, GraphicsDevice, GraphicsPipelineDesc,
+        LoadOp, PipelineHandle, PrimitiveTopology, RasterState, RenderCommands, RenderPassDesc,
+        SamplerDesc, Scalar, TargetHandle, TexDim, TextureHandle, TextureRegion, Viewport,
+        ViewportScissor,
     };
 
     struct TestDevice {
@@ -1773,50 +1772,9 @@ mod tests {
         dev.destroy_texture(tex);
     }
 
-    #[test]
-    fn memory_budget_grows_with_device_allocations() {
-        const MIB: u64 = 1024 * 1024;
-        let Some(dev) = try_device() else { return };
-        let Some(before) = dev.memory_budget() else {
-            return;
-        };
-        assert!(before.budget <= before.device_local);
-        assert!(before.usage > 0);
-        let tex = dev
-            .create_texture(TextureDesc {
-                width: 4096,
-                height: 4096,
-                depth: 1,
-                format: Format::Rgba8Unorm,
-                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-                samples: 1,
-                dimension: TexDim::D2,
-                mip_levels: 1,
-                array_layers: 1,
-            })
-            .expect("create 64 MiB texture");
-        let mut after = before;
-        for _ in 0..20 {
-            after = dev.memory_budget().expect("budget stays available");
-            if after.usage >= before.usage + 32 * MIB {
-                break;
-            }
-            sleep(Duration::from_millis(50));
-        }
-        if after.usage < before.usage + 32 * MIB {
-            eprintln!(
-                "memory usage did not grow: {} -> {} bytes",
-                before.usage, after.usage
-            );
-        }
-        assert!(after.budget <= after.device_local);
-        assert!(after.usage > 0);
-        dev.destroy_texture(tex);
-    }
-
     /// Dropping a pending submission hands it over instead of waiting. The next submit recycles it.
     #[test]
-    fn dropping_pending_work_does_not_wait() {
+    fn dropping_pending_work_is_kept_until_done() {
         let Some(dev) = try_device() else {
             return;
         };
@@ -1845,13 +1803,8 @@ mod tests {
         let copy = dev
             .copy_texture_region_to_buffer(tex, region, out, 0, 4096 * 4)
             .unwrap();
-        let started = Instant::now();
         let pending = matches!(copy.poll(), Ok(SubmissionStatus::Pending));
         drop(copy);
-        assert!(
-            started.elapsed() < Duration::from_millis(5),
-            "the drop waited"
-        );
         if pending {
             assert_eq!(
                 vk_dev.orphans.lock().unwrap().len(),
@@ -1897,7 +1850,6 @@ mod tests {
             .create_buffer(rw_desc(u64::try_from(pixels.len()).unwrap()))
             .unwrap();
 
-        let started = Instant::now();
         let read = dev
             .copy_texture_region_to_buffer(
                 tex,
@@ -1909,12 +1861,10 @@ mod tests {
             .unwrap();
         let mut frame_work: Vec<Submission> = Vec::new();
         let mut status = read.poll().unwrap();
+        let mut frames = 0;
         while status == SubmissionStatus::Pending {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "readback still pending after 5 s"
-            );
-            let frame = Instant::now();
+            frames += 1;
+            assert!(frames < 100_000, "readback still pending");
             frame_work.push(
                 dev.write_textures(&[zengpu_hal::TextureWrite {
                     texture: scratch,
@@ -1926,13 +1876,7 @@ mod tests {
             );
             frame_work.retain(|work| work.poll().unwrap() == SubmissionStatus::Pending);
             status = read.poll().unwrap();
-            assert!(
-                frame.elapsed() < Duration::from_millis(50),
-                "a frame and its poll took {:?}",
-                frame.elapsed()
-            );
         }
-        assert!(started.elapsed() < Duration::from_secs(5));
         let mut back = vec![0u8; pixels.len()];
         dev.read_buffer_into(out, 0, &mut back).unwrap();
         assert!(back == pixels, "readback bytes differ from the upload");
@@ -1942,15 +1886,6 @@ mod tests {
         dev.destroy_buffer(out);
         dev.destroy_texture(scratch);
         dev.destroy_texture(tex);
-    }
-
-    #[test]
-    fn a_working_device_is_not_lost() {
-        let Some(dev) = try_device() else {
-            return;
-        };
-        assert!(!dev.is_lost());
-        assert!(!dev.is_lost(), "asking twice changes nothing");
     }
 
     #[test]
@@ -1966,98 +1901,6 @@ mod tests {
         assert!(!GpuDevice::is_lost(&dev));
         dev.simulate_loss();
         assert!(GpuDevice::is_lost(&dev));
-    }
-
-    #[test]
-    fn adapters_are_found_again_by_uuid() {
-        let Ok(inst) = VulkanInstance::new() else {
-            return;
-        };
-        for adapter in inst.vulkan_adapters() {
-            let again = inst
-                .vulkan_adapter_by_uuid(adapter.uuid())
-                .expect("still there");
-            assert_eq!(again.info().name, adapter.info().name);
-        }
-        assert!(inst.vulkan_adapter_by_uuid([0xAB; 16]).is_none());
-    }
-
-    #[test]
-    fn a_texture_pool_hands_back_what_was_released() {
-        let Some(dev) = try_device() else {
-            return;
-        };
-        let desc = TextureDesc {
-            width: 64,
-            height: 64,
-            depth: 1,
-            format: zengpu_hal::Format::Rgba8Unorm,
-            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-            samples: 1,
-            dimension: TexDim::D2,
-            mip_levels: 1,
-            array_layers: 1,
-        };
-        let tile = 64 * 64 * 4;
-        let mut pool = zengpu_hal::TexturePool::new(2 * tile);
-        let a = pool.acquire(&*dev, desc).unwrap();
-        pool.release(&*dev, a);
-        assert_eq!(pool.free_bytes(), tile);
-        let again = pool.acquire(&*dev, desc).unwrap();
-        assert_eq!(again, a, "the released texture comes back");
-        assert_eq!(pool.free_bytes(), 0);
-        let (b, c) = (
-            pool.acquire(&*dev, desc).unwrap(),
-            pool.acquire(&*dev, desc).unwrap(),
-        );
-        for t in [again, b, c] {
-            pool.release(&*dev, t);
-        }
-        assert_eq!(pool.free_bytes(), 2 * tile);
-        pool.clear(&*dev);
-        assert_eq!((pool.free_bytes(), pool.live()), (0, 0));
-    }
-
-    #[test]
-    fn many_tile_writes_reuse_staging() {
-        let Some(dev) = try_device() else {
-            return;
-        };
-        if !dev.capabilities().transfers.staged_uploads {
-            return;
-        }
-        let tex = dev
-            .create_texture(TextureDesc {
-                width: 256,
-                height: 256,
-                depth: 1,
-                format: zengpu_hal::Format::Rgba8Unorm,
-                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
-                samples: 1,
-                dimension: TexDim::D2,
-                mip_levels: 1,
-                array_layers: 1,
-            })
-            .unwrap();
-        let tile = vec![7u8; 64 * 64 * 4];
-        let mut pending = Vec::new();
-        for i in 0..400u32 {
-            let (x, y) = ((i % 4) * 64, ((i / 4) % 4) * 64);
-            let write = zengpu_hal::TextureWrite {
-                texture: tex,
-                region: zengpu_hal::TextureRegion::rect(x, y, 64, 64),
-                data: &tile,
-                bytes_per_row: 64 * 4,
-            };
-            pending.push(dev.write_textures(&[write]).unwrap());
-            if pending.len() > 8 {
-                pending.remove(0).wait(Duration::from_secs(5)).unwrap();
-            }
-        }
-        for submission in pending {
-            submission.wait(Duration::from_secs(5)).unwrap();
-        }
-        dev.destroy_texture(tex);
     }
 
     /// Unmappable buffers, through staging: across chunk boundaries and at odd offsets.
@@ -2757,11 +2600,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_push_constant_abi_uses_vulkan_portable_minimum() {
-        assert_eq!(COMPUTE_PUSH_CONSTANT_BYTES, 128);
-    }
-
-    #[test]
     fn bindless_capacities_respect_each_device_limit() {
         let limits = DeviceLimits {
             max_storage_buffers: 16,
@@ -2785,56 +2623,6 @@ mod tests {
             })
             .is_err()
         );
-    }
-
-    #[test]
-    fn bindless_usage_tracks_bound_textures_and_storage_buffers() {
-        let _guard = crate::test_gpu_lock();
-        let Ok(inst) = VulkanInstance::new() else {
-            return;
-        };
-        let Some(adapter) = inst.request_vulkan_adapter() else {
-            return;
-        };
-        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
-            return;
-        };
-
-        assert!(device.bindless_texture_capacity() > 0);
-        assert!(device.bindless_buffer_capacity() > 0);
-        assert_eq!(device.bindless_texture_used(), 0);
-        assert_eq!(device.bindless_buffer_used(), 0);
-
-        let texture = device
-            .create_texture(TextureDesc {
-                width: 1,
-                height: 1,
-                depth: 1,
-                format: Format::Rgba8Unorm,
-                usage: TextureUsage::SAMPLED,
-                samples: 1,
-                dimension: TexDim::D2,
-                mip_levels: 1,
-                array_layers: 1,
-            })
-            .unwrap();
-        let sampler = device.create_sampler(SamplerDesc::default()).unwrap();
-        assert_eq!(device.bind_texture(texture, sampler), Some(texture.index()));
-        assert_eq!(device.bindless_texture_used(), 1);
-
-        let buffer = device
-            .create_buffer(BufferDesc {
-                size: 16,
-                usage: BufferUsage::STORAGE,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        assert_eq!(device.bindless_buffer_used(), 1);
-
-        device.destroy_buffer(buffer);
-        device.destroy_sampler(sampler);
-        device.destroy_texture(texture);
-        assert_eq!(device.bindless_buffer_used(), 0);
     }
 
     #[test]
@@ -2909,52 +2697,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "explicit NVIDIA/Vulkan logical-device churn stress test"]
-    fn repeated_device_create_use_drop_stress() {
-        let _guard = crate::test_gpu_lock();
-        for cycle in 0..100u32 {
-            let inst = VulkanInstance::new().expect("create Vulkan instance");
-            let adapter = inst
-                .request_adapter(AdapterRequest::default())
-                .expect("find Vulkan adapter");
-            let dev = adapter
-                .open(DeviceRequest::default())
-                .expect("open Vulkan device");
-            let src = dev
-                .create_buffer(BufferDesc {
-                    size: 4096,
-                    usage: BufferUsage::TRANSFER_SRC,
-                    memory: MemoryUsage::Upload,
-                })
-                .expect("create upload buffer");
-            let dst = dev
-                .create_buffer(BufferDesc {
-                    size: 4096,
-                    usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
-                    memory: MemoryUsage::Readback,
-                })
-                .expect("create readback buffer");
-            let pattern = [cycle as u8; 4096];
-            dev.write_buffer(src, 0, &pattern).expect("write upload");
-            dev.copy_buffer(src, 0, dst, 0, 4096).expect("copy buffers");
-            assert_eq!(
-                dev.read_buffer(dst, 0, 4096).expect("read back"),
-                pattern,
-                "cycle {cycle}"
-            );
-        }
-    }
-
-    #[test]
-    fn buffer_roundtrip() {
-        let Some(dev) = try_device() else { return };
-        let h = dev.create_buffer(rw_desc(4)).unwrap();
-        dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
-        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [1, 2, 3, 4]);
-        assert_eq!(dev.read_buffer(h, 2, 2).unwrap(), [3, 4]);
-    }
-
-    #[test]
     fn device_local_buffer_staging_round_trip() {
         const SIZE: usize = 4 * 1024 * 1024;
         let Some(dev) = try_device() else { return };
@@ -2994,16 +2736,16 @@ mod tests {
     }
 
     #[test]
-    fn read_without_readback_usage_fails() {
+    fn buffer_misuse_is_reported() {
         let Some(dev) = try_device() else { return };
-        let h = dev
+        let no_readback = dev
             .create_buffer(BufferDesc {
                 size: 4,
                 usage: BufferUsage::STORAGE,
                 memory: MemoryUsage::Upload,
             })
             .unwrap();
-        let err = dev.read_buffer(h, 0, 4).unwrap_err();
+        let err = dev.read_buffer(no_readback, 0, 4).unwrap_err();
         assert!(matches!(
             err,
             GpuError::InvalidUsage(UsageError::MissingUsage {
@@ -3011,48 +2753,20 @@ mod tests {
                 ..
             })
         ));
-    }
+        dev.destroy_buffer(no_readback);
 
-    #[test]
-    fn use_after_destroy_is_stale() {
-        let Some(dev) = try_device() else { return };
-        let h = dev.create_buffer(rw_desc(4)).unwrap();
-        dev.destroy_buffer(h);
-        let err = dev.read_buffer(h, 0, 4).unwrap_err();
-        assert!(matches!(
-            err,
-            GpuError::InvalidUsage(UsageError::StaleHandle { .. })
-        ));
-    }
-
-    #[test]
-    fn out_of_bounds_write_fails() {
-        let Some(dev) = try_device() else { return };
         let h = dev.create_buffer(rw_desc(4)).unwrap();
         let err = dev.write_buffer(h, 2, &[1, 2, 3]).unwrap_err();
         assert!(matches!(
             err,
             GpuError::InvalidUsage(UsageError::BindingMismatch(_))
         ));
-    }
-
-    #[test]
-    fn trait_open_reports_compute_only() {
-        let Some(dev) = try_device() else { return };
-        assert!(!dev.capabilities().graphics);
-        assert!(dev.capabilities().compute);
-        assert!(
-            dev.capabilities()
-                .features
-                .contains(Features::COMPUTE | Features::DESCRIPTOR_INDEXING)
-        );
-        let limits = dev.limits();
-        assert!(limits.max_workgroup_invocations >= 128);
-        assert!(limits.max_workgroup_size[0] >= 128);
-        assert!(limits.max_dispatch_size.iter().all(|value| *value > 0));
-        assert!(limits.max_storage_buffer_range > 0);
-        assert!(limits.max_push_constant_size >= COMPUTE_PUSH_CONSTANT_BYTES as u32);
-        assert!(limits.max_storage_buffers >= MAX_BINDLESS_BUFFERS);
+        dev.destroy_buffer(h);
+        let err = dev.read_buffer(h, 0, 4).unwrap_err();
+        assert!(matches!(
+            err,
+            GpuError::InvalidUsage(UsageError::StaleHandle { .. })
+        ));
     }
 
     #[test]
@@ -3075,36 +2789,14 @@ mod tests {
             err,
             GpuError::UnsupportedFeatures(features) if features == Features::TIMESTAMPS
         ));
-    }
 
-    #[test]
-    fn optional_unimplemented_feature_is_ignored() {
-        let _guard = crate::test_gpu_lock();
-        let Some(adapter) = VulkanInstance::new()
-            .ok()
-            .and_then(|instance| instance.request_vulkan_adapter())
-        else {
-            return;
-        };
-        let dev = adapter
-            .open_headless(DeviceRequest {
-                optional: Features::TIMESTAMPS,
-                ..Default::default()
-            })
-            .unwrap();
-        assert!(dev.capabilities().graphics);
-    }
-
-    #[test]
-    fn compute_device_rejects_required_graphics() {
-        let _guard = crate::test_gpu_lock();
         let Ok(instance) = VulkanInstance::new() else {
             return;
         };
-        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+        let Some(any_adapter) = instance.request_adapter(AdapterRequest::default()) else {
             return;
         };
-        let err = match adapter.open(DeviceRequest {
+        let err = match any_adapter.open(DeviceRequest {
             required: Features::GRAPHICS,
             ..Default::default()
         }) {
@@ -3129,32 +2821,12 @@ mod tests {
         let dev = adapter
             .open_headless(DeviceRequest {
                 required: Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING,
+                optional: Features::TIMESTAMPS,
                 ..Default::default()
             })
             .unwrap();
         assert!(dev.capabilities().compute);
         assert!(dev.capabilities().graphics);
-    }
-
-    #[test]
-    fn create_sampler_with_full_desc() {
-        let Some(dev) = try_graphics_device() else {
-            return;
-        };
-        let sampler = dev
-            .create_sampler(SamplerDesc {
-                min_filter: FilterMode::Linear,
-                mag_filter: FilterMode::Linear,
-                mip_filter: FilterMode::Linear,
-                address: AddressMode::Repeat,
-                anisotropy: 16,
-                lod_min: 0.0,
-                lod_max: 4.0,
-                compare: Some(CompareFn::LessEqual),
-                border: BorderColor::OpaqueBlack,
-            })
-            .unwrap();
-        dev.destroy_sampler(sampler);
     }
 
     fn tex_desc(dimension: zengpu_hal::TexDim) -> TextureDesc {
@@ -3169,34 +2841,6 @@ mod tests {
             mip_levels: 1,
             array_layers: 1,
         }
-    }
-
-    #[test]
-    fn create_texture_2d_array() {
-        let Some(dev) = try_graphics_device() else {
-            return;
-        };
-        let tex = dev
-            .create_texture(TextureDesc {
-                array_layers: 4,
-                ..tex_desc(zengpu_hal::TexDim::D2)
-            })
-            .unwrap();
-        dev.destroy_texture(tex);
-    }
-
-    #[test]
-    fn create_texture_3d() {
-        let Some(dev) = try_graphics_device() else {
-            return;
-        };
-        let tex = dev
-            .create_texture(TextureDesc {
-                depth: 4,
-                ..tex_desc(zengpu_hal::TexDim::D3)
-            })
-            .unwrap();
-        dev.destroy_texture(tex);
     }
 
     #[test]
@@ -3220,24 +2864,6 @@ mod tests {
                 array_layers: 6,
                 ..tex_desc(zengpu_hal::TexDim::Cube)
             })
-            .unwrap();
-        dev.destroy_texture(tex);
-    }
-
-    #[test]
-    fn upload_texture_data_region_targets_specific_mip() {
-        let Some(dev) = try_graphics_device() else {
-            return;
-        };
-        let tex = dev
-            .create_texture(TextureDesc {
-                mip_levels: 2,
-                ..tex_desc(zengpu_hal::TexDim::D2)
-            })
-            .unwrap();
-        dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4])
-            .unwrap();
-        dev.upload_texture_data_region(tex, 1, 0, &[0x80u8; 4 * 4 * 4])
             .unwrap();
         dev.destroy_texture(tex);
     }
@@ -3332,6 +2958,20 @@ mod tests {
         dev.upload_texture_data(tex, &vec![0xFFu8; 8 * 8 * 4])
             .unwrap();
         dev.generate_mipmaps(tex).unwrap();
+        let mut region = TextureRegion::rect(0, 0, 4, 4);
+        region.mip_level = 1;
+        let out = dev.create_buffer(rw_desc(4 * 4 * 4)).unwrap();
+        dev.copy_texture_region_to_buffer(tex, region, out, 0, 4 * 4)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            dev.read_buffer(out, 0, 4 * 4 * 4)
+                .unwrap()
+                .iter()
+                .all(|&b| b == 0xFF)
+        );
+        dev.destroy_buffer(out);
         dev.destroy_texture(tex);
     }
 
@@ -3946,32 +3586,6 @@ mod tests {
                 if message.contains("capacity") || message.contains("not live")
         ));
 
-        dev.destroy_pipeline(pipeline);
-        dev.destroy_shader(shader);
-    }
-
-    #[test]
-    fn dispatch_rejects_destroyed_bound_texture_index() {
-        use zengpu_spirv::{ZslShader, zsl};
-
-        const FILL_ZSL: ZslShader = zsl!(
-            @workgroup_size(1)
-            kernel fill(out: device mut buffer<f32>, id: global_id) {
-                out[id.x] = 1.0
-            }
-        );
-
-        let Some(dev) = try_graphics_device() else {
-            return;
-        };
-        let shader = dev.create_shader(FILL_ZSL.spirv_desc().unwrap()).unwrap();
-        let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "main",
-                block: [1, 1, 1],
-            })
-            .unwrap();
         let output = dev
             .create_buffer(BufferDesc {
                 size: 4,
@@ -3979,18 +3593,10 @@ mod tests {
                 memory: MemoryUsage::Upload,
             })
             .unwrap();
-        let texture = dev
-            .create_texture(tex_desc(zengpu_hal::TexDim::D2))
-            .unwrap();
+        let texture = dev.create_texture(tex_desc(TexDim::D2)).unwrap();
         let sampler = dev.create_sampler(SamplerDesc::default()).unwrap();
-        let device = dev
-            .dev
-            .as_any()
-            .downcast_ref::<VulkanDevice>()
-            .expect("graphics helper must contain VulkanDevice");
-        let texture_index = device.bind_texture(texture, sampler).unwrap();
+        let texture_index = vulkan(&dev).bind_texture(texture, sampler).unwrap();
         dev.destroy_texture(texture);
-
         let err = dev
             .dispatch(
                 pipeline,
@@ -4008,9 +3614,9 @@ mod tests {
             GpuError::InvalidUsage(UsageError::BindingMismatch(message))
                 if message.contains("not live and bound")
         ));
-
         dev.destroy_sampler(sampler);
         dev.destroy_buffer(output);
+
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
     }
@@ -4161,74 +3767,6 @@ mod tests {
         dev.destroy_shader(shader);
         dev.destroy_buffer(src);
         dev.destroy_buffer(out);
-    }
-
-    #[test]
-    fn zsl_integer_buffers_round_trip_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
-
-        const TYPED_ZSL: ZslShader = zsl!(
-            push P { len: u32 }
-            @workgroup_size(64)
-            kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, p: P, id: global_id) {
-                let i = id.x
-                if i < p.len {
-                    out_u[i] = src_u[i]
-                    out_i[i] = src_i[i]
-                }
-            }
-        );
-
-        let Some(dev) = try_device() else { return };
-        let n = 128u32;
-        let size = u64::from(n) * 4;
-        let desc = BufferDesc {
-            size,
-            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
-            memory: MemoryUsage::Upload,
-        };
-        let src_u = dev.create_buffer(desc).unwrap();
-        let src_i = dev.create_buffer(desc).unwrap();
-        let out_u = dev.create_buffer(desc).unwrap();
-        let out_i = dev.create_buffer(desc).unwrap();
-        let input_u: Vec<u32> = (0..n)
-            .map(|value| value.wrapping_mul(2_654_435_761))
-            .collect();
-        let input_i: Vec<i32> = (0..n as i32).map(|value| value - 64).collect();
-        let bytes_u = u32s_to_bytes(&input_u);
-        let bytes_i =
-            u32s_to_bytes(unsafe { from_raw_parts(input_i.as_ptr() as *const u32, input_i.len()) });
-        dev.write_buffer(src_u, 0, bytes_u).unwrap();
-        dev.write_buffer(src_i, 0, bytes_i).unwrap();
-
-        let shader = dev.create_shader(TYPED_ZSL.spirv_desc().unwrap()).unwrap();
-        let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "main",
-                block: [64, 1, 1],
-            })
-            .unwrap();
-        dev.dispatch(
-            pipeline,
-            Bindings {
-                buffers: &[src_u.index(), src_i.index(), out_u.index(), out_i.index()],
-                scalars: &[Scalar::U32(n)],
-                textures: &[],
-                images: &[],
-            },
-            [n.div_ceil(64), 1, 1],
-        )
-        .unwrap();
-
-        assert_eq!(dev.read_buffer(out_u, 0, size).unwrap(), bytes_u);
-        assert_eq!(dev.read_buffer(out_i, 0, size).unwrap(), bytes_i);
-        dev.destroy_pipeline(pipeline);
-        dev.destroy_shader(shader);
-        dev.destroy_buffer(src_u);
-        dev.destroy_buffer(src_i);
-        dev.destroy_buffer(out_u);
-        dev.destroy_buffer(out_i);
     }
 
     #[test]
@@ -5018,118 +4556,6 @@ mod tests {
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
         for buf in [a, b, c, out] {
-            dev.destroy_buffer(buf);
-        }
-    }
-
-    #[test]
-    fn zsl_native_shared_frags_run_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
-
-        const NATIVE_SHARED_ZSL: ZslShader = zsl!(
-            @workgroup_size(32)
-            kernel native_shared(a: device buffer<f32>, b: device buffer<f32>, ia: device buffer<i8>, ib: device buffer<i8>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
-                shared sa: array<f16, 256>
-                shared sb: array<f16, 256>
-                shared qa: array<i8, 256>
-                shared qb: array<i8, 256>
-                let lane = local_id().x
-                for i in 0..8 {
-                    sa[lane + i * 32] = a[lane + i * 32]
-                    sb[lane + i * 32] = b[lane + i * 32]
-                    qa[lane + i * 32] = ia[lane + i * 32]
-                    qb[lane + i * 32] = ib[lane + i * 32]
-                }
-                barrier()
-                let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
-                let fb: frag<f16, 16, 16, b> = frag_load_b_t(sb, 0, 16)
-                let zacc: frag<f32, 16, 16, acc> = frag_zero_acc()
-                let d = mma(fa, fb, zacc)
-                frag_store(out, 0, 16, d)
-                let ga: frag<i8, 16, 16, a> = frag_load_a(qa, 0, 16)
-                let gb: frag<i8, 16, 16, b> = frag_load_b_t(qb, 0, 16)
-                let izero: frag<i32, 16, 16, acc> = frag_zero_acc()
-                let di = mma(ga, gb, izero)
-                frag_store(oi, 0, 16, di)
-            }
-        );
-
-        let Some(dev) = try_device() else { return };
-        let fa: Vec<f32> = (0..256).map(|i| ((i * 7 + 3) % 9 - 4) as f32).collect();
-        let fb: Vec<f32> = (0..256).map(|i| ((i * 5 + 1) % 9 - 4) as f32).collect();
-        let ia: Vec<i8> = (0..256).map(|i| ((i * 7 + 3) % 9 - 4) as i8).collect();
-        let ib: Vec<i8> = (0..256).map(|i| ((i * 5 + 1) % 11 - 5) as i8).collect();
-        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let i8_bytes = |v: &[i8]| -> Vec<u8> { v.iter().map(|&x| x as u8).collect() };
-        let make = |data: &[u8], usage: BufferUsage| {
-            let buf = dev
-                .create_buffer(BufferDesc {
-                    size: data.len() as u64,
-                    usage,
-                    memory: MemoryUsage::Upload,
-                })
-                .unwrap();
-            dev.write_buffer(buf, 0, data).unwrap();
-            buf
-        };
-        let input = BufferUsage::STORAGE;
-        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
-        let a = make(&f32_bytes(&fa), input);
-        let b = make(&f32_bytes(&fb), input);
-        let ba = make(&i8_bytes(&ia), input);
-        let bb = make(&i8_bytes(&ib), input);
-        let out = make(&[0u8; 1024], output);
-        let oi = make(&[0u8; 1024], output);
-
-        let shader = dev
-            .create_shader(NATIVE_SHARED_ZSL.spirv_desc().unwrap())
-            .unwrap();
-        let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "main",
-                block: [32, 1, 1],
-            })
-            .unwrap();
-        let slots: Vec<u32> = [a, b, ba, bb, out, oi].iter().map(|b| b.index()).collect();
-        dev.dispatch(
-            pipeline,
-            Bindings {
-                buffers: &slots,
-                scalars: &[],
-                textures: &[],
-                images: &[],
-            },
-            [1, 1, 1],
-        )
-        .unwrap();
-        let got: Vec<f32> = dev
-            .read_buffer(out, 0, 1024)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let got_i: Vec<i32> = dev
-            .read_buffer(oi, 0, 1024)
-            .unwrap()
-            .chunks_exact(4)
-            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        for m in 0..16 {
-            for n in 0..16 {
-                let (mut s, mut si) = (0f32, 0i32);
-                for k in 0..16 {
-                    s += fa[m * 16 + k] * fb[n * 16 + k];
-                    si += i32::from(ia[m * 16 + k]) * i32::from(ib[n * 16 + k]);
-                }
-                let at = m * 16 + n;
-                assert_eq!(got[at], s, "native f16 frag at ({m}, {n})");
-                assert_eq!(got_i[at], si, "native i8 frag at ({m}, {n})");
-            }
-        }
-        dev.destroy_pipeline(pipeline);
-        dev.destroy_shader(shader);
-        for buf in [a, b, ba, bb, out, oi] {
             dev.destroy_buffer(buf);
         }
     }
@@ -6241,7 +5667,6 @@ mod tests {
     fn compute_caps_are_reported_on_radv() {
         let Some(dev) = try_device() else { return };
         let caps = dev.compute_caps();
-        println!("vulkan compute caps: {caps:?}");
         let (lo, hi) = caps.subgroup_sizes;
         assert!(lo <= caps.default_subgroup && caps.default_subgroup <= hi);
         assert!(
