@@ -56,9 +56,12 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::Unsupported("buffer size query".into()))
     }
 
+    /// Copies `data` into `buffer` and returns once it is visible to later work. Waits only for
+    /// pending submissions that use `buffer`, never for unrelated work.
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()>;
 
-    /// Requires `BufferUsage::READBACK`.
+    /// Requires `BufferUsage::READBACK`. Waits only for pending writes to `buffer`, never for
+    /// unrelated work.
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>>;
 
     /// Starts an async write of `data` into `buffer`. Returns before the copy finishes. `data` is
