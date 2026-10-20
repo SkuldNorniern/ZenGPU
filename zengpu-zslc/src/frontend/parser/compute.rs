@@ -114,6 +114,7 @@ impl<'a> Parser<'a> {
                 name: name.clone(),
                 elem: ctx.shared[name].elem,
                 len: ctx.shared[name].len,
+                view_of: ctx.shared[name].view_of.clone(),
             })
             .collect();
 
@@ -260,6 +261,8 @@ impl<'a> Parser<'a> {
             }
             if self.eat_kw("shared") {
                 self.parse_shared(ctx)?;
+            } else if self.eat_kw("view") {
+                self.parse_view(ctx)?;
             } else {
                 stmts.extend(self.parse_stmt(ctx)?);
             }
@@ -292,7 +295,70 @@ impl<'a> Parser<'a> {
             return self.err(format!("duplicate symbol `{name}`"));
         }
         ctx.shared_order.push(name.clone());
-        ctx.shared.insert(name.clone(), PendingShared { elem, len });
+        ctx.shared.insert(
+            name.clone(),
+            PendingShared {
+                elem,
+                len,
+                view_of: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// `view name: array<T> = base` reinterprets `base`'s bytes as `T` (u32, u32x2, u32x4). Length
+    /// is base bytes / sizeof(T), which must divide evenly.
+    pub(super) fn parse_view(&mut self, ctx: &mut Ctx) -> Result<(), ParseError> {
+        let name = self.ident()?;
+        self.expect(&Tok::Colon, "`:` after view name")?;
+        if !self.eat_kw("array") {
+            return self.err("view declarations require `array<T>`");
+        }
+        self.expect(&Tok::Lt, "`<` in array<T>")?;
+        let elem = self.parse_buffer_elem_type()?;
+        self.expect(&Tok::Gt, "`>` in array<T>")?;
+        self.expect(&Tok::Eq, "`=` in view declaration")?;
+        let base = self.ident()?;
+        let Some(base_decl) = ctx.shared.get(&base) else {
+            return self.err(format!("`{base}` is not a shared array"));
+        };
+        if base_decl.view_of.is_some() {
+            return self.err(format!(
+                "`{base}` is a view; views of views are not supported"
+            ));
+        }
+        let (base_elem, base_len) = (base_decl.elem, base_decl.len);
+        let Some(base_bytes) = storage_byte_size(&self.types, base_elem) else {
+            return self.err(format!(
+                "`{base}` has an element type that cannot be viewed"
+            ));
+        };
+        let view_bytes = match u32_vec_lanes(&self.types, elem) {
+            Some(lanes) => 4 * u32::from(lanes),
+            None if elem == self.types.u32_id() => 4,
+            None => return self.err("views are array<u32>, array<u32x2> or array<u32x4>"),
+        };
+        let total = u64::from(base_len) * u64::from(base_bytes);
+        if total % u64::from(view_bytes) != 0 {
+            return self.err(format!(
+                "view `{name}`: the {total}-byte base `{base}` is not a whole number of {view_bytes}-byte elements"
+            ));
+        }
+        if ctx.shared.contains_key(&name)
+            || ctx.buffers.contains_key(&name)
+            || ctx.locals.contains_key(&name)
+        {
+            return self.err(format!("duplicate symbol `{name}`"));
+        }
+        ctx.shared_order.push(name.clone());
+        ctx.shared.insert(
+            name,
+            PendingShared {
+                elem,
+                len: (total / u64::from(view_bytes)) as u32,
+                view_of: Some(base),
+            },
+        );
         Ok(())
     }
 

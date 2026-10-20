@@ -256,14 +256,30 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
         s.push_str("\n) {\n");
     }
 
+    let aligned = e.shared.iter().any(|d| d.view_of.is_some());
     for shared in &e.shared {
-        let _ = writeln!(
-            s,
-            "    threadgroup {} {}[{}];",
-            shared_elems[shared.name.as_str()],
-            shared.name,
-            shared.len
-        );
+        let elem = shared_elems[shared.name.as_str()];
+        match &shared.view_of {
+            None => {
+                let attr = if aligned {
+                    " __attribute__((aligned(16)))"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    s,
+                    "    threadgroup {elem} {}[{}]{attr};",
+                    shared.name, shared.len
+                );
+            }
+            Some(base) => {
+                let _ = writeln!(
+                    s,
+                    "    threadgroup {elem}* {} = (threadgroup {elem}*){base};",
+                    shared.name
+                );
+            }
+        }
     }
     if uses_workgroup_reduce {
         let _ = writeln!(

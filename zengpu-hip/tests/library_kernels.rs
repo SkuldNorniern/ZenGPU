@@ -2119,3 +2119,83 @@ fn zsl_bit_builtins_match_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// Stores `u32x4`, runs a barrier, then loads f16 fragments and runs one mma.
+const VIEW_MMA_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel view_mma(a: device buffer<u32x4>, b: device buffer<u32x4>, c: device buffer<f32>, out: device mut buffer<f32>) {
+        shared sa: array<f16, 256>
+        shared sb: array<f16, 256>
+        view sa4: array<u32x4> = sa
+        view sb4: array<u32x4> = sb
+        let lane = local_id().x
+        sa4[lane] = a[lane]
+        sb4[lane] = b[lane]
+        barrier()
+        let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b_t(sb, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let done: frag<f32, 16, 16, acc> = mma(fa, fb, acc)
+        frag_store(out, 0, 16, done)
+    }
+);
+
+#[test]
+fn zsl_shared_view_mma_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = VIEW_MMA_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let bits_a: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let bits_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let a = upload_half(&pool, vec![256], DType::F16, &bits_a);
+    let b = upload_half(&pool, vec![256], DType::F16, &bits_b);
+    let c = upload(&pool, vec![256], &fc);
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            c.buffer.index(),
+            out.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[n * 16 + k];
+            }
+            assert!(
+                close(got[m * 16 + n], s),
+                "({m}, {n}): {} vs {s}",
+                got[m * 16 + n]
+            );
+        }
+    }
+    drop(ops);
+    for arr in [a, b, c, out] {
+        pool.free(arr);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

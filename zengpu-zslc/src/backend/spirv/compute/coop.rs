@@ -212,7 +212,9 @@ impl LowerCtx<'_> {
                     .shared
                     .get(name)
                     .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
-                Ok(self.spv.op_access_chain(sv.elem_ptr, sv.var, &[offset]))
+                let zero = self.spv.constant_u32(self.t_u32, 0);
+                let chain = sv.chain(zero, offset);
+                Ok(self.spv.op_access_chain(sv.elem_ptr, sv.var, &chain))
             }
             FragSrc::Buffer(name) => {
                 let info = *self
@@ -328,6 +330,7 @@ impl LowerCtx<'_> {
             ));
         }
         let tile = sv.var;
+        let tile_zero = self.spv.constant_u32(self.t_u32, 0);
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let coop_ty = self.frag_spv_ty(ty)?;
         let [sx, sy, sz] = self.local_size;
@@ -369,9 +372,10 @@ impl LowerCtx<'_> {
 
         self.spv.op_control_barrier(scope, scope, semantics);
         for i in 0..8u32 {
+            let src_chain = sv.chain(tile_zero, src_idx);
             let src_ptr = self
                 .spv
-                .op_access_chain(self.t_ptr_wg_f32, tile, &[src_idx]);
+                .op_access_chain(self.t_ptr_wg_f32, tile, &src_chain);
             let value = self.spv.op_load(t_f32, src_ptr);
             let half = self.spv.op_convert_f_to_f(t_f16, value);
             let dst_idx = if i == 0 {

@@ -255,9 +255,26 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
 
     s.push_str(") {\n");
 
+    let aligned = e.shared.iter().any(|d| d.view_of.is_some());
     for shared in &e.shared {
         let cty = shared_c_type(&module.types, shared.elem)?;
-        let _ = writeln!(s, "    __shared__ {cty} {}[{}];", shared.name, shared.len);
+        match &shared.view_of {
+            None => {
+                let align = if aligned { "__align__(16) " } else { "" };
+                let _ = writeln!(
+                    s,
+                    "    __shared__ {align}{cty} {}[{}];",
+                    shared.name, shared.len
+                );
+            }
+            Some(base) => {
+                let _ = writeln!(
+                    s,
+                    "    {cty}* {} = reinterpret_cast<{cty}*>({base});",
+                    shared.name
+                );
+            }
+        }
     }
     if uses_workgroup_reduce {
         let _ = writeln!(s, "    __shared__ float __zsl_wg_reduce_f32[{block_size}];");
@@ -332,6 +349,9 @@ fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
 /// `u8` buffers load zero-extended. f16 and bf16 shared elements are `unsigned short` bits,
 /// converted on each access.
 fn shared_c_type(types: &TypeArena, elem: TypeId) -> Result<&'static str, Diagnostic> {
+    if let Some(lanes) = u32_vec_lanes(types, elem) {
+        return Ok(if lanes == 2 { "uint2" } else { "uint4" });
+    }
     Ok(match storage_elem(types, elem) {
         Some(StorageElem::F32) => "float",
         Some(StorageElem::F16 | StorageElem::Bf16) => "unsigned short",
