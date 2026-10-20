@@ -434,6 +434,9 @@ pub(crate) struct VulkanDeviceInner {
     /// `(min, max)` subgroup sizes a compute pipeline may require (`VK_EXT_subgroup_size_control`).
     pub compute_subgroup_sizes: Option<(u32, u32)>,
     pub coop_matrix: bool,
+    /// `VK_KHR_pipeline_executable_properties` enabled: stats-capture pipelines report
+    /// resource use.
+    pub pipeline_executable_info: bool,
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
@@ -788,11 +791,14 @@ impl VulkanDevice {
         let mut supported_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut supported_wg_explicit =
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
+        let mut supported_pipe_exec =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
         supported_subgroup_size.p_next = &mut supported_coop as *mut _ as *mut c_void;
         supported_coop.p_next = &mut supported_storage16 as *mut _ as *mut c_void;
         supported_storage16.p_next = &mut supported_storage8 as *mut _ as *mut c_void;
         supported_storage8.p_next = &mut supported_f16i8 as *mut _ as *mut c_void;
         supported_f16i8.p_next = &mut supported_wg_explicit as *mut _ as *mut c_void;
+        supported_wg_explicit.p_next = &mut supported_pipe_exec as *mut _ as *mut c_void;
         let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
             p_next: &mut supported_desc_idx as *mut _ as *mut c_void,
             ..Default::default()
@@ -976,6 +982,17 @@ impl VulkanDevice {
         }
         let wg_explicit_supported = supports_extension(khr::workgroup_memory_explicit_layout::NAME)
             && supported_wg_explicit.workgroup_memory_explicit_layout == vk::TRUE;
+        let pipe_exec_supported = supports_extension(khr::pipeline_executable_properties::NAME)
+            && supported_pipe_exec.pipeline_executable_info == vk::TRUE;
+        let mut pipe_exec_feat = vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR {
+            pipeline_executable_info: vk::TRUE,
+            ..Default::default()
+        };
+        if pipe_exec_supported {
+            extensions.push(khr::pipeline_executable_properties::NAME.as_ptr());
+            pipe_exec_feat.p_next = features2.p_next;
+            features2.p_next = &mut pipe_exec_feat as *mut _ as *mut c_void;
+        }
         let mut wg_explicit_feat = vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR {
             workgroup_memory_explicit_layout: vk::TRUE,
             workgroup_memory_explicit_layout8_bit_access: supported_wg_explicit
@@ -1055,6 +1072,7 @@ impl VulkanDevice {
             depth24_stencil8,
             compute_subgroup_sizes,
             coop_matrix: coop_supported,
+            pipeline_executable_info: pipe_exec_supported,
             dynamic_rendering,
             debug_utils,
         });
@@ -3315,6 +3333,68 @@ mod tests {
             .unwrap();
         dev.generate_mipmaps(tex).unwrap();
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn pipeline_stats_order_tiny_and_heavy_kernels() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const TINY: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel tiny(out: device mut buffer<f32>, id: global_id) {
+                out[id.x] = 1.0
+            }
+        );
+        const HEAVY: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel heavy(inp: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+                let i = id.x
+                let x0 = inp[i]
+                let x1 = x0 * 1.5
+                let x2 = x1 + x0
+                let x3 = x2 * x1
+                let x4 = x3 + x2
+                let x5 = x4 * x3
+                let x6 = x5 + x4
+                let x7 = x6 * x5
+                let x8 = x7 + x6
+                let x9 = x8 * x7
+                let x10 = x9 + x8
+                let x11 = x10 * x9
+                let x12 = x11 + x10
+                let x13 = x12 * x11
+                let x14 = x13 + x12
+                let x15 = x14 * x13
+                out[i] = x0 * x1 + x2 * x3 + x4 * x5 + x6 * x7 + x8 * x9 + x10 * x11 + x12 * x13 + x14 * x15
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        let capture = zengpu_hal::ComputePipelineHints {
+            capture_stats: true,
+            ..Default::default()
+        };
+        let stats = |shader: &ZslShader, entry: &str| {
+            let module = dev.create_shader(shader.spirv_desc().unwrap()).unwrap();
+            let pipeline = dev
+                .create_compute_pipeline_with(
+                    ComputePipelineDesc {
+                        shader: module,
+                        entry,
+                        block: [64, 1, 1],
+                    },
+                    capture,
+                )
+                .unwrap();
+            dev.pipeline_stats(pipeline)
+        };
+        let tiny = stats(&TINY, "main").expect("captured stats");
+        let heavy = stats(&HEAVY, "main").expect("captured stats");
+        assert!(tiny.vgprs > 0 && tiny.sgprs > 0, "{tiny:?}");
+        assert!(heavy.vgprs > tiny.vgprs, "{heavy:?} vs {tiny:?}");
+        assert_eq!(tiny.scratch_bytes, 0);
+        assert!(tiny.max_threads >= 64);
+        assert!(tiny.waves_per_simd.is_some());
+        println!("vulkan stats: tiny {tiny:?} heavy {heavy:?}");
     }
 
     #[test]
