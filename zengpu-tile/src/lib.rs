@@ -1,7 +1,6 @@
-//! ZenGPU tile layer: kernels over tile blocks, lowered to ZSL and then to every backend.
-//!
-//! i8 inputs are `u32` buffers, four values per word, little-endian. `cols` must be a multiple
-//! of 4.
+//! Lowers tile kernels to ZSL, then to every backend that `zengpu-zslc` emits.
+//! Schedules pick the form. Unsupported requests fall back, and `CompiledTile::notes` says why.
+//! i8 tensors: one byte per element, read as i32 in the kernel.
 //!
 //! ```ignore
 //! let mut b = TileKernel::builder("gemm", [32, 32]);
@@ -29,9 +28,11 @@ use zengpu_zslc::frontend::parser::parse_compute;
 mod compiled;
 mod ir;
 mod lower;
+mod schedule;
 
 pub use compiled::{BackendSource, CompiledTile, TileBinding, TileProgram};
 pub use ir::{Affine, Block, DType, KernelBuilder, Op, Stmt, Tensor, Tile, TileKernel};
+pub use schedule::{Matrix, Schedule, Target};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TileError {
@@ -61,9 +62,25 @@ impl Display for TileError {
 
 impl Error for TileError {}
 
-/// backend failures reported on use, not at build, so one missing backend does not block the rest.
+/// O0 reference schedule. Backend errors are kept and reported on use, so one missing backend does
+/// not stop the rest.
 pub fn compile(kernel: &TileKernel) -> Result<CompiledTile, TileError> {
-    let (zsl, workgroup) = lower::zsl_source(kernel)?;
+    compile_with(
+        kernel,
+        &Schedule::o0(),
+        &Target::scalar_only(zengpu_hal::BackendPreference::Auto),
+    )
+}
+
+/// Never fails on the schedule: unsupported requests fall back, with reasons in
+/// `CompiledTile::notes`.
+pub fn compile_with(
+    kernel: &TileKernel,
+    schedule: &Schedule,
+    target: &Target,
+) -> Result<CompiledTile, TileError> {
+    let (plan, notes) = schedule::resolve(kernel, schedule, target);
+    let zsl = lower::zsl_source(kernel, &plan)?;
     let module = parse_compute(&zsl).map_err(|e| {
         TileError::Lower(format!(
             "generated ZSL does not parse: {} (at {:?})",
@@ -72,6 +89,7 @@ pub fn compile(kernel: &TileKernel) -> Result<CompiledTile, TileError> {
     })?;
     let [grid_m, grid_n] = kernel.grid();
     let grid = [grid_n as u32, grid_m as u32, 1];
+    let workgroup = plan.workgroup as u32;
     let bindings = kernel
         .tensors
         .iter()
@@ -87,6 +105,13 @@ pub fn compile(kernel: &TileKernel) -> Result<CompiledTile, TileError> {
         zsl,
         grid,
         workgroup: [workgroup, 1, 1],
+        mode: match plan.mode {
+            lower::Mode::Naive => "naive",
+            lower::Mode::Staged => "staged",
+            lower::Mode::Mma => "mma",
+        },
+        subgroup: (plan.mode == lower::Mode::Mma).then_some(plan.wave_size as u32),
+        notes,
         bindings,
         spirv: backend("spirv", spirv::lower_compute(&module).map(|w| w.to_vec())),
         hip: backend(
@@ -124,16 +149,20 @@ fn backend<T>(name: &'static str, r: Result<T, Diagnostic>) -> Result<T, TileErr
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::time::Instant;
+
     use zengpu_hal::{
-        AdapterRequest, BufferDesc, BufferHandle, BufferUsage, DeviceRequest, GpuDevice,
-        GpuInstance, MemoryUsage,
+        AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage, DeviceRequest,
+        GpuDevice, GpuInstance, MemoryUsage,
     };
     use zengpu_hip::HipInstance;
     use zengpu_vulkan::VulkanInstance;
 
     use super::*;
 
-    /// Computes `C[M,N] = A[M,K] * B[N,K]^T + bias[N]`, cast to the output dtype.
+    /// Computes `C[M,N] = A[M,K] * B[N,K]^T + bias[N]`, cast to the output dtype. `rounded`: rounds
+    /// the f16 accumulator to binary16 before the bias is added.
+    #[allow(clippy::too_many_arguments)]
     fn gemm(
         input: DType,
         out: DType,
@@ -142,6 +171,7 @@ mod tests {
         k: usize,
         tile: [usize; 2],
         bk: usize,
+        rounded: bool,
     ) -> Result<TileKernel, TileError> {
         let acc_dt = if input == DType::I8 {
             DType::I32
@@ -159,6 +189,10 @@ mod tests {
             let bt = kb.load(Block::new(w, Affine::grid_n(), Affine::k(), [tile[1], bk]));
             acc = kb.dot(at, bt, acc);
         });
+        if rounded {
+            let r = b.cast(acc, DType::F16);
+            acc = b.cast(r, DType::F32);
+        }
         let bi = b.load(Block::new(
             bias,
             Affine::constant(0),
@@ -189,13 +223,28 @@ mod tests {
         };
         assert!(matches!(dot_dims, Err(TileError::Build(m)) if m.contains("dot shapes")));
 
-        let i8_cols = {
-            let mut b = TileKernel::builder("bad", [16, 16]);
+        let i8_odd = {
+            let mut b = TileKernel::builder("ok", [16, 16]);
             b.input("a", DType::I8, [16, 6]);
             b.output("c", DType::I32, [16, 16]);
             b.build()
         };
-        assert!(matches!(i8_cols, Err(TileError::Build(m)) if m.contains("multiple of 4")));
+        assert!(i8_odd.is_ok());
+
+        let k_width = {
+            let mut b = TileKernel::builder("bad", [16, 16]);
+            let a = b.input("a", DType::F32, [16, 64]);
+            let w = b.input("b", DType::F32, [16, 64]);
+            b.output("c", DType::F32, [16, 16]);
+            let mut acc = b.zeros(DType::F32, [16, 16]);
+            b.loop_k(64, 16, |kb| {
+                let at = kb.load(Block::new(a, Affine::grid_m(), Affine::k(), [16, 32]));
+                let bt = kb.load(Block::new(w, Affine::grid_n(), Affine::k(), [16, 32]));
+                acc = kb.dot(at, bt, acc);
+            });
+            b.build()
+        };
+        assert!(matches!(k_width, Err(TileError::Build(m)) if m.contains("wide along k")));
 
         let reuse = {
             let mut b = TileKernel::builder("bad", [16, 16]);
@@ -214,22 +263,96 @@ mod tests {
 
     #[test]
     fn gemm_display_snapshot() {
-        let kernel = gemm(DType::F16, DType::F16, 100, 70, 37, [32, 32], 16).unwrap();
+        let kernel = gemm(DType::F16, DType::F16, 100, 70, 37, [32, 32], 16, false).unwrap();
         let text = kernel.to_string();
         assert_eq!(text, EXPECTED_GEMM_TEXT);
     }
 
     #[test]
     fn gemm_lowers_to_every_backend() {
-        let kernel = gemm(DType::F32, DType::F32, 64, 64, 64, [32, 32], 32).unwrap();
+        let kernel = gemm(DType::F32, DType::F32, 64, 64, 64, [32, 32], 32, false).unwrap();
         let compiled = compile(&kernel).unwrap();
         assert_eq!(compiled.grid(), [2, 2, 1]);
         assert_eq!(compiled.workgroup(), [256, 1, 1]);
+        assert_eq!(compiled.schedule_name(), "naive");
+        assert!(compiled.notes().is_empty());
         assert!(compiled.zsl().contains("kernel gemm("));
         assert!(compiled.spirv().unwrap().len() > 5);
         assert!(compiled.hip().unwrap().text.contains("zsl_kernel"));
         assert!(compiled.cuda().is_ok());
         assert!(compiled.msl().is_ok());
+    }
+
+    #[test]
+    fn scheduled_forms_lower_to_every_backend() {
+        let kernel = gemm(DType::F16, DType::F16, 100, 70, 37, [64, 64], 16, true).unwrap();
+        let target = Target::hip_gfx12();
+        let mma = compile_with(
+            &kernel,
+            &Schedule {
+                matrix: Matrix::Mma,
+                ..Schedule::default()
+            },
+            &target,
+        )
+        .unwrap();
+        assert_eq!(mma.schedule_name(), "mma");
+        assert!(mma.notes().is_empty());
+        assert_eq!(mma.workgroup(), [128, 1, 1]);
+        assert!(mma.zsl().contains("frag_load_a(sa,"));
+        assert!(mma.zsl().contains("frag_store(sc,"));
+        assert!(mma.spirv().is_ok());
+        assert!(mma.hip().is_ok());
+        assert!(mma.cuda().is_ok());
+        assert!(mma.msl().is_err());
+
+        let staged = compile_with(
+            &kernel,
+            &Schedule {
+                matrix: Matrix::Scalar,
+                ..Schedule::default()
+            },
+            &target,
+        )
+        .unwrap();
+        assert_eq!(staged.schedule_name(), "staged");
+        assert!(staged.spirv().is_ok() && staged.msl().is_ok());
+    }
+
+    #[test]
+    fn unsupported_schedules_fall_back_with_notes() {
+        let target = Target::hip_gfx12();
+        let f32_kernel = gemm(DType::F32, DType::F32, 64, 64, 64, [32, 32], 32, false).unwrap();
+        let mma = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let got = compile_with(&f32_kernel, &mma, &target).unwrap();
+        assert_eq!(got.schedule_name(), "staged");
+        assert!(got.notes()[0].starts_with("mma: dot is f32 x f32"));
+
+        let i8_kernel = gemm(DType::I8, DType::I32, 48, 32, 64, [16, 16], 16, false).unwrap();
+        let got = compile_with(&i8_kernel, &mma, &target).unwrap();
+        assert_eq!(got.schedule_name(), "naive");
+        assert_eq!(got.notes().len(), 2, "{:?}", got.notes());
+
+        let auto = compile_with(
+            &kernel_f16(64, 64, 64),
+            &Schedule::default(),
+            &Target::scalar_only(BackendPreference::Auto),
+        )
+        .unwrap();
+        assert_eq!(auto.schedule_name(), "staged");
+        assert!(auto.notes()[0].starts_with("mma: target has no f16 matrix unit"));
+
+        let odd = gemm(DType::F16, DType::F16, 100, 70, 37, [24, 32], 16, false).unwrap();
+        let got = compile_with(&odd, &mma, &target).unwrap();
+        assert_eq!(got.schedule_name(), "staged");
+        assert!(got.notes()[0].contains("BM 24"));
+    }
+
+    fn kernel_f16(m: usize, n: usize, k: usize) -> TileKernel {
+        gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap()
     }
 
     fn hip_device() -> Option<Box<dyn GpuDevice>> {
@@ -244,6 +367,17 @@ mod tests {
         adapter.open(DeviceRequest::default()).ok()
     }
 
+    /// The HAL does not report this. RADV on gfx1200 has f16 cooperative matrix, wave32 by default.
+    fn vulkan_target() -> Target {
+        Target {
+            backend: BackendPreference::Vulkan,
+            wave_size: 32,
+            lds_bytes: 32768,
+            has_mma_f16: true,
+            has_mma_i8: false,
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct Case {
         input: DType,
@@ -255,6 +389,7 @@ mod tests {
         bk: usize,
     }
 
+    /// Naive (O0) cases. f16 rounds the accumulator mid-kernel.
     const CASES: [Case; 3] = [
         Case {
             input: DType::F32,
@@ -285,11 +420,62 @@ mod tests {
         },
     ];
 
+    /// Scheduled cases with edges in M, N and K.
+    ///
+    /// 64-wide tiles run four waves. The last two cases cannot use the matrix unit.
+    const SCHEDULED: [Case; 5] = [
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 64,
+            n: 64,
+            k: 64,
+            tile: [64, 64],
+            bk: 16,
+        },
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 100,
+            n: 70,
+            k: 37,
+            tile: [64, 64],
+            bk: 16,
+        },
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 256,
+            n: 128,
+            k: 96,
+            tile: [64, 64],
+            bk: 32,
+        },
+        Case {
+            input: DType::F32,
+            out: DType::F32,
+            m: 100,
+            n: 70,
+            k: 37,
+            tile: [32, 32],
+            bk: 16,
+        },
+        Case {
+            input: DType::I8,
+            out: DType::I32,
+            m: 48,
+            n: 32,
+            k: 64,
+            tile: [16, 16],
+            bk: 16,
+        },
+    ];
+
     #[test]
     fn gemm_on_hip() {
         let Some(dev) = hip_device() else { return };
         for case in CASES {
-            run_case(&*dev, case).unwrap();
+            run_case(&*dev, &Target::hip_gfx12(), case, &Schedule::o0()).unwrap();
         }
     }
 
@@ -297,11 +483,47 @@ mod tests {
     fn gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         for case in CASES {
-            run_case(&*dev, case).unwrap();
+            run_case(&*dev, &vulkan_target(), case, &Schedule::o0()).unwrap();
         }
     }
 
-    /// Binary16 bits for multiples of 1/4 with magnitude 1/4-8, or zero.
+    #[test]
+    fn scheduled_gemm_on_hip() {
+        let Some(dev) = hip_device() else { return };
+        check_scheduled(&*dev, &Target::hip_gfx12());
+    }
+
+    #[test]
+    fn scheduled_gemm_on_vulkan() {
+        let Some(dev) = vulkan_device() else { return };
+        check_scheduled(&*dev, &vulkan_target());
+    }
+
+    fn check_scheduled(dev: &dyn GpuDevice, target: &Target) {
+        let mma = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let staged = Schedule {
+            matrix: Matrix::Scalar,
+            ..Schedule::default()
+        };
+        for case in SCHEDULED {
+            for sched in [Schedule::o0(), staged, mma] {
+                let (shape, notes) = run_case(dev, target, case, &sched).unwrap();
+                if sched == mma && case.input == DType::F16 {
+                    assert_eq!(shape, "mma", "{}x{}x{}", case.m, case.n, case.k);
+                    assert!(notes.is_empty(), "{notes:?}");
+                }
+                if sched == mma && case.input == DType::I8 {
+                    assert_eq!(shape, "naive");
+                    assert!(notes.iter().any(|n| n.starts_with("mma:")), "{notes:?}");
+                }
+            }
+        }
+    }
+
+    /// Exact binary16 bits for small integers, quarters and zero.
     fn f16_bits(x: f32) -> u16 {
         if x == 0.0 {
             return 0;
@@ -323,7 +545,22 @@ mod tests {
         if sign { -mag } else { mag }
     }
 
-    fn run_case(dev: &dyn GpuDevice, case: Case) -> Result<(), String> {
+    /// Rounds to the nearest binary16, ties to even. Normal values only.
+    fn round_f16(x: f32) -> f32 {
+        if x == 0.0 {
+            return 0.0;
+        }
+        let exp = ((x.to_bits() >> 23) & 0xff) as i32 - 127;
+        let ulp = 2f32.powi(exp - 10);
+        (x / ulp).round_ties_even() * ulp
+    }
+
+    fn run_case(
+        dev: &dyn GpuDevice,
+        target: &Target,
+        case: Case,
+        schedule: &Schedule,
+    ) -> Result<(String, Vec<String>), String> {
         let Case {
             input,
             out,
@@ -333,12 +570,21 @@ mod tests {
             tile,
             bk,
         } = case;
-        let kernel = gemm(input, out, m, n, k, tile, bk).map_err(|e| e.to_string())?;
-        let compiled = compile(&kernel).map_err(|e| e.to_string())?;
+        let kernel =
+            gemm(input, out, m, n, k, tile, bk, input == DType::F16).map_err(|e| e.to_string())?;
+        let compiled = compile_with(&kernel, schedule, target).map_err(|e| e.to_string())?;
+        let shape = (
+            compiled.schedule_name().to_string(),
+            compiled.notes().to_vec(),
+        );
         let program = compiled.load(dev).map_err(|e| e.to_string())?;
 
         let int8 = input == DType::I8;
-        let (span, lo) = if int8 { (17, 8) } else { (9, 4) };
+        let (span, lo) = match input {
+            DType::I8 => (17, 8),
+            DType::F16 => (33, 16),
+            _ => (9, 4),
+        };
         let a_ref: Vec<i32> = (0..m * k)
             .map(|i| ((i * 7 + 3) % span) as i32 - lo)
             .collect();
@@ -349,25 +595,24 @@ mod tests {
 
         let mut uploads = Vec::new();
         for binding in compiled.bindings() {
-            let bytes = match binding.name.as_str() {
-                "a" | "b" if int8 => {
-                    let src = if binding.name == "a" { &a_ref } else { &b_ref };
-                    let cols = binding.shape[1];
-                    let mut words = vec![0u32; binding.shape[0] * cols / 4];
-                    for (i, v) in src.iter().enumerate() {
-                        let (r, c) = (i / cols, i % cols);
-                        words[r * cols / 4 + c / 4] |= ((*v as i8) as u8 as u32) << (8 * (c % 4));
-                    }
-                    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-                }
+            let bytes: Vec<u8> = match binding.name.as_str() {
                 "a" | "b" => {
                     let src = if binding.name == "a" { &a_ref } else { &b_ref };
-                    src.iter().flat_map(|&v| half_or_float(input, v)).collect()
+                    src.iter()
+                        .flat_map(|&v| match input {
+                            DType::I8 => vec![(v as i8) as u8],
+                            DType::F16 => f16_bits(v as f32).to_le_bytes().to_vec(),
+                            _ => (v as f32 / 4.0).to_le_bytes().to_vec(),
+                        })
+                        .collect()
                 }
                 "bias" if int8 => bias_ref.iter().flat_map(|v| v.to_le_bytes()).collect(),
                 "bias" => bias_ref
                     .iter()
-                    .flat_map(|&v| (v as f32 / 4.0).to_le_bytes())
+                    .flat_map(|&v| {
+                        let scale = if input == DType::F16 { 1.0 } else { 0.25 };
+                        (v as f32 * scale).to_le_bytes()
+                    })
                     .collect(),
                 _ => vec![0u8; binding.shape[0] * binding.shape[1] * dtype_bytes(binding.dtype)],
             };
@@ -406,47 +651,53 @@ mod tests {
         let mut bad = Vec::new();
         for r in 0..m {
             for c in 0..n {
-                let dot: i32 = (0..k).map(|kk| a_ref[r * k + kk] * b_ref[c * k + kk]).sum();
+                let dot: i64 = (0..k)
+                    .map(|kk| i64::from(a_ref[r * k + kk]) * i64::from(b_ref[c * k + kk]))
+                    .sum();
                 let at = r * n + c;
-                if int8 {
-                    let want = dot + bias_ref[c];
-                    let g = i32::from_le_bytes(got[at * 4..at * 4 + 4].try_into().unwrap());
-                    if g != want {
-                        bad.push(format!("({r},{c}) {g} != {want}"));
+                match input {
+                    DType::I8 => {
+                        let want = dot as i32 + bias_ref[c];
+                        let g = i32::from_le_bytes(got[at * 4..at * 4 + 4].try_into().unwrap());
+                        if g != want {
+                            bad.push(format!("({r},{c}) {g} != {want}"));
+                        }
                     }
-                    continue;
-                }
-                let want = dot as f32 / 16.0 + bias_ref[c] as f32 / 4.0;
-                let (g, tol) = if out == DType::F16 {
-                    let bits = u16::from_le_bytes(got[at * 2..at * 2 + 2].try_into().unwrap());
-                    (f16_value(bits), want.abs() / 1024.0 + 1e-6)
-                } else {
-                    let g = f32::from_le_bytes(got[at * 4..at * 4 + 4].try_into().unwrap());
-                    (g, 1e-4 * want.abs().max(1.0))
-                };
-                if (g - want).abs() > tol {
-                    bad.push(format!("({r},{c}) {g} != {want}"));
+                    DType::F16 => {
+                        let mid = round_f16(dot as f32);
+                        let want = round_f16(mid + bias_ref[c] as f32);
+                        let bits = u16::from_le_bytes(got[at * 2..at * 2 + 2].try_into().unwrap());
+                        let g = f16_value(bits);
+                        if g != want {
+                            bad.push(format!("({r},{c}) {g} != {want}"));
+                        }
+                    }
+                    _ => {
+                        let want = dot as f32 / 16.0 + bias_ref[c] as f32 / 4.0;
+                        let g = f32::from_le_bytes(got[at * 4..at * 4 + 4].try_into().unwrap());
+                        if (g - want).abs() > 1e-4 * want.abs().max(1.0) {
+                            bad.push(format!("({r},{c}) {g} != {want}"));
+                        }
+                    }
                 }
             }
         }
         if bad.is_empty() {
-            Ok(())
+            Ok(shape)
         } else {
             Err(format!(
-                "{:?}->{:?} {m}x{n}x{k}: {} mismatches, first {}",
+                "{:?}->{:?} {m}x{n}x{k} {}: {} mismatches, first {}",
                 input,
                 out,
+                schedule_label(schedule),
                 bad.len(),
                 bad[0]
             ))
         }
     }
 
-    fn half_or_float(dtype: DType, v: i32) -> Vec<u8> {
-        match dtype {
-            DType::F16 => f16_bits(v as f32 / 4.0).to_le_bytes().to_vec(),
-            _ => (v as f32 / 4.0).to_le_bytes().to_vec(),
-        }
+    fn schedule_label(s: &Schedule) -> String {
+        format!("{:?} stage={}", s.matrix, s.stage_lds)
     }
 
     fn dtype_bytes(dtype: DType) -> usize {
@@ -454,6 +705,88 @@ mod tests {
             DType::F16 => 2,
             DType::I8 => 1,
             _ => 4,
+        }
+    }
+
+    /// Benchmarks each shape and schedule with one warmup, then three timed dispatches.
+    ///
+    /// Run with `cargo test -p zengpu-tile bench_f16_gemm_hip -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_f16_gemm_hip() {
+        let Some(dev) = hip_device() else { return };
+        let target = Target::hip_gfx12();
+        let shapes = [
+            (128, 5120, 5120),
+            (128, 17408, 5120),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+        ];
+        let variants = [
+            ("O0", Schedule::o0()),
+            (
+                "scalar-tiled",
+                Schedule {
+                    matrix: Matrix::Scalar,
+                    ..Schedule::default()
+                },
+            ),
+            (
+                "mma",
+                Schedule {
+                    matrix: Matrix::Mma,
+                    ..Schedule::default()
+                },
+            ),
+        ];
+        println!("| M | N | K | schedule | ms | TFLOPS |");
+        println!("|---|---|---|---|---|---|");
+        for (m, n, k) in shapes {
+            let kernel = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+            let f16_bytes = |len: usize| -> Vec<u8> {
+                (0..len)
+                    .flat_map(|i| f16_bits(((i * 7 + 3) % 9) as f32 - 4.0).to_le_bytes())
+                    .collect()
+            };
+            let inputs = [
+                f16_bytes(m * k),
+                f16_bytes(n * k),
+                vec![0u8; n * 4],
+                vec![0u8; m * n * 2],
+            ];
+            let mut handles = Vec::new();
+            for bytes in &inputs {
+                let h = dev
+                    .create_buffer(BufferDesc {
+                        size: bytes.len() as u64,
+                        usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST,
+                        memory: MemoryUsage::GpuOnly,
+                    })
+                    .unwrap();
+                dev.write_buffer(h, 0, bytes).unwrap();
+                handles.push(h);
+            }
+            for (name, sched) in variants {
+                let compiled = compile_with(&kernel, &sched, &target).unwrap();
+                let program = compiled.load(&*dev).unwrap();
+                program.dispatch(&*dev, &handles).unwrap();
+                let iters = 3;
+                let t0 = Instant::now();
+                for _ in 0..iters {
+                    program.dispatch(&*dev, &handles).unwrap();
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
+                let flops = 2.0 * m as f64 * n as f64 * k as f64;
+                let tflops = flops / (ms * 1e-3) / 1e12;
+                println!(
+                    "| {m} | {n} | {k} | {name} ({}) | {ms:.3} | {tflops:.2} |",
+                    compiled.schedule_name()
+                );
+                program.destroy(&*dev);
+            }
+            for h in handles {
+                dev.destroy_buffer(h);
+            }
         }
     }
 

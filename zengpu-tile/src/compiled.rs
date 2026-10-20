@@ -1,7 +1,7 @@
 
 use zengpu_hal::{
-    BackendPreference, Bindings, BufferHandle, ComputePipelineDesc, GpuDevice, PipelineHandle,
-    ShaderDesc, ShaderHandle,
+    BackendPreference, Bindings, BufferHandle, ComputePipelineDesc, ComputePipelineHints,
+    GpuDevice, PipelineHandle, ShaderDesc, ShaderHandle,
 };
 
 use crate::TileError;
@@ -30,6 +30,11 @@ pub struct CompiledTile {
     pub(crate) grid: [u32; 3],
     pub(crate) workgroup: [u32; 3],
     pub(crate) bindings: Vec<TileBinding>,
+    /// `naive`, `staged` or `mma`: the code shape the schedule resolved to.
+    pub(crate) mode: &'static str,
+    /// Lanes per subgroup the code needs, when it uses the matrix unit.
+    pub(crate) subgroup: Option<u32>,
+    pub(crate) notes: Vec<String>,
     pub(crate) spirv: Result<Vec<u32>, TileError>,
     pub(crate) hip: Result<BackendSource, TileError>,
     pub(crate) cuda: Result<BackendSource, TileError>,
@@ -56,6 +61,15 @@ impl CompiledTile {
 
     pub fn bindings(&self) -> &[TileBinding] {
         &self.bindings
+    }
+
+    pub fn schedule_name(&self) -> &'static str {
+        self.mode
+    }
+
+    /// One note per fallback. Empty when the schedule applied as written.
+    pub fn notes(&self) -> &[String] {
+        &self.notes
     }
 
     pub fn spirv(&self) -> Result<&[u32], TileError> {
@@ -101,7 +115,10 @@ impl CompiledTile {
             entry,
             block: self.workgroup,
         };
-        match device.create_compute_pipeline(desc) {
+        let hints = ComputePipelineHints {
+            subgroup_size: self.subgroup,
+        };
+        match device.create_compute_pipeline_with(desc, hints) {
             Ok(pipeline) => Ok(TileProgram {
                 shader,
                 pipeline,
