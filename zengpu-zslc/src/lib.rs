@@ -2402,7 +2402,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 24] = [
+        let kernels: [(&str, &str); 28] = [
             ("tiled_gemm", TILED_GEMM),
             ("scatter_add", SCATTER_ADD),
             ("trig", TRIG),
@@ -2425,6 +2425,10 @@ int main() {{
             ("frag_i8", FRAG_I8),
             ("frag_fn", FRAG_FN),
             ("frag_shared_ab", FRAG_SHARED_AB),
+            ("rem", REM_KERNEL),
+            ("select", SELECT_KERNEL),
+            ("i32_cast", I32_KERNEL),
+            ("byte_buffers", BYTE_KERNEL),
             ("packed", PACKED),
             ("texel_kernel", TEXEL_KERNEL),
         ];
