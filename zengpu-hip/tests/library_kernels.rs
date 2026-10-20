@@ -408,6 +408,177 @@ fn zsl_bitwise_ops_unpack_nibbles() {
     device.destroy_shader(shader);
 }
 
+const TRIG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { len: u32 }
+    @workgroup_size(64)
+    kernel trig(src: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.len {
+            let x = src[i]
+            out[i] = sin(x) + cos(x) + tan(x)
+        }
+    }
+);
+
+#[test]
+fn zsl_trigonometry_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = TRIG_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 128u32;
+    let input: Vec<f32> = (0..n).map(|i| -0.5 + i as f32 / n as f32).collect();
+    let src = upload(&pool, vec![n], &input);
+    let out = pool.alloc(vec![n], DType::F32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[src.buffer.index(), out.buffer.index()],
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    for (i, x) in input.iter().enumerate() {
+        let want = x.sin() + x.cos() + x.tan();
+        assert!(
+            (got[i] - want).abs() < 2e-5,
+            "out[{i}]: got {} want {want}",
+            got[i]
+        );
+    }
+    drop(ops);
+    pool.free(src);
+    pool.free(out);
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
+const TYPED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { len: u32 }
+    @workgroup_size(64)
+    kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.len {
+            out_u[i] = src_u[i]
+            out_i[i] = src_i[i]
+        }
+    }
+);
+
+#[test]
+fn zsl_integer_buffers_round_trip() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = TYPED_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 128u32;
+    let input_u: Vec<u32> = (0..n).map(|v| v.wrapping_mul(2_654_435_761)).collect();
+    let input_i: Vec<i32> = (0..n as i32).map(|v| v - 64).collect();
+    let src_u = pool.alloc(vec![n], DType::U32).unwrap();
+    let src_i = pool.alloc(vec![n], DType::I32).unwrap();
+    let out_u = pool.alloc(vec![n], DType::U32).unwrap();
+    let out_i = pool.alloc(vec![n], DType::I32).unwrap();
+    let bytes_u: Vec<u8> = input_u.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let bytes_i: Vec<u8> = input_i.iter().flat_map(|w| w.to_le_bytes()).collect();
+    device.write_buffer(src_u.buffer, 0, &bytes_u).unwrap();
+    device.write_buffer(src_i.buffer, 0, &bytes_i).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            src_u.buffer.index(),
+            src_i.buffer.index(),
+            out_u.buffer.index(),
+            out_i.buffer.index(),
+        ],
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |a: &DeviceArray| device.read_buffer(a.buffer, 0, a.size_bytes()).unwrap();
+    assert_eq!(read(&out_u), bytes_u);
+    assert_eq!(read(&out_i), bytes_i);
+    drop(ops);
+    for a in [src_u, src_i, out_u, out_i] {
+        pool.free(a);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
+const FINITE_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { len: u32 }
+    @workgroup_size(64)
+    kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.len {
+            let x = src[i]
+            if isfinite(x) {
+                out[i] = 1
+            } else {
+                if isnan(x) {
+                    out[i] = 2
+                } else {
+                    if isinf(x) { out[i] = 3 } else { out[i] = 4 }
+                }
+            }
+        }
+    }
+);
+
+#[test]
+fn zsl_finite_classification_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FINITE_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let input = [0.0f32, -12.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+    let n = input.len() as u32;
+    let src = upload(&pool, vec![n], &input);
+    let out = pool.alloc(vec![n], DType::U32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[src.buffer.index(), out.buffer.index()],
+        &[zengpu_hal::Scalar::U32(n)],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got: Vec<u32> = device
+        .read_buffer(out.buffer, 0, out.size_bytes())
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect();
+    assert_eq!(got, [1, 1, 2, 3, 3]);
+    drop(ops);
+    pool.free(src);
+    pool.free(out);
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
 const DOT4_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     push P { n: u32 }
     @workgroup_size(64)
