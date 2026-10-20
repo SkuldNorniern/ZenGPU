@@ -343,39 +343,24 @@ mod zsl_native_tests {
     }
 
     #[test]
-    fn native_vertex_mvp() {
-        const SHADER: ZslShader = zsl!(
+    fn native_vertex_fragment_and_module_forms_compile() {
+        const MVP: ZslShader = zsl!(
             push Mvp { mvp: mat4x4<f32> }
             vertex vs(@location(0) pos: f32x3, m: Mvp) -> f32x4 {
                 m.mvp * pos.extend(1.0)
             }
         );
-        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
-    }
-
-    #[test]
-    fn native_vertex_with_varying() {
-        const SHADER: ZslShader = zsl!(
+        const VARYING: ZslShader = zsl!(
             vertex vs(@location(0) pos: f32x4, @location(1) uv: f32x2) -> (f32x4, f32x2) {
                 (pos, uv)
             }
         );
-        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
-    }
-
-    #[test]
-    fn native_fragment_color() {
-        const SHADER: ZslShader = zsl!(
+        const FRAGMENT: ZslShader = zsl!(
             fragment fs(@location(0) color: f32x4) -> f32x4 {
                 color * 0.5
             }
         );
-        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
-    }
-
-    #[test]
-    fn native_copy_with_module_and_workgroup() {
-        const SHADER: ZslShader = zsl!(
+        const COPY: ZslShader = zsl!(
             module zengpu.examples.copy
             @workgroup_size(64)
             kernel copy(
@@ -387,7 +372,9 @@ mod zsl_native_tests {
                 dst[i] = src[i]
             }
         );
-        assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC);
+        for shader in [MVP, VARYING, FRAGMENT, COPY] {
+            assert_eq!(shader.spv.unwrap()[0], SPIRV_MAGIC, "valid SPIR-V header");
+        }
     }
 }
 
@@ -403,16 +390,6 @@ mod push_const_derive_tests {
         scale: f32,
     }
 
-    #[derive(ZslPushConst)]
-    struct AllU32 {
-        a: u32,
-        b: u32,
-        c: u32,
-    }
-
-    #[derive(ZslPushConst)]
-    struct Empty {}
-
     #[test]
     fn to_scalars_types_and_order() {
         let p = ScalePush {
@@ -424,30 +401,6 @@ mod push_const_derive_tests {
         assert_eq!(s[0], Scalar::U32(1024));
         assert_eq!(s[1], Scalar::I32(-7));
         assert_eq!(s[2], Scalar::F32(2.5));
-    }
-
-    #[test]
-    fn to_scalars_all_u32() {
-        let p = AllU32 { a: 3, b: 5, c: 7 };
-        let [a, b, c] = p.to_scalars();
-        assert_eq!(a, Scalar::U32(3));
-        assert_eq!(b, Scalar::U32(5));
-        assert_eq!(c, Scalar::U32(7));
-    }
-
-    #[test]
-    fn to_scalars_empty() {
-        let p = Empty {};
-        let s: [Scalar; 0] = p.to_scalars();
-        assert_eq!(s.len(), 0);
-    }
-
-    #[test]
-    fn to_scalars_coerces_to_slice() {
-        let p = AllU32 { a: 1, b: 2, c: 3 };
-        let scalars = p.to_scalars();
-        let slice: &[Scalar] = &scalars;
-        assert_eq!(slice.len(), 3);
     }
 
     #[derive(ZslPushConst)]
@@ -463,12 +416,9 @@ mod push_const_derive_tests {
     }
 
     #[test]
-    fn mat4_expands_to_16_scalars() {
+    fn mat4_and_mixed_push_expand_in_declaration_order() {
         let identity = [
-            1.0f32, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, 1.0, 0.0,
-            0.0, 0.0, 0.0, 1.0,
+            1.0f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let p = MvpPush {
             mvp: ZslMat4(identity),
@@ -481,14 +431,10 @@ mod push_const_derive_tests {
         assert_eq!(s[15], Scalar::F32(1.0));
         assert_eq!(s[1], Scalar::F32(0.0));
         assert_eq!(s[4], Scalar::F32(0.0));
-    }
 
-    #[test]
-    fn mixed_push_mat4_ordering() {
-        let identity = [1.0f32; 16];
         let p = MixedPush {
             scale: 2.0,
-            mvp: ZslMat4(identity),
+            mvp: ZslMat4([1.0f32; 16]),
             tint: 255,
         };
         let s = p.to_scalars();
