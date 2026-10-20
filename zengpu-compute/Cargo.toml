@@ -17,3 +17,7 @@ workspace = true
 [dependencies]
 zengpu-hal.workspace = true
 zengpu-spirv.workspace = true
+
+[dev-dependencies]
+zengpu-hip.workspace = true
+zengpu-spirv = { workspace = true, features = ["hip"] }
