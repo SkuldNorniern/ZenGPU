@@ -1020,10 +1020,14 @@ int main() {{
             .source;
         assert!(cuda_source.contains("nvcuda::wmma::mma_sync("));
         spirv::lower_compute(&module).expect("lower frag mma to SPIR-V");
-        let msl_err = msl::lower_compute(&module)
-            .err()
-            .expect("MSL has no frag lowering yet");
-        assert!(format!("{msl_err:?}").contains("not lowered yet"));
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower frag mma to MSL")
+            .source;
+        assert_eq!(
+            msl_source.matches("simdgroup_multiply_accumulate(").count(),
+            8
+        );
+        assert_eq!(msl_source.matches("simdgroup_store(").count(), 4);
         let module = parse_compute(FRAG_FN).expect("parse frag fn");
         hip::lower_compute(&module).expect("lower frag fn to HIP");
         cuda::lower_compute(&module).expect("lower frag fn to CUDA");
@@ -1035,6 +1039,10 @@ int main() {{
         assert!(hip_source.contains("zsl_mma_i8("));
         cuda::lower_compute(&module).expect("lower frag i8 to CUDA");
         spirv::lower_compute(&module).expect("lower frag i8 to SPIR-V");
+        let Err(err) = msl::lower_compute(&module) else {
+            panic!("MSL has no integer simdgroup matrix");
+        };
+        assert!(format!("{err:?}").contains("integer element type"));
     }
 
     const FRAG_SHARED_AB: &str = r#"
@@ -1068,6 +1076,10 @@ int main() {{
             .source;
         assert!(cuda_source.contains("zsl_stage_tile(zsl_stage["));
         assert!(cuda_source.contains("nvcuda::wmma::load_matrix_sync(fa"));
+        let Err(err) = msl::lower_compute(&module) else {
+            panic!("MSL stages no a/b tiles from shared arrays");
+        };
+        assert!(format!("{err:?}").contains("shared"));
         let words = spirv::lower_compute(&module).expect("lower shared frag to SPIR-V");
         let ops = spirv_opcodes(&words);
         assert!(ops.contains(&4457) && ops.contains(&224) && ops.contains(&115));
@@ -1090,6 +1102,10 @@ int main() {{
         assert!(format!("{err:?}").contains("frag_row"));
         let Err(err) = spirv::lower_compute(&module) else {
             panic!("SPIR-V has no frag_row lowering");
+        };
+        assert!(format!("{err:?}").contains("frag_row"));
+        let Err(err) = msl::lower_compute(&module) else {
+            panic!("MSL has no frag_row lowering");
         };
         assert!(format!("{err:?}").contains("frag_row"));
     }

@@ -4,11 +4,13 @@ use std::fmt::Write;
 
 use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
+use crate::ir::arena::TypeArena;
 use crate::ir::node::{
-    BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
+    BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
     stmts_use_workgroup_reduce,
 };
-use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
+use crate::ir::typeck::frag_parts;
+use crate::ir::types::{FloatFormat, FragUse, IntWidth, Signedness, Type, TypeId};
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
 
@@ -18,8 +20,13 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let EntryKind::Compute { local_size } = e.kind;
 
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
+    let mut frags: HashMap<&str, FragTiles> = HashMap::new();
     for (n, t) in &e.locals {
-        locals.insert(n.as_str(), msl_scalar(module.types.get(*t))?);
+        if frag_parts(&module.types, *t).is_some() {
+            frags.insert(n.as_str(), frag_tiles(&module.types, *t)?);
+        } else {
+            locals.insert(n.as_str(), msl_scalar(module.types.get(*t))?);
+        }
     }
     let buffers: Vec<(&str, TypeId)> = e
         .params
@@ -69,6 +76,10 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
         .filter(|(_, elem)| *elem == f16_id)
         .map(|(name, _)| *name)
         .collect();
+    let mut buffer_elems: HashMap<&str, &'static str> = HashMap::new();
+    for (name, elem) in &buffers {
+        buffer_elems.insert(name, msl_buffer_elem(module.types.get(*elem))?);
+    }
     let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
@@ -227,6 +238,8 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
 
     let ctx = Ctx {
         locals,
+        frags,
+        buffer_elems,
         bf16_buffers,
         f16_buffers,
         block_size,
@@ -246,8 +259,20 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
     })
 }
 
+/// Four 8x8 `simdgroup_matrix` tiles, indexed `tile = 2 * row + col`.
+#[derive(Clone, Copy)]
+struct FragTiles {
+    usage: FragUse,
+    /// The tile element: `half` for a/b, `float` for an accumulator.
+    elem: &'static str,
+}
+
+const TILES: usize = 4;
+
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    frags: HashMap<&'a str, FragTiles>,
+    buffer_elems: HashMap<&'a str, &'static str>,
     bf16_buffers: HashSet<&'a str>,
     f16_buffers: HashSet<&'a str>,
     block_size: u32,
@@ -279,17 +304,47 @@ fn indent(s: &mut String, depth: usize) {
     }
 }
 
+fn emit_lines(s: &mut String, depth: usize, lines: &[String]) {
+    for line in lines {
+        indent(s, depth);
+        s.push_str(line);
+        s.push('\n');
+    }
+}
+
 fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Result<(), Diagnostic> {
     match stmt {
-        IrStmt::FragStore { .. } => return Err(frag_unsupported("frag_store")),
+        IrStmt::FragStore {
+            src,
+            offset,
+            ld,
+            value,
+        } => {
+            let lines = frag_store_lines(ctx, src, offset, ld, value)?;
+            emit_lines(s, depth, &lines);
+        }
         IrStmt::Let { name, init } => {
-            let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("uint");
-            indent(s, depth);
-            let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            if let Some(frag) = ctx.frags.get(name.as_str()).copied() {
+                let mut lines = vec![format!(
+                    "simdgroup_matrix<{}, 8, 8> {name}[{TILES}];",
+                    frag.elem
+                )];
+                lines.extend(frag_fill_lines(ctx, name, frag, init)?);
+                emit_lines(s, depth, &lines);
+            } else {
+                let ty = ctx.locals.get(name.as_str()).copied().unwrap_or("uint");
+                indent(s, depth);
+                let _ = writeln!(s, "{} {} = {};", ty, name, emit_expr(ctx, init)?);
+            }
         }
         IrStmt::AssignLocal { name, value } => {
-            indent(s, depth);
-            let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            if let Some(frag) = ctx.frags.get(name.as_str()).copied() {
+                let lines = frag_fill_lines(ctx, name, frag, value)?;
+                emit_lines(s, depth, &lines);
+            } else {
+                indent(s, depth);
+                let _ = writeln!(s, "{} = {};", name, emit_expr(ctx, value)?);
+            }
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             indent(s, depth);
@@ -399,7 +454,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
 
 fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
-        IrExpr::FragLoad { .. } => return Err(frag_unsupported("frag_load")),
+        IrExpr::FragLoad { .. } => {
+            return Err(frag_rejected(
+                "frag_load",
+                "a fragment load must be the whole initializer of a `let` or an assignment",
+            ));
+        }
         IrExpr::LitU32(v) => format!("{v}u"),
         IrExpr::LitF32(v) => msl_float(*v),
         IrExpr::Local(n) => n.clone(),
@@ -425,13 +485,22 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 BuiltinFn::U32 => format!("uint({})", a[0]),
-                BuiltinFn::FragZeroAcc
-                | BuiltinFn::Mma
-                | BuiltinFn::FragLen
+                BuiltinFn::FragZeroAcc | BuiltinFn::Mma => {
+                    return Err(frag_rejected(
+                        func.name(),
+                        "a fragment op must be the whole initializer of a `let` or an assignment",
+                    ));
+                }
+                BuiltinFn::FragLen
                 | BuiltinFn::FragRow
                 | BuiltinFn::FragCol
                 | BuiltinFn::FragGet
-                | BuiltinFn::FragSet => return Err(frag_unsupported(func.name())),
+                | BuiltinFn::FragSet => {
+                    return Err(frag_rejected(
+                        func.name(),
+                        "simdgroup_matrix elements have no per-lane fragment mapping; use HIP",
+                    ));
+                }
                 BuiltinFn::F32 => format!("float({})", a[0]),
                 BuiltinFn::Step => format!("step({}, {})", a[0], a[1]),
                 BuiltinFn::Smoothstep => format!("smoothstep({}, {}, {})", a[0], a[1], a[2]),
@@ -592,15 +661,267 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
     })
 }
 
-/// MSL spelling of a scalar [`Type`]. A non-scalar here is a compiler defect.
-///
-/// Fragments are not yet lowered for MSL. `simdgroup_matrix` is 8x8, so the 16x16x16 tile needs its
-/// own lowering.
+/// Non-scalar types are a compiler defect here, reported as `Unsupported`. Not yet: graphics
+/// entries are not lowered for MSL.
 pub(super) fn frag_unsupported(what: &str) -> Diagnostic {
     Diagnostic::new(
         DiagnosticCode::Unsupported,
         format!("MSL backend: {what} is not lowered yet (simdgroup_matrix is 8x8)"),
     )
+}
+
+fn frag_rejected(what: &str, why: &str) -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::Unsupported,
+        format!("MSL backend: {what} is not supported: {why}"),
+    )
+}
+
+/// MSL `simdgroup_matrix` is only `half` or `float`: packed i8 and i32 fragments are rejected.
+fn frag_tiles(types: &TypeArena, ty: TypeId) -> Result<FragTiles, Diagnostic> {
+    let (elem, usage) =
+        frag_parts(types, ty).ok_or_else(|| frag_rejected("fragment", "not a fragment type"))?;
+    let elem = match (types.get(elem), usage) {
+        (
+            Type::Float {
+                format: FloatFormat::F16,
+            },
+            FragUse::A | FragUse::B,
+        ) => "half",
+        (
+            Type::Float {
+                format: FloatFormat::F32,
+            },
+            FragUse::Acc,
+        ) => "float",
+        (
+            Type::Int {
+                width: IntWidth::W8,
+                ..
+            },
+            _,
+        ) => {
+            return Err(frag_rejected(
+                "packed i8 fragment",
+                "simdgroup_matrix has no integer element type",
+            ));
+        }
+        (
+            Type::Int {
+                width: IntWidth::W32,
+                ..
+            },
+            _,
+        ) => {
+            return Err(frag_rejected(
+                "i32 fragment",
+                "simdgroup_matrix has no integer element type",
+            ));
+        }
+        _ => {
+            return Err(frag_rejected(
+                "fragment",
+                "a/b fragments are f16 and accumulators are f32 on MSL",
+            ));
+        }
+    };
+    Ok(FragTiles { usage, elem })
+}
+
+fn tile_origin(t: usize) -> (usize, usize) {
+    ((t / 2) * 8, (t % 2) * 8)
+}
+
+fn frag_fill_lines(
+    ctx: &Ctx<'_>,
+    name: &str,
+    frag: FragTiles,
+    value: &IrExpr,
+) -> Result<Vec<String>, Diagnostic> {
+    match value {
+        IrExpr::FragLoad {
+            src, offset, ld, ..
+        } => {
+            let off = emit_expr(ctx, offset)?;
+            let ld = emit_expr(ctx, ld)?;
+            let base = match src {
+                FragSrc::Buffer(buf) => {
+                    let elem = ctx.buffer_elems.get(buf.as_str()).copied().unwrap_or("");
+                    if elem != frag.elem {
+                        return Err(frag_rejected(
+                            &format!("frag load from `{buf}`"),
+                            "a/b load f16 buffers, accumulator loads f32 buffers",
+                        ));
+                    }
+                    format!("({buf} + ({off}))")
+                }
+                FragSrc::Shared(tile) => {
+                    if frag.elem != "float" {
+                        return Err(frag_rejected(
+                            &format!("frag load from shared `{tile}`"),
+                            "only accumulators load from shared arrays on MSL (a/b would need an f16 stage)",
+                        ));
+                    }
+                    format!("({tile} + ({off}))")
+                }
+            };
+            Ok((0..TILES)
+                .map(|t| {
+                    let (r, c) = tile_origin(t);
+                    format!("simdgroup_load({name}[{t}], {base} + {r}u * ({ld}) + {c}u, ({ld}));")
+                })
+                .collect())
+        }
+        IrExpr::Builtin {
+            func: BuiltinFn::Mma,
+            args,
+        } => mma_lines(ctx, name, frag, args),
+        IrExpr::Builtin {
+            func: BuiltinFn::FragZeroAcc,
+            ..
+        } => Ok((0..TILES)
+            .map(|t| format!("{name}[{t}] = simdgroup_matrix<{}, 8, 8>(0);", frag.elem))
+            .collect()),
+        IrExpr::Local(src) => {
+            let src_frag = ctx.frags.get(src.as_str()).copied().ok_or_else(|| {
+                frag_rejected(
+                    &format!("`{src}`"),
+                    "a fragment value must be a fragment local",
+                )
+            })?;
+            if src_frag.elem != frag.elem || src_frag.usage != frag.usage {
+                return Err(frag_rejected(
+                    &format!("assignment from `{src}`"),
+                    "fragment types must match",
+                ));
+            }
+            Ok((0..TILES)
+                .map(|t| format!("{name}[{t}] = {src}[{t}];"))
+                .collect())
+        }
+        _ => Err(frag_rejected(
+            "fragment value",
+            "expected a fragment load, mma, frag_zero_acc or a fragment local",
+        )),
+    }
+}
+
+/// `mma` as eight `simdgroup_multiply_accumulate` calls. `c` seeds `d`.
+fn mma_lines(
+    ctx: &Ctx<'_>,
+    name: &str,
+    frag: FragTiles,
+    args: &[IrExpr],
+) -> Result<Vec<String>, Diagnostic> {
+    let (IrExpr::Local(a), IrExpr::Local(b), c) = (&args[0], &args[1], &args[2]) else {
+        return Err(frag_rejected("mma", "operands must be fragment locals"));
+    };
+    let a_frag = ctx
+        .frags
+        .get(a.as_str())
+        .copied()
+        .filter(|f| f.usage == FragUse::A)
+        .ok_or_else(|| frag_rejected("mma", "the first operand must be an a fragment"))?;
+    let b_frag = ctx
+        .frags
+        .get(b.as_str())
+        .copied()
+        .filter(|f| f.usage == FragUse::B)
+        .ok_or_else(|| frag_rejected("mma", "the second operand must be a b fragment"))?;
+    if frag.usage != FragUse::Acc || a_frag.elem != "half" || b_frag.elem != "half" {
+        return Err(frag_rejected(
+            "mma",
+            "mma takes f16 a and b and yields an f32 accumulator",
+        ));
+    }
+    let mut lines = match c {
+        IrExpr::Local(cn) => {
+            let c_frag =
+                ctx.frags.get(cn.as_str()).copied().ok_or_else(|| {
+                    frag_rejected("mma", "the accumulator must be a fragment local")
+                })?;
+            if c_frag.usage != FragUse::Acc || c_frag.elem != "float" {
+                return Err(frag_rejected(
+                    "mma",
+                    "the accumulator must be an f32 acc fragment",
+                ));
+            }
+            (0..TILES)
+                .map(|t| format!("{name}[{t}] = {cn}[{t}];"))
+                .collect::<Vec<_>>()
+        }
+        IrExpr::Builtin {
+            func: BuiltinFn::FragZeroAcc,
+            ..
+        } => (0..TILES)
+            .map(|t| format!("{name}[{t}] = simdgroup_matrix<float, 8, 8>(0);"))
+            .collect(),
+        _ => {
+            return Err(frag_rejected(
+                "mma",
+                "the accumulator must be a fragment local or frag_zero_acc()",
+            ));
+        }
+    };
+    for i in 0..2 {
+        for j in 0..2 {
+            for k in 0..2 {
+                lines.push(format!(
+                    "simdgroup_multiply_accumulate({name}[{}], {a}[{}], {b}[{}], {name}[{}]);",
+                    2 * i + j,
+                    2 * i + k,
+                    2 * k + j,
+                    2 * i + j,
+                ));
+            }
+        }
+    }
+    Ok(lines)
+}
+
+fn frag_store_lines(
+    ctx: &Ctx<'_>,
+    src: &FragSrc,
+    offset: &IrExpr,
+    ld: &IrExpr,
+    value: &IrExpr,
+) -> Result<Vec<String>, Diagnostic> {
+    let IrExpr::Local(acc) = value else {
+        return Err(frag_rejected(
+            "frag_store",
+            "the value must be a fragment local",
+        ));
+    };
+    let is_f32_acc = ctx
+        .frags
+        .get(acc.as_str())
+        .is_some_and(|f| f.usage == FragUse::Acc && f.elem == "float");
+    if !is_f32_acc {
+        return Err(frag_rejected(
+            "frag_store",
+            "only f32 accumulators can be stored",
+        ));
+    }
+    let off = emit_expr(ctx, offset)?;
+    let ld = emit_expr(ctx, ld)?;
+    let base = match src {
+        FragSrc::Buffer(buf) => {
+            if ctx.buffer_elems.get(buf.as_str()).copied() != Some("float") {
+                return Err(frag_rejected(
+                    &format!("frag_store to `{buf}`"),
+                    "accumulators are stored to f32 buffers",
+                ));
+            }
+            format!("({buf} + ({off}))")
+        }
+        FragSrc::Shared(tile) => format!("({tile} + ({off}))"),
+    };
+    Ok((0..TILES)
+        .map(|t| {
+            let (r, c) = tile_origin(t);
+            format!("simdgroup_store({acc}[{t}], {base} + {r}u * ({ld}) + {c}u, ({ld}));")
+        })
+        .collect())
 }
 
 fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
