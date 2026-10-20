@@ -3046,18 +3046,12 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
         if try_instance().is_none() {
             return;
         }
-        let rocm = RocmVersion::runtime().min(RocmVersion::COMPILE_TIME);
         for gfx in [
             "gfx1010", "gfx1012", "gfx1030", "gfx1100", "gfx906", "gfx90a",
         ] {
-            let family = GfxFamily::from_gfx(gfx);
-            let caps = HipCapabilities::for_family(rocm, rocm, family);
-            let opts = caps.rtc_options(gfx);
             for src in [VEC_ADD_SRC, SGEMM_OPT_SRC, REDUCE_SRC, WAVE_REDUCE_SRC] {
-                let code = compile_hip_src(src.as_bytes(), &opts, gfx, None)
-                    .unwrap_or_else(|e| panic!("{gfx}: {e}"))
-                    .0;
-                assert!(!code.is_empty(), "{gfx}: empty code object");
+                let size = compile_for_target(src, gfx).unwrap_or_else(|e| panic!("{gfx}: {e}"));
+                assert!(size > 0, "{gfx}: empty code object");
             }
         }
     }
@@ -3672,6 +3666,95 @@ extern "C" __global__ void spin(unsigned int ticks) {
         device.write_buffer(buf, 0, &data).unwrap();
         assert_eq!(device.read_buffer(buf, 0, data.len() as u64).unwrap(), data);
         device.destroy_buffer(buf);
+    }
+
+    /// Each dispatch in one batch sees the writes of the one before.
+    #[test]
+    fn dispatch_batch_runs_ops_in_order() {
+        const INC_SRC: &str = r#"
+extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) data[i] += 1;
+}
+"#;
+        let Some(device) = open_device() else { return };
+        let device = device.as_ref();
+        let n = 1000u32;
+        let data = rw_buffer(device, u64::from(n) * 4);
+        device
+            .write_buffer(data, 0, &vec![0; n as usize * 4])
+            .unwrap();
+        let (shader, pipeline) = kernel(device, INC_SRC, "inc");
+        let scalars = [Scalar::U32(n)];
+        let op = DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &[data.index()],
+                textures: &[],
+                images: &[],
+                scalars: &scalars,
+            },
+            grid: [n.div_ceil(64), 1, 1],
+        };
+        device.dispatch_batch(&[op; 100]).unwrap();
+        let raw = device.read_buffer(data, 0, u64::from(n) * 4).unwrap();
+        assert!(
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|c| u32::from_ne_bytes(*c) == 100)
+        );
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(data);
+    }
+
+    #[test]
+    fn compute_caps_match_device_info_and_textures_are_unsupported() {
+        let Some(device) = open_device() else { return };
+        let info = device
+            .as_any()
+            .downcast_ref::<HipDevice>()
+            .unwrap()
+            .device_info();
+        assert_eq!(device.capabilities(), HalCapabilities::compute_only());
+        let caps = device.compute_caps();
+        assert_eq!(caps.default_subgroup, info.wave_size);
+        assert_eq!(caps.subgroup_sizes, (info.wave_size, info.wave_size));
+        assert_eq!(caps.shared_bytes, info.shared_mem_per_block);
+        assert_eq!(
+            caps.max_workgroup,
+            device.limits().max_workgroup_invocations
+        );
+        assert!(matches!(
+            device.create_sampler(SamplerDesc::default()),
+            Err(GpuError::Unsupported(_))
+        ));
+    }
+
+    /// Leaks most of free VRAM on each of three devices; without frees on drop the second
+    /// allocation fails.
+    #[test]
+    fn heavy_dropped_device_frees_its_buffers() {
+        let Some(inst) = try_instance() else { return };
+        let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let budget = adapter
+            .open(DeviceRequest::default())
+            .unwrap()
+            .memory_budget()
+            .unwrap();
+        if budget.budget < budget.device_local / 2 {
+            println!("hip: skipped: VRAM held by other jobs");
+            return;
+        }
+        let size = budget.budget / 5 * 3;
+        for round in 0..3 {
+            let device = adapter.open(DeviceRequest::default()).unwrap();
+            let leaked = buffer(device.as_ref(), size, BufferUsage::STORAGE);
+            device.write_buffer(leaked, 0, &[round; 4096]).unwrap();
+        }
     }
 
     /// ZSL kernels lowered for HIP, checked against CPU references and Zetna kernels.
