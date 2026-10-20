@@ -14,6 +14,64 @@ pub struct ComputeTypeCtx {
     pub locals: HashMap<String, TypeId>,
     pub scalars: HashMap<String, TypeId>,
     pub buffers: HashMap<String, TypeId>,
+    pub shared: HashMap<String, TypeId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageElem {
+    F32,
+    F16,
+    Bf16,
+    I8,
+    U8,
+    I32,
+    U32,
+}
+
+pub fn storage_elem(arena: &TypeArena, elem: TypeId) -> Option<StorageElem> {
+    Some(match arena.get(elem) {
+        Type::Float {
+            format: FloatFormat::F32,
+        } => StorageElem::F32,
+        Type::Float {
+            format: FloatFormat::F16,
+        } => StorageElem::F16,
+        Type::Float {
+            format: FloatFormat::Bf16,
+        } => StorageElem::Bf16,
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Signed,
+        } => StorageElem::I8,
+        Type::Int {
+            width: IntWidth::W8,
+            signedness: Signedness::Unsigned,
+        } => StorageElem::U8,
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Signed,
+        } => StorageElem::I32,
+        Type::Int {
+            width: IntWidth::W32,
+            signedness: Signedness::Unsigned,
+        } => StorageElem::U32,
+        _ => return None,
+    })
+}
+
+/// Value type after a load: f16 and bf16 widen to f32, i8 to i32 and u8 to u32.
+pub fn storage_value_type(arena: &mut TypeArena, elem: TypeId) -> TypeId {
+    let bf16 = arena.bf16_id();
+    let f16 = arena.f16_id();
+    if elem == bf16 || elem == f16 {
+        arena.f32_id()
+    } else if arena.get(elem) == &i8_type() {
+        arena.i32_id()
+    } else if arena.get(elem) == &u8_type() {
+        arena.u32_id()
+    } else {
+        elem
+    }
 }
 
 pub fn frag_parts(arena: &TypeArena, ty: TypeId) -> Option<(TypeId, FragUse)> {
@@ -52,8 +110,6 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
     let i32_id = arena.i32_id();
     let f32_id = arena.f32_id();
     let bool_id = arena.bool_id();
-    let bf16_id = arena.bf16_id();
-    let f16_id = arena.f16_id();
     let bitset128_id = arena.bitset128_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
@@ -64,17 +120,12 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::LocalId(_) | IrExpr::GroupId(_) => u32_id,
         IrExpr::BufferLoad { buf, .. } => {
             let elem = ctx.buffers.get(buf).copied().unwrap_or(f32_id);
-            if elem == bf16_id || elem == f16_id {
-                f32_id
-            } else if arena.get(elem) == &i8_type() {
-                i32_id
-            } else if arena.get(elem) == &u8_type() {
-                u32_id
-            } else {
-                elem
-            }
+            storage_value_type(arena, elem)
         }
-        IrExpr::SharedLoad { .. } => f32_id,
+        IrExpr::SharedLoad { name, .. } => match ctx.shared.get(name).copied() {
+            Some(elem) => storage_value_type(arena, elem),
+            None => f32_id,
+        },
         IrExpr::Texel { .. } => f32_id,
         IrExpr::TexSize { .. } => u32_id,
         IrExpr::FragLoad { ty, .. } => *ty,

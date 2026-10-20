@@ -15,6 +15,8 @@ use crate::ir::typeck::{frag_parts, frag16_id};
 use crate::ir::types::{FloatFormat, FragUse, IntWidth, Type, TypeId};
 
 const ROW_MAJOR: u32 = 0;
+/// ColumnMajorKHR for `frag_load_b_t`: N x K row-major B is column-major over K x N
+const COLUMN_MAJOR: u32 = 1;
 const SCOPE_SUBGROUP: u32 = 3;
 /// `CooperativeMatrixOperands` for signed A, B, C and result.
 const SIGNED_OPERANDS: u32 = 0x1 | 0x2 | 0x4 | 0x8;
@@ -189,11 +191,11 @@ impl LowerCtx<'_> {
             .ok_or_else(|| "ZSL: expected a frag type".to_string())?;
         match src {
             FragSrc::Shared(name) => {
-                let var = *self
+                let sv = *self
                     .shared
                     .get(name)
                     .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
-                Ok(self.spv.op_access_chain(self.t_ptr_wg_f32, var, &[offset]))
+                Ok(self.spv.op_access_chain(sv.elem_ptr, sv.var, &[offset]))
             }
             FragSrc::Buffer(name) => {
                 let info = *self
@@ -244,18 +246,36 @@ impl LowerCtx<'_> {
         src: &FragSrc,
         offset: &IrExpr,
         ld: &IrExpr,
+        trans: bool,
     ) -> Result<Val, String> {
         let (_, usage) =
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
+        if trans
+            && let FragSrc::Shared(name) = src
+            && self
+                .shared
+                .get(name)
+                .is_some_and(|sv| sv.value_ty == self.f32_id)
+        {
+            return Err(format!(
+                "ZSL: SPIR-V frag_load_b_t from f32 shared `{name}` is not lowered (stage it as f16 first)"
+            ));
+        }
         if let FragSrc::Shared(name) = src
             && usage != FragUse::Acc
+            && self
+                .shared
+                .get(name)
+                .is_some_and(|sv| sv.value_ty == self.f32_id)
         {
             return self.lower_shared_frag_ab(name, ty, offset, ld);
         }
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let ptr = self.frag_elem_ptr(src, ty, off)?;
         let coop_ty = self.frag_spv_ty(ty)?;
-        let layout = self.spv.constant_u32(self.t_u32, ROW_MAJOR);
+        let layout = self
+            .spv
+            .constant_u32(self.t_u32, if trans { COLUMN_MAJOR } else { ROW_MAJOR });
         let id = self
             .spv
             .op_cooperative_matrix_load(coop_ty, ptr, layout, stride);
@@ -275,10 +295,16 @@ impl LowerCtx<'_> {
         offset: &IrExpr,
         ld: &IrExpr,
     ) -> Result<Val, String> {
-        let tile = *self
+        let sv = *self
             .shared
             .get(name)
             .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
+        if sv.value_ty != self.f32_id {
+            return Err(format!(
+                "ZSL: SPIR-V frag loads and stores from shared `{name}` need an f32 array"
+            ));
+        }
+        let tile = sv.var;
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let coop_ty = self.frag_spv_ty(ty)?;
         let [sx, sy, sz] = self.local_size;

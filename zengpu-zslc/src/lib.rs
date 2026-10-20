@@ -1223,6 +1223,82 @@ int main() {{
         assert!(ops.contains(&4457) && ops.contains(&224) && ops.contains(&115));
     }
 
+    const TYPED_SHARED: &str = r#"
+        @workgroup_size(32)
+        kernel typed_shared(a: device buffer<f32>, ci: device buffer<i32>, ui: device buffer<u8>, out: device mut buffer<f32>, oi: device mut buffer<i32>, ou: device mut buffer<u32>) {
+            shared sh: array<f16, 256>
+            shared sb: array<bf16, 256>
+            shared sq: array<i8, 256>
+            shared su: array<u8, 256>
+            shared sn: array<u32, 256>
+            shared sm: array<i32, 256>
+            let lane = local_id().x
+            for i in 0..8 {
+                sh[lane + i * 32] = a[lane + i * 32]
+                sb[lane + i * 32] = a[lane + i * 32]
+                sq[lane + i * 32] = ci[lane + i * 32]
+                su[lane + i * 32] = ui[lane + i * 32]
+                sn[lane + i * 32] = ui[lane + i * 32]
+                sm[lane + i * 32] = ci[lane + i * 32]
+            }
+            barrier()
+            for i in 0..8 {
+                out[lane + i * 32] = sh[lane + i * 32] + sb[lane + i * 32]
+                oi[lane + i * 32] = sq[lane + i * 32] + sm[lane + i * 32]
+                ou[lane + i * 32] = su[lane + i * 32] + sn[lane + i * 32]
+            }
+        }
+    "#;
+
+    #[test]
+    fn typed_shared_lowers_per_backend() {
+        let module = parse_compute(TYPED_SHARED).expect("parse typed shared");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower typed shared to HIP")
+            .source;
+        assert!(hip_source.contains("__shared__ unsigned short sh[256];"));
+        assert!(hip_source.contains("__shared__ signed char sq[256];"));
+        assert!(hip_source.contains("f32_to_f16("));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower typed shared to CUDA")
+            .source;
+        assert!(cuda_source.contains("__shared__ __half sh[256];"));
+        assert!(cuda_source.contains("__float2half("));
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower typed shared to MSL")
+            .source;
+        assert!(msl_source.contains("threadgroup half sh[256];"));
+        assert!(msl_source.contains("threadgroup char sq[256];"));
+        let words = spirv::lower_compute(&module).expect("lower typed shared to SPIR-V");
+        let ops = spirv_opcodes(&words);
+        assert!(ops.contains(&21) && ops.contains(&22));
+        assert!(ops.contains(&114));
+    }
+
+    const FRAG_LOAD_B_T: &str = r#"
+        @workgroup_size(32)
+        kernel frag_bt(a: device buffer<f16>, b: device buffer<f16>, out: device mut buffer<f32>) {
+            let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b_t(b, 0, 16)
+            let acc: frag<f32, 16, 16, acc> = frag_zero_acc()
+            let d = mma(fa, fb, acc)
+            frag_store(out, 0, 16, d)
+        }
+    "#;
+
+    #[test]
+    fn frag_load_b_t_lowers_per_backend() {
+        let module = parse_compute(FRAG_LOAD_B_T).expect("parse frag_load_b_t");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        assert!(hip_source.contains("zsl_load_h8<false, true>("));
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        assert!(cuda_source.contains("matrix_b, 16, 16, 16, __half, nvcuda::wmma::col_major>"));
+        let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
+        assert!(msl_source.contains("ulong2(0, 0), true);"));
+        let words = spirv::lower_compute(&module).expect("lower to SPIR-V");
+        assert!(spirv_opcodes(&words).contains(&4457));
+    }
+
     #[test]
     fn frag_element_queries_are_rejected_off_hip() {
         const ROW: &str = r#"
@@ -2402,8 +2478,10 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 28] = [
+        let kernels: [(&str, &str); 30] = [
             ("tiled_gemm", TILED_GEMM),
+            ("typed_shared", TYPED_SHARED),
+            ("frag_load_b_t", FRAG_LOAD_B_T),
             ("scatter_add", SCATTER_ADD),
             ("trig", TRIG),
             ("typed_buffers", TYPED_BUFFERS),

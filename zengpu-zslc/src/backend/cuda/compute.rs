@@ -6,7 +6,7 @@ use crate::backend::cuda::{CudaShader, ENTRY};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
-use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
+use crate::ir::typeck::{ComputeTypeCtx, StorageElem, storage_elem, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
@@ -94,10 +94,15 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
 
     let mut s = String::new();
 
-    if !f16_buffers.is_empty() {
+    let shared_has = |kind: StorageElem| {
+        e.shared
+            .iter()
+            .any(|d| storage_elem(&module.types, d.elem) == Some(kind))
+    };
+    if !f16_buffers.is_empty() || shared_has(StorageElem::F16) {
         s.push_str("#include <cuda_fp16.h>\n");
     }
-    if !bf16_buffers.is_empty() {
+    if !bf16_buffers.is_empty() || shared_has(StorageElem::Bf16) {
         s.push_str(
             "__device__ __forceinline__ unsigned short f32_to_bf16(float x) {\n\
              \x20   unsigned int bits = __float_as_uint(x);\n\
@@ -263,7 +268,8 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
     s.push_str(") {\n");
 
     for shared in &e.shared {
-        let _ = writeln!(s, "    __shared__ float {}[{}];", shared.name, shared.len);
+        let cty = shared_c_type(&module.types, shared.elem)?;
+        let _ = writeln!(s, "    __shared__ {cty} {}[{}];", shared.name, shared.len);
     }
     if uses_workgroup_reduce {
         let _ = writeln!(s, "    __shared__ float __zsl_wg_reduce_f32[{block_size}];");
@@ -288,6 +294,7 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
         f16_buffers,
         type_ctx: ComputeTypeCtx {
             locals: e.locals.iter().cloned().collect(),
+            shared: e.shared.iter().map(|d| (d.name.clone(), d.elem)).collect(),
             scalars: scalars
                 .iter()
                 .map(|(name, ty)| ((*name).to_string(), *ty))
@@ -333,6 +340,30 @@ struct Ctx<'a> {
 fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
     let mut types = ctx.types.borrow_mut();
     type_of_compute_expr(expr, &ctx.type_ctx, &mut types)
+}
+
+/// u8 loads zero-extend. Shared: f16 is `__half`, bf16 is `unsigned short` bits.
+fn shared_c_type(types: &TypeArena, elem: TypeId) -> Result<&'static str, Diagnostic> {
+    Ok(match storage_elem(types, elem) {
+        Some(StorageElem::F32) => "float",
+        Some(StorageElem::F16) => "__half",
+        Some(StorageElem::Bf16) => "unsigned short",
+        Some(StorageElem::I8) => "signed char",
+        Some(StorageElem::U8) => "unsigned char",
+        Some(StorageElem::I32) => "int",
+        Some(StorageElem::U32) => "unsigned int",
+        None => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                "CUDA: unsupported shared array element type",
+            ));
+        }
+    })
+}
+
+fn shared_kind(ctx: &Ctx<'_>, name: &str) -> Option<StorageElem> {
+    let elem = *ctx.type_ctx.shared.get(name)?;
+    storage_elem(&ctx.types.borrow(), elem)
 }
 
 fn buffer_is_u8(ctx: &Ctx<'_>, buf: &str) -> bool {
@@ -530,13 +561,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(
-                s,
-                "{}[{}] = {};",
-                name,
-                emit_expr(ctx, index)?,
-                emit_expr(ctx, value)?
-            );
+            let val = emit_expr(ctx, value)?;
+            let val = match shared_kind(ctx, name) {
+                Some(StorageElem::Bf16) => format!("f32_to_bf16({val})"),
+                Some(StorageElem::F16) => format!("__float2half({val})"),
+                _ => val,
+            };
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(ctx, index)?, val);
         }
         IrStmt::Discard => {
             return Err(Diagnostic::new(
@@ -622,7 +653,16 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 inner
             }
         }
-        IrExpr::SharedLoad { name, index } => format!("{}[{}]", name, emit_expr(ctx, index)?),
+        IrExpr::SharedLoad { name, index } => {
+            let inner = format!("{}[{}]", name, emit_expr(ctx, index)?);
+            match shared_kind(ctx, name) {
+                Some(StorageElem::Bf16) => format!("bf16_to_f32({inner})"),
+                Some(StorageElem::F16) => format!("__half2float({inner})"),
+                Some(StorageElem::I8) => format!("((int)({inner}))"),
+                Some(StorageElem::U8) => format!("((unsigned int)({inner}))"),
+                _ => inner,
+            }
+        }
         IrExpr::GlobalId(0) => "zsl_gx".into(),
         IrExpr::GlobalId(1) => "zsl_gy".into(),
         IrExpr::GlobalId(2) => "zsl_gz".into(),

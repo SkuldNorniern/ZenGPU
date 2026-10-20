@@ -52,6 +52,8 @@ pub enum IrExpr {
         src: FragSrc,
         offset: Box<IrExpr>,
         ld: Box<IrExpr>,
+        /// `frag_load_b_t`: B is N x K row-major, (k, n) at `offset + n * ld + k`.
+        trans: bool,
     },
     Builtin { func: BuiltinFn, args: Vec<IrExpr> },
     Neg(Box<IrExpr>),

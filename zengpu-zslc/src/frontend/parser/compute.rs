@@ -271,14 +271,11 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         self.expect(&Tok::Colon, "`:` after shared name")?;
         if !self.eat_kw("array") {
-            return self.err("shared declarations require `array<f32, N>`");
+            return self.err("shared declarations require `array<T, N>`");
         }
-        self.expect(&Tok::Lt, "`<` in array<f32, N>")?;
-        let elem = self.parse_scalar_type()?;
-        if elem != self.types.f32_id() {
-            return self.err("only shared array<f32, N> is supported");
-        }
-        self.expect(&Tok::Comma, "`,` in array<f32, N>")?;
+        self.expect(&Tok::Lt, "`<` in array<T, N>")?;
+        let elem = self.parse_buffer_elem_type()?;
+        self.expect(&Tok::Comma, "`,` in array<T, N>")?;
         let len = match self.peek() {
             Some(Tok::Int(v)) if *v > 0 && *v <= u32::MAX as u64 => {
                 let len = *v as u32;
@@ -287,7 +284,7 @@ impl<'a> Parser<'a> {
             }
             _ => return self.err("shared array length must be a positive u32 literal"),
         };
-        self.expect(&Tok::Gt, "`>` in array<f32, N>")?;
+        self.expect(&Tok::Gt, "`>` in array<T, N>")?;
         if ctx.shared.contains_key(&name)
             || ctx.buffers.contains_key(&name)
             || ctx.locals.contains_key(&name)
@@ -295,8 +292,7 @@ impl<'a> Parser<'a> {
             return self.err(format!("duplicate symbol `{name}`"));
         }
         ctx.shared_order.push(name.clone());
-        ctx.shared
-            .insert(name.clone(), PendingShared { name, elem, len });
+        ctx.shared.insert(name.clone(), PendingShared { elem, len });
         Ok(())
     }
 
@@ -417,8 +413,15 @@ impl<'a> Parser<'a> {
                     }
                 }
                 IrExpr::SharedLoad { name, index } => {
-                    if !ctx.shared.contains_key(&name) {
+                    let Some(elem) = ctx.shared.get(&name).map(|d| d.elem) else {
                         return self.err(format!("`{name}` is not a declared shared array"));
+                    };
+                    let expected = storage_value_type(&mut self.types, elem);
+                    if type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types) != expected {
+                        return self.err(format!(
+                            "assignment to shared array<{}> has incompatible value type",
+                            buffer_elem_name(elem, &self.types)
+                        ));
                     }
                     IrStmt::AssignShared {
                         name,

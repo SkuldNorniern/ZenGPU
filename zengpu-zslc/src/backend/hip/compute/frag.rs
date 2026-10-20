@@ -17,31 +17,41 @@ pub(super) const FRAG_PRELUDE: &str = r#"typedef _Float16 zsl_h8 __attribute__((
 typedef float zsl_f8 __attribute__((ext_vector_type(8)));
 typedef int zsl_i2 __attribute__((ext_vector_type(2)));
 typedef int zsl_i8v __attribute__((ext_vector_type(8)));
-// gfx12 wave32 layout: lane l holds A[l%16][8*(l/16)+i] (kA), and B or acc at [8*(l/16)+i][l%16].
-// `off` and `ld` count elements; packed i8 counts bytes.
-template <bool kA>
+// gfx12 wave32: lane l holds A[l%16][8*(l/16)+i] (kA), B and acc at [8*(l/16)+i][l%16]. `off`, `ld`
+// in elements; packed i8 in bytes. `T`: B from N x K row-major, element (k, n) at n * ld + k.
+template <bool kA, bool T = false>
 __device__ __forceinline__ unsigned int zsl_frag_at(unsigned int lane, unsigned int i, unsigned int off, unsigned int ld) {
     unsigned int r = kA ? (lane & 15u) : (8u * (lane >> 4) + i);
     unsigned int c = kA ? (8u * (lane >> 4) + i) : (lane & 15u);
+    if (T) { unsigned int t = r; r = c; c = t; }
     return off + r * ld + c;
 }
-template <bool kA>
+template <bool kA, bool T = false>
 __device__ __forceinline__ zsl_h8 zsl_load_h8(const unsigned short* b, unsigned int off, unsigned int ld, unsigned int lane) {
     zsl_h8 v;
-    for (unsigned int i = 0; i < 8; ++i) v[i] = __builtin_bit_cast(_Float16, b[zsl_frag_at<kA>(lane, i, off, ld)]);
+    for (unsigned int i = 0; i < 8; ++i) v[i] = __builtin_bit_cast(_Float16, b[zsl_frag_at<kA, T>(lane, i, off, ld)]);
     return v;
 }
-template <bool kA>
+template <bool kA, bool T = false>
 __device__ __forceinline__ zsl_h8 zsl_load_h8f(const float* b, unsigned int off, unsigned int ld, unsigned int lane) {
     zsl_h8 v;
-    for (unsigned int i = 0; i < 8; ++i) v[i] = (_Float16)b[zsl_frag_at<kA>(lane, i, off, ld)];
+    for (unsigned int i = 0; i < 8; ++i) v[i] = (_Float16)b[zsl_frag_at<kA, T>(lane, i, off, ld)];
     return v;
 }
-template <bool kA>
+template <bool kA, bool T = false>
+__device__ __forceinline__ zsl_i2 zsl_load_i2s(const signed char* b, unsigned int off, unsigned int ld, unsigned int lane) {
+    zsl_i2 v = {0, 0};
+    for (unsigned int i = 0; i < 8; ++i) {
+        unsigned int byte = (unsigned int)(unsigned char)b[zsl_frag_at<kA, T>(lane, i, off, ld)];
+        v[i >> 2] |= (int)(byte << (8u * (i & 3u)));
+    }
+    return v;
+}
+template <bool kA, bool T = false>
 __device__ __forceinline__ zsl_i2 zsl_load_i2(const unsigned int* b, unsigned int off, unsigned int ld, unsigned int lane) {
     zsl_i2 v = {0, 0};
     for (unsigned int i = 0; i < 8; ++i) {
-        unsigned int at = zsl_frag_at<kA>(lane, i, off, ld);
+        unsigned int at = zsl_frag_at<kA, T>(lane, i, off, ld);
         unsigned int byte = (b[at >> 2] >> (8u * (at & 3u))) & 0xffu;
         v[i >> 2] |= (int)(byte << (8u * (i & 3u)));
     }
@@ -175,7 +185,12 @@ fn source_elem(ctx: &Ctx<'_>, src: &FragSrc) -> Result<TypeId, Diagnostic> {
             .get(name)
             .copied()
             .ok_or_else(|| unsupported(format!("`{name}` is not a buffer"))),
-        FragSrc::Shared(_) => Ok(ctx.types.borrow_mut().f32_id()),
+        FragSrc::Shared(name) => ctx
+            .type_ctx
+            .shared
+            .get(name)
+            .copied()
+            .ok_or_else(|| unsupported(format!("`{name}` is not a shared array"))),
     }
 }
 
@@ -191,6 +206,7 @@ pub(super) fn load_expr(
     src: &FragSrc,
     offset: &IrExpr,
     ld: &IrExpr,
+    trans: bool,
 ) -> Result<String, Diagnostic> {
     ctx.frag_used.set(true);
     let (_, usage) = frag_shape(ctx, ty)?;
@@ -200,30 +216,39 @@ pub(super) fn load_expr(
     let ld = super::emit_expr(ctx, ld)?;
     let args = format!("{off}, {ld}, __lane_id())");
     let k_a = usage == FragUse::A;
+    let t = trans;
     let shared = matches!(src, FragSrc::Shared(_));
     let f16 = f16_type();
     let i32 = i32_type();
+    let f32 = Type::Float {
+        format: FloatFormat::F32,
+    };
+    let i8 = Type::Int {
+        width: IntWidth::W8,
+        signedness: Signedness::Signed,
+    };
     Ok(match usage {
-        FragUse::A | FragUse::B if shared => format!("zsl_load_h8f<{k_a}>({name}, {args}"),
+        FragUse::A | FragUse::B if shared && kind_is(ctx, elem, &f32) => {
+            format!("zsl_load_h8f<{k_a}, {t}>({name}, {args}")
+        }
         FragUse::A | FragUse::B if kind_is(ctx, elem, &f16) => {
-            format!("zsl_load_h8<{k_a}>({name}, {args}")
+            let p = if shared {
+                "(const unsigned short*)"
+            } else {
+                ""
+            };
+            format!("zsl_load_h8<{k_a}, {t}>({p}{name}, {args}")
+        }
+        FragUse::A | FragUse::B if shared && kind_is(ctx, elem, &i8) => {
+            format!("zsl_load_i2s<{k_a}, {t}>((const signed char*){name}, {args}")
         }
         FragUse::A | FragUse::B if is_word(ctx, elem) => {
-            format!("zsl_load_i2<{k_a}>((const unsigned int*){name}, {args}")
+            format!("zsl_load_i2<{k_a}, {t}>((const unsigned int*){name}, {args}")
         }
-        FragUse::Acc if !shared && kind_is(ctx, elem, &i32) => {
+        FragUse::Acc if kind_is(ctx, elem, &i32) => {
             format!("zsl_load_i8v((const int*){name}, {args}")
         }
-        FragUse::Acc
-            if shared
-                || kind_is(
-                    ctx,
-                    elem,
-                    &Type::Float {
-                        format: FloatFormat::F32,
-                    },
-                ) =>
-        {
+        FragUse::Acc if kind_is(ctx, elem, &f32) => {
             format!("zsl_load_f8({name}, {args}")
         }
         _ => {
