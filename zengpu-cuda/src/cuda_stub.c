@@ -3,6 +3,7 @@
 CUDA_STUB(cuCtxCreate_v2)
 CUDA_STUB(cuCtxDestroy_v2)
 CUDA_STUB(cuCtxGetApiVersion)
+CUDA_STUB(cuCtxGetDevice)
 CUDA_STUB(cuCtxGetCurrent)
 CUDA_STUB(cuCtxGetLimit)
 CUDA_STUB(cuCtxSetCurrent)

@@ -3,6 +3,7 @@
 
 use core::any::Any;
 
+use crate::caps::ComputeCaps;
 use crate::command::{Bindings, ComputeOp, DispatchOp};
 use crate::desc::{
     BufferDesc, ComputePipelineDesc, ComputePipelineHints, SamplerDesc, ShaderDesc, TextureDesc,
@@ -29,6 +30,11 @@ pub trait GpuDevice: Send + Sync {
 
     fn limits(&self) -> DeviceLimits {
         DeviceLimits::default()
+    }
+
+    /// The default claims scalar work only. Backends report what they checked.
+    fn compute_caps(&self) -> ComputeCaps {
+        ComputeCaps::scalar_only()
     }
 
     /// What textures of `format` can do here. The default claims nothing.

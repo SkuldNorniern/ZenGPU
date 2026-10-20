@@ -22,11 +22,12 @@ use std::{env, fs, io, process, ptr, slice};
 use cuda_oxide::{Cuda, context::Context, device::Device, sys};
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, CompletedReadback, CompletedSubmission, ComputeOp, ComputePipelineDesc,
-    DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuReadback,
-    GpuSubmission, HalCapabilities, MemoryBudget, PipelineHandle, ReadSubmission, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
-    Submission, SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
+    BufferUsage, CompletedReadback, CompletedSubmission, ComputeCaps, ComputeOp,
+    ComputePipelineDesc, DType, DeviceRequest, DeviceType, GpuAdapter, GpuDevice, GpuError,
+    GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget, MmaShape,
+    PipelineHandle, ReadSubmission, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc,
+    ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, TextureDesc, TextureHandle,
+    UsageError, marker,
 };
 
 use error::{cu, from_cuda};
@@ -2263,6 +2264,61 @@ impl CudaDevice {
 impl GpuDevice for CudaDevice {
     fn backend(&self) -> BackendPreference {
         BackendPreference::Cuda
+    }
+
+    fn compute_caps(&self) -> ComputeCaps {
+        let (major, minor) = self.shared.sm;
+        let queried = self.shared.with_current(|| {
+            let mut dev: sys::CUdevice = 0;
+            // SAFETY: the context is current; writes one device ordinal.
+            cu(unsafe { sys::cuCtxGetDevice(&mut dev) })?;
+            let get = |attr: sys::CUdevice_attribute_enum| -> Result<u32> {
+                let mut value = 0i32;
+                // SAFETY: writes one int for a valid attribute of `dev`.
+                cu(unsafe { sys::cuDeviceGetAttribute(&mut value, attr, dev) })?;
+                Ok(u32::try_from(value).unwrap_or(0))
+            };
+            Ok((
+                get(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_WARP_SIZE)?,
+                get(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK)?,
+                get(sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)?,
+            ))
+        });
+        let mut caps = ComputeCaps::scalar_only();
+        let Ok((warp, shared, threads)) = queried else {
+            return caps;
+        };
+        if warp == 0 {
+            return caps;
+        }
+        caps.subgroup_sizes = (warp, warp);
+        caps.default_subgroup = warp;
+        caps.shared_bytes = shared;
+        caps.max_workgroup = threads;
+        let sm = major * 10 + minor;
+        if warp == 32 && sm >= 70 {
+            caps.mma.push(MmaShape {
+                m: 16,
+                n: 16,
+                k: 16,
+                a: DType::F16,
+                b: DType::F16,
+                acc: DType::F32,
+                subgroup: 32,
+            });
+        }
+        if warp == 32 && sm >= 72 {
+            caps.mma.push(MmaShape {
+                m: 16,
+                n: 16,
+                k: 16,
+                a: DType::I8,
+                b: DType::I8,
+                acc: DType::I32,
+                subgroup: 32,
+            });
+        }
+        caps
     }
 
     fn memory_budget(&self) -> Option<MemoryBudget> {

@@ -433,6 +433,7 @@ pub(crate) struct VulkanDeviceInner {
     pub depth24_stencil8: vk::Format,
     /// `(min, max)` subgroup sizes a compute pipeline may require (`VK_EXT_subgroup_size_control`).
     pub compute_subgroup_sizes: Option<(u32, u32)>,
+    pub coop_matrix: bool,
     /// `VK_KHR_dynamic_rendering` loader: `cmd_begin_rendering`/`cmd_end_rendering`, no
     /// `vk::RenderPass` or `vk::Framebuffer`.
     pub dynamic_rendering: khr::dynamic_rendering::Device,
@@ -1035,6 +1036,7 @@ impl VulkanDevice {
             max_sampler_anisotropy,
             depth24_stencil8,
             compute_subgroup_sizes,
+            coop_matrix: coop_supported,
             dynamic_rendering,
             debug_utils,
         });
@@ -5434,6 +5436,41 @@ mod tests {
         for buf in [a, b, c, ba, bb, ci_buf, out, oi] {
             dev.destroy_buffer(buf);
         }
+    }
+
+    #[test]
+    fn compute_caps_are_reported_on_radv() {
+        let Some(dev) = try_device() else { return };
+        let caps = dev.compute_caps();
+        println!("vulkan compute caps: {caps:?}");
+        let (lo, hi) = caps.subgroup_sizes;
+        assert!(lo <= caps.default_subgroup && caps.default_subgroup <= hi);
+        assert!(
+            caps.shared_bytes >= 32 * 1024,
+            "shared {}",
+            caps.shared_bytes
+        );
+        assert!(
+            caps.max_workgroup >= 256,
+            "workgroup {}",
+            caps.max_workgroup
+        );
+        for shape in &caps.mma {
+            assert_eq!(
+                (shape.m, shape.n, shape.k, shape.subgroup),
+                (16, 16, 16, 32)
+            );
+        }
+        assert!(
+            caps.mma
+                .iter()
+                .any(|s| s.a == zengpu_hal::DType::F16 && s.acc == zengpu_hal::DType::F32)
+        );
+        assert!(
+            caps.mma
+                .iter()
+                .any(|s| s.a == zengpu_hal::DType::I8 && s.acc == zengpu_hal::DType::I32)
+        );
     }
 
     #[test]

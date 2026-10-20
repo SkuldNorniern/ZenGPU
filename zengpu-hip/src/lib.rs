@@ -30,12 +30,12 @@ use std::time::{Duration, Instant};
 
 use zengpu_hal::{
     AdapterInfo, AdapterRequest, BackendPreference, Bindings, BufferDesc, BufferHandle,
-    BufferUsage, CompletedReadback, CompletedSubmission, ComputeOp, ComputePipelineDesc,
-    DeviceLimits, DeviceRequest, DeviceType, DispatchOp, GpuAdapter, GpuDevice, GpuError,
-    GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget, MemoryUsage,
-    PipelineHandle, PowerPreference, ReadSubmission, Result, SamplerDesc, SamplerHandle, Scalar,
-    ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus, TextureDesc,
-    TextureHandle, UsageError, marker,
+    BufferUsage, CompletedReadback, CompletedSubmission, ComputeCaps, ComputeOp,
+    ComputePipelineDesc, DType, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, GpuAdapter,
+    GpuDevice, GpuError, GpuInstance, GpuReadback, GpuSubmission, HalCapabilities, MemoryBudget,
+    MemoryUsage, MmaShape, PipelineHandle, PowerPreference, ReadSubmission, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
+    SubmissionStatus, TextureDesc, TextureHandle, UsageError, marker,
 };
 
 mod hip_layout {
@@ -234,7 +234,37 @@ pub struct HipDeviceInfo {
     pub max_threads_per_block: u32,
     pub max_block_dim: [u32; 3],
     pub max_grid_dim: [u32; 3],
+    /// Workgroup-shared memory per block, in bytes (`hipDeviceAttributeMaxSharedMemoryPerBlock`).
+    pub shared_mem_per_block: u32,
     pub capabilities: HipCapabilities,
+}
+
+/// WMMA shapes emitted: 16x16x16 f16 and i8, gfx12 wave32. gfx11 is gated on `__GFX12__` and is not
+/// yet lowered or run.
+fn hip_mma_shapes(family: GfxFamily, wave_size: u32) -> Vec<MmaShape> {
+    if family != GfxFamily::Rdna4 || wave_size != 32 {
+        return Vec::new();
+    }
+    vec![
+        MmaShape {
+            m: 16,
+            n: 16,
+            k: 16,
+            a: DType::F16,
+            b: DType::F16,
+            acc: DType::F32,
+            subgroup: 32,
+        },
+        MmaShape {
+            m: 16,
+            n: 16,
+            k: 16,
+            a: DType::I8,
+            b: DType::I8,
+            acc: DType::I32,
+            subgroup: 32,
+        },
+    ]
 }
 
 impl HipDeviceInfo {
@@ -314,6 +344,8 @@ impl HipDeviceInfo {
             max_threads_per_block,
             max_block_dim,
             max_grid_dim,
+            shared_mem_per_block: positive_attribute(HIP_ATTR_MAX_SHARED_MEMORY_PER_BLOCK, ordinal)
+                .unwrap_or(0),
             capabilities: caps,
         })
     }
@@ -1467,6 +1499,17 @@ impl GpuDevice for HipDevice {
 
     fn capabilities(&self) -> HalCapabilities {
         HalCapabilities::compute_only()
+    }
+
+    fn compute_caps(&self) -> ComputeCaps {
+        let info = &self.core.info;
+        ComputeCaps {
+            subgroup_sizes: (info.wave_size, info.wave_size),
+            default_subgroup: info.wave_size,
+            shared_bytes: info.shared_mem_per_block,
+            max_workgroup: info.max_threads_per_block,
+            mma: hip_mma_shapes(info.gfx_family, info.wave_size),
+        }
     }
 
     fn limits(&self) -> DeviceLimits {
@@ -3857,6 +3900,26 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
     }
 
     #[test]
+    fn compute_caps_are_reported() {
+        let Some(device) = first_device() else { return };
+        let caps = device.compute_caps();
+        println!("hip compute caps: {caps:?}");
+        let (lo, hi) = caps.subgroup_sizes;
+        assert!(lo == 32 || lo == 64, "wave size {lo}");
+        assert!(lo <= caps.default_subgroup && caps.default_subgroup <= hi);
+        assert!(
+            caps.shared_bytes >= 32 * 1024,
+            "shared {}",
+            caps.shared_bytes
+        );
+        assert!(caps.max_workgroup >= 256);
+        for shape in &caps.mma {
+            assert_eq!((shape.m, shape.n, shape.k), (16, 16, 16));
+            assert_eq!(shape.subgroup, lo);
+        }
+    }
+
+    #[test]
     fn limits_and_budget_are_reported() {
         let Some(device) = first_device() else { return };
         let limits = device.limits();
@@ -3962,6 +4025,7 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
                 max_threads_per_block: 1024,
                 max_block_dim: [1024; 3],
                 max_grid_dim: [1 << 30; 3],
+                shared_mem_per_block: 65536,
                 capabilities: HipCapabilities::for_family(
                     RocmVersion::COMPILE_TIME,
                     RocmVersion::COMPILE_TIME,
