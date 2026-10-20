@@ -1931,6 +1931,16 @@ name = "zengpu-spv"
 version = "0.0.1"
 
 [[package]]
+name = "zengpu-tile"
+version = "0.0.1"
+dependencies = [
+ "zengpu-hal",
+ "zengpu-hip",
+ "zengpu-vulkan",
+ "zengpu-zslc",
+]
+
+[[package]]
 name = "zengpu-vulkan"
 version = "0.0.1"
 dependencies = [
