@@ -203,13 +203,11 @@ impl HipCapabilities {
     /// hipRTC options for wave-reduction kernels.
     pub fn rtc_options_wave(&self, gfx_target: &str) -> Vec<String> {
         let mut opts = self.rtc_options(gfx_target);
-        if self.wave_reduction {
-            if self.gfx_family.is_rdna() {
-                if self.wave_size == 32 {
-                    opts.push("-mwavefrontsize32".into());
-                } else {
-                    opts.push("-mwavefrontsize64".into());
-                }
+        if self.wave_reduction && self.gfx_family.is_rdna() {
+            if self.wave_size == 32 {
+                opts.push("-mwavefrontsize32".into());
+            } else {
+                opts.push("-mwavefrontsize64".into());
             }
         }
         opts
