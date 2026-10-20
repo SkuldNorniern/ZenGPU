@@ -81,6 +81,22 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
     s.push_str(
+        "template <int OP> inline float zsl_wg_reduce(threadgroup float* scratch, uint lid, uint n, float x) {\n\
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   scratch[lid] = x;\n\
+         \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   for (uint s = n / 2; s > 0; s /= 2) {\n\
+         \x20       if (lid < s) {\n\
+         \x20           float o = scratch[lid + s];\n\
+         \x20           float v = scratch[lid];\n\
+         \x20           scratch[lid] = OP == 0 ? v + o : OP == 1 ? min(v, o) : max(v, o);\n\
+         \x20       }\n\
+         \x20       threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+         \x20   }\n\
+         \x20   return scratch[0];\n\
+         }\n",
+    );
+    s.push_str(
         "inline uint zsl_dot4(uint a, bool sa, uint b, bool sb, uint acc) {\n\
          \x20   for (uint i = 0; i < 4; ++i) {\n\
          \x20       uint ua = (a >> (8 * i)) & 0xffu;\n\
@@ -457,23 +473,15 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::WorkgroupReduceAdd
                 | BuiltinFn::WorkgroupReduceMin
                 | BuiltinFn::WorkgroupReduceMax => {
-                    let combine = match func {
-                        BuiltinFn::WorkgroupReduceAdd => "v + o",
-                        BuiltinFn::WorkgroupReduceMin => "min(v, o)",
-                        BuiltinFn::WorkgroupReduceMax => "max(v, o)",
+                    let op = match func {
+                        BuiltinFn::WorkgroupReduceAdd => 0,
+                        BuiltinFn::WorkgroupReduceMin => 1,
+                        BuiltinFn::WorkgroupReduceMax => 2,
                         _ => unreachable!(),
                     };
-                    let mut steps = String::new();
-                    let mut s = ctx.block_size / 2;
-                    while s > 0 {
-                        steps.push_str(&format!(
-                            "if (lid.x < {s}u) {{ auto o = __zsl_wg_reduce_f32[lid.x + {s}u]; auto v = __zsl_wg_reduce_f32[lid.x]; __zsl_wg_reduce_f32[lid.x] = {combine}; }} threadgroup_barrier(mem_flags::mem_threadgroup); "
-                        ));
-                        s /= 2;
-                    }
                     format!(
-                        "({{ threadgroup_barrier(mem_flags::mem_threadgroup); __zsl_wg_reduce_f32[lid.x] = {}; threadgroup_barrier(mem_flags::mem_threadgroup); {steps} __zsl_wg_reduce_f32[0]; }})",
-                        a[0]
+                        "zsl_wg_reduce<{op}>(__zsl_wg_reduce_f32, lid.x, {}u, {})",
+                        ctx.block_size, a[0]
                     )
                 }
                 BuiltinFn::SubgroupSize => "simd_size".to_string(),

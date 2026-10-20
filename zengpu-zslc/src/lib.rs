@@ -708,8 +708,9 @@ int main() {{
         assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 256u, "));
         assert!(cuda_source.contains("__syncthreads()"));
         assert!(msl_source.contains("threadgroup float __zsl_wg_reduce_f32[256]"));
-        assert!(msl_source.contains("min(v, o)"));
-        assert!(msl_source.contains("max(v, o)"));
+        assert!(msl_source.contains("zsl_wg_reduce<1>(__zsl_wg_reduce_f32, lid.x, 256u, "));
+        assert!(msl_source.contains("zsl_wg_reduce<2>(__zsl_wg_reduce_f32, lid.x, 256u, "));
+        assert!(!msl_source.contains("({"));
         assert!(msl_source.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
         spirv::lower_compute(&module).expect("lower workgroup reduce to SPIR-V");
     }
