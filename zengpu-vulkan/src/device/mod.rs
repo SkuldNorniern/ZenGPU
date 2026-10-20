@@ -4475,6 +4475,74 @@ mod tests {
     }
 
     #[test]
+    fn zsl_bitwise_ops_unpack_nibbles_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const NIBBLES_ZSL: ZslShader = zsl!(
+            push P { n: u32 }
+            @workgroup_size(64)
+            kernel nibbles(packed: device buffer<u32>, out: device mut buffer<u32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.n {
+                    let w = packed[i >> 3]
+                    out[i] = ((w >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 1000u32;
+        let words: Vec<u32> = (0..n.div_ceil(8))
+            .map(|i| i.wrapping_mul(0x9e37_79b9))
+            .collect();
+        let packed = dev
+            .create_buffer(BufferDesc {
+                size: words.len() as u64 * 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let out = dev
+            .create_buffer(BufferDesc {
+                size: u64::from(n) * 4,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        dev.write_buffer(packed, 0, u32s_to_bytes(&words)).unwrap();
+        let shader = dev.create_shader(NIBBLES_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[packed.index(), out.index()],
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+        let raw = dev.read_buffer(out, 0, u64::from(n) * 4).unwrap();
+        for i in 0..n {
+            let at = i as usize * 4;
+            let got = u32::from_ne_bytes(raw[at..at + 4].try_into().unwrap());
+            let want = ((words[(i >> 3) as usize] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8);
+            assert_eq!(got, want, "at {i}");
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(packed);
+        dev.destroy_buffer(out);
+    }
+
+    #[test]
     fn zsl_finite_classification_runs_through_vulkan() {
         use zengpu_spirv::{ZslShader, zsl};
 
