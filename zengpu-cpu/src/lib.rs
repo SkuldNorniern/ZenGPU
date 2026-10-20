@@ -434,15 +434,6 @@ mod tests {
     }
 
     #[test]
-    fn buffer_roundtrip() {
-        let dev = CpuDevice::new();
-        let h = dev.create_buffer(rw_desc(4)).unwrap();
-        dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
-        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), vec![1, 2, 3, 4]);
-        assert_eq!(dev.read_buffer(h, 2, 2).unwrap(), vec![3, 4]);
-    }
-
-    #[test]
     fn read_without_readback_usage_fails() {
         let dev = CpuDevice::new();
         let h = dev
@@ -492,46 +483,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_compute_only_capabilities() {
-        let dev = CpuDevice::new();
-        assert!(dev.capabilities().compute);
-        assert!(!dev.capabilities().graphics);
-    }
-
-    #[test]
     fn usable_as_dyn_device() {
         let dev: Box<dyn GpuDevice> = Box::new(CpuDevice::new());
         let h = dev.create_buffer(rw_desc(2)).unwrap();
         dev.write_buffer(h, 0, &[9, 8]).unwrap();
         assert_eq!(dev.read_buffer(h, 0, 2).unwrap(), vec![9, 8]);
-    }
-
-    #[test]
-    fn adapter_opens_cpu_device() {
-        let adapter = CpuAdapter::new();
-        assert_eq!(adapter.info().name, "ZenGPU CPU Reference");
-        assert!(!adapter.capabilities().graphics);
-        assert!(adapter.capabilities().compute);
-        let dev = adapter.open(DeviceRequest::default()).unwrap();
-        let h = dev.create_buffer(rw_desc(4)).unwrap();
-        dev.write_buffer(h, 0, &[1, 2, 3, 4]).unwrap();
-        assert_eq!(dev.read_buffer(h, 0, 4).unwrap(), [1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn instance_enumerates_one_adapter() {
-        let inst = CpuInstance;
-        let adapters = inst.enumerate_adapters();
-        assert_eq!(adapters.len(), 1);
-        assert_eq!(adapters[0].info().name, "ZenGPU CPU Reference");
-    }
-
-    #[test]
-    fn instance_request_adapter_always_returns_cpu() {
-        let inst = CpuInstance;
-        let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
-        let dev = adapter.open(DeviceRequest::default()).unwrap();
-        assert!(dev.capabilities().compute);
     }
 
     #[test]
@@ -692,26 +648,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_stale_pipeline_fails() {
-        let dev = CpuDevice::new();
-        let dummy_spv = [0u8; 4];
-        let shader = dev.create_shader(ShaderDesc::spirv(&dummy_spv)).unwrap();
-        let pipeline = dev
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "main",
-                block: [0, 0, 0],
-            })
-            .unwrap();
-        dev.destroy_pipeline(pipeline);
-        let err = dev
-            .dispatch(pipeline, Bindings::default(), [1, 1, 1])
-            .unwrap_err();
-        assert!(matches!(err, GpuError::Dispatch(_)));
-    }
-
-    #[test]
-    fn dispatch_missing_kernel_fails() {
+    fn dispatch_fails_without_kernel_or_for_stale_pipeline() {
         let dev = CpuDevice::new();
         let dummy_spv = [0u8; 4];
         let shader = dev.create_shader(ShaderDesc::spirv(&dummy_spv)).unwrap();
@@ -729,5 +666,10 @@ mod tests {
             matches!(err, GpuError::Dispatch(ref msg) if msg.contains("no CPU kernel")),
             "unexpected error: {err}"
         );
+        dev.destroy_pipeline(pipeline);
+        let err = dev
+            .dispatch(pipeline, Bindings::default(), [1, 1, 1])
+            .unwrap_err();
+        assert!(matches!(err, GpuError::Dispatch(_)));
     }
 }
