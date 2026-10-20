@@ -1,6 +1,6 @@
 [package]
 name = "zengpu-zsl"
-description = "ZenGPU shader proc-macro internals: ZSL parsing and SPIR-V lowering."
+description = "ZenGPU shader proc-macro internals: ZSL token glue over zengpu-zslc."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,18 +16,18 @@ workspace = true
 
 [features]
 default = ["spirv"]
-spirv = []
-hip = []
-cuda = []
-metal = []
-dx = []
-# Enables every emitter: used by this crate's own test suite so `cargo test -p zengpu-zsl`
-# exercises spirv+hip+cuda+metal without extra flags.
-test-all-backends = ["spirv", "hip", "cuda", "metal"]
+spirv = ["zengpu-zslc/spirv"]
+hip = ["zengpu-zslc/hip"]
+cuda = ["zengpu-zslc/cuda"]
+metal = ["zengpu-zslc/metal"]
+dx = ["zengpu-zslc/dx"]
+# Enables every emitter in the glue and in zengpu-zslc (whose test suite these gate).
+test-all-backends = ["spirv", "hip", "cuda", "metal", "zengpu-zslc/test-all-backends"]
 
 [lib]
 proc-macro = true
 
-# No external parser deps: ZSL has its own lexer/parser/lowerer over the builtin
-# `proc_macro` token stream. (No syn / quote / proc-macro2.)
+# No external parser deps: ZSL token parsing and the macro glue use only the
+# builtin `proc_macro` token stream. (No syn / quote / proc-macro2.)
 [dependencies]
+zengpu-zslc.workspace = true

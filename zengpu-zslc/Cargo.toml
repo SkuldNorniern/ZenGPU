@@ -1,0 +1,30 @@
+[package]
+name = "zengpu-zslc"
+description = "ZenGPU ZSL compiler: IR, type checking, passes, and SPIR-V / HIP / CUDA / MSL backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["spirv", "hip", "cuda", "metal"]
+spirv = []
+hip = []
+cuda = []
+metal = []
+dx = []
+# Enables every emitter: used by this crate's own test suite so `cargo test -p zengpu-zslc`
+# exercises spirv+hip+cuda+metal without extra flags.
+test-all-backends = ["spirv", "hip", "cuda", "metal"]
+
+# Plain library: no proc-macro, no external deps. The ZSL token glue lives in
+# `zengpu-zsl`, which depends on this crate.
+[dependencies]
