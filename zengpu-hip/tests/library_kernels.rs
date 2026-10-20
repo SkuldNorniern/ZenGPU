@@ -1075,6 +1075,84 @@ const FRAG_GET_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     }
 );
 
+/// Fragment A/B loads from f32 shared memory, staged through f16: loads cannot convert.
+const FRAG_SHARED_AB_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {
+        shared sa: array<f32, 256>
+        shared sb: array<f32, 256>
+        let lane = local_id().x
+        for i in 0..8 {
+            sa[lane + i * 32] = a[lane + i * 32]
+            sb[lane + i * 32] = b[lane + i * 32]
+        }
+        barrier()
+        let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let d = mma(fa, fb, acc)
+        frag_store(out, 0, 16, d)
+    }
+);
+
+#[test]
+fn zsl_frag_ab_from_shared_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FRAG_SHARED_AB_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let a = upload(&pool, vec![256], &fa);
+    let b = upload(&pool, vec![256], &fb);
+    let c = upload(&pool, vec![256], &fc);
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            c.buffer.index(),
+            out.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[k * 16 + n];
+            }
+            assert!(
+                close(got[m * 16 + n], s),
+                "({m}, {n}): {} vs {s}",
+                got[m * 16 + n]
+            );
+        }
+    }
+    drop(ops);
+    for buf in [a, b, c, out] {
+        pool.free(buf);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
 /// Lane probe, HIP only: SPIR-V's cooperative matrix mapping is opaque. Lowered with `zengpu-zslc`,
 /// not `zsl!`.
 const FRAG_PROBE: &str = r#"

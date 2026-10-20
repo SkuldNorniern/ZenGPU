@@ -1037,6 +1037,42 @@ int main() {{
         spirv::lower_compute(&module).expect("lower frag i8 to SPIR-V");
     }
 
+    const FRAG_SHARED_AB: &str = r#"
+        @workgroup_size(32)
+        kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {
+            shared sa: array<f32, 256>
+            shared sb: array<f32, 256>
+            let lane = local_id().x
+            for i in 0..8 {
+                sa[lane + i * 32] = a[lane + i * 32]
+                sb[lane + i * 32] = b[lane + i * 32]
+            }
+            barrier()
+            let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
+            let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+            let d = mma(fa, fb, acc)
+            frag_store(out, 0, 16, d)
+        }
+    "#;
+
+    #[test]
+    fn frag_ab_from_shared_lowers_per_backend() {
+        let module = parse_compute(FRAG_SHARED_AB).expect("parse shared frag");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower shared frag to HIP")
+            .source;
+        assert!(hip_source.contains("zsl_load_h8f<"));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower shared frag to CUDA")
+            .source;
+        assert!(cuda_source.contains("zsl_stage_tile(zsl_stage["));
+        assert!(cuda_source.contains("nvcuda::wmma::load_matrix_sync(fa"));
+        let words = spirv::lower_compute(&module).expect("lower shared frag to SPIR-V");
+        let ops = spirv_opcodes(&words);
+        assert!(ops.contains(&4457) && ops.contains(&224) && ops.contains(&115));
+    }
+
     #[test]
     fn frag_element_queries_are_rejected_off_hip() {
         const ROW: &str = r#"
@@ -2212,7 +2248,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 23] = [
+        let kernels: [(&str, &str); 24] = [
             ("tiled_gemm", TILED_GEMM),
             ("scatter_add", SCATTER_ADD),
             ("trig", TRIG),
@@ -2234,6 +2270,7 @@ int main() {{
             ("frag_mma", FRAG_MMA),
             ("frag_i8", FRAG_I8),
             ("frag_fn", FRAG_FN),
+            ("frag_shared_ab", FRAG_SHARED_AB),
             ("packed", PACKED),
             ("texel_kernel", TEXEL_KERNEL),
         ];

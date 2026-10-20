@@ -470,6 +470,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         workgroup_reduce_var,
         workgroup_reduce_len,
         t_ptr_wg_f32,
+        local_size,
         const_0_u32,
         locals,
         coop,
@@ -596,6 +597,9 @@ struct LowerCtx<'a> {
     workgroup_reduce_var: Option<Id>,
     workgroup_reduce_len: u32,
     t_ptr_wg_f32: Id,
+    /// Workgroup dimensions, for the linear local index that subgroups and fragment staging are
+    /// derived from.
+    local_size: [u32; 3],
     const_0_u32: Id,
     locals: HashMap<String, LocalVar>,
     coop: Coop,

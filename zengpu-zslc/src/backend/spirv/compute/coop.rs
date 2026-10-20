@@ -31,7 +31,14 @@ pub(super) struct Coop {
     t_i8: Option<Id>,
     /// Aliased views of the u32 table, keyed by element width in bits.
     views: HashMap<u32, (Id, Id)>,
+    /// Workgroup f16 staging array for `frag_load_a|b`: the variable and its pointer type.
+    stage: Option<(Id, Id)>,
 }
+
+/// Subgroup size pinned to match `zengpu-vulkan`, with one 16x16 tile per subgroup.
+const SUBGROUP_LANES: u32 = 32;
+const TILE_ELEMS: u32 = 16 * 16;
+const SEMANTICS_WG_ACQ_REL: u32 = 0x108;
 
 impl Coop {
     fn require(&mut self, spv: &mut SpvBuilder, capability: u32, ext: Option<&'static str>) {
@@ -109,6 +116,20 @@ impl Coop {
         let id = spv.type_cooperative_matrix(component, scope, rows, cols, usage_id);
         self.matrices.insert(ty, id);
         Ok(id)
+    }
+
+    fn stage(&mut self, spv: &mut SpvBuilder, t_u32: Id, subgroups: u32) -> (Id, Id) {
+        if let Some(stage) = self.stage {
+            return stage;
+        }
+        let t_f16 = self.t_f16(spv);
+        let len = spv.constant_u32(t_u32, subgroups * TILE_ELEMS);
+        let array_ty = spv.type_array(t_f16, len);
+        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+        let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
+        let t_ptr_elem = spv.type_pointer(sc::WORKGROUP, t_f16);
+        self.stage = Some((var, t_ptr_elem));
+        (var, t_ptr_elem)
     }
 
     fn view(&mut self, spv: &mut SpvBuilder, bits: u32) -> (Id, Id) {
@@ -226,11 +247,10 @@ impl LowerCtx<'_> {
     ) -> Result<Val, String> {
         let (_, usage) =
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
-        if usage != FragUse::Acc && matches!(src, FragSrc::Shared(_)) {
-            return Err(
-                "SPIR-V backend: frag_load_a/frag_load_b from a shared array is not lowered yet"
-                    .into(),
-            );
+        if let FragSrc::Shared(name) = src
+            && usage != FragUse::Acc
+        {
+            return self.lower_shared_frag_ab(name, ty, offset, ld);
         }
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let ptr = self.frag_elem_ptr(src, ty, off)?;
@@ -239,6 +259,93 @@ impl LowerCtx<'_> {
         let id = self
             .spv
             .op_cooperative_matrix_load(coop_ty, ptr, layout, stride);
+        Ok(Val { id, ty })
+    }
+
+    /// Loads from f32 shared via `frag_load_a|b(shared, offset, ld)`.
+    ///
+    /// Cooperative loads cannot convert, so each lane writes its share as f16 into its subgroup's
+    /// slice of a workgroup f16 array, then the subgroup loads it. Element `e = lane + 32 * i` is
+    /// `(2 * i + lane / 16, lane % 16)`: lane `l` reads
+    /// `off + (l / 16) * ld + l % 16 + 2 * i * ld`.
+    fn lower_shared_frag_ab(
+        &mut self,
+        name: &str,
+        ty: TypeId,
+        offset: &IrExpr,
+        ld: &IrExpr,
+    ) -> Result<Val, String> {
+        let tile = *self
+            .shared
+            .get(name)
+            .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
+        let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
+        let coop_ty = self.frag_spv_ty(ty)?;
+        let [sx, sy, sz] = self.local_size;
+        let subgroups = (sx * sy * sz).div_ceil(SUBGROUP_LANES);
+        let (stage, t_ptr_f16) = self.coop.stage(self.spv, self.t_u32, subgroups);
+        let t_f16 = self.coop.t_f16(self.spv);
+        let t_u32 = self.t_u32;
+        let t_f32 = self.t_f32;
+        let scope = self.spv.constant_u32(t_u32, SCOPE_SUBGROUP);
+        let semantics = self.spv.constant_u32(t_u32, SEMANTICS_WG_ACQ_REL);
+
+        let lid3 = self.spv.op_load(self.t_uvec3, self.lid_var);
+        let x = self.spv.op_composite_extract(t_u32, lid3, &[0]);
+        let y = self.spv.op_composite_extract(t_u32, lid3, &[1]);
+        let z = self.spv.op_composite_extract(t_u32, lid3, &[2]);
+        let sy_c = self.spv.constant_u32(t_u32, sy);
+        let sx_c = self.spv.constant_u32(t_u32, sx);
+        let zs = self.spv.op_imul(t_u32, z, sy_c);
+        let ys = self.spv.op_iadd(t_u32, y, zs);
+        let ys_sx = self.spv.op_imul(t_u32, ys, sx_c);
+        let lin = self.spv.op_iadd(t_u32, x, ys_sx);
+        let c31 = self.spv.constant_u32(t_u32, SUBGROUP_LANES - 1);
+        let lane = self.spv.op_bitwise_and(t_u32, lin, c31);
+        let c5 = self.spv.constant_u32(t_u32, 5);
+        let sub = self.spv.op_shift_right_logical(t_u32, lin, c5);
+        let c8 = self.spv.constant_u32(t_u32, 8);
+        let slice = self.spv.op_shift_left_logical(t_u32, sub, c8);
+
+        let c4 = self.spv.constant_u32(t_u32, 4);
+        let row_hi = self.spv.op_shift_right_logical(t_u32, lane, c4);
+        let c15 = self.spv.constant_u32(t_u32, 15);
+        let col = self.spv.op_bitwise_and(t_u32, lane, c15);
+        let row_off = self.spv.op_imul(t_u32, row_hi, stride);
+        let base = self.spv.op_iadd(t_u32, off, row_off);
+        let mut src_idx = self.spv.op_iadd(t_u32, base, col);
+        let c1 = self.spv.constant_u32(t_u32, 1);
+        let step = self.spv.op_shift_left_logical(t_u32, stride, c1);
+        let stage_lane = self.spv.op_iadd(t_u32, slice, lane);
+
+        self.spv.op_control_barrier(scope, scope, semantics);
+        for i in 0..8u32 {
+            let src_ptr = self
+                .spv
+                .op_access_chain(self.t_ptr_wg_f32, tile, &[src_idx]);
+            let value = self.spv.op_load(t_f32, src_ptr);
+            let half = self.spv.op_convert_f_to_f(t_f16, value);
+            let dst_idx = if i == 0 {
+                stage_lane
+            } else {
+                let k = self.spv.constant_u32(t_u32, SUBGROUP_LANES * i);
+                self.spv.op_iadd(t_u32, stage_lane, k)
+            };
+            let dst = self.spv.op_access_chain(t_ptr_f16, stage, &[dst_idx]);
+            self.spv.op_store(dst, half);
+            if i < 7 {
+                src_idx = self.spv.op_iadd(t_u32, src_idx, step);
+            }
+        }
+        self.spv.op_control_barrier(scope, scope, semantics);
+
+        let tile_ptr = self.spv.op_access_chain(t_ptr_f16, stage, &[slice]);
+        let layout = self.spv.constant_u32(t_u32, ROW_MAJOR);
+        let row_stride = self.spv.constant_u32(t_u32, 16);
+        let id = self
+            .spv
+            .op_cooperative_matrix_load(coop_ty, tile_ptr, layout, row_stride);
+        self.spv.op_control_barrier(scope, scope, semantics);
         Ok(Val { id, ty })
     }
 

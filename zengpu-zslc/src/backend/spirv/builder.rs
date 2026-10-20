@@ -92,6 +92,7 @@ pub(crate) mod op {
     pub const CONVERT_F_TO_S: u32 = 110;
     pub const CONVERT_S_TO_F: u32 = 111;
     pub const CONVERT_U_TO_F: u32 = 112;
+    pub const CONVERT_F_TO_F: u32 = 115;
     pub const BITCAST: u32 = 124;
     pub const SNEGATE: u32 = 126;
     pub const FNEGATE: u32 = 127;
@@ -1120,6 +1121,16 @@ impl SpvBuilder {
             &mut self.functions,
             op::CONVERT_S_TO_F,
             &[f32_ty.0, id.0, val.0],
+        );
+        id
+    }
+
+    pub fn op_convert_f_to_f(&mut self, ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::CONVERT_F_TO_F,
+            &[ty.0, id.0, val.0],
         );
         id
     }
