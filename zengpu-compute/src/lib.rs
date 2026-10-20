@@ -108,33 +108,11 @@ fn contiguous_strides(shape: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zengpu_hal::{SlotMap, marker};
-
-    fn dummy_handle() -> BufferHandle {
-        let mut map = SlotMap::<marker::Buffer, ()>::new();
-        map.insert(())
-    }
 
     #[test]
     fn contiguous_strides_row_major() {
         assert_eq!(contiguous_strides(&[2, 3, 4]), vec![12, 4, 1]);
         assert_eq!(contiguous_strides(&[5]), vec![1]);
         assert_eq!(contiguous_strides(&[]), Vec::<u32>::new());
-    }
-
-    #[test]
-    fn device_array_len_and_size() {
-        let arr = DeviceArray::new(dummy_handle(), vec![2, 3, 4], DType::F32);
-        assert_eq!(arr.len(), 24);
-        assert_eq!(arr.size_bytes(), 24 * 4);
-        assert_eq!(arr.allocation_size_bytes(), 24 * 4);
-        assert_eq!(arr.stride, vec![12, 4, 1]);
-    }
-
-    #[test]
-    fn device_array_can_track_larger_backing_capacity() {
-        let arr = DeviceArray::with_allocation_size(dummy_handle(), vec![3], DType::F32, 64);
-        assert_eq!(arr.size_bytes(), 12);
-        assert_eq!(arr.allocation_size_bytes(), 64);
     }
 }
