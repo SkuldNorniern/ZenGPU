@@ -1071,6 +1071,37 @@ int main() {{
         assert!(ops.contains(&137) && ops.contains(&138) && ops.contains(&140));
     }
 
+    const SELECT_KERNEL: &str = r#"
+        @workgroup_size(32)
+        kernel select_kernel(fa: device buffer<f32>, ua: device buffer<u32>, of: device mut buffer<f32>, ou: device mut buffer<u32>, id: global_id) {
+            let i = id.x
+            let c = fa[i] < 0.5
+            of[i] = select(c, fa[i], 1.0)
+            ou[i] = select(c, ua[i], 7u)
+        }
+    "#;
+
+    #[test]
+    fn select_lowers_per_backend() {
+        let module = parse_compute(SELECT_KERNEL).expect("parse select");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower select to HIP")
+            .source;
+        assert!(hip_source.contains("zsl_select("));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower select to CUDA")
+            .source;
+        assert!(cuda_source.contains("zsl_select("));
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower select to MSL")
+            .source;
+        assert!(msl_source.contains("select("));
+        let words = spirv::lower_compute(&module).expect("lower select to SPIR-V");
+        assert!(spirv_opcodes(&words).contains(&169));
+        let mismatched = "@workgroup_size(1)\nkernel k(o: device mut buffer<f32>, id: global_id) { o[id.x] = select(id.x < 1u, 1.0, 1u) }";
+        assert!(parse_compute(mismatched).is_err());
+    }
+
     const FRAG_SHARED_AB: &str = r#"
         @workgroup_size(32)
         kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {
