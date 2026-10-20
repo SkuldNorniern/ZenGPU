@@ -971,6 +971,93 @@ int main() {{
         spirv::lower_compute(&module).expect("lower dot4 to SPIR-V");
     }
 
+    const FRAG_MMA: &str = r#"
+        @workgroup_size(32)
+        kernel frag_mma(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+            let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+            let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+            let d = mma(fa, fb, acc)
+            frag_store(out, 0, 16, d)
+        }
+    "#;
+
+    const FRAG_FN: &str = r#"
+        fn mma_step(x: frag<f16, 16, 16, a>, w: frag<f16, 16, 16, b>, out dst: frag<f32, 16, 16, acc>) {
+            dst = mma(x, w, dst)
+        }
+        @workgroup_size(32)
+        kernel frag_fn(a: device buffer<f16>, b: device buffer<f16>, c: device mut buffer<f32>, id: global_id) {
+            let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+            let d: frag<f32, 16, 16, acc> = frag_zero_acc()
+            mma_step(fa, fb, d)
+            frag_store(c, 0, 16, d)
+        }
+    "#;
+
+    /// Int8 wmma needs sm_72 or newer. Compiled for compute_80 only.
+    const FRAG_I8: &str = r#"
+        @workgroup_size(32)
+        kernel frag_i8(bytes: device buffer<u32>, out: device mut buffer<i32>, id: global_id) {
+            let ia: frag<i8, 16, 16, a> = frag_load_a(bytes, 0, 16)
+            let ib: frag<i8, 16, 16, b> = frag_load_b(bytes, 0, 16)
+            let iacc: frag<i32, 16, 16, acc> = frag_zero_acc()
+            let id2 = mma(ia, ib, iacc)
+            frag_store(out, 0, 16, id2)
+        }
+    "#;
+
+    #[test]
+    fn frag_mma_lowers_per_backend() {
+        let module = parse_compute(FRAG_MMA).expect("parse frag mma");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower frag mma to HIP")
+            .source;
+        assert!(hip_source.contains("zsl_mma_f16("));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower frag mma to CUDA")
+            .source;
+        assert!(cuda_source.contains("nvcuda::wmma::mma_sync("));
+        spirv::lower_compute(&module).expect("lower frag mma to SPIR-V");
+        let msl_err = msl::lower_compute(&module)
+            .err()
+            .expect("MSL has no frag lowering yet");
+        assert!(format!("{msl_err:?}").contains("not lowered yet"));
+        let module = parse_compute(FRAG_FN).expect("parse frag fn");
+        hip::lower_compute(&module).expect("lower frag fn to HIP");
+        cuda::lower_compute(&module).expect("lower frag fn to CUDA");
+        spirv::lower_compute(&module).expect("lower frag fn to SPIR-V");
+        let module = parse_compute(FRAG_I8).expect("parse frag i8");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower frag i8 to HIP")
+            .source;
+        assert!(hip_source.contains("zsl_mma_i8("));
+        cuda::lower_compute(&module).expect("lower frag i8 to CUDA");
+        spirv::lower_compute(&module).expect("lower frag i8 to SPIR-V");
+    }
+
+    #[test]
+    fn frag_element_queries_are_rejected_off_hip() {
+        const ROW: &str = r#"
+            @workgroup_size(32)
+            kernel frag_row_probe(out: device mut buffer<u32>, id: global_id) {
+                let fa: frag<f16, 16, 16, a> = frag_zero_acc()
+                out[id.x] = frag_row(fa, 0)
+            }
+        "#;
+        let module = parse_compute(ROW).expect("parse frag_row probe");
+        assert!(hip::lower_compute(&module).is_ok());
+        let err = cuda::lower_compute(&module)
+            .err()
+            .expect("CUDA has no frag_row lowering");
+        assert!(format!("{err:?}").contains("frag_row"));
+        let err = spirv::lower_compute(&module)
+            .err()
+            .expect("SPIR-V has no frag_row lowering");
+        assert!(format!("{err:?}").contains("frag_row"));
+    }
+
     const PACKED: &str = r#"
         @workgroup_size(64)
         kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, id: global_id) {
@@ -2125,7 +2212,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 20] = [
+        let kernels: [(&str, &str); 23] = [
             ("tiled_gemm", TILED_GEMM),
             ("scatter_add", SCATTER_ADD),
             ("trig", TRIG),
@@ -2144,6 +2231,9 @@ int main() {{
             ("workgroup_reduce", WORKGROUP_REDUCE),
             ("workgroup_reduce_proof", WORKGROUP_REDUCE_PROOF),
             ("dot4", DOT4),
+            ("frag_mma", FRAG_MMA),
+            ("frag_i8", FRAG_I8),
+            ("frag_fn", FRAG_FN),
             ("packed", PACKED),
             ("texel_kernel", TEXEL_KERNEL),
         ];
@@ -2159,6 +2249,9 @@ int main() {{
                 }
             };
             for arch in ["compute_70", "compute_80"] {
+                if name == "frag_i8" && arch == "compute_70" {
+                    continue;
+                }
                 checked += 1;
                 if let Err(log) = nvrtc.compile(name, &text, arch, &include) {
                     failures.push(format!("{name} {arch}:\n{log}"));

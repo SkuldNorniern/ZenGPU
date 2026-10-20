@@ -1043,3 +1043,235 @@ fn zsl_packed_ops_match_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// gfx12 WMMA: f16 and packed-i8 `C = A*B + C`. SPIR-V has no `frag_row`/`frag_get`/`frag_set`: the
+/// lane probe is in `FRAG_PROBE`.
+const FRAG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel frag_gemm(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, ba: device buffer<u32>, bb: device buffer<u32>, ci: device buffer<i32>, oi: device mut buffer<i32>) {
+        let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let d = mma(fa, fb, acc)
+        frag_store(out, 0, 16, d)
+        let ia: frag<i8, 16, 16, a> = frag_load_a(ba, 0, 16)
+        let ib: frag<i8, 16, 16, b> = frag_load_b(bb, 0, 16)
+        let iacc: frag<i32, 16, 16, acc> = frag_load_acc(ci, 0, 16)
+        let id2 = mma(ia, ib, iacc)
+        frag_store(oi, 0, 16, id2)
+    }
+);
+
+/// Lane probe, HIP only: SPIR-V's cooperative matrix mapping is opaque. Lowered with `zengpu-zslc`,
+/// not `zsl!`.
+const FRAG_PROBE: &str = r#"
+    @workgroup_size(32)
+    kernel frag_probe(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, pr: device mut buffer<u32>, pc: device mut buffer<u32>, pv: device mut buffer<f32>, out2: device mut buffer<f32>, id: global_id) {
+        let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let d = mma(fa, fb, acc)
+        let lane = local_id().x
+        for i in 0..8 {
+            pr[lane * 8 + i] = frag_row(d, i)
+            pc[lane * 8 + i] = frag_col(d, i)
+            pv[lane * 8 + i] = frag_get(d, i)
+        }
+        let d2 = frag_set(d, 0, frag_get(d, 0) + 1.0)
+        frag_store(out2, 0, 16, d2)
+    }
+"#;
+
+#[test]
+fn zsl_frag_mma_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FRAG_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let ba8: Vec<i8> = (0..256).map(|i| ((i * 5 + 2) % 16) as i8 - 8).collect();
+    let bb8: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
+    let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
+    let words = |v: &[i8]| -> Vec<u8> {
+        v.chunks_exact(4)
+            .flat_map(|c| {
+                u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8]).to_le_bytes()
+            })
+            .collect()
+    };
+    let halves: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let halves_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let a = upload_half(&pool, vec![256], DType::F16, &halves);
+    let b = upload_half(&pool, vec![256], DType::F16, &halves_b);
+    let c = upload(&pool, vec![256], &fc);
+    let ba = pool.alloc(vec![64], DType::U32).unwrap();
+    let bb = pool.alloc(vec![64], DType::U32).unwrap();
+    device.write_buffer(ba.buffer, 0, &words(&ba8)).unwrap();
+    device.write_buffer(bb.buffer, 0, &words(&bb8)).unwrap();
+    let ci_buf = pool.alloc(vec![256], DType::I32).unwrap();
+    let ci_bytes: Vec<u8> = ci.iter().flat_map(|v| v.to_le_bytes()).collect();
+    device.write_buffer(ci_buf.buffer, 0, &ci_bytes).unwrap();
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let oi = pool.alloc(vec![256], DType::I32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            c.buffer.index(),
+            out.buffer.index(),
+            ba.buffer.index(),
+            bb.buffer.index(),
+            ci_buf.buffer.index(),
+            oi.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got_f = download(&*device, &out);
+    let got_i: Vec<i32> = device
+        .read_buffer(oi.buffer, 0, oi.size_bytes())
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            let mut si = ci[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[k * 16 + n];
+                si = si.wrapping_add(i32::from(ba8[m * 16 + k]) * i32::from(bb8[k * 16 + n]));
+            }
+            let at = m * 16 + n;
+            assert!(
+                close(got_f[at], s),
+                "f16 mma at ({m}, {n}): {} vs {s}",
+                got_f[at]
+            );
+            assert_eq!(got_i[at], si, "i8 mma at ({m}, {n})");
+        }
+    }
+    drop(ops);
+    for buf in [a, b, c, out, oi] {
+        pool.free(buf);
+    }
+    for buf in [ba, bb, ci_buf] {
+        pool.free(buf);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
+#[test]
+fn zsl_frag_probe_maps_lanes() {
+    use zengpu_zslc::{backend::hip::lower_compute, frontend::parser::parse_compute};
+    let Some(device) = hip_device() else { return };
+    let module = parse_compute(FRAG_PROBE).unwrap();
+    let hip = lower_compute(&module).unwrap();
+    let shader = device
+        .create_shader(zengpu_hal::ShaderDesc::hip(&hip.source))
+        .unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry: hip.entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let halves: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let halves_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let a = upload_half(&pool, vec![256], DType::F16, &halves);
+    let b = upload_half(&pool, vec![256], DType::F16, &halves_b);
+    let c = upload(&pool, vec![256], &fc);
+    let pr = pool.alloc(vec![256], DType::U32).unwrap();
+    let pc = pool.alloc(vec![256], DType::U32).unwrap();
+    let pv = upload(&pool, vec![256], &[0.0; 256]);
+    let out2 = upload(&pool, vec![256], &[0.0; 256]);
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            c.buffer.index(),
+            pr.buffer.index(),
+            pc.buffer.index(),
+            pv.buffer.index(),
+            out2.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read_u32 = |arr: &DeviceArray| -> Vec<u32> {
+        device
+            .read_buffer(arr.buffer, 0, arr.size_bytes())
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let (got_r, got_c) = (read_u32(&pr), read_u32(&pc));
+    let got_v = download(&*device, &pv);
+    let got_out2 = download(&*device, &out2);
+
+    let mut want = vec![0f32; 256];
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[k * 16 + n];
+            }
+            want[m * 16 + n] = s;
+        }
+    }
+    let mut seen = [false; 256];
+    for i in 0..256 {
+        let (r, c) = (got_r[i] as usize, got_c[i] as usize);
+        assert!(r < 16 && c < 16, "frag_row/frag_col out of range at {i}");
+        assert!(!seen[r * 16 + c], "frag position ({r}, {c}) mapped twice");
+        seen[r * 16 + c] = true;
+        assert!(close(got_v[i], want[r * 16 + c]), "frag_get at ({r}, {c})");
+    }
+    for r in 0..16 {
+        for c in 0..16 {
+            let bump = if r == 0 || r == 8 { 1.0 } else { 0.0 };
+            assert!(
+                close(got_out2[r * 16 + c], want[r * 16 + c] + bump),
+                "frag_set store at ({r}, {c})"
+            );
+        }
+    }
+    drop(ops);
+    for buf in [a, b, c, pv, out2] {
+        pool.free(buf);
+    }
+    for buf in [pr, pc] {
+        pool.free(buf);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

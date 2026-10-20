@@ -513,6 +513,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
 fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
     match stmt {
+        IrStmt::FragStore { .. } => Err("frag_store is only available in compute shaders".into()),
         IrStmt::Let {
             name,
             init: IrExpr::ArrayLit(elems),
@@ -686,6 +687,7 @@ fn lower_condition(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<Id> {
 
 fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
     match expr {
+        IrExpr::FragLoad { .. } => Err("frag_load is only available in compute shaders".into()),
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
             Ok(GVal { id, ty: ctx.u32_id })
@@ -874,6 +876,15 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
 fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal> {
     let name = func.name();
     match func {
+        BuiltinFn::FragZeroAcc
+        | BuiltinFn::Mma
+        | BuiltinFn::FragLen
+        | BuiltinFn::FragRow
+        | BuiltinFn::FragCol
+        | BuiltinFn::FragGet
+        | BuiltinFn::FragSet => {
+            Err("fragment builtins are only available in compute shaders".into())
+        }
         BuiltinFn::IsNan
         | BuiltinFn::IsInf
         | BuiltinFn::IsFinite

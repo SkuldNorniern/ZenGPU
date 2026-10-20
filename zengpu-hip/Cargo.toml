@@ -22,4 +22,5 @@ log.workspace = true
 
 [dev-dependencies]
 zengpu-spirv = { workspace = true, features = ["hip"] }
+zengpu-zslc = { path = "../zengpu-zslc" }
 zengpu-compute.workspace = true
