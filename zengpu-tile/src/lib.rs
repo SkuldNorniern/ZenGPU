@@ -417,13 +417,22 @@ mod tests {
 
     /// Scheduled cases: edges in M, N, K. 64-wide tiles run four waves. i8 uses the matrix unit
     /// where the target has it.
-    const SCHEDULED: [Case; 8] = [
+    const SCHEDULED: [Case; 9] = [
         Case {
             input: DType::F16,
             out: DType::F16,
             m: 64,
             n: 64,
             k: 64,
+            tile: [64, 64],
+            bk: 16,
+        },
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 260,
+            n: 130,
+            k: 72,
             tile: [64, 64],
             bk: 16,
         },

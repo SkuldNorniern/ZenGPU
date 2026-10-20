@@ -607,6 +607,29 @@ impl<'a> Gen<'a> {
         } else {
             format!("r * {cols} + c")
         };
+        let decl = &self.kernel.tensors[block.tensor.0];
+        let (tr, tc) = (decl.shape[0], decl.shape[1]);
+        let br = format!("({} * {rows})", affine(block.rows, &self.kt));
+        let bc = format!("({} * {cols})", affine(block.cols, &self.kt));
+        let exact = total % workgroup == 0;
+        let (ty, zero) = (scalar(decl.dtype), zero(decl.dtype));
+        let _ = writeln!(out, "if {br} + {rows} <= {tr} && {bc} + {cols} <= {tc} {{");
+        let _ = writeln!(out, "for it in 0..{per} {{");
+        let _ = writeln!(out, "let e = lid + it * {workgroup}");
+        if !exact {
+            let _ = writeln!(out, "if e < {total} {{");
+        }
+        let _ = writeln!(out, "let r = e / {cols}");
+        let _ = writeln!(out, "let c = e % {cols}");
+        let v = self.name("ld");
+        let _ = writeln!(out, "let {v}: {ty} = {zero}");
+        let _ = writeln!(out, "{v} = b_{}[({br} + r) * {tc} + {bc} + c]", decl.name);
+        let _ = writeln!(out, "{dst}[{index}] = {v}");
+        if !exact {
+            let _ = writeln!(out, "}}");
+        }
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out, "}} else {{");
         let _ = writeln!(out, "for it in 0..{per} {{");
         let _ = writeln!(out, "let e = lid + it * {workgroup}");
         let _ = writeln!(out, "if e < {total} {{");
@@ -614,6 +637,7 @@ impl<'a> Gen<'a> {
         let _ = writeln!(out, "let c = e % {cols}");
         let v = self.load(out, block, "r", "c");
         let _ = writeln!(out, "{dst}[{index}] = {v}");
+        let _ = writeln!(out, "}}");
         let _ = writeln!(out, "}}");
         let _ = writeln!(out, "}}");
     }
