@@ -9,7 +9,7 @@ use crate::TileError;
 pub enum DType {
     F16,
     F32,
-    /// Packed four per `u32` word in buffers (see the crate docs).
+    /// Signed byte, one per element in buffers (read as i32 in code).
     I8,
     I32,
     U32,
@@ -338,14 +338,8 @@ impl KernelBuilder {
         if shape.contains(&0) {
             self.fail(format!("tensor `{name}` has a zero dimension"));
         }
-        if dtype == DType::I8 {
-            if is_output {
-                self.fail(format!("output `{name}`: i8 is input-only"));
-            } else if !shape[1].is_multiple_of(4) {
-                self.fail(format!(
-                    "i8 input `{name}` needs a column count multiple of 4"
-                ));
-            }
+        if dtype == DType::I8 && is_output {
+            self.fail(format!("output `{name}`: i8 is input-only"));
         }
         if self.tensors.iter().any(|t| t.name == name) {
             self.fail(format!("duplicate tensor name `{name}`"));
@@ -359,7 +353,6 @@ impl KernelBuilder {
         Tensor(self.tensors.len() - 1)
     }
 
-    /// i8 inputs pack four per `u32` word: `cols` must be a multiple of 4.
     pub fn input(&mut self, name: &str, dtype: DType, shape: [usize; 2]) -> Tensor {
         self.tensor(name, dtype, shape, false)
     }
@@ -413,12 +406,6 @@ impl KernelBuilder {
         }
         if block.shape.contains(&0) {
             self.fail(format!("block of `{}` has a zero dimension", decl.name));
-        }
-        if block.shape[1] > 0 && decl.dtype == DType::I8 && !block.shape[1].is_multiple_of(4) {
-            self.fail(format!(
-                "i8 block of `{}` needs a column count multiple of 4",
-                decl.name
-            ));
         }
         Some(decl.dtype)
     }
@@ -476,8 +463,8 @@ impl KernelBuilder {
         self.define(va.dtype, va.shape, make(a, b))
     }
 
-    /// Supported conversions: f16 to and from f32, and i32 and u32 to f32. f16 rounds when stored,
-    /// not per op.
+    /// Supported: same type, f16 <-> f32, f32 -> i32, i32 -> f32, u32 -> f32. f32 -> f16 rounds to
+    /// binary16 here, so later ops see the rounded value.
     pub fn cast(&mut self, a: Tile, to: DType) -> Tile {
         let Some(va) = self.use_value(a) else {
             return self.define(to, self.tile, Op::Cast(a, to));
@@ -487,6 +474,7 @@ impl KernelBuilder {
                 (va.dtype, to),
                 (DType::F16, DType::F32)
                     | (DType::F32, DType::F16)
+                    | (DType::F32, DType::I32)
                     | (DType::I32, DType::F32)
                     | (DType::U32, DType::F32)
             );
@@ -575,6 +563,16 @@ impl KernelBuilder {
         self.scopes.push(Vec::new());
         body(self);
         let inner = self.scopes.pop().unwrap_or_default();
+        for s in &inner {
+            if let Stmt::Def(_, Op::Load(b)) = s {
+                let name = self.tensors[b.tensor.0].name.clone();
+                if (b.cols.uses_k() && b.shape[1] != bk) || (b.rows.uses_k() && b.shape[0] != bk) {
+                    self.fail(format!(
+                        "block of `{name}` in the k loop must be {bk} wide along k"
+                    ));
+                }
+            }
+        }
         self.push(Stmt::Loop {
             extent: k,
             step: bk,

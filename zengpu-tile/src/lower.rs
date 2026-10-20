@@ -1,74 +1,159 @@
-//! O0 lowering: one ZSL compute kernel per tile kernel, no schedule, one workgroup per output
-//! tile. Threads run the body as scalar code. i8 operands are read as packed words and
-//! reduced with `dot4_i8`.
+//! Lowers a tile kernel to one ZSL compute kernel. One workgroup per output tile. Shapes,
+//! chosen by `crate::schedule`:
+//! - `Naive` (O0): scalar per output element, reads globals. The reference.
+//! - `Staged`: A and B blocks per k step go to shared arrays, then scalar FMAs.
+//! - `Mma`: staged, with `mma` on 16x16 fragments loaded from shared.
 
 use std::fmt::Write as _;
 
 use crate::TileError;
 use crate::ir::{Affine, Block, DType, Op, Stmt, Tile, TileKernel};
 
-/// Workgroup size for tiles of at least this many elements.
+/// Naive workgroup size for tiles of at least this many elements.
 const MAX_WORKGROUP: usize = 256;
 
-pub(crate) fn zsl_source(kernel: &TileKernel) -> Result<(String, u32), TileError> {
-    let tile_elems = kernel.tile[0] * kernel.tile[1];
-    let workgroup = MAX_WORKGROUP.min(tile_elems.div_ceil(32) * 32);
-    let iters = tile_elems.div_ceil(workgroup);
-
-    let mut g = Gen {
-        kernel,
-        values: vec![None; kernel.values.len()],
-        fresh: 0,
-    };
-    let mut body = String::new();
-    for stmt in &kernel.body {
-        g.stmt(&mut body, stmt)?;
-    }
-
-    let mut src = String::new();
-    let params: Vec<String> = kernel
-        .tensors
-        .iter()
-        .map(|t| {
-            let mutability = if t.is_output { "mut " } else { "" };
-            format!(
-                "b_{}: device {mutability}buffer<{}>",
-                t.name,
-                buffer_elem(t.dtype)
-            )
-        })
-        .collect();
-    let _ = writeln!(src, "@workgroup_size({workgroup})");
-    let _ = writeln!(src, "kernel {}({}) {{", kernel.name, params.join(", "));
-    let _ = writeln!(src, "let gn = group_id().x");
-    let _ = writeln!(src, "let gm = group_id().y");
-    let _ = writeln!(src, "for it in 0..{iters} {{");
-    let _ = writeln!(src, "let e = local_id().x + it * {workgroup}");
-    let _ = writeln!(src, "if e < {tile_elems} {{");
-    let _ = writeln!(src, "let tr = e / {}", kernel.tile[1]);
-    let _ = writeln!(src, "let tc = e - tr * {}", kernel.tile[1]);
-    src.push_str(&body);
-    let _ = writeln!(src, "}}");
-    let _ = writeln!(src, "}}");
-    let _ = writeln!(src, "}}");
-    Ok((src, workgroup as u32))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Naive,
+    Staged,
+    Mma,
 }
 
-/// i8 is stored packed in `u32` words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Plan {
+    pub mode: Mode,
+    pub workgroup: usize,
+    /// Waves per workgroup (`Mma` only; 1 otherwise).
+    pub waves: usize,
+    /// Lanes per wave the code assumes (`Mma` only; 0 otherwise).
+    pub wave_size: usize,
+}
+
+impl Plan {
+    /// Naive form. Needs no target.
+    pub(crate) fn naive(kernel: &TileKernel) -> Self {
+        let tile_elems = kernel.tile[0] * kernel.tile[1];
+        let workgroup = MAX_WORKGROUP.min(tile_elems.div_ceil(32) * 32);
+        Plan {
+            mode: Mode::Naive,
+            workgroup,
+            waves: 1,
+            wave_size: 0,
+        }
+    }
+}
+
+/// A k loop the staged lowerings can tile: loads plus one `dot` into a zeroed accumulator, then an
+/// elementwise epilogue and stores.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Parts {
+    pub extent: usize,
+    pub step: usize,
+    /// Operand blocks of the dot: `a` is `[BM, BK]`, `b` is `[BN, BK]`.
+    pub a: Block,
+    pub b: Block,
+    pub a_dtype: DType,
+    pub b_dtype: DType,
+    pub dot_out: Tile,
+    pub loop_at: usize,
+}
+
+pub(crate) fn analyze(kernel: &TileKernel) -> Result<Parts, String> {
+    let loops: Vec<usize> = kernel
+        .body
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stmt::Loop { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let [loop_at] = loops[..] else {
+        return Err("staged lowering needs exactly one k loop".to_string());
+    };
+    for s in &kernel.body[..loop_at] {
+        if !matches!(s, Stmt::Def(t, Op::Zeros) if kernel.values[t.0].def == Op::Zeros) {
+            return Err("staged lowering needs only zeros before the k loop".to_string());
+        }
+    }
+    for s in &kernel.body[loop_at + 1..] {
+        if matches!(s, Stmt::Loop { .. } | Stmt::Def(_, Op::Dot { .. })) {
+            return Err("staged lowering needs one dot, inside the k loop".to_string());
+        }
+    }
+    let Stmt::Loop { extent, step, body } = &kernel.body[loop_at] else {
+        return Err("staged lowering needs a k loop".to_string());
+    };
+    let (extent, step) = (*extent, *step);
+    let mut dot = None;
+    for s in body {
+        match s {
+            Stmt::Def(_, Op::Load(_)) => {}
+            Stmt::Def(t, Op::Dot { a, b, acc }) if dot.is_none() => {
+                dot = Some((*t, *a, *b, *acc));
+            }
+            _ => return Err("the k loop body must be loads and one dot".to_string()),
+        }
+    }
+    let Some((dot_out, a, b, acc)) = dot else {
+        return Err("the k loop has no dot".to_string());
+    };
+    if kernel.values[acc.0].def != Op::Zeros {
+        return Err("the dot accumulator must be zeros".to_string());
+    }
+    let block_of = |t: Tile| match kernel.values[t.0].def {
+        Op::Load(block) => Some(block),
+        _ => None,
+    };
+    let (Some(ab), Some(bb)) = (block_of(a), block_of(b)) else {
+        return Err("dot operands must be loads".to_string());
+    };
+    let tile = kernel.tile;
+    if ab.rows != Affine::grid_m() || ab.cols != Affine::k() || ab.shape != [tile[0], step] {
+        return Err("dot lhs must be the [BM, BK] block at (grid_m, k)".to_string());
+    }
+    if bb.rows != Affine::grid_n() || bb.cols != Affine::k() || bb.shape != [tile[1], step] {
+        return Err("dot rhs must be the [BN, BK] block at (grid_n, k)".to_string());
+    }
+    let a_dtype = kernel.tensors[ab.tensor.0].dtype;
+    let b_dtype = kernel.tensors[bb.tensor.0].dtype;
+    Ok(Parts {
+        extent,
+        step,
+        a: ab,
+        b: bb,
+        a_dtype,
+        b_dtype,
+        dot_out,
+        loop_at,
+    })
+}
+
+pub(crate) fn zsl_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
+    match plan.mode {
+        Mode::Naive => naive_source(kernel, plan),
+        Mode::Staged | Mode::Mma => {
+            let parts = analyze(kernel).map_err(lower_err)?;
+            staged_source(kernel, plan, &parts)
+        }
+    }
+}
+
+/// Buffer element type. i8 is one byte per element.
 fn buffer_elem(dtype: DType) -> &'static str {
     match dtype {
         DType::F16 => "f16",
         DType::F32 => "f32",
         DType::I32 => "i32",
-        DType::U32 | DType::I8 => "u32",
+        DType::U32 => "u32",
+        DType::I8 => "i8",
     }
 }
 
+/// Local type of a tile element. i8 loads sign-extend to i32.
 fn scalar(dtype: DType) -> &'static str {
     match dtype {
         DType::F16 | DType::F32 => "f32",
-        DType::I32 => "i32",
-        DType::U32 | DType::I8 => "u32",
+        DType::I32 | DType::I8 => "i32",
+        DType::U32 => "u32",
     }
 }
 
@@ -103,9 +188,170 @@ fn row_arg(shape0: usize, r: &str) -> String {
     }
 }
 
+fn header(kernel: &TileKernel, workgroup: usize, src: &mut String) {
+    let params: Vec<String> = kernel
+        .tensors
+        .iter()
+        .map(|t| {
+            let mutability = if t.is_output { "mut " } else { "" };
+            format!(
+                "b_{}: device {mutability}buffer<{}>",
+                t.name,
+                buffer_elem(t.dtype)
+            )
+        })
+        .collect();
+    let _ = writeln!(src, "@workgroup_size({workgroup})");
+    let _ = writeln!(src, "kernel {}({}) {{", kernel.name, params.join(", "));
+    let _ = writeln!(src, "let gn = group_id().x");
+    let _ = writeln!(src, "let gm = group_id().y");
+}
+
+fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
+    let tile_elems = kernel.tile[0] * kernel.tile[1];
+    let workgroup = plan.workgroup;
+    let iters = tile_elems.div_ceil(workgroup);
+
+    let mut g = Gen {
+        kernel,
+        values: vec![None; kernel.values.len()],
+        fresh: 0,
+    };
+    let mut body = String::new();
+    for stmt in &kernel.body {
+        g.stmt(&mut body, stmt)?;
+    }
+
+    let mut src = String::new();
+    header(kernel, workgroup, &mut src);
+    let _ = writeln!(src, "for it in 0..{iters} {{");
+    let _ = writeln!(src, "let e = local_id().x + it * {workgroup}");
+    let _ = writeln!(src, "if e < {tile_elems} {{");
+    let _ = writeln!(src, "let tr = e / {}", kernel.tile[1]);
+    let _ = writeln!(src, "let tc = e % {}", kernel.tile[1]);
+    src.push_str(&body);
+    let _ = writeln!(src, "}}");
+    let _ = writeln!(src, "}}");
+    let _ = writeln!(src, "}}");
+    Ok(src)
+}
+
+/// The k loop stages A and B to shared memory (masked, zero outside the tensor), then runs a
+/// barrier, compute, and barrier. The epilogue runs the kernel's ops per output element.
+fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
+    let [bm, bn] = kernel.tile;
+    let bk = parts.step;
+    let wg = plan.workgroup;
+    let mma = plan.mode == Mode::Mma;
+    let elems = bm * bn;
+    let per_thread = elems.div_ceil(wg);
+    let ksteps = parts.extent.div_ceil(bk);
+    let fn_cols = bn / 16;
+    let frags = (bm / 16) * fn_cols;
+    let waves = plan.waves;
+    let frags_per_wave = if mma { frags / waves } else { 0 };
+
+    let mut g = Gen {
+        kernel,
+        values: vec![None; kernel.values.len()],
+        fresh: 0,
+    };
+    let mut src = String::new();
+    header(kernel, wg, &mut src);
+    let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
+    let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
+    if mma {
+        let _ = writeln!(src, "shared sc: array<f32, {elems}>");
+        let _ = writeln!(src, "let lid = local_id().x");
+        let _ = writeln!(src, "let wv = lid / {}", plan.wave_size);
+        for j in 0..frags_per_wave {
+            let _ = writeln!(src, "let f{j}: u32 = wv + {}", j * waves);
+            let _ = writeln!(src, "let c{j}: frag<f32, 16, 16, acc> = frag_zero_acc()");
+        }
+    } else {
+        let _ = writeln!(src, "let lid = local_id().x");
+        for p in 0..per_thread {
+            let _ = writeln!(src, "let acc{p}: f32 = 0.0");
+        }
+    }
+
+    let _ = writeln!(src, "for kt in 0..{ksteps} {{");
+    g.stage(&mut src, "sa", parts.a, [bm, bk], false, wg);
+    g.stage(&mut src, "sb", parts.b, [bn, bk], mma, wg);
+    let _ = writeln!(src, "barrier()");
+    if mma {
+        let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
+        for j in 0..frags_per_wave {
+            let _ = writeln!(
+                src,
+                "let fa{j}: frag<f16, 16, 16, a> = frag_load_a(sa, (f{j} / {fn_cols}) * {} + kq * 16, {bk})",
+                16 * bk
+            );
+            let _ = writeln!(
+                src,
+                "let fb{j}: frag<f16, 16, 16, b> = frag_load_b(sb, kq * {} + (f{j} % {fn_cols}) * 16, {bn})",
+                16 * bn
+            );
+            let _ = writeln!(src, "c{j} = mma(fa{j}, fb{j}, c{j})");
+        }
+        let _ = writeln!(src, "}}");
+    } else {
+        for p in 0..per_thread {
+            let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
+            let _ = writeln!(src, "if e{p} < {elems} {{");
+            let _ = writeln!(src, "let tr = e{p} / {bn}");
+            let _ = writeln!(src, "let tc = e{p} % {bn}");
+            let _ = writeln!(src, "for kk in 0..{bk} {{");
+            let _ = writeln!(
+                src,
+                "acc{p} = acc{p} + sa[tr * {bk} + kk] * sb[tc * {bk} + kk]"
+            );
+            let _ = writeln!(src, "}}");
+            let _ = writeln!(src, "}}");
+        }
+    }
+    let _ = writeln!(src, "barrier()");
+    let _ = writeln!(src, "}}");
+
+    if mma {
+        for j in 0..frags_per_wave {
+            let _ = writeln!(
+                src,
+                "frag_store(sc, (f{j} / {fn_cols}) * {} + (f{j} % {fn_cols}) * 16, {bn}, c{j})",
+                16 * bn
+            );
+        }
+        let _ = writeln!(src, "barrier()");
+    }
+
+    let loop_at = parts.loop_at;
+    for p in 0..per_thread {
+        let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
+        let _ = writeln!(src, "if e{p} < {elems} {{");
+        let _ = writeln!(src, "let tr = e{p} / {bn}");
+        let _ = writeln!(src, "let tc = e{p} % {bn}");
+        let dot_expr = if mma {
+            format!("sc[tr * {bn} + tc]")
+        } else {
+            format!("acc{p}")
+        };
+        g.values[parts.dot_out.0] = Some(dot_expr);
+        for stmt in &kernel.body[loop_at + 1..] {
+            g.stmt(&mut src, stmt)?;
+        }
+        let _ = writeln!(src, "}}");
+    }
+    let _ = writeln!(src, "}}");
+    Ok(src)
+}
+
+fn lower_err(msg: String) -> TileError {
+    TileError::Lower(msg)
+}
+
 struct Gen<'a> {
     kernel: &'a TileKernel,
-    /// Loads have no local. The consumer reads them on demand.
+    /// A local or expression per materialized value. Loads have none: they are read on demand.
     values: Vec<Option<String>>,
     fresh: usize,
 }
@@ -152,11 +398,11 @@ impl Gen<'_> {
                 let src_dtype = self.kernel.values[a.0].dtype;
                 let ea = self.elem_row(out, a, "tr", "tc")?;
                 let v = format!("v{}", t.0);
-                let needs_float = matches!(src_dtype, DType::I32 | DType::U32) && to == DType::F32;
-                let expr = if needs_float {
-                    format!("f32({ea})")
-                } else {
-                    ea
+                let expr = match (src_dtype, to) {
+                    (DType::F32, DType::F16) => format!("f16_round({ea})"),
+                    (DType::I32 | DType::U32, DType::F32) => format!("f32({ea})"),
+                    (DType::F32, DType::I32) => format!("i32({ea})"),
+                    _ => ea,
                 };
                 let _ = writeln!(out, "let {v}: {} = {expr}", scalar(to));
                 self.values[t.0] = Some(v);
@@ -164,28 +410,13 @@ impl Gen<'_> {
             Op::Dot { a, b, acc } => {
                 let acc_var = self.values[acc.0]
                     .clone()
-                    .ok_or_else(|| lower_err("dot accumulator has no local"))?;
+                    .ok_or_else(|| lower_err("dot accumulator has no local".to_string()))?;
                 let k_len = self.kernel.values[a.0].shape[1];
-                let int8 = self.kernel.values[a.0].dtype == DType::I8;
-                let (index, count, step) = if int8 {
-                    let g = self.name("g");
-                    (g, k_len / 4, 4)
-                } else {
-                    (self.name("kk"), k_len, 1)
-                };
-                let _ = writeln!(out, "for {index} in 0..{count} {{");
-                let idx = if step == 1 {
-                    index.clone()
-                } else {
-                    format!("({index} * 4)")
-                };
+                let idx = self.name("kk");
+                let _ = writeln!(out, "for {idx} in 0..{k_len} {{");
                 let ea = self.elem(out, a, "tr", &idx)?;
                 let eb = self.elem(out, b, "tc", &idx)?;
-                if int8 {
-                    let _ = writeln!(out, "{acc_var} = dot4_i8({ea}, {eb}, {acc_var})");
-                } else {
-                    let _ = writeln!(out, "{acc_var} = {acc_var} + {ea} * {eb}");
-                }
+                let _ = writeln!(out, "{acc_var} = {acc_var} + {ea} * {eb}");
                 let _ = writeln!(out, "}}");
                 self.values[t.0] = Some(acc_var);
             }
@@ -212,11 +443,11 @@ impl Gen<'_> {
             Op::Load(block) => Ok(self.load(out, block, r, c)),
             _ => self.values[t.0]
                 .clone()
-                .ok_or_else(|| lower_err("value used before it is defined")),
+                .ok_or_else(|| lower_err("value used before it is defined".to_string())),
         }
     }
 
-    /// Out-of-range reads return 0. For i8, returns the packed word holding column `c`.
+    /// Masked element read from an input block: out of range reads 0. Returns its local.
     fn load(&mut self, out: &mut String, block: Block, r: &str, c: &str) -> String {
         let decl = &self.kernel.tensors[block.tensor.0];
         let v = self.name("ld");
@@ -225,15 +456,41 @@ impl Gen<'_> {
         let gr = format!("({} * {} + {r})", affine(block.rows), block.shape[0]);
         let gc = format!("({} * {} + {c})", affine(block.cols), block.shape[1]);
         let (rows, cols) = (decl.shape[0], decl.shape[1]);
-        let index = if decl.dtype == DType::I8 {
-            format!("{gr} * {} + {gc} / 4", cols / 4)
-        } else {
-            format!("{gr} * {cols} + {gc}")
-        };
         let _ = writeln!(out, "if {gr} < {rows} && {gc} < {cols} {{");
-        let _ = writeln!(out, "{v} = b_{}[{index}]", decl.name);
+        let _ = writeln!(out, "{v} = b_{}[{gr} * {cols} + {gc}]", decl.name);
         let _ = writeln!(out, "}}");
         v
+    }
+
+    /// Copies a `[rows, cols]` block into shared `dst` with the whole workgroup.
+    ///
+    /// With `transposed`, element (r, c) goes to `c * rows + r` (the `frag_load_b` layout).
+    /// Otherwise it goes to `r * cols + c`.
+    fn stage(
+        &mut self,
+        out: &mut String,
+        dst: &str,
+        block: Block,
+        [rows, cols]: [usize; 2],
+        transposed: bool,
+        workgroup: usize,
+    ) {
+        let total = rows * cols;
+        let per = total.div_ceil(workgroup);
+        let index = if transposed {
+            format!("c * {rows} + r")
+        } else {
+            format!("r * {cols} + c")
+        };
+        let _ = writeln!(out, "for it in 0..{per} {{");
+        let _ = writeln!(out, "let e = lid + it * {workgroup}");
+        let _ = writeln!(out, "if e < {total} {{");
+        let _ = writeln!(out, "let r = e / {cols}");
+        let _ = writeln!(out, "let c = e % {cols}");
+        let v = self.load(out, block, "r", "c");
+        let _ = writeln!(out, "{dst}[{index}] = {v}");
+        let _ = writeln!(out, "}}");
+        let _ = writeln!(out, "}}");
     }
 
     fn store(&mut self, out: &mut String, block: &Block, value: Tile) -> Result<(), TileError> {
@@ -248,8 +505,4 @@ impl Gen<'_> {
         let _ = writeln!(out, "}}");
         Ok(())
     }
-}
-
-fn lower_err(msg: &str) -> TileError {
-    TileError::Lower(msg.to_string())
 }
