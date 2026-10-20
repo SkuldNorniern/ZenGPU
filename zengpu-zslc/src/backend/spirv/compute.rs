@@ -1860,7 +1860,14 @@ fn store_half(
             let lsb = ctx.spv.op_bitwise_and(t_u32, upper, c1);
             let bias = ctx.spv.op_iadd(t_u32, c7fff, lsb);
             let rounded = ctx.spv.op_iadd(t_u32, raw, bias);
-            ctx.spv.op_shift_right_logical(t_u32, rounded, c16)
+            let rounded = ctx.spv.op_shift_right_logical(t_u32, rounded, c16);
+            let mag_mask = ctx.spv.constant_u32(t_u32, 0x7fff_ffff);
+            let inf = ctx.spv.constant_u32(t_u32, 0x7f80_0000);
+            let quiet_bit = ctx.spv.constant_u32(t_u32, 0x40);
+            let mag = ctx.spv.op_bitwise_and(t_u32, raw, mag_mask);
+            let is_nan = ctx.spv.op_ult(ctx.t_bool, inf, mag);
+            let upper_quiet = ctx.spv.op_bitwise_or(t_u32, upper, quiet_bit);
+            ctx.spv.op_select(t_u32, is_nan, upper_quiet, rounded)
         }
     };
     let (ptr, shift) = half_word(ctx, table, buf_idx, idx);

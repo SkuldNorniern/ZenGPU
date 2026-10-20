@@ -243,6 +243,9 @@ fn store_inputs(n: u32) -> Vec<f32> {
         f32::MAX,
         1.0e-40,
         -2.0 * 2f32.powi(-25),
+        f32::NAN,
+        f32::from_bits(0x7f80_0001),
+        f32::from_bits(0xffc0_0000),
     ];
     (0..n)
         .map(|i| {
@@ -318,17 +321,22 @@ fn zsl_half_buffers_load_and_store() {
         assert_eq!(bf16_bits_to_f32(out_b[i]), 2.0 * x[i], "bf16 at {i}");
         assert_eq!(out_sum[i], 2.0 * x[i], "sum at {i}");
         let v = store_in[i];
+        let got_h = f16_bits_to_f32(store_h[i]);
+        let got_b = bf16_bits_to_f32(store_b[i]);
+        if v.is_nan() {
+            assert!(got_h.is_nan(), "f16 store of NaN at {i}");
+            assert!(got_b.is_nan(), "bf16 store of NaN at {i}");
+            continue;
+        }
         let want_h = round_ref(v, 10, -14, 65504.0);
         let want_b = round_ref(v, 7, -126, f64::from(f32::from_bits(0x7f7f_0000)));
-        let got_h = f64::from(f16_bits_to_f32(store_h[i]));
-        let got_b = f64::from(bf16_bits_to_f32(store_b[i]));
         assert_eq!(
-            got_h.to_bits(),
+            f64::from(got_h).to_bits(),
             want_h.to_bits(),
             "f16 store of {v:e} at {i}"
         );
         assert_eq!(
-            got_b.to_bits(),
+            f64::from(got_b).to_bits(),
             want_b.to_bits(),
             "bf16 store of {v:e} at {i}"
         );

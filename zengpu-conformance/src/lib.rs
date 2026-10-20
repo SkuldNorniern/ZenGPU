@@ -1085,6 +1085,9 @@ mod half_buffer_tests {
             f32::MAX,
             1.0e-40,
             -2.0 * 2f32.powi(-25),
+            f32::NAN,
+            f32::from_bits(0x7f80_0001),
+            f32::from_bits(0xffc0_0000),
         ];
         (0..n)
             .map(|i| {
@@ -1177,17 +1180,22 @@ mod half_buffer_tests {
             assert_eq!(f32::from_bits(u32::from(yb[i]) << 16), want, "bf16 at {i}");
             assert_eq!(sum[i], want, "sum at {i}");
             let v = store_in[i];
+            let got16 = f16_value(zh[i]);
+            let got_b = f32::from_bits(u32::from(zb[i]) << 16);
+            if v.is_nan() {
+                assert!(got16.is_nan(), "f16 store of NaN at {i}");
+                assert!(got_b.is_nan(), "bf16 store of NaN at {i}");
+                continue;
+            }
             let want16 = round_ref(v, 10, -14, 65504.0);
             let want_b = round_ref(v, 7, -126, f64::from(f32::from_bits(0x7f7f_0000)));
-            let got16 = f64::from(f16_value(zh[i]));
-            let got_b = f64::from(f32::from_bits(u32::from(zb[i]) << 16));
             assert_eq!(
-                got16.to_bits(),
+                f64::from(got16).to_bits(),
                 want16.to_bits(),
                 "f16 store of {v:e} at {i}"
             );
             assert_eq!(
-                got_b.to_bits(),
+                f64::from(got_b).to_bits(),
                 want_b.to_bits(),
                 "bf16 store of {v:e} at {i}"
             );
