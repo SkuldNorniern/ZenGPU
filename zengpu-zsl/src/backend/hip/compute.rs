@@ -109,6 +109,35 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
         );
     }
 
+    s.push_str(
+        "__device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
+         #if defined(__GFX11__) || defined(__GFX12__)\n\
+         \x20   return __builtin_amdgcn_sudot4(true, a, true, b, acc, false);\n\
+         #else\n\
+         \x20   unsigned int s = (unsigned int)acc;\n\
+         \x20   for (int i = 0; i < 4; ++i) s += (unsigned int)((signed char)(a >> (8 * i)) * (signed char)(b >> (8 * i)));\n\
+         \x20   return (int)s;\n\
+         #endif\n\
+         }\n\
+         __device__ __forceinline__ unsigned int zsl_dot4_u8(unsigned int a, unsigned int b, unsigned int acc) {\n\
+         #if defined(__GFX11__) || defined(__GFX12__)\n\
+         \x20   return (unsigned int)__builtin_amdgcn_sudot4(false, (int)a, false, (int)b, (int)acc, false);\n\
+         #else\n\
+         \x20   for (unsigned int i = 0; i < 4; ++i) acc += ((a >> (8 * i)) & 0xffu) * ((b >> (8 * i)) & 0xffu);\n\
+         \x20   return acc;\n\
+         #endif\n\
+         }\n\
+         __device__ __forceinline__ int zsl_dot4_iu8(int a, unsigned int b, int acc) {\n\
+         #if defined(__GFX11__) || defined(__GFX12__)\n\
+         \x20   return __builtin_amdgcn_sudot4(true, a, false, (int)b, acc, false);\n\
+         #else\n\
+         \x20   unsigned int s = (unsigned int)acc;\n\
+         \x20   for (int i = 0; i < 4; ++i) s += (unsigned int)(((signed char)(a >> (8 * i))) * (int)((b >> (8 * i)) & 0xffu));\n\
+         \x20   return (int)s;\n\
+         #endif\n\
+         }\n",
+    );
+
     let threads = local_size[0] * local_size[1] * local_size[2];
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
@@ -535,6 +564,15 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4I8 => {
+                    format!("zsl_dot4_i8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4U8 => {
+                    format!("zsl_dot4_u8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4IU8 => {
+                    format!("zsl_dot4_iu8({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::SubgroupAny => {
                     format!("((bool)__any((int)({})))", args_s[0])

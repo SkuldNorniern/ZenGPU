@@ -1443,6 +1443,40 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             Ok(Val { id, ty: ctx.f32_id })
         }
 
+        BuiltinFn::Dot4I8 | BuiltinFn::Dot4U8 | BuiltinFn::Dot4IU8 => {
+            if args.len() != 3 {
+                return Err(format!("ZSL: {name}(a, b, acc) takes 3 args"));
+            }
+            let (a_signed, b_signed) = match func {
+                BuiltinFn::Dot4I8 => (true, true),
+                BuiltinFn::Dot4U8 => (false, false),
+                _ => (true, false),
+            };
+            let (res_zsl, res_spv) = if matches!(func, BuiltinFn::Dot4U8) {
+                (ctx.u32_id, ctx.t_u32)
+            } else {
+                (ctx.i32_id, ctx.t_i32)
+            };
+            let a_zsl = if a_signed { ctx.i32_id } else { ctx.u32_id };
+            let b_zsl = if b_signed { ctx.i32_id } else { ctx.u32_id };
+            let a_val = lower_expr(ctx, &args[0])?;
+            let a = coerce(ctx, a_val, a_zsl);
+            let b_val = lower_expr(ctx, &args[1])?;
+            let b = coerce(ctx, b_val, b_zsl);
+            let acc_val = lower_expr(ctx, &args[2])?;
+            let mut acc = coerce(ctx, acc_val, res_zsl);
+            for lane in 0..4u32 {
+                let x = dot4_lane(ctx, a, a_signed, lane, res_spv);
+                let y = dot4_lane(ctx, b, b_signed, lane, res_spv);
+                let prod = ctx.spv.op_imul(res_spv, x, y);
+                acc = ctx.spv.op_iadd(res_spv, acc, prod);
+            }
+            Ok(Val {
+                id: acc,
+                ty: res_zsl,
+            })
+        }
+
         BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown => {
             if args.len() != 2 {
                 return Err(format!("ZSL: {}(value, delta) takes 2 args", func.name()));
@@ -1719,6 +1753,22 @@ fn store_half(
         .op_atomic_int(op::ATOMIC_AND, t_u32, ptr, scope, relaxed, keep);
     ctx.spv
         .op_atomic_int(op::ATOMIC_OR, t_u32, ptr, scope, relaxed, placed);
+}
+
+fn dot4_lane(ctx: &mut LowerCtx<'_>, word: Id, signed: bool, lane: u32, want: Id) -> Id {
+    let offset = ctx.spv.constant_u32(ctx.t_u32, 8 * lane);
+    let count = ctx.spv.constant_u32(ctx.t_u32, 8);
+    let base_ty = if signed { ctx.t_i32 } else { ctx.t_u32 };
+    let field = if signed {
+        ctx.spv.op_bitfield_sextract(base_ty, word, offset, count)
+    } else {
+        ctx.spv.op_bitfield_uextract(base_ty, word, offset, count)
+    };
+    if base_ty == want {
+        field
+    } else {
+        ctx.spv.op_bitcast(want, field)
+    }
 }
 
 fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {

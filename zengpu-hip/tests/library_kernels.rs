@@ -323,3 +323,99 @@ fn zsl_bitwise_ops_unpack_nibbles() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+const DOT4_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32 }
+    @workgroup_size(64)
+    kernel dot4(x: device buffer<i32>, y: device buffer<u32>, k: device buffer<i32>, z: device buffer<u32>, out_i: device mut buffer<i32>, out_iu: device mut buffer<i32>, out_u: device mut buffer<u32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            out_i[i] = dot4_i8(x[i], x[i ^ 1], k[i])
+            out_iu[i] = dot4_iu8(x[i], y[i], k[i])
+            out_u[i] = dot4_u8(y[i], y[i ^ 1], z[i])
+        }
+    }
+);
+
+#[test]
+fn zsl_dot4_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = DOT4_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 1000u32;
+    const EDGE: [u8; 4] = [0x80, 0x7f, 0xff, 0x00];
+    let word = |i: u32| {
+        u32::from_le_bytes([
+            EDGE[(i % 4) as usize],
+            EDGE[((i / 4 + 1) % 4) as usize],
+            EDGE[((i / 2 + 2) % 4) as usize],
+            (i.wrapping_mul(0x9e37_79b9) >> 24) as u8,
+        ])
+    };
+    let xs: Vec<u32> = (0..n).map(word).collect();
+    let ys: Vec<u32> = (0..n).map(|i| word(i + 7)).collect();
+    let ks: Vec<u32> = (0..n).map(|i| i32::MAX as u32 - i % 1000).collect();
+    let zs: Vec<u32> = (0..n).map(|i| u32::MAX - i % 1000).collect();
+    let mut bufs = Vec::new();
+    for data in [&xs, &ys, &ks, &zs] {
+        let b = pool.alloc(vec![n], DType::U32).unwrap();
+        let bytes: Vec<u8> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        device.write_buffer(b.buffer, 0, &bytes).unwrap();
+        bufs.push(b);
+    }
+    let outs: Vec<_> = (0..3)
+        .map(|_| pool.alloc(vec![n], DType::U32).unwrap())
+        .collect();
+    let mut ops = OpList::new(&pool);
+    let slots: Vec<u32> = bufs
+        .iter()
+        .chain(outs.iter())
+        .map(|b| b.buffer.index())
+        .collect();
+    ops.dispatch(
+        pipeline,
+        &slots,
+        &[zengpu_hal::Scalar::U32(n)],
+        [n.div_ceil(64), 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |b: &DeviceArray| -> Vec<u32> {
+        device
+            .read_buffer(b.buffer, 0, b.size_bytes())
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let (got_i, got_iu, got_u) = (read(&outs[0]), read(&outs[1]), read(&outs[2]));
+    let s8 = |w: u32, l: u32| ((w >> (8 * l)) as u8) as i8 as i32;
+    let u8l = |w: u32, l: u32| ((w >> (8 * l)) & 0xff) as i32;
+    for i in 0..n as usize {
+        let (x, x2, y, y2) = (xs[i], xs[i ^ 1], ys[i], ys[i ^ 1]);
+        let (k, z) = (ks[i] as i32, zs[i]);
+        let mut want_i = k;
+        let mut want_iu = k;
+        let mut want_u = z;
+        for l in 0..4 {
+            want_i = want_i.wrapping_add(s8(x, l).wrapping_mul(s8(x2, l)));
+            want_iu = want_iu.wrapping_add(s8(x, l).wrapping_mul(u8l(y, l)));
+            want_u = want_u.wrapping_add((u8l(y, l) * u8l(y2, l)) as u32);
+        }
+        assert_eq!(got_i[i] as i32, want_i, "dot4_i8 at {i}");
+        assert_eq!(got_iu[i] as i32, want_iu, "dot4_iu8 at {i}");
+        assert_eq!(got_u[i], want_u, "dot4_u8 at {i}");
+    }
+    drop(ops);
+    for b in bufs.into_iter().chain(outs) {
+        pool.free(b);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

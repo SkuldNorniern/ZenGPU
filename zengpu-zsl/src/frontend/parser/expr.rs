@@ -336,6 +336,13 @@ impl<'a> Parser<'a> {
         }
         if matches!(
             func,
+            BuiltinFn::Dot4I8 | BuiltinFn::Dot4U8 | BuiltinFn::Dot4IU8
+        ) && args.len() != 3
+        {
+            return self.err(format!("{}(a, b, acc) takes 3 args", func.name()));
+        }
+        if matches!(
+            func,
             BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize
         ) && !args.is_empty()
         {

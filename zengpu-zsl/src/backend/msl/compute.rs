@@ -80,6 +80,18 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
 
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
+    s.push_str(
+        "inline uint zsl_dot4(uint a, bool sa, uint b, bool sb, uint acc) {\n\
+         \x20   for (uint i = 0; i < 4; ++i) {\n\
+         \x20       uint ua = (a >> (8 * i)) & 0xffu;\n\
+         \x20       uint ub = (b >> (8 * i)) & 0xffu;\n\
+         \x20       int x = sa ? int(char(ua)) : int(ua);\n\
+         \x20       int y = sb ? int(char(ub)) : int(ub);\n\
+         \x20       acc += uint(x * y);\n\
+         \x20   }\n\
+         \x20   return acc;\n\
+         }\n\n",
+    );
     if !bf16_buffers.is_empty() {
         s.push_str(
             "inline ushort f32_to_bf16(float x) {\n\
@@ -353,6 +365,15 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Step => format!("step({}, {})", a[0], a[1]),
                 BuiltinFn::Smoothstep => format!("smoothstep({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::MulAddF32 => format!("fma({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::Dot4I8 => {
+                    format!("int(zsl_dot4({}, true, {}, true, {}))", a[0], a[1], a[2])
+                }
+                BuiltinFn::Dot4U8 => {
+                    format!("zsl_dot4({}, false, {}, false, {})", a[0], a[1], a[2])
+                }
+                BuiltinFn::Dot4IU8 => {
+                    format!("int(zsl_dot4({}, true, {}, false, {}))", a[0], a[1], a[2])
+                }
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
                 BuiltinFn::SubgroupBallot => {
