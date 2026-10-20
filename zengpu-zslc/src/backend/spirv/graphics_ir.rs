@@ -17,6 +17,7 @@ mod glsl_op {
     pub const TANH: u32 = 21;
     pub const POW: u32 = 26;
     pub const EXP: u32 = 27;
+    pub const ROUND_EVEN: u32 = 2;
     pub const LOG: u32 = 28;
     pub const SQRT: u32 = 31;
     pub const F_MIN: u32 = 37;
@@ -981,6 +982,8 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         BuiltinFn::Abs
         | BuiltinFn::Sign
         | BuiltinFn::Exp
+        | BuiltinFn::FastExp
+        | BuiltinFn::RoundEven
         | BuiltinFn::Tanh
         | BuiltinFn::Sin
         | BuiltinFn::Cos
@@ -1006,7 +1009,8 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let opcode = match func {
                 BuiltinFn::Abs => glsl_op::F_ABS,
                 BuiltinFn::Sign => glsl_op::F_SIGN,
-                BuiltinFn::Exp => glsl_op::EXP,
+                BuiltinFn::Exp | BuiltinFn::FastExp => glsl_op::EXP,
+                BuiltinFn::RoundEven => glsl_op::ROUND_EVEN,
                 BuiltinFn::Tanh => glsl_op::TANH,
                 BuiltinFn::Sin => glsl_op::SIN,
                 BuiltinFn::Cos => glsl_op::COS,

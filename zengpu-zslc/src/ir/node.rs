@@ -143,6 +143,10 @@ pub enum BuiltinFn {
     Abs,
     Sign,
     Exp,
+    /// Approximate `exp`. Uses `__expf` on HIP and CUDA, and `exp` on SPIR-V.
+    FastExp,
+    /// Nearest integer, ties to even.
+    RoundEven,
     Tanh,
     Sin,
     Cos,
@@ -270,6 +274,8 @@ impl BuiltinFn {
             BuiltinFn::Abs => "abs",
             BuiltinFn::Sign => "sign",
             BuiltinFn::Exp => "exp",
+            BuiltinFn::FastExp => "fast_exp",
+            BuiltinFn::RoundEven => "round_even",
             BuiltinFn::Tanh => "tanh",
             BuiltinFn::Sin => "sin",
             BuiltinFn::Cos => "cos",

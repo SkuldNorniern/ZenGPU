@@ -449,6 +449,8 @@ fn builtin_requires_f32(func: BuiltinFn) -> bool {
         BuiltinFn::Abs
             | BuiltinFn::Sign
             | BuiltinFn::Exp
+            | BuiltinFn::FastExp
+            | BuiltinFn::RoundEven
             | BuiltinFn::Tanh
             | BuiltinFn::Sin
             | BuiltinFn::Cos
@@ -799,6 +801,8 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
                 BuiltinFn::Exp => format!("expf({})", args_s[0]),
+                BuiltinFn::FastExp => format!("__expf({})", args_s[0]),
+                BuiltinFn::RoundEven => format!("rintf({})", args_s[0]),
                 BuiltinFn::Tanh => format!("tanhf({})", args_s[0]),
                 BuiltinFn::Sin => format!("sinf({})", args_s[0]),
                 BuiltinFn::Cos => format!("cosf({})", args_s[0]),

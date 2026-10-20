@@ -2255,3 +2255,200 @@ fn zsl_one_buffer_two_element_types_matches_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+/// Zetna kernel sources; comparison tests skip without `ZETNA_HIP_DIR`.
+fn zetna_hip_source(files: &[&str]) -> Option<String> {
+    let dir = std::env::var_os("ZETNA_HIP_DIR")?;
+    let mut src = String::new();
+    for f in files {
+        let path = std::path::Path::new(&dir).join(f);
+        src.push_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")));
+        src.push('\n');
+    }
+    Some(src)
+}
+
+/// Returns the median time per dispatch in milliseconds over batched launches.
+fn hip_time_ms(
+    device: &dyn zengpu_hal::GpuDevice,
+    pipeline: zengpu_hal::PipelineHandle,
+    grid: [u32; 3],
+    slots: &[u32],
+    scalars: &[zengpu_hal::Scalar],
+) -> f64 {
+    let bindings = zengpu_hal::Bindings {
+        buffers: slots,
+        scalars,
+        ..Default::default()
+    };
+    let batch = |k: usize| {
+        let ops: Vec<zengpu_hal::DispatchOp<'_>> = (0..k)
+            .map(|_| zengpu_hal::DispatchOp {
+                pipeline,
+                bindings,
+                grid,
+            })
+            .collect();
+        device.dispatch_batch(&ops).unwrap();
+    };
+    let t0 = std::time::Instant::now();
+    batch(1);
+    batch(1);
+    let one = t0.elapsed().as_secs_f64().max(1e-6);
+    let k = ((0.02 / one).round() as usize).max(1);
+    let warm = std::time::Instant::now();
+    while warm.elapsed().as_secs_f64() < 0.3 {
+        batch(k);
+    }
+    let mut ms: Vec<f64> = (0..10)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            batch(k);
+            t.elapsed().as_secs_f64() * 1e3 / k as f64
+        })
+        .collect();
+    ms.sort_by(f64::total_cmp);
+    (ms[4] + ms[5]) / 2.0
+}
+
+/// Returns the ulp distance between two finite f32 values.
+fn ulp_gap(a: f32, b: f32) -> u32 {
+    let key = |x: f32| {
+        let b = x.to_bits() as i32;
+        if b < 0 { i32::MIN.wrapping_sub(b) } else { b }
+    };
+    (key(a) as i64 - key(b) as i64).unsigned_abs() as u32
+}
+
+const GLU_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32, act: u32 }
+    @workgroup_size(256)
+    kernel glu(gate: device buffer<f32>, up: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        if i < p.n {
+            let g = gate[i]
+            let silu = g / (1.0 + fast_exp(-g))
+            let gelu = 0.5 * g * (1.0 + tanh(0.7978845608 * (g + 0.044715 * g * g * g)))
+            y[i] = select(p.act != 0, gelu, silu) * up[i]
+        }
+    }
+);
+
+/// Silu and gelu over `n` elements, where `n` is not a block multiple.
+#[test]
+fn zsl_glu_matches_zetna() {
+    let Some(device) = hip_device() else { return };
+    let Some(src) = zetna_hip_source(&["common.hip", "ops.hip"]) else {
+        return;
+    };
+    let zetna = device
+        .create_shader(zengpu_hal::ShaderDesc::hip(&src))
+        .unwrap();
+    let zetna_pipe = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader: zetna,
+            entry: "glu",
+            block: [256, 1, 1],
+        })
+        .unwrap();
+    let (shader, entry) = GLU_ZSL.create(&*device).unwrap();
+    let zsl_pipe = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [256, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = (1u32 << 20) + 37;
+    let mut seed = 0x2545_f491u32;
+    let mut rnd = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        (seed >> 8) as f32 / (1u32 << 24) as f32 * 12.0 - 6.0
+    };
+    let gate: Vec<f32> = (0..n).map(|_| rnd()).collect();
+    let up: Vec<f32> = (0..n).map(|_| rnd()).collect();
+    let g = upload(&pool, vec![n], &gate);
+    let u = upload(&pool, vec![n], &up);
+    let y = pool.alloc(vec![n], DType::F32).unwrap();
+    let grid = [n.div_ceil(256), 1, 1];
+    for act in [0u32, 1] {
+        let slots = [g.buffer.index(), u.buffer.index(), y.buffer.index()];
+        let scalars = [zengpu_hal::Scalar::U32(n), zengpu_hal::Scalar::U32(act)];
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(zetna_pipe, &slots, &scalars, grid);
+        ops.run(&*device).unwrap();
+        let want = download(&*device, &y);
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(zsl_pipe, &slots, &scalars, grid);
+        ops.run(&*device).unwrap();
+        let got = download(&*device, &y);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(&a, &b)| ulp_gap(a, b))
+            .max()
+            .unwrap();
+        println!("glu act {act}: max ulp vs zetna {worst}");
+        assert!(worst <= 1, "glu act {act}: {worst} ulp");
+        let t_zetna = hip_time_ms(&*device, zetna_pipe, grid, &slots, &scalars);
+        let t_zsl = hip_time_ms(&*device, zsl_pipe, grid, &slots, &scalars);
+        let bytes = 12.0 * f64::from(n);
+        println!(
+            "glu act {act} n {n}: zetna {:.4} ms ({:.0} GB/s), zsl {:.4} ms ({:.0} GB/s)",
+            t_zetna,
+            bytes / t_zetna / 1e6,
+            t_zsl,
+            bytes / t_zsl / 1e6
+        );
+    }
+    device.destroy_pipeline(zetna_pipe);
+    device.destroy_pipeline(zsl_pipe);
+    device.destroy_shader(zetna);
+    device.destroy_shader(shader);
+}
+
+const ROUND_EVEN_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(64)
+    kernel round_even(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+        let i = id.x
+        out[i] = round_even(src[i])
+    }
+);
+
+/// Rounds ties to even, as `__float2int_rn` does.
+#[test]
+fn zsl_round_even_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = ROUND_EVEN_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [64, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let input: Vec<f32> = (0..128).map(|i| (i as f32 - 64.0) * 0.25 + 1e-3).collect();
+    let src = upload(&pool, vec![128], &input);
+    let out = pool.alloc(vec![128], DType::F32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[src.buffer.index(), out.buffer.index()],
+        &[],
+        [2, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    for (i, (&g, &x)) in got.iter().zip(&input).enumerate() {
+        assert_eq!(g, x.round_ties_even(), "at {i}: {x}");
+    }
+    drop(ops);
+    pool.free(src);
+    pool.free(out);
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
