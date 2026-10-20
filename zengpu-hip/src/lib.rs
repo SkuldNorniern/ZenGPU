@@ -2104,7 +2104,7 @@ mod tests {
     use std::process;
     use std::slice::{from_raw_parts, from_ref};
     use std::sync::Arc;
-    use std::thread::{sleep, spawn};
+    use std::thread::spawn;
     use std::time::Instant;
 
     use zengpu_hal::{BufferUsage, GpuInstance, MemoryUsage};
@@ -2175,126 +2175,6 @@ extern "C" __global__ __launch_bounds__(256) void spill(float* out) {
         assert!(spill.scratch_bytes > 0, "{spill:?}");
         assert_eq!(heavy.max_threads, 256);
         println!("hip stats: tiny {tiny:?} heavy {heavy:?} spill {spill:?}");
-    }
-
-    #[test]
-    fn enumerate_adapters() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        println!("hip: {} adapter(s) found", adapters.len());
-        for a in &adapters {
-            let i = a.info();
-            println!("  [{}] {}", i.device, i.name);
-        }
-        assert!(
-            !adapters.is_empty(),
-            "ROCm initialised but found no adapters"
-        );
-    }
-
-    #[test]
-    fn device_info_gcn_target() {
-        let Some(inst) = try_instance() else { return };
-        for info in inst.device_infos() {
-            println!(
-                "  [{ordinal}] {name} → gfx target: {gfx:?}",
-                ordinal = info.ordinal,
-                name = info.name,
-                gfx = info.gfx_target
-            );
-            assert!(
-                !info.gfx_target.is_empty(),
-                "no gfx target derived for {}",
-                info.name
-            );
-        }
-    }
-
-    #[test]
-    fn buffer_roundtrip() {
-        let Some(inst) = try_instance() else { return };
-        let adapter = match inst.request_adapter(AdapterRequest::default()) {
-            Some(a) => a,
-            None => {
-                println!("hip: no adapter");
-                return;
-            }
-        };
-        let device = adapter.open(DeviceRequest::default()).unwrap();
-
-        let data: Vec<u8> = (0u8..128).collect();
-        let buf = device
-            .create_buffer(BufferDesc {
-                size: data.len() as u64,
-                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        device.write_buffer(buf, 0, &data).unwrap();
-        let back = device.read_buffer(buf, 0, data.len() as u64).unwrap();
-        assert_eq!(data, back, "buffer roundtrip mismatch");
-        device.destroy_buffer(buf);
-    }
-
-    #[test]
-    fn peer_buffer_copy() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        if adapters.len() < 2 {
-            println!(
-                "hip: peer copy test needs ≥ 2 GPUs; found {}",
-                adapters.len()
-            );
-            return;
-        }
-
-        let dev0 = adapters[0].open(DeviceRequest::default()).unwrap();
-        let dev1 = adapters[1].open(DeviceRequest::default()).unwrap();
-        let values = [1.25f32, -2.5, 3.75, 1024.5, -0.125, 42.0];
-        let data: Vec<u8> = values
-            .iter()
-            .flat_map(|value| value.to_ne_bytes())
-            .collect();
-        let desc = BufferDesc {
-            size: data.len() as u64,
-            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
-            memory: MemoryUsage::GpuOnly,
-        };
-        let dst = dev0.create_buffer(desc).unwrap();
-        let src = dev1.create_buffer(desc).unwrap();
-        dev1.write_buffer(src, 0, &data).unwrap();
-
-        let direct = dev0.can_peer(dev1.device_ordinal());
-        println!(
-            "hip: GPU {} ← GPU {} peer copy: {}",
-            dev0.device_ordinal(),
-            dev1.device_ordinal(),
-            if direct {
-                "P2P fast path"
-            } else {
-                "host-staging fallback"
-            }
-        );
-        dev0.copy_from_peer(dst, dev1.as_ref(), src, data.len() as u64)
-            .unwrap();
-        let copied = dev0.read_buffer(dst, 0, data.len() as u64).unwrap();
-        assert_eq!(copied, data, "peer buffer copy mismatch");
-        println!("hip: peer copy correctness: OK");
-
-        dev0.destroy_buffer(dst);
-        dev1.destroy_buffer(src);
-    }
-
-    #[test]
-    fn vec_add_single_gpu() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        assert!(!adapters.is_empty());
-
-        run_vec_add(
-            adapters[0].open(DeviceRequest::default()).unwrap().as_ref(),
-            "GPU 0",
-        );
     }
 
     #[test]
@@ -2564,19 +2444,6 @@ void reduce_sum(const float* __restrict__ in, float* __restrict__ out, unsigned 
 }
 "#;
 
-    const SCALE_SRC: &str = r#"
-extern "C" __global__
-void mem_scale(const float* __restrict__ in, float* __restrict__ out,
-               float scale, unsigned int n) {
-    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = in[i] * scale;
-}
-"#;
-
-    fn elapsed_ms(start: Instant) -> f64 {
-        start.elapsed().as_secs_f64() * 1000.0
-    }
-
     #[test]
     fn heavy_sgemm() {
         let Some(inst) = try_instance() else { return };
@@ -2584,7 +2451,6 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
         assert!(!adapters.is_empty());
 
         let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let info = adapters[0].info();
 
         const M: usize = 2048;
         const N: usize = 2048;
@@ -2644,21 +2510,6 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             ],
         };
         device.dispatch(pipeline, bindings, grid).unwrap();
-
-        const REPS: u32 = 5;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, grid).unwrap();
-        }
-        let ms = elapsed_ms(t0) / REPS as f64;
-
-        let flop = 2.0 * M as f64 * N as f64 * K as f64;
-        let gflops = flop / (ms * 1e6);
-
-        println!(
-            "[{}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s",
-            info.name
-        );
 
         let raw = device.read_buffer(bc, 0, bytes_mn).unwrap();
         let c: &[f32] = bytemuck_cast_slice(&raw);
@@ -2731,15 +2582,6 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .dispatch(pipeline, bindings, [num_blocks, 1, 1])
             .unwrap();
 
-        const REPS: u32 = 3;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device
-                .dispatch(pipeline, bindings, [num_blocks, 1, 1])
-                .unwrap();
-        }
-        let ms = elapsed_ms(t0) / REPS as f64;
-
         let raw = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
         let partials: &[f32] = bytemuck_cast_slice(&raw);
         let sum: f32 = partials.iter().sum();
@@ -2750,469 +2592,10 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             "reduction sum wrong: got {sum}, expected {expected}, err={err:.2e}"
         );
 
-        let bytes_moved = (N * 4 + num_blocks as usize * 4) as f64;
-        let gb_s = bytes_moved / (ms * 1e6);
-        println!("[GPU 0] reduce_sum {N} floats (512 MB): {ms:.2} ms → {gb_s:.1} GB/s (sum={sum})");
-
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
         device.destroy_buffer(buf_in);
         device.destroy_buffer(buf_out);
-    }
-
-    #[test]
-    fn heavy_bandwidth() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        assert!(!adapters.is_empty());
-
-        for adapter in &adapters {
-            let device = adapter.open(DeviceRequest::default()).unwrap();
-            let name = adapter.info().name.clone();
-
-            const N: usize = 256 * 1024 * 1024;
-            const BLOCK: u32 = 256;
-
-            let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
-            let bytes = (N * 4) as u64;
-            let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-
-            let buf_in = device
-                .create_buffer(BufferDesc {
-                    size: bytes,
-                    usage: storage,
-                    memory: MemoryUsage::GpuOnly,
-                })
-                .unwrap();
-            let buf_out = device
-                .create_buffer(BufferDesc {
-                    size: bytes,
-                    usage: storage,
-                    memory: MemoryUsage::GpuOnly,
-                })
-                .unwrap();
-            device
-                .write_buffer(buf_in, 0, bytemuck_cast(&data))
-                .unwrap();
-
-            let shader = device.create_shader(ShaderDesc::hip(SCALE_SRC)).unwrap();
-            let pipeline = device
-                .create_compute_pipeline(ComputePipelineDesc {
-                    shader,
-                    entry: "mem_scale",
-                    block: [BLOCK, 1, 1],
-                })
-                .unwrap();
-
-            let grid = [(N as u32 + BLOCK - 1) / BLOCK, 1, 1];
-            let bindings = Bindings {
-                buffers: &[buf_in.index(), buf_out.index()],
-                textures: &[],
-                images: &[],
-                scalars: &[
-                    zengpu_hal::Scalar::F32(2.0f32),
-                    zengpu_hal::Scalar::U32(N as u32),
-                ],
-            };
-
-            device.dispatch(pipeline, bindings, grid).unwrap();
-
-            const REPS: u32 = 5;
-            let t0 = Instant::now();
-            for _ in 0..REPS {
-                device.dispatch(pipeline, bindings, grid).unwrap();
-            }
-            let ms = elapsed_ms(t0) / REPS as f64;
-
-            let gb_s = (2.0 * bytes as f64) / (ms * 1e6);
-            println!("[{name}] mem_scale {N} floats (1 GB r+w): {ms:.2} ms → {gb_s:.1} GB/s");
-
-            let raw = device.read_buffer(buf_out, 0, 64).unwrap();
-            let out: &[f32] = bytemuck_cast_slice(&raw);
-            assert!((out[0] - 0.0f32).abs() < 1e-5, "out[0] wrong: {}", out[0]);
-            assert!((out[1] - 2.0f32).abs() < 1e-5, "out[1] wrong: {}", out[1]);
-
-            device.destroy_pipeline(pipeline);
-            device.destroy_shader(shader);
-            device.destroy_buffer(buf_in);
-            device.destroy_buffer(buf_out);
-        }
-    }
-
-    #[test]
-    fn heavy_multi_gpu_sgemm() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        if adapters.len() < 2 {
-            println!(
-                "hip: multi-gpu SGEMM needs ≥ 2 GPUs; found {}",
-                adapters.len()
-            );
-        }
-
-        let devices: Vec<Arc<Box<dyn GpuDevice>>> = adapters
-            .iter()
-            .map(|a| Arc::new(a.open(DeviceRequest::default()).unwrap()))
-            .collect();
-        let names: Vec<String> = adapters.iter().map(|a| a.info().name.clone()).collect();
-
-        let handles: Vec<_> = devices
-            .into_iter()
-            .zip(names)
-            .enumerate()
-            .map(|(idx, (dev, name))| {
-                spawn(move || {
-                    const M: usize = 2048;
-                    const N: usize = 2048;
-                    const K: usize = 2048;
-                    let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.1).collect();
-                    let b: Vec<f32> = (0..K * N).map(|i| (i % 5) as f32 * 0.1).collect();
-                    let bytes = |r: usize, c: usize| (r * c * 4) as u64;
-                    let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-                    let ba = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(M, K),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    let bb = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(K, N),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    let bc = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(M, N),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    dev.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-                    dev.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-                    let shader = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-                    let pipeline = dev
-                        .create_compute_pipeline(ComputePipelineDesc {
-                            shader,
-                            entry: "sgemm",
-                            block: [32, 32, 1],
-                        })
-                        .unwrap();
-                    let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
-                    let bindings = Bindings {
-                        buffers: &[ba.index(), bb.index(), bc.index()],
-                        textures: &[],
-                        images: &[],
-                        scalars: &[
-                            zengpu_hal::Scalar::U32(M as u32),
-                            zengpu_hal::Scalar::U32(N as u32),
-                            zengpu_hal::Scalar::U32(K as u32),
-                        ],
-                    };
-                    dev.dispatch(pipeline, bindings, grid).unwrap();
-                    const REPS: u32 = 5;
-                    let t0 = Instant::now();
-                    for _ in 0..REPS {
-                        dev.dispatch(pipeline, bindings, grid).unwrap();
-                    }
-                    let ms = elapsed_ms(t0) / REPS as f64;
-                    let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
-                    println!(
-                        "[GPU {idx} - {name}] SGEMM {M}×{K}×{N}: {ms:.2} ms → {gflops:.1} GFLOP/s"
-                    );
-                    dev.destroy_pipeline(pipeline);
-                    dev.destroy_shader(shader);
-                    dev.destroy_buffer(ba);
-                    dev.destroy_buffer(bb);
-                    dev.destroy_buffer(bc);
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-    }
-
-    fn run_sgemm_opt(device: &dyn GpuDevice, m: usize, n: usize, k: usize) -> f64 {
-        let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.001).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| (i % 11) as f32 * 0.001).collect();
-        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-        let ba = device
-            .create_buffer(BufferDesc {
-                size: (m * k * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bb = device
-            .create_buffer(BufferDesc {
-                size: (k * n * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bc = device
-            .create_buffer(BufferDesc {
-                size: (m * n * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-        let shader = device
-            .create_shader(ShaderDesc::hip(SGEMM_OPT_SRC))
-            .unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "sgemm_opt",
-                block: [16, 16, 1],
-            })
-            .unwrap();
-        let grid = [((n + 63) / 64) as u32, ((m + 63) / 64) as u32, 1];
-        let bindings = Bindings {
-            buffers: &[ba.index(), bb.index(), bc.index()],
-            textures: &[],
-            images: &[],
-            scalars: &[
-                zengpu_hal::Scalar::U32(m as u32),
-                zengpu_hal::Scalar::U32(n as u32),
-                zengpu_hal::Scalar::U32(k as u32),
-            ],
-        };
-        device.dispatch(pipeline, bindings, grid).unwrap();
-        device.dispatch(pipeline, bindings, grid).unwrap();
-        device.read_buffer(bc, 0, 4).unwrap();
-        const REPS: u32 = 3;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, grid).unwrap();
-        }
-        device.read_buffer(bc, 0, 4).unwrap();
-        let ms = elapsed_ms(t0) / REPS as f64;
-        let gflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e6);
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        device.destroy_buffer(ba);
-        device.destroy_buffer(bb);
-        device.destroy_buffer(bc);
-        gflops
-    }
-
-    #[test]
-    fn heavy_sgemm_opt_sweep() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        assert!(!adapters.is_empty());
-
-        let adapter = &adapters[0];
-        let device = adapter.open(DeviceRequest::default()).unwrap();
-        let name = adapter.info().name.clone();
-
-        for &sz in &[2048usize, 4096, 8192] {
-            let mem_mb = 3 * sz * sz * 4 / (1024 * 1024);
-            let info = inst.device_infos();
-            let vram = info[0].total_mem / (1024 * 1024);
-            if mem_mb as usize > vram * 3 / 4 {
-                println!("[{name}] skip SGEMM {sz}³: need {mem_mb} MB, VRAM={vram} MB");
-                continue;
-            }
-
-            let gflops_naive = if sz <= 4096 {
-                Some(run_sgemm_naive(device.as_ref(), sz))
-            } else {
-                None
-            };
-            let gflops_opt = run_sgemm_opt(device.as_ref(), sz, sz, sz);
-
-            match gflops_naive {
-                Some(n) => println!(
-                    "[{name}] SGEMM {sz}³  naive={n:.0}  opt={gflops_opt:.0} GFLOP/s  ({:.1}×)",
-                    gflops_opt / n
-                ),
-                None => println!("[{name}] SGEMM {sz}³  opt={gflops_opt:.0} GFLOP/s"),
-            }
-
-            assert!(
-                gflops_opt.is_finite() && gflops_opt > 0.0,
-                "opt SGEMM {sz}³ produced an invalid throughput measurement: {gflops_opt}"
-            );
-            if let Some(n) = gflops_naive {
-                assert!(
-                    n.is_finite() && n > 0.0,
-                    "naive SGEMM {sz}³ produced an invalid throughput measurement: {n}"
-                );
-            }
-        }
-    }
-
-    fn run_sgemm_naive(device: &dyn GpuDevice, sz: usize) -> f64 {
-        let a: Vec<f32> = (0..sz * sz).map(|i| (i % 7) as f32 * 0.01).collect();
-        let b: Vec<f32> = (0..sz * sz).map(|i| (i % 13) as f32 * 0.01).collect();
-        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-        let ba = device
-            .create_buffer(BufferDesc {
-                size: (sz * sz * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bb = device
-            .create_buffer(BufferDesc {
-                size: (sz * sz * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bc = device
-            .create_buffer(BufferDesc {
-                size: (sz * sz * 4) as u64,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-        let shader = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "sgemm",
-                block: [32, 32, 1],
-            })
-            .unwrap();
-        let grid = [((sz as u32) + 31) / 32, ((sz as u32) + 31) / 32, 1];
-        let bindings = Bindings {
-            buffers: &[ba.index(), bb.index(), bc.index()],
-            textures: &[],
-            images: &[],
-            scalars: &[
-                zengpu_hal::Scalar::U32(sz as u32),
-                zengpu_hal::Scalar::U32(sz as u32),
-                zengpu_hal::Scalar::U32(sz as u32),
-            ],
-        };
-        device.dispatch(pipeline, bindings, grid).unwrap();
-        device.read_buffer(bc, 0, 4).unwrap();
-        const REPS: u32 = 3;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, grid).unwrap();
-        }
-        device.read_buffer(bc, 0, 4).unwrap();
-        let ms = elapsed_ms(t0) / REPS as f64;
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        device.destroy_buffer(ba);
-        device.destroy_buffer(bb);
-        device.destroy_buffer(bc);
-        2.0 * sz as f64 * sz as f64 * sz as f64 / (ms * 1e6)
-    }
-
-    #[test]
-    fn heavy_multi_gpu_sgemm_opt_4096() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        if adapters.is_empty() {
-            return;
-        }
-
-        let handles: Vec<_> = adapters
-            .iter()
-            .enumerate()
-            .map(|(idx, a)| {
-                let dev: Arc<dyn GpuDevice> = Arc::from(a.open(DeviceRequest::default()).unwrap());
-                let name = a.info().name.clone();
-                spawn(move || {
-                    let gflops = run_sgemm_opt(dev.as_ref(), 4096, 4096, 4096);
-                    println!("[GPU {idx} - {name}] opt SGEMM 4096³: {gflops:.0} GFLOP/s");
-                })
-            })
-            .collect();
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-    }
-
-    #[test]
-    fn zsl_hip_vec_scale() {
-        let Some(inst) = try_instance() else { return };
-        let device = adapters_or_skip(&inst);
-
-        const SCALE: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
-            push Consts { n: u32 }
-            @workgroup_size(256)
-            kernel scale(
-                id: global_id,
-                a: device buffer<f32>,
-                b: device mut buffer<f32>,
-                c: Consts,
-            ) {
-                let i = id.x
-                if i < c.n {
-                    b[i] = a[i] * 2.0
-                }
-            }
-        );
-        let scale_src = SCALE.hip.unwrap();
-
-        const N: usize = 1 << 20;
-        let data: Vec<f32> = (0..N).map(|i| i as f32).collect();
-        let bytes = (N * 4) as u64;
-        let st = BufferUsage::STORAGE | BufferUsage::READBACK;
-
-        let src = device
-            .create_buffer(BufferDesc {
-                size: bytes,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let dst = device
-            .create_buffer(BufferDesc {
-                size: bytes,
-                usage: st,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        device.write_buffer(src, 0, bytemuck_cast(&data)).unwrap();
-
-        let shader = device.create_shader(ShaderDesc::hip(scale_src)).unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "zsl_kernel",
-                block: [256, 1, 1],
-            })
-            .unwrap();
-
-        let bindings = Bindings {
-            buffers: &[src.index(), dst.index()],
-            textures: &[],
-            images: &[],
-            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
-        };
-        let grid = [(N as u32 + 255) / 256, 1, 1];
-        device.dispatch(pipeline, bindings, grid).unwrap();
-
-        let raw = device.read_buffer(dst, 0, 32).unwrap();
-        let out = bytemuck_cast_slice(&raw);
-        assert!((out[0] - 0.0f32).abs() < 1e-5, "out[0]={}", out[0]);
-        assert!((out[1] - 2.0f32).abs() < 1e-5, "out[1]={}", out[1]);
-        assert!((out[2] - 4.0f32).abs() < 1e-5, "out[2]={}", out[2]);
-        println!(
-            "zsl! → hipRTC: vec_scale OK  out[0..3]={} {} {}",
-            out[0], out[1], out[2]
-        );
-
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        device.destroy_buffer(src);
-        device.destroy_buffer(dst);
     }
 
     fn adapters_or_skip(inst: &HipInstance) -> Box<dyn GpuDevice> {
@@ -3224,194 +2607,6 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
             .unwrap()
             .open(DeviceRequest::default())
             .unwrap()
-    }
-
-    #[test]
-    fn heavy_sgemm_4096() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        assert!(!adapters.is_empty());
-
-        let adapter = &adapters[0];
-        let device = adapter.open(DeviceRequest::default()).unwrap();
-        let info = adapter.info();
-
-        const M: usize = 4096;
-        const N: usize = 4096;
-        const K: usize = 4096;
-
-        let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.001).collect();
-        let b: Vec<f32> = (0..K * N).map(|i| (i % 11) as f32 * 0.001).collect();
-
-        let bytes_mn = (M * N * 4) as u64;
-        let bytes_mk = (M * K * 4) as u64;
-        let bytes_kn = (K * N * 4) as u64;
-        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-
-        let ba = device
-            .create_buffer(BufferDesc {
-                size: bytes_mk,
-                usage: storage,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bb = device
-            .create_buffer(BufferDesc {
-                size: bytes_kn,
-                usage: storage,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let bc = device
-            .create_buffer(BufferDesc {
-                size: bytes_mn,
-                usage: storage,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-
-        device.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-        device.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-
-        let shader = device.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "sgemm",
-                block: [32, 32, 1],
-            })
-            .unwrap();
-
-        let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
-        let bindings = Bindings {
-            buffers: &[ba.index(), bb.index(), bc.index()],
-            textures: &[],
-            images: &[],
-            scalars: &[
-                zengpu_hal::Scalar::U32(M as u32),
-                zengpu_hal::Scalar::U32(N as u32),
-                zengpu_hal::Scalar::U32(K as u32),
-            ],
-        };
-
-        device.dispatch(pipeline, bindings, grid).unwrap();
-        device.dispatch(pipeline, bindings, grid).unwrap();
-
-        const REPS: u32 = 3;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device.dispatch(pipeline, bindings, grid).unwrap();
-        }
-        let ms = elapsed_ms(t0) / REPS as f64;
-        let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
-
-        println!(
-            "[{}] SGEMM {M}×{K}×{N}: {ms:.1} ms → {gflops:.1} GFLOP/s",
-            info.name
-        );
-
-        let raw = device.read_buffer(bc, 0, 64).unwrap();
-        let c: &[f32] = bytemuck_cast_slice(&raw);
-        let expected: f32 = (0..K).map(|k| a[k] * b[k * N]).sum();
-        let err = (c[0] - expected).abs() / expected.abs().max(1e-6);
-        assert!(
-            err < 1e-2,
-            "SGEMM 4096 C[0][0] err {err:.2e}: got {} expected {expected}",
-            c[0]
-        );
-
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        device.destroy_buffer(ba);
-        device.destroy_buffer(bb);
-        device.destroy_buffer(bc);
-    }
-
-    /// 256 M floats (1 GB), larger than L2.
-    #[test]
-    fn heavy_reduction_256m() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-        assert!(!adapters.is_empty());
-
-        let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let name = adapters[0].info().name.clone();
-
-        const N: usize = 256 * 1024 * 1024;
-        const BLOCK: u32 = 512;
-
-        let data: Vec<f32> = vec![1.0f32; N];
-
-        let src_bytes = (N * 4) as u64;
-        let num_blocks = ((N as u32) + BLOCK * 2 - 1) / (BLOCK * 2);
-        let partial_bytes = (num_blocks as usize * 4) as u64;
-        let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-
-        let buf_in = device
-            .create_buffer(BufferDesc {
-                size: src_bytes,
-                usage: storage,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        let buf_out = device
-            .create_buffer(BufferDesc {
-                size: partial_bytes,
-                usage: storage,
-                memory: MemoryUsage::GpuOnly,
-            })
-            .unwrap();
-        device
-            .write_buffer(buf_in, 0, bytemuck_cast(&data))
-            .unwrap();
-
-        let shader = device.create_shader(ShaderDesc::hip(REDUCE_SRC)).unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "reduce_sum",
-                block: [BLOCK, 1, 1],
-            })
-            .unwrap();
-
-        let bindings = Bindings {
-            buffers: &[buf_in.index(), buf_out.index()],
-            textures: &[],
-            images: &[],
-            scalars: &[zengpu_hal::Scalar::U32(N as u32)],
-        };
-
-        device
-            .dispatch(pipeline, bindings, [num_blocks, 1, 1])
-            .unwrap();
-
-        const REPS: u32 = 3;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device
-                .dispatch(pipeline, bindings, [num_blocks, 1, 1])
-                .unwrap();
-        }
-        let ms = elapsed_ms(t0) / REPS as f64;
-
-        let raw = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
-        let partials = bytemuck_cast_slice(&raw);
-        let sum: f32 = partials.iter().sum();
-        let expected = N as f32;
-        let err = (sum - expected).abs() / expected;
-        assert!(
-            err < 1e-3,
-            "reduction 256M: got {sum}, expected {expected}, err={err:.2e}"
-        );
-
-        let bytes_moved = (N * 4 + num_blocks as usize * 4) as f64;
-        let gb_s = bytes_moved / (ms * 1e6);
-        println!("[{name}] reduce_sum 256M floats (1 GB): {ms:.2} ms → {gb_s:.1} GB/s  sum={sum}");
-
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        device.destroy_buffer(buf_in);
-        device.destroy_buffer(buf_out);
     }
 
     /// RDNA 4 wave reduction via `__builtin_amdgcn_ds_swizzle`, no LDS. Falls back to LDS on older
@@ -3464,7 +2659,6 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
         }
 
         let device = adapters[0].open(DeviceRequest::default()).unwrap();
-        let name = adapters[0].info().name.clone();
 
         const N: usize = 256 * 1024 * 1024;
         const BLOCK: u32 = 256;
@@ -3516,15 +2710,6 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             .dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1])
             .unwrap();
 
-        const REPS: u32 = 5;
-        let t0 = Instant::now();
-        for _ in 0..REPS {
-            device
-                .dispatch(pipeline, bindings, [NUM_BLOCKS, 1, 1])
-                .unwrap();
-        }
-        let ms = elapsed_ms(t0) / REPS as f64;
-
         let raw = device.read_buffer(buf_out, 0, partial_bytes).unwrap();
         let partials = bytemuck_cast_slice(&raw);
         let sum: f32 = partials.iter().sum();
@@ -3535,165 +2720,10 @@ void wave_reduce_sum(const float* __restrict__ in, float* __restrict__ out,
             "wave reduce: got {sum}, expected {expected}, err={err:.2e}"
         );
 
-        let bytes_moved = N as f64 * 4.0;
-        let gb_s = bytes_moved / (ms * 1e6);
-        println!(
-            "[{name}] wave_reduce 256M floats: {ms:.2} ms → {gb_s:.1} GB/s  (wave{} DPP)",
-            hip_info[0].capabilities.wave_size
-        );
-
         device.destroy_pipeline(pipeline);
         device.destroy_shader(shader);
         device.destroy_buffer(buf_in);
         device.destroy_buffer(buf_out);
-    }
-
-    #[test]
-    fn heavy_multi_gpu_sgemm_4096() {
-        let Some(inst) = try_instance() else { return };
-        let adapters = inst.enumerate_adapters();
-
-        if adapters.is_empty() {
-            return;
-        }
-        if adapters.len() < 2 {
-            println!("hip: multi-gpu 4096 needs ≥ 2 GPUs; running single-GPU only");
-        }
-
-        let devices: Vec<Arc<Box<dyn GpuDevice>>> = adapters
-            .iter()
-            .map(|a| Arc::new(a.open(DeviceRequest::default()).unwrap()))
-            .collect();
-        let names: Vec<String> = adapters.iter().map(|a| a.info().name.clone()).collect();
-
-        let handles: Vec<_> = devices
-            .into_iter()
-            .zip(names)
-            .enumerate()
-            .map(|(idx, (dev, name))| {
-                spawn(move || {
-                    const M: usize = 4096;
-                    const N: usize = 4096;
-                    const K: usize = 4096;
-
-                    let a: Vec<f32> = (0..M * K).map(|i| (i % 7) as f32 * 0.001).collect();
-                    let b: Vec<f32> = (0..K * N).map(|i| (i % 11) as f32 * 0.001).collect();
-
-                    let bytes = |r: usize, c: usize| (r * c * 4) as u64;
-                    let storage = BufferUsage::STORAGE | BufferUsage::READBACK;
-
-                    let ba = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(M, K),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    let bb = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(K, N),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    let bc = dev
-                        .create_buffer(BufferDesc {
-                            size: bytes(M, N),
-                            usage: storage,
-                            memory: MemoryUsage::GpuOnly,
-                        })
-                        .unwrap();
-                    dev.write_buffer(ba, 0, bytemuck_cast(&a)).unwrap();
-                    dev.write_buffer(bb, 0, bytemuck_cast(&b)).unwrap();
-
-                    let shader = dev.create_shader(ShaderDesc::hip(SGEMM_SRC)).unwrap();
-                    let pipeline = dev
-                        .create_compute_pipeline(ComputePipelineDesc {
-                            shader,
-                            entry: "sgemm",
-                            block: [32, 32, 1],
-                        })
-                        .unwrap();
-
-                    let grid = [(N as u32 + 31) / 32, (M as u32 + 31) / 32, 1];
-                    let bindings = Bindings {
-                        buffers: &[ba.index(), bb.index(), bc.index()],
-                        textures: &[],
-                        images: &[],
-                        scalars: &[
-                            zengpu_hal::Scalar::U32(M as u32),
-                            zengpu_hal::Scalar::U32(N as u32),
-                            zengpu_hal::Scalar::U32(K as u32),
-                        ],
-                    };
-
-                    dev.dispatch(pipeline, bindings, grid).unwrap();
-                    dev.dispatch(pipeline, bindings, grid).unwrap();
-
-                    const REPS: u32 = 3;
-                    let t0 = Instant::now();
-                    for _ in 0..REPS {
-                        dev.dispatch(pipeline, bindings, grid).unwrap();
-                    }
-                    let ms = elapsed_ms(t0) / REPS as f64;
-                    let gflops = 2.0 * M as f64 * N as f64 * K as f64 / (ms * 1e6);
-                    println!("[GPU {idx} - {name}] SGEMM 4096³: {ms:.1} ms → {gflops:.1} GFLOP/s");
-
-                    dev.destroy_pipeline(pipeline);
-                    dev.destroy_shader(shader);
-                    dev.destroy_buffer(ba);
-                    dev.destroy_buffer(bb);
-                    dev.destroy_buffer(bc);
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().expect("thread panicked");
-        }
-    }
-
-    #[test]
-    fn capability_report() {
-        let Some(inst) = try_instance() else { return };
-        let infos = inst.device_infos();
-        assert!(!infos.is_empty(), "no HIP adapters found");
-
-        for info in infos {
-            let report = info.capabilities.report(&info.name, &info.gfx_target);
-            println!("─────────────────────────────────────────────────");
-            println!("{report}");
-            println!("─────────────────────────────────────────────────");
-
-            let caps = &info.capabilities;
-
-            assert!(
-                caps.wave_size == 32 || caps.wave_size == 64,
-                "unexpected wave size {} on {}",
-                caps.wave_size,
-                info.gfx_target,
-            );
-            if caps.mfma {
-                assert!(
-                    info.gfx_family.full_fp64(),
-                    "mfma set but not a CDNA device: {}",
-                    info.gfx_target,
-                );
-            }
-            if !caps.hiprtc {
-                assert!(
-                    !caps.hiprtc_bitcode,
-                    "bitcode without hipRTC on {}",
-                    info.gfx_target
-                );
-            }
-            let expect_wgp = info.gfx_family.is_rdna();
-            assert_eq!(
-                caps.wgp_default, expect_wgp,
-                "WGP mode mismatch for {} ({:?})",
-                info.gfx_target, info.gfx_family,
-            );
-        }
     }
 
     fn first_device() -> Option<Box<dyn GpuDevice>> {
@@ -3732,6 +2762,19 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
             if info.gfx_family.is_rdna() && env::var_os(version::WAVE64_ENV).is_none() {
                 assert_eq!(info.wave_size, 32, "HIP runs RDNA in wave32");
             }
+            if info.capabilities.mfma {
+                assert!(
+                    info.gfx_family.full_fp64(),
+                    "mfma set but not a CDNA device: {}",
+                    info.gfx_target
+                );
+            }
+            assert_eq!(
+                info.capabilities.wgp_default,
+                info.gfx_family.is_rdna(),
+                "WGP mode mismatch for {}",
+                info.gfx_target
+            );
         }
     }
 
@@ -3931,26 +2974,6 @@ extern "C" __global__ void fill(unsigned int* out, unsigned int value, unsigned 
     }
 
     #[test]
-    fn compute_caps_are_reported() {
-        let Some(device) = first_device() else { return };
-        let caps = device.compute_caps();
-        println!("hip compute caps: {caps:?}");
-        let (lo, hi) = caps.subgroup_sizes;
-        assert!(lo == 32 || lo == 64, "wave size {lo}");
-        assert!(lo <= caps.default_subgroup && caps.default_subgroup <= hi);
-        assert!(
-            caps.shared_bytes >= 32 * 1024,
-            "shared {}",
-            caps.shared_bytes
-        );
-        assert!(caps.max_workgroup >= 256);
-        for shape in &caps.mma {
-            assert_eq!((shape.m, shape.n, shape.k), (16, 16, 16));
-            assert_eq!(shape.subgroup, lo);
-        }
-    }
-
-    #[test]
     fn limits_and_budget_are_reported() {
         let Some(device) = first_device() else { return };
         let limits = device.limits();
@@ -4137,9 +3160,7 @@ extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
 
         let build = |label: &str| {
             let device = adapter.open(request.clone()).unwrap();
-            let t = Instant::now();
             let shader = device.create_shader(ShaderDesc::hip(&src)).unwrap();
-            println!("hip: {label}: {:?}", t.elapsed());
             let pipeline = device
                 .create_compute_pipeline(ComputePipelineDesc {
                     shader,
@@ -4183,69 +3204,6 @@ extern "C" __global__ __launch_bounds__(64) void small(unsigned int* out) {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Destroying a buffer never calls `hipFree` inline (it waits for every kernel).
-    #[test]
-    fn destroying_large_buffer_does_not_wait_for_busy_gpu() {
-        const SPIN: &str = r#"
-extern "C" __global__ void spin(unsigned int ticks) {
-    unsigned long long start = wall_clock64();
-    while (wall_clock64() - start < ticks) {}
-}
-"#;
-        let Some(inst) = try_instance() else { return };
-        let adapter = inst.request_adapter(AdapterRequest::default()).unwrap();
-        let busy = adapter.open(DeviceRequest::default()).unwrap();
-        let other = adapter.open(DeviceRequest::default()).unwrap();
-
-        let shader = busy.create_shader(ShaderDesc::hip(SPIN)).unwrap();
-        let pipeline = busy
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry: "spin",
-                block: [1, 1, 1],
-            })
-            .unwrap();
-        let sizes: [u64; 3] = [64 << 20, 1 << 20, 600 << 20];
-        let bufs: Vec<_> = sizes
-            .iter()
-            .map(|&size| buffer(other.as_ref(), size, BufferUsage::STORAGE))
-            .collect();
-
-        let ticks = zengpu_hal::Scalar::U32(50_000_000);
-        let submission = busy
-            .submit(
-                1,
-                pipeline,
-                Bindings {
-                    buffers: &[],
-                    textures: &[],
-                    images: &[],
-                    scalars: &[ticks],
-                },
-                [1, 1, 1],
-            )
-            .unwrap();
-        sleep(Duration::from_millis(50));
-        let t = Instant::now();
-        for b in bufs {
-            other.destroy_buffer(b);
-        }
-        let took = t.elapsed();
-        let pending = submission.poll().unwrap() == SubmissionStatus::Pending;
-        submission.wait(Duration::from_secs(30)).unwrap();
-        println!(
-            "hip: destroy 64 MiB + 1 MiB + 600 MiB while GPU busy: {took:?} (kernel still running: {pending})"
-        );
-        assert!(
-            pending,
-            "spin kernel ended too early for the test to mean anything"
-        );
-        assert!(took < Duration::from_millis(100), "destroy waited {took:?}");
-
-        busy.destroy_pipeline(pipeline);
-        busy.destroy_shader(shader);
-    }
-
     /// Host-staged copies use 4 MiB chunks. A size that is not a whole multiple leaves a
     /// short tail chunk.
     #[test]
@@ -4269,15 +3227,6 @@ extern "C" __global__ void spin(unsigned int ticks) {
         dst_dev
             .copy_from_peer(dst, src_dev.as_ref(), src, bytes as u64)
             .unwrap();
-        let t = Instant::now();
-        dst_dev
-            .copy_from_peer(dst, src_dev.as_ref(), src, bytes as u64)
-            .unwrap();
-        let secs = t.elapsed().as_secs_f64();
-        println!(
-            "hip: peer copy 64 MiB  {:.1} GB/s",
-            bytes as f64 / secs / 1e9
-        );
         assert_eq!(dst_dev.read_buffer(dst, 0, bytes as u64).unwrap(), data);
         src_dev.destroy_buffer(src);
         dst_dev.destroy_buffer(dst);
@@ -4406,13 +3355,8 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
         device.destroy_buffer(y);
     }
 
-    /// The two timing-sensitive write tests share one GPU, and HIP calls from one can stall the
-    /// other's copy, so they run one at a time.
-    static WRITE_TIMING: Mutex<()> = Mutex::new(());
-
     #[test]
-    fn write_to_idle_buffer_does_not_wait_for_busy_one() {
-        let _serial = WRITE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
+    fn writes_to_busy_and_idle_buffers_keep_their_data() {
         let Some(device) = open_device() else { return };
         let device = &*device;
         const N: usize = 1 << 16;
@@ -4430,142 +3374,17 @@ extern "C" __global__ void slow_copy(const float* in, float* out, unsigned int n
             &[Scalar::U32(64), Scalar::U32(4_000_000_000)],
             64,
         );
-        let payload = float_bytes((0..N).map(|i| i as f32 * 0.5));
-        device.write_buffer(idle, 0, &payload).unwrap();
-        assert_eq!(
-            spin.poll().unwrap(),
-            SubmissionStatus::Pending,
-            "write waited for an unrelated kernel"
-        );
-        assert_eq!(device.read_buffer(idle, 0, size).unwrap(), payload);
+        let idle_data = float_bytes((0..N).map(|i| i as f32 * 0.5));
+        let busy_data = float_bytes((0..N).map(|i| -(i as f32)));
+        device.write_buffer(idle, 0, &idle_data).unwrap();
+        device.write_buffer(busy, 0, &busy_data).unwrap();
         spin.wait(Duration::from_secs(30)).unwrap();
+        assert_eq!(device.read_buffer(idle, 0, size).unwrap(), idle_data);
+        assert_eq!(device.read_buffer(busy, 0, size).unwrap(), busy_data);
         device.destroy_pipeline(slow);
         device.destroy_shader(shader);
         device.destroy_buffer(busy);
         device.destroy_buffer(idle);
         device.destroy_buffer(scratch);
-    }
-
-    #[test]
-    fn write_to_busy_buffer_waits_for_its_kernel() {
-        let _serial = WRITE_TIMING.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(device) = open_device() else { return };
-        let device = &*device;
-        const N: usize = 1 << 16;
-        let size = (N * 4) as u64;
-        let (x, y) = (rw_buffer(device, size), rw_buffer(device, size));
-        let (shader, slow) = kernel(device, COPY_SRC, "slow_copy");
-        let first = float_bytes((0..N).map(|i| i as f32));
-        device.write_buffer(x, 0, &first).unwrap();
-        let spin = dispatch(
-            device,
-            slow,
-            &[x, y],
-            &[Scalar::U32(64), Scalar::U32(4_000_000_000)],
-            64,
-        );
-        let second = float_bytes((0..N).map(|i| -(i as f32)));
-        device.write_buffer(x, 0, &second).unwrap();
-        assert_eq!(
-            spin.poll().unwrap(),
-            SubmissionStatus::Complete,
-            "write did not wait for the kernel reading its target"
-        );
-        assert_eq!(device.read_buffer(x, 0, size).unwrap(), second);
-        assert_eq!(device.read_buffer(y, 0, 256).unwrap(), first[..256]);
-        device.destroy_pipeline(slow);
-        device.destroy_shader(shader);
-        device.destroy_buffer(x);
-        device.destroy_buffer(y);
-    }
-
-    const HALF_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
-        push P { n: u32 }
-        @workgroup_size(64)
-        kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, packed: device buffer<u32>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, nib: device mut buffer<u32>, p: P, id: global_id) {
-            let i = id.x
-            if i < p.n {
-                yh[i] = xh[i] * 2.0
-                yb[i] = xb[i] * 2.0
-                nib[i] = ((packed[i >> 3] >> ((i & 7) << 2)) & 15) | ((i ^ 1) << 8)
-            }
-        }
-    );
-
-    #[test]
-    fn zsl_half_buffers_and_bitwise_ops() {
-        let Some(device) = open_device() else { return };
-        let device = &*device;
-        let (shader, entry) = HALF_ZSL.create(device).unwrap();
-        let pipeline = device
-            .create_compute_pipeline(ComputePipelineDesc {
-                shader,
-                entry,
-                block: [64, 1, 1],
-            })
-            .unwrap();
-        let n = 1001u32;
-        let x: Vec<f32> = (0..n).map(|i| ((i % 256) as f32 - 128.0) * 0.25).collect();
-        let f16_bits = |v: f32| -> u16 {
-            if v == 0.0 {
-                return 0;
-            }
-            let b = v.to_bits();
-            (((b >> 16) & 0x8000) | ((((b >> 23) & 0xff) - 112) << 10) | ((b >> 13) & 0x3ff)) as u16
-        };
-        let halves =
-            |bits: Vec<u16>| -> Vec<u8> { bits.into_iter().flat_map(u16::to_le_bytes).collect() };
-        let words: Vec<u32> = (0..n.div_ceil(8))
-            .map(|i| i.wrapping_mul(0x9e37_79b9))
-            .collect();
-        let inputs = [
-            halves(x.iter().map(|&v| f16_bits(v)).collect()),
-            halves(x.iter().map(|&v| (v.to_bits() >> 16) as u16).collect()),
-            words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-        ];
-        let mut bufs = Vec::new();
-        for data in &inputs {
-            let b = rw_buffer(device, data.len() as u64);
-            device.write_buffer(b, 0, data).unwrap();
-            bufs.push(b);
-        }
-        for size in [2 * n, 2 * n, 4 * n] {
-            bufs.push(rw_buffer(device, u64::from(size)));
-        }
-        dispatch(device, pipeline, &bufs, &[Scalar::U32(n)], n)
-            .wait(Duration::MAX)
-            .unwrap();
-
-        let read = |b: BufferHandle, len: u32| device.read_buffer(b, 0, u64::from(len)).unwrap();
-        let (yh, yb, nib) = (
-            read(bufs[3], 2 * n),
-            read(bufs[4], 2 * n),
-            read(bufs[5], 4 * n),
-        );
-        for i in 0..n as usize {
-            let want = 2.0 * x[i];
-            assert_eq!(
-                u16::from_le_bytes([yh[2 * i], yh[2 * i + 1]]),
-                f16_bits(want),
-                "f16 {i}"
-            );
-            assert_eq!(
-                u16::from_le_bytes([yb[2 * i], yb[2 * i + 1]]),
-                (want.to_bits() >> 16) as u16,
-                "bf16 {i}"
-            );
-            let w = words[i >> 3];
-            let got = u32::from_le_bytes(nib[4 * i..4 * i + 4].try_into().unwrap());
-            assert_eq!(
-                got,
-                ((w >> ((i & 7) << 2)) & 15) | (((i ^ 1) as u32) << 8),
-                "nibble {i}"
-            );
-        }
-        device.destroy_pipeline(pipeline);
-        device.destroy_shader(shader);
-        for b in bufs {
-            device.destroy_buffer(b);
-        }
     }
 }

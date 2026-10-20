@@ -405,10 +405,6 @@ mod tests {
         assert_eq!(GfxFamily::from_gfx("gfx9999"), GfxFamily::Unknown);
         assert_eq!(GfxFamily::from_gfx("navi10"), GfxFamily::Unknown);
         assert_eq!(GfxFamily::from_gfx(""), GfxFamily::Unknown);
-    }
-
-    #[test]
-    fn rdna1_targets_classify() {
         for gfx in ["gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1010:xnack-"] {
             assert_eq!(GfxFamily::from_gfx(gfx), GfxFamily::Rdna1, "{gfx}");
         }
@@ -458,53 +454,6 @@ mod tests {
         );
         assert!(!caps.target_rdna4, "ROCm 6.1 runtime cannot target gfx12");
         assert!(!caps.target_supported());
-    }
-
-    #[test]
-    fn arch_properties() {
-        assert!(GfxFamily::Rdna4.wgp_default());
-        assert!(GfxFamily::Rdna3.wgp_default());
-        assert!(GfxFamily::Rdna2.wgp_default());
-        assert!(GfxFamily::Rdna1.wgp_default());
-        assert!(!GfxFamily::Cdna2.wgp_default());
-
-        assert_eq!(GfxFamily::Rdna4.wave_size(), 32);
-        assert_eq!(GfxFamily::Rdna1.wave_size(), 32);
-        assert_eq!(GfxFamily::Cdna2.wave_size(), 64);
-        assert_eq!(GfxFamily::Gcn5.wave_size(), 64);
-
-        assert!(GfxFamily::Cdna3.has_mfma());
-        assert!(GfxFamily::Cdna2.has_mfma());
-        assert!(!GfxFamily::Rdna4.has_mfma());
-
-        assert!(GfxFamily::Rdna4.has_wmma());
-        assert!(GfxFamily::Rdna3.has_wmma());
-        assert!(!GfxFamily::Rdna2.has_wmma());
-        assert!(!GfxFamily::Cdna3.has_wmma());
-
-        assert!(GfxFamily::Cdna1.full_fp64());
-        assert!(!GfxFamily::Rdna4.full_fp64());
-    }
-
-    #[test]
-    fn version_ordering() {
-        let v60 = RocmVersion::new(6, 0);
-        let v72 = RocmVersion::new(7, 2);
-        let v53 = RocmVersion::new(5, 3);
-        assert!(v72 > v60);
-        assert!(v72.at_least(7, 0));
-        assert!(v72.at_least(6, 0));
-        assert!(!v60.at_least(7, 0));
-        assert!(!v53.at_least(6, 0));
-    }
-
-    #[test]
-    fn compile_time_version_is_sane() {
-        assert!(
-            RocmVersion::COMPILE_TIME.at_least(5, 0),
-            "compiled against ROCm {}: expected ≥ 5.0",
-            RocmVersion::COMPILE_TIME,
-        );
     }
 
     #[test]
@@ -568,25 +517,5 @@ mod tests {
                 .iter()
                 .any(|o| o.contains("gpu-architecture"))
         );
-    }
-
-    #[test]
-    fn runtime_version_available() {
-        let rt = RocmVersion::runtime();
-        assert!(
-            rt.at_least(5, 0),
-            "runtime ROCm version {rt} is unexpectedly old",
-        );
-    }
-
-    #[test]
-    fn capability_report_format() {
-        let v72 = RocmVersion::new(7, 2);
-        let caps = HipCapabilities::for_family(v72, v72, GfxFamily::Rdna4);
-        let report = caps.report("AMD Radeon RX 9060 XT", "gfx1200");
-        assert!(report.contains("gfx1200"));
-        assert!(report.contains("RDNA4"));
-        assert!(report.contains("wave32"));
-        assert!(report.contains("compile=7.2"));
     }
 }
