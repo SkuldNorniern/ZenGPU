@@ -1872,6 +1872,80 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             })
         }
 
+        BuiltinFn::F16Lo | BuiltinFn::F16Hi => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {name}(x) takes 1 arg"));
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let word = coerce(ctx, v, ctx.u32_id);
+            let (lo, hi) = f16_lanes(ctx, word);
+            let id = if func == BuiltinFn::F16Lo { lo } else { hi };
+            Ok(Val {
+                id,
+                ty: ctx.f32_id,
+            })
+        }
+        BuiltinFn::PackF16x2 => {
+            if args.len() != 2 {
+                return Err("ZSL: pack_f16x2(lo, hi) takes 2 args".into());
+            }
+            let lo_val = lower_expr(ctx, &args[0])?;
+            let lo = coerce(ctx, lo_val, ctx.f32_id);
+            let hi_val = lower_expr(ctx, &args[1])?;
+            let hi = coerce(ctx, hi_val, ctx.f32_id);
+            let id = f16_pack(ctx, lo, hi);
+            Ok(Val {
+                id,
+                ty: ctx.u32_id,
+            })
+        }
+        BuiltinFn::BitcastF32 | BuiltinFn::BitcastU32 | BuiltinFn::BitcastI32 => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {name}(x) takes 1 arg"));
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let (target, ty) = match func {
+                BuiltinFn::BitcastF32 => (ctx.t_f32, ctx.f32_id),
+                BuiltinFn::BitcastU32 => (ctx.t_u32, ctx.u32_id),
+                _ => (ctx.t_i32, ctx.i32_id),
+            };
+            if v.ty == ty {
+                return Ok(v);
+            }
+            if ![ctx.f32_id, ctx.u32_id, ctx.i32_id].contains(&v.ty) {
+                return Err(format!("ZSL: {name}() takes an f32, u32 or i32 value"));
+            }
+            let id = ctx.spv.op_bitcast(target, v.id);
+            Ok(Val { id, ty })
+        }
+        BuiltinFn::Byte | BuiltinFn::SByte => {
+            if args.len() != 2 {
+                return Err(format!("ZSL: {name}(x, i) takes 2 args"));
+            }
+            let x_val = lower_expr(ctx, &args[0])?;
+            let word = coerce(ctx, x_val, ctx.u32_id);
+            let i_val = lower_expr(ctx, &args[1])?;
+            let index = coerce(ctx, i_val, ctx.u32_id);
+            let t_u32 = ctx.t_u32;
+            let c3 = ctx.spv.constant_u32(t_u32, 3);
+            let c8 = ctx.spv.constant_u32(t_u32, 8);
+            let lane = ctx.spv.op_bitwise_and(t_u32, index, c3);
+            let offset = ctx.spv.op_shift_left_logical(t_u32, lane, c3);
+            let id = if func == BuiltinFn::Byte {
+                ctx.spv.op_bitfield_uextract(t_u32, word, offset, c8)
+            } else {
+                let t_i32 = ctx.t_i32;
+                ctx.spv.op_bitfield_sextract(t_i32, word, offset, c8)
+            };
+            Ok(Val {
+                id,
+                ty: if func == BuiltinFn::Byte {
+                    ctx.u32_id
+                } else {
+                    ctx.i32_id
+                },
+            })
+        }
         BuiltinFn::SubgroupShuffleUp | BuiltinFn::SubgroupShuffleDown => {
             if args.len() != 2 {
                 return Err(format!("ZSL: {}(value, delta) takes 2 args", func.name()));

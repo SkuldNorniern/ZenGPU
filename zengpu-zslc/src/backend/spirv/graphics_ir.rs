@@ -901,6 +901,14 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::Dot2F16
         | BuiltinFn::FunnelShr
         | BuiltinFn::BytePerm
+        | BuiltinFn::F16Lo
+        | BuiltinFn::F16Hi
+        | BuiltinFn::PackF16x2
+        | BuiltinFn::BitcastF32
+        | BuiltinFn::BitcastU32
+        | BuiltinFn::BitcastI32
+        | BuiltinFn::Byte
+        | BuiltinFn::SByte
         | BuiltinFn::Select
         | BuiltinFn::I32
         | BuiltinFn::F16Round

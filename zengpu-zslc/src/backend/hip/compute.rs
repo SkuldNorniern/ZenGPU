@@ -160,6 +160,18 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
 typedef unsigned short zsl_u16x2 __attribute__((ext_vector_type(2)));
 typedef _Float16 zsl_f16x2 __attribute__((ext_vector_type(2)));
 // Rust `as` from f32: NaN -> 0, saturate at the i32 bounds, truncate.
+__device__ __forceinline__ float zsl_f16_lo(unsigned int x) { return (float)__builtin_bit_cast(_Float16, (unsigned short)(x & 0xffffu)); }
+__device__ __forceinline__ float zsl_f16_hi(unsigned int x) { return (float)__builtin_bit_cast(_Float16, (unsigned short)(x >> 16)); }
+__device__ __forceinline__ unsigned int zsl_pack_f16x2(float lo, float hi) {
+    return (unsigned int)__builtin_bit_cast(unsigned short, (_Float16)lo) | ((unsigned int)__builtin_bit_cast(unsigned short, (_Float16)hi) << 16);
+}
+__device__ __forceinline__ float zsl_bitcast_f32(unsigned int x) { return __builtin_bit_cast(float, x); }
+__device__ __forceinline__ unsigned int zsl_bitcast_u32(float x) { return __builtin_bit_cast(unsigned int, x); }
+__device__ __forceinline__ unsigned int zsl_bitcast_u32(int x) { return (unsigned int)x; }
+__device__ __forceinline__ unsigned int zsl_bitcast_u32(unsigned int x) { return x; }
+__device__ __forceinline__ int zsl_bitcast_i32(unsigned int x) { return (int)x; }
+__device__ __forceinline__ unsigned int zsl_byte(unsigned int x, unsigned int i) { return (x >> (8u * (i & 3u))) & 0xffu; }
+__device__ __forceinline__ int zsl_sbyte(unsigned int x, unsigned int i) { return (int)(signed char)((x >> (8u * (i & 3u))) & 0xffu); }
 __device__ __forceinline__ int zsl_f32_to_i32(float x) {
     if (x != x) return 0;
     if (x >= 2147483648.0f) return 2147483647;
@@ -822,6 +834,14 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::BytePerm => {
                     format!("zsl_byte_perm({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::F16Lo => format!("zsl_f16_lo({})", args_s[0]),
+                BuiltinFn::F16Hi => format!("zsl_f16_hi({})", args_s[0]),
+                BuiltinFn::PackF16x2 => format!("zsl_pack_f16x2({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::BitcastF32 => format!("zsl_bitcast_f32({})", args_s[0]),
+                BuiltinFn::BitcastU32 => format!("zsl_bitcast_u32({})", args_s[0]),
+                BuiltinFn::BitcastI32 => format!("zsl_bitcast_i32({})", args_s[0]),
+                BuiltinFn::Byte => format!("zsl_byte({}, {})", args_s[0], args_s[1]),
+                BuiltinFn::SByte => format!("zsl_sbyte({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::SubgroupAny => {
                     format!("((bool)__any((int)({})))", args_s[0])
                 }

@@ -207,7 +207,12 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::PkMulF16
             | BuiltinFn::PkFmaF16
             | BuiltinFn::FunnelShr
-            | BuiltinFn::BytePerm => u32_id,
+            | BuiltinFn::BytePerm
+            | BuiltinFn::PackF16x2
+            | BuiltinFn::BitcastU32
+            | BuiltinFn::Byte => u32_id,
+            BuiltinFn::F16Lo | BuiltinFn::F16Hi | BuiltinFn::BitcastF32 => f32_id,
+            BuiltinFn::BitcastI32 | BuiltinFn::SByte => i32_id,
             BuiltinFn::IsNan
             | BuiltinFn::IsInf
             | BuiltinFn::IsFinite

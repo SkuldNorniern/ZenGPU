@@ -118,6 +118,20 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
          }\n",
     );
     s.push_str(
+        "inline float zsl_f16_lo(uint x) { return float(as_type<half>(ushort(x & 0xffffu))); }\n\
+         inline float zsl_f16_hi(uint x) { return float(as_type<half>(ushort(x >> 16))); }\n\
+         inline uint zsl_pack_f16x2(float lo, float hi) {\n\
+         \x20   return uint(as_type<ushort>(half(lo))) | (uint(as_type<ushort>(half(hi))) << 16);\n\
+         }\n\
+         inline float zsl_bitcast_f32(uint x) { return as_type<float>(x); }\n\
+         inline uint zsl_bitcast_u32(float x) { return as_type<uint>(x); }\n\
+         inline uint zsl_bitcast_u32(int x) { return uint(x); }\n\
+         inline uint zsl_bitcast_u32(uint x) { return x; }\n\
+         inline int zsl_bitcast_i32(uint x) { return int(x); }\n\
+         inline uint zsl_byte(uint x, uint i) { return (x >> (8u * (i & 3u))) & 0xffu; }\n\
+         inline int zsl_sbyte(uint x, uint i) { return int(char((x >> (8u * (i & 3u))) & 0xffu)); }\n",
+    );
+    s.push_str(
         "inline uint zsl_dot4(uint a, bool sa, uint b, bool sb, uint acc) {\n\
          \x20   for (uint i = 0; i < 4; ++i) {\n\
          \x20       uint ua = (a >> (8 * i)) & 0xffu;\n\
@@ -592,6 +606,14 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                     }
                 }
                 BuiltinFn::BytePerm => format!("zsl_byte_perm({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::F16Lo => format!("zsl_f16_lo({})", a[0]),
+                BuiltinFn::F16Hi => format!("zsl_f16_hi({})", a[0]),
+                BuiltinFn::PackF16x2 => format!("zsl_pack_f16x2({}, {})", a[0], a[1]),
+                BuiltinFn::BitcastF32 => format!("zsl_bitcast_f32({})", a[0]),
+                BuiltinFn::BitcastU32 => format!("zsl_bitcast_u32({})", a[0]),
+                BuiltinFn::BitcastI32 => format!("zsl_bitcast_i32({})", a[0]),
+                BuiltinFn::Byte => format!("zsl_byte({}, {})", a[0], a[1]),
+                BuiltinFn::SByte => format!("zsl_sbyte({}, {})", a[0], a[1]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
                 BuiltinFn::SubgroupBallot => {
