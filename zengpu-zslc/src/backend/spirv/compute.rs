@@ -1800,7 +1800,6 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
 }
 
 const NO_CONTRACTION: u32 = 42;
-const GLSL_PACK_HALF_2X16: u32 = 58;
 const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
 /// `u32` word holding half element `idx`, and its bit offset (0 or 16).
@@ -1852,12 +1851,7 @@ fn store_half(
     let t_u32 = ctx.t_u32;
     let c16 = ctx.spv.constant_u32(t_u32, 16);
     let bits = match half {
-        Half::F16 => {
-            let zero = ctx.spv.constant_f32(ctx.t_f32, 0.0);
-            let v2 = ctx.spv.op_composite_construct(ctx.t_vec2, &[value, zero]);
-            ctx.spv
-                .op_ext_inst(t_u32, ctx.glsl_ext, GLSL_PACK_HALF_2X16, &[v2])
-        }
+        Half::F16 => f32_to_f16_rne(ctx, value),
         Half::Bf16 => {
             let c1 = ctx.spv.constant_u32(t_u32, 1);
             let c7fff = ctx.spv.constant_u32(t_u32, 0x7fff);

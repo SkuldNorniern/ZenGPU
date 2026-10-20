@@ -196,15 +196,68 @@ fn half_conversions_round_trip() {
 const HALF_IO_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     push P { n: u32 }
     @workgroup_size(64)
-    kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, p: P, id: global_id) {
+    kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, xf: device buffer<f32>, zh: device mut buffer<f16>, zb: device mut buffer<bf16>, p: P, id: global_id) {
         let i = id.x
         if i < p.n {
             yh[i] = xh[i] * 2.0
             yb[i] = xb[i] * 2.0
             sum[i] = xh[i] + xb[i]
+            zh[i] = xf[i]
+            zb[i] = xf[i]
         }
     }
 );
+
+/// Rounds `x` to nearest even at `man` fraction bits. Assumes exp >= `min_exp` and a finite result
+/// <= `max`. `x` must not be NaN.
+fn round_ref(x: f32, man: i32, min_exp: i32, max: f64) -> f64 {
+    let v = f64::from(x);
+    if v == 0.0 || !v.is_finite() {
+        return v;
+    }
+    let e = (v.abs().log2().floor() as i32).max(min_exp);
+    let ulp = 2f64.powi(e - man);
+    let q = (v / ulp).round_ties_even() * ulp;
+    if q.abs() > max {
+        f64::INFINITY.copysign(v)
+    } else {
+        q
+    }
+}
+
+fn store_inputs(n: u32) -> Vec<f32> {
+    let edge = [
+        65504.0,
+        65519.0,
+        65520.0,
+        1.0e30,
+        -1.0e30,
+        2f32.powi(-24),
+        2f32.powi(-25),
+        3.0 * 2f32.powi(-25),
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        2f32.powi(-14) * (1.0 - 2f32.powi(-11)),
+        3.0e38,
+        f32::MAX,
+        1.0e-40,
+        -2.0 * 2f32.powi(-25),
+    ];
+    (0..n)
+        .map(|i| {
+            if let Some(&e) = edge.get(i as usize) {
+                return e;
+            }
+            let v = if i % 2 == 0 {
+                (1.0 + ((i % 1024) as f32 + 0.5) * 2f32.powi(-10)) * 2f32.powi((i % 40) as i32 - 20)
+            } else {
+                (1.0 + ((i % 128) as f32 + 0.5) * 2f32.powi(-7)) * 2f32.powi((i % 40) as i32 - 20)
+            };
+            if i % 3 == 0 { -v } else { v }
+        })
+        .collect()
+}
 
 #[test]
 fn zsl_half_buffers_load_and_store() {
@@ -227,6 +280,10 @@ fn zsl_half_buffers_load_and_store() {
     let yh = pool.alloc(vec![n], DType::F16).unwrap();
     let yb = pool.alloc(vec![n], DType::Bf16).unwrap();
     let sum = pool.alloc(vec![n], DType::F32).unwrap();
+    let store_in = store_inputs(n);
+    let xf = upload(&pool, vec![n], &store_in);
+    let zh = pool.alloc(vec![n], DType::F16).unwrap();
+    let zb = pool.alloc(vec![n], DType::Bf16).unwrap();
     let mut ops = OpList::new(&pool);
     ops.dispatch(
         pipeline,
@@ -236,6 +293,9 @@ fn zsl_half_buffers_load_and_store() {
             yh.buffer.index(),
             yb.buffer.index(),
             sum.buffer.index(),
+            xf.buffer.index(),
+            zh.buffer.index(),
+            zb.buffer.index(),
         ],
         &[zengpu_hal::Scalar::U32(n)],
         [n.div_ceil(64), 1, 1],
@@ -252,13 +312,29 @@ fn zsl_half_buffers_load_and_store() {
             .collect()
     };
     let (out_h, out_b, out_sum) = (halves(&yh), halves(&yb), download(&*device, &sum));
+    let (store_h, store_b) = (halves(&zh), halves(&zb));
     for i in 0..n as usize {
         assert_eq!(f16_bits_to_f32(out_h[i]), 2.0 * x[i], "f16 at {i}");
         assert_eq!(bf16_bits_to_f32(out_b[i]), 2.0 * x[i], "bf16 at {i}");
         assert_eq!(out_sum[i], 2.0 * x[i], "sum at {i}");
+        let v = store_in[i];
+        let want_h = round_ref(v, 10, -14, 65504.0);
+        let want_b = round_ref(v, 7, -126, f64::from(f32::from_bits(0x7f7f_0000)));
+        let got_h = f64::from(f16_bits_to_f32(store_h[i]));
+        let got_b = f64::from(bf16_bits_to_f32(store_b[i]));
+        assert_eq!(
+            got_h.to_bits(),
+            want_h.to_bits(),
+            "f16 store of {v:e} at {i}"
+        );
+        assert_eq!(
+            got_b.to_bits(),
+            want_b.to_bits(),
+            "bf16 store of {v:e} at {i}"
+        );
     }
     drop(ops);
-    for a in [xh, xb, yh, yb, sum] {
+    for a in [xh, xb, yh, yb, sum, xf, zh, zb] {
         pool.free(a);
     }
     device.destroy_pipeline(pipeline);
@@ -762,7 +838,8 @@ fn zsl_packed_ops_match_cpu() {
             (want_f.is_nan() && got_f.is_nan())
                 || want_f.to_bits() == got_f.to_bits()
                 || (got_f - want_f).abs() <= tol,
-            "dot2_f16 at {i}: got {got_f:?} want {want_f:?} x={x:08x} y={y:08x} acc={:?}", fs[i]
+            "dot2_f16 at {i}: got {got_f:?} want {want_f:?} x={x:08x} y={y:08x} acc={:?}",
+            fs[i]
         );
     }
     drop(ops);
