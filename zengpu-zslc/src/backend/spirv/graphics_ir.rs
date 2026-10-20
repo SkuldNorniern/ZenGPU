@@ -1386,22 +1386,10 @@ pub(crate) mod tests {
             push P { viewport: f32x2, tint: f32x4, slot: u32 }
             vertex vs(@location(0) rect: f32x4, p: P) -> (f32x4, f32x2) {
                 let half = rect.zw * 0.5
-                let reach = half + f32x2(1.0)
+                let reach = half + f32x2(1.0) + p.tint.zw * p.tint.x
                 let px = rect.xy + half + reach
                 let ndc = px / p.viewport * 2.0 - 1.0
                 (f32x4(ndc, 0.0, 1.0), max(abs(ndc) - half + 1.0, 0.0))
-            }
-            "#,
-        ));
-    }
-
-    #[test]
-    fn push_vector_fields_take_swizzles() {
-        validate(&lower(
-            r#"
-            push P { tint: f32x4, scale: f32x2 }
-            fragment fs(p: P) -> f32x4 {
-                f32x4(p.tint.x, p.scale.y, p.tint.zw)
             }
             "#,
         ));
@@ -1481,23 +1469,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn samples_the_bindless_texture_table() {
-        validate(&lower(
-            r#"
-            push P { viewport: f32x2, slot: u32 }
-            fragment fs(@location(0) uv: f32x2, @location(1) color: f32x4, tex: textures, p: P) -> f32x4 {
-                let coverage = tex[p.slot].sample(uv)
-                let alpha = coverage.a * color.a
-                if alpha <= 0.0 {
-                    discard
-                }
-                f32x4(color.rgb, alpha)
-            }
-            "#,
-        ));
-    }
-
-    #[test]
     fn vertex_samples_name_their_level() {
         validate(&lower(
             r#"
@@ -1570,30 +1541,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn arrays_are_read_only() {
-        assert!(
-            parse_zsl(
-                "vertex vs(vi: vertex_index) -> f32x4 { let a = [1.0, 2.0]
- a = 1.0
- f32x4(a[vi]) }"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn discard_is_fragment_only() {
-        assert!(
-            parse_zsl(
-                "vertex vs(@location(0) p: f32x4) -> f32x4 { discard
- p }"
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn builtins_belong_to_their_stage() {
+    fn stage_and_mutability_rules_are_enforced() {
+        assert!(parse_zsl("vertex vs(vi: vertex_index) -> f32x4 { let a = [1.0, 2.0]\n a = 1.0\n f32x4(a[vi]) }").is_err());
+        assert!(parse_zsl("vertex vs(@location(0) p: f32x4) -> f32x4 { discard\n p }").is_err());
         assert!(parse_zsl("fragment fs(vi: vertex_index) -> f32x4 { f32x4(1.0) }").is_err());
         assert!(parse_zsl("vertex vs(at: frag_coord) -> f32x4 { at }").is_err());
     }

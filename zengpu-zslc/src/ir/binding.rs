@@ -124,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn f32_buffers_route_to_binding_zero() {
+    fn untyped_buffers_route_to_binding_zero() {
         let src = r#"
             @workgroup_size(64)
             kernel copy(src: device buffer<f32>, dst: device mut buffer<f32>, id: global_id) {
@@ -135,10 +135,7 @@ mod tests {
         let bindings = compute_bindings(&module);
         assert_eq!(bindings.len(), 2);
         assert!(bindings.iter().all(|(_, b)| b.binding == 0));
-    }
 
-    #[test]
-    fn graphics_buffers_route_to_binding_zero() {
         let src = r#"
             @workgroup_size(1)
             kernel k(dst: device mut buffer<f32>, id: global_id) {

@@ -404,25 +404,19 @@ mod tests {
     }
 
     #[test]
-    fn compute_buffer_load_narrows_bf16_to_f32() {
+    fn compute_buffer_load_narrows_half_to_f32() {
         let mut arena = TypeArena::new();
         let mut ctx = ComputeTypeCtx::default();
         ctx.buffers.insert("x".into(), arena.bf16_id());
-
         let load = IrExpr::BufferLoad {
             buf: "x".into(),
             index: Box::new(IrExpr::LitU32(0)),
         };
         let ty = type_of_compute_expr(&load, &ctx, &mut arena);
         assert_eq!(ty, arena.f32_id());
-    }
 
-    #[test]
-    fn compute_buffer_load_narrows_f16_to_f32() {
-        let mut arena = TypeArena::new();
         let mut ctx = ComputeTypeCtx::default();
         ctx.buffers.insert("x".into(), arena.f16_id());
-
         let load = IrExpr::BufferLoad {
             buf: "x".into(),
             index: Box::new(IrExpr::LitU32(0)),

@@ -208,164 +208,40 @@ mod tests {
     }
 
     #[test]
-    fn collective_inside_group_id_guard_is_uniform() {
-        check(
-            r#"
-            push P { n: u32 }
+    fn collectives_are_uniform_under_group_guards_and_divergent_under_local_guards() {
+        for call in [
+            "subgroup_any(id.x < 10u32)",
+            "subgroup_ballot(id.x < 10u32)",
+            "subgroup_all(id.x < 10u32)",
+            "subgroup_shuffle_xor(id.x * 1.0, 1u32)",
+            "subgroup_reduce_add(id.x * 1.0)",
+            "workgroup_reduce_add(id.x * 1.0)",
+        ] {
+            let uniform = format!(
+                r#"
+            push P {{ n: u32 }}
             @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, push: P, id: global_id) {
-                let r = group_id().x
-                if r < push.n {
-                    subgroup_any(id.x < 10u32)
-                }
-            }
-        "#,
-        )
-        .expect("group-id guard is uniform");
-    }
-
-    #[test]
-    fn subgroup_any_inside_local_id_guard_is_rejected() {
-        let err = check(
-            r#"
+            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {{
+                if group_id().x < push.n {{
+                    {call}
+                }}
+            }}
+        "#
+            );
+            check(&uniform).expect("group-id guard is uniform");
+            let divergent = format!(
+                r#"
             @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, id: global_id) {
-                if local_id().x < 5u32 {
-                    subgroup_any(id.x < 10u32)
-                }
-            }
-        "#,
-        )
-        .expect_err("local-id guard is divergent");
-        assert!(err.contains("uniform"));
-    }
-
-    #[test]
-    fn subgroup_ballot_inside_local_id_guard_is_rejected() {
-        let err = check(
-            r#"
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, id: global_id) {
-                if local_id().x < 5u32 {
-                    subgroup_ballot(id.x < 10u32)
-                }
-            }
-        "#,
-        )
-        .expect_err("local-id guard is divergent");
-        assert!(err.contains("uniform"));
-    }
-
-    #[test]
-    fn subgroup_all_inside_group_id_guard_is_uniform() {
-        check(
-            r#"
-            push P { n: u32 }
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, push: P, id: global_id) {
-                if group_id().x < push.n {
-                    subgroup_all(id.x < 10u32)
-                }
-            }
-        "#,
-        )
-        .expect("group-id guard is uniform");
-    }
-
-    #[test]
-    fn subgroup_shuffle_xor_inside_group_id_guard_is_uniform() {
-        check(
-            r#"
-            push P { n: u32 }
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
-                if group_id().x < push.n {
-                    out[id.x] = subgroup_shuffle_xor(id.x * 1.0, 1u32)
-                }
-            }
-        "#,
-        )
-        .expect("group-id guard is uniform");
-    }
-
-    #[test]
-    fn subgroup_shuffle_xor_inside_local_id_guard_is_rejected() {
-        let err = check(
-            r#"
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<f32>, id: global_id) {
-                if local_id().x < 5u32 {
-                    out[id.x] = subgroup_shuffle_xor(id.x * 1.0, 1u32)
-                }
-            }
-        "#,
-        )
-        .expect_err("local-id guard is divergent");
-        assert!(err.contains("uniform"));
-    }
-
-    #[test]
-    fn subgroup_reduce_add_inside_group_id_guard_is_uniform() {
-        check(
-            r#"
-            push P { n: u32 }
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, push: P, id: global_id) {
-                if group_id().x < push.n {
-                    out[id.x] = subgroup_reduce_add(id.x)
-                }
-            }
-        "#,
-        )
-        .expect("group-id guard is uniform");
-    }
-
-    #[test]
-    fn subgroup_reduce_add_inside_local_id_guard_is_rejected() {
-        let err = check(
-            r#"
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<u32>, id: global_id) {
-                if local_id().x < 5u32 {
-                    out[id.x] = subgroup_reduce_add(id.x)
-                }
-            }
-        "#,
-        )
-        .expect_err("local-id guard is divergent");
-        assert!(err.contains("uniform"));
-    }
-
-    #[test]
-    fn workgroup_reduce_add_inside_group_id_guard_is_uniform() {
-        check(
-            r#"
-            push P { n: u32 }
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
-                if group_id().x < push.n {
-                    out[id.x] = workgroup_reduce_add(id.x * 1.0)
-                }
-            }
-        "#,
-        )
-        .expect("group-id guard is uniform");
-    }
-
-    #[test]
-    fn workgroup_reduce_add_inside_local_id_guard_is_rejected() {
-        let err = check(
-            r#"
-            @workgroup_size(64)
-            kernel k(out: device mut buffer<f32>, id: global_id) {
-                if local_id().x < 5u32 {
-                    out[id.x] = workgroup_reduce_add(id.x * 1.0)
-                }
-            }
-        "#,
-        )
-        .expect_err("local-id guard is divergent");
-        assert!(err.contains("uniform"));
+            kernel k(out: device mut buffer<f32>, id: global_id) {{
+                if local_id().x < 5u32 {{
+                    {call}
+                }}
+            }}
+        "#
+            );
+            let err = check(&divergent).expect_err("local-id guard is divergent");
+            assert!(err.contains("uniform"), "{call}: {err}");
+        }
     }
 
     #[test]

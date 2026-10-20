@@ -102,29 +102,29 @@ mod tests {
     use crate::ir::types::{FloatFormat, IntWidth, Signedness};
 
     #[test]
-    fn interning_the_same_scalar_type_twice_yields_the_same_id() {
-        let mut arena = TypeArena::new();
-        let a = arena.f32_id();
-        let b = arena.f32_id();
-        assert_eq!(a, b);
-        assert_eq!(
-            *arena.get(a),
-            Type::Float {
-                format: FloatFormat::F32
-            }
-        );
-    }
-
-    #[test]
-    fn distinct_scalar_types_get_distinct_ids() {
+    fn scalar_types_intern_to_distinct_stable_ids() {
         let mut arena = TypeArena::new();
         let f32_id = arena.f32_id();
         let u32_id = arena.u32_id();
         let i32_id = arena.i32_id();
         let bool_id = arena.bool_id();
-        assert_ne!(f32_id, u32_id);
-        assert_ne!(u32_id, i32_id);
-        assert_ne!(i32_id, bool_id);
+        let bf16_id = arena.bf16_id();
+        let f16_id = arena.f16_id();
+        assert_eq!(f32_id, arena.f32_id());
+        assert_eq!(bf16_id, arena.bf16_id());
+        assert_eq!(f16_id, arena.f16_id());
+        let ids = [f32_id, u32_id, i32_id, bool_id, bf16_id, f16_id];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(
+            *arena.get(f32_id),
+            Type::Float {
+                format: FloatFormat::F32
+            }
+        );
         assert_eq!(
             *arena.get(u32_id),
             Type::Int {
@@ -132,32 +132,12 @@ mod tests {
                 signedness: Signedness::Unsigned
             }
         );
-    }
-
-    #[test]
-    fn bf16_is_distinct_from_f32_and_idempotent() {
-        let mut arena = TypeArena::new();
-        let bf16_a = arena.bf16_id();
-        let bf16_b = arena.bf16_id();
-        let f32_id = arena.f32_id();
-        assert_eq!(bf16_a, bf16_b);
-        assert_ne!(bf16_a, f32_id);
         assert_eq!(
-            *arena.get(bf16_a),
+            *arena.get(bf16_id),
             Type::Float {
                 format: FloatFormat::Bf16
             }
         );
-    }
-
-    #[test]
-    fn f16_is_distinct_from_bf16_and_f32() {
-        let mut arena = TypeArena::new();
-        let f16_id = arena.f16_id();
-        let bf16_id = arena.bf16_id();
-        let f32_id = arena.f32_id();
-        assert_ne!(f16_id, bf16_id);
-        assert_ne!(f16_id, f32_id);
         assert_eq!(
             *arena.get(f16_id),
             Type::Float {

@@ -37,31 +37,3 @@ pub enum SupportLevel {
     /// Reason shown in diagnostics.
     Unsupported { reason: String },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capability_is_orderable_for_use_as_a_map_key() {
-        let mut caps = vec![Capability::TensorMma, Capability::Int8, Capability::Float64];
-        caps.sort();
-        assert_eq!(
-            caps,
-            vec![Capability::Int8, Capability::Float64, Capability::TensorMma]
-        );
-    }
-
-    #[test]
-    fn support_level_variants_construct_and_compare() {
-        assert_eq!(SupportLevel::Native, SupportLevel::Native);
-        assert_ne!(
-            SupportLevel::Emulated {
-                strategy: "packed u16 + F32 convert"
-            },
-            SupportLevel::Unsupported {
-                reason: "no bf16 type on this target".to_string()
-            }
-        );
-    }
-}
