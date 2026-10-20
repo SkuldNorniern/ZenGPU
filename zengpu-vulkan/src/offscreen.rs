@@ -199,8 +199,12 @@ mod zsl_parity_tests {
     }
 
     fn pipeline(dev: &VulkanDevice, vs: &ZslShader, fs: &ZslShader) -> PipelineHandle {
-        let v = dev.create_shader(vs.spirv_desc()).expect("vertex shader");
-        let f = dev.create_shader(fs.spirv_desc()).expect("fragment shader");
+        let v = dev
+            .create_shader(vs.spirv_desc().unwrap())
+            .expect("vertex shader");
+        let f = dev
+            .create_shader(fs.spirv_desc().unwrap())
+            .expect("fragment shader");
         dev.create_graphics_pipeline(GraphicsPipelineDesc {
             vertex_shader: v,
             fragment_shader: f,

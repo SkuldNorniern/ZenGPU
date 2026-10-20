@@ -73,10 +73,10 @@ fn main() {
 
     eprintln!("repro: create shaders (glslang SPIR-V)");
     let vs = device
-        .create_shader(ShaderDesc::spirv(bytemuck_cast(VS.spv)))
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(VS.spv.unwrap())))
         .expect("vs");
     let fs = device
-        .create_shader(ShaderDesc::spirv(bytemuck_cast(FS.spv)))
+        .create_shader(ShaderDesc::spirv(bytemuck_cast(FS.spv.unwrap())))
         .expect("fs");
 
     eprintln!("repro: create_graphics_pipeline");
@@ -107,11 +107,11 @@ fn main() {
 
     eprintln!(
         "\n=== glslang VERTEX disassembly ===\n{}",
-        zengpu_spv::disassemble(VS.spv)
+        zengpu_spv::disassemble(VS.spv.unwrap())
     );
     eprintln!(
         "\n=== glslang FRAGMENT disassembly ===\n{}",
-        zengpu_spv::disassemble(FS.spv)
+        zengpu_spv::disassemble(FS.spv.unwrap())
     );
 }
 

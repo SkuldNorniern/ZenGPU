@@ -2441,8 +2441,8 @@ mod tests {
         format: Format,
         blend: Option<BlendState>,
     ) -> PipelineHandle {
-        let vs_shader = device.create_shader(QUAD_VS.spirv_desc()).unwrap();
-        let fs_shader = device.create_shader(fs.spirv_desc()).unwrap();
+        let vs_shader = device.create_shader(QUAD_VS.spirv_desc().unwrap()).unwrap();
+        let fs_shader = device.create_shader(fs.spirv_desc().unwrap()).unwrap();
         let pipeline = device
             .create_graphics_pipeline(GraphicsPipelineDesc {
                 vertex_shader: vs_shader,
@@ -2849,7 +2849,9 @@ mod tests {
         }) else {
             return;
         };
-        let shader = device.create_shader(CACHE_TEST_ZSL.spirv_desc()).unwrap();
+        let shader = device
+            .create_shader(CACHE_TEST_ZSL.spirv_desc().unwrap())
+            .unwrap();
         device
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -3304,7 +3306,7 @@ mod tests {
             }
         );
         let Some(dev) = try_device() else { return };
-        let shader = dev.create_shader(DOUBLE_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(DOUBLE_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -3425,7 +3427,7 @@ mod tests {
             return;
         }
         let pipeline = |shader: &ZslShader| {
-            let shader = dev.create_shader(shader.spirv_desc()).unwrap();
+            let shader = dev.create_shader(shader.spirv_desc().unwrap()).unwrap();
             dev.create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "main",
@@ -3549,7 +3551,7 @@ mod tests {
 
         let Some(dev) = try_device() else { return };
 
-        let add_shader = dev.create_shader(ADD_ZSL.spirv_desc()).unwrap();
+        let add_shader = dev.create_shader(ADD_ZSL.spirv_desc().unwrap()).unwrap();
         let add_pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: add_shader,
@@ -3557,7 +3559,7 @@ mod tests {
                 block: [64, 1, 1],
             })
             .unwrap();
-        let relu_shader = dev.create_shader(RELU_ZSL.spirv_desc()).unwrap();
+        let relu_shader = dev.create_shader(RELU_ZSL.spirv_desc().unwrap()).unwrap();
         let relu_pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: relu_shader,
@@ -3685,7 +3687,7 @@ mod tests {
         );
 
         let Some(dev) = try_device() else { return };
-        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -3773,7 +3775,7 @@ mod tests {
         let Some(dev) = try_graphics_device() else {
             return;
         };
-        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -3843,7 +3845,7 @@ mod tests {
             _guard: test_guard,
         } = dev;
         let dev: Arc<dyn GpuDevice> = Arc::from(dev);
-        let shader = dev.create_shader(FILL_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -3939,7 +3941,7 @@ mod tests {
         )
         .unwrap();
 
-        let shader = dev.create_shader(TRIG_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(TRIG_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4010,7 +4012,7 @@ mod tests {
         dev.write_buffer(src_u, 0, bytes_u).unwrap();
         dev.write_buffer(src_i, 0, bytes_i).unwrap();
 
-        let shader = dev.create_shader(TYPED_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(TYPED_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4093,7 +4095,7 @@ mod tests {
             .collect();
         let outs: Vec<_> = (0..3).map(|_| dev.create_buffer(output).unwrap()).collect();
 
-        let shader = dev.create_shader(DOT4_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(DOT4_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4431,7 +4433,7 @@ mod tests {
             .map(|_| dev.create_buffer(output).unwrap())
             .collect();
 
-        let shader = dev.create_shader(PACKED_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(PACKED_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4549,7 +4551,9 @@ mod tests {
             })
             .unwrap();
         dev.write_buffer(packed, 0, u32s_to_bytes(&words)).unwrap();
-        let shader = dev.create_shader(NIBBLES_ZSL.spirv_desc()).unwrap();
+        let shader = dev
+            .create_shader(NIBBLES_ZSL.spirv_desc().unwrap())
+            .unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4659,7 +4663,7 @@ mod tests {
         let oi = make(1024, output, &[0u8; 1024]);
         let zout = make(1024, output, &[0u8; 1024]);
 
-        let shader = dev.create_shader(FRAG_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(FRAG_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4769,7 +4773,7 @@ mod tests {
         )
         .unwrap();
 
-        let shader = dev.create_shader(FINITE_ZSL.spirv_desc()).unwrap();
+        let shader = dev.create_shader(FINITE_ZSL.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4834,7 +4838,7 @@ mod tests {
         outputs: &[u64],
         scalars: &[Scalar],
     ) -> Vec<Vec<u8>> {
-        let shader_h = dev.create_shader(shader.spirv_desc()).unwrap();
+        let shader_h = dev.create_shader(shader.spirv_desc().unwrap()).unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: shader_h,

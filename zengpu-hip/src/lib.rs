@@ -3083,7 +3083,7 @@ void mem_scale(const float* __restrict__ in, float* __restrict__ out,
                 }
             }
         );
-        let scale_src = SCALE.hip;
+        let scale_src = SCALE.hip.unwrap();
 
         const N: usize = 1 << 20;
         let data: Vec<f32> = (0..N).map(|i| i as f32).collect();

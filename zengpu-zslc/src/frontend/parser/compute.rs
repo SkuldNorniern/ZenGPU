@@ -18,30 +18,63 @@ impl<'a> Parser<'a> {
         }
 
         let mut local_size = [1u32, 1, 1];
+        let mut backends: Vec<Backend> = Vec::new();
         while self.eat(&Tok::At) {
             let name = self.ident()?;
-            if name != "workgroup_size" {
-                return self.err(format!(
-                    "unknown attribute `@{name}`; expected @workgroup_size"
-                ));
+            match name.as_str() {
+                "workgroup_size" => {
+                    self.expect(&Tok::LParen, "`(` after @workgroup_size")?;
+                    local_size = self.parse_workgroup_size()?;
+                    self.expect(&Tok::RParen, "`)`")?;
+                }
+                "backends" => {
+                    self.expect(&Tok::LParen, "`(` after @backends")?;
+                    loop {
+                        let b = self.ident()?;
+                        let Some(backend) = Backend::from_name(&b) else {
+                            return self.err(format!(
+                                "unknown backend `{b}` in @backends; expected spirv, hip, cuda or metal"
+                            ));
+                        };
+                        if !backends.contains(&backend) {
+                            backends.push(backend);
+                        }
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&Tok::RParen, "`)` closing @backends")?;
+                }
+                other => {
+                    return self.err(format!(
+                        "unknown attribute `@{other}`; expected @workgroup_size or @backends"
+                    ));
+                }
             }
-            self.expect(&Tok::LParen, "`(` after @workgroup_size")?;
-            local_size = self.parse_workgroup_size()?;
-            self.expect(&Tok::RParen, "`)`")?;
         }
 
-        if self.eat_kw("kernel") {
+        let shader = if self.eat_kw("kernel") {
             let _name = self.ident()?;
-            Ok(Shader::Compute(self.parse_kernel_rest(local_size)?))
+            Shader::Compute(self.parse_kernel_rest(local_size)?)
         } else if self.eat_kw("vertex") {
             let _name = self.ident()?;
-            Ok(Shader::Graphics(self.parse_graphics_rest(false)?))
+            Shader::Graphics(self.parse_graphics_rest(false)?)
         } else if self.eat_kw("fragment") {
             let _name = self.ident()?;
-            Ok(Shader::Graphics(self.parse_graphics_rest(true)?))
+            Shader::Graphics(self.parse_graphics_rest(true)?)
         } else {
-            self.err("expected `kernel`, `vertex`, or `fragment`")
-        }
+            return self.err("expected `kernel`, `vertex`, or `fragment`");
+        };
+        Ok(match shader {
+            Shader::Compute(mut m) => {
+                m.backends = backends;
+                Shader::Compute(m)
+            }
+            Shader::Graphics(mut m) => {
+                m.backends = backends;
+                Shader::Graphics(m)
+            }
+        })
     }
 
     pub(super) fn parse_kernel_rest(&mut self, local_size: [u32; 3]) -> Result<Module, ParseError> {
@@ -104,6 +137,7 @@ impl<'a> Parser<'a> {
                 body,
             },
             types: mem::replace(&mut self.types, TypeArena::new()),
+            backends: Vec::new(),
         })
     }
 

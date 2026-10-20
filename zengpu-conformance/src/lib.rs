@@ -384,8 +384,8 @@ mod cpu_vs_vulkan_tests {
     fn vec_add_spv_bytes() -> &'static [u8] {
         unsafe {
             from_raw_parts(
-                VEC_ADD_SHADER.spv.as_ptr() as *const u8,
-                size_of_val(VEC_ADD_SHADER.spv),
+                VEC_ADD_SHADER.spv.unwrap().as_ptr() as *const u8,
+                size_of_val(VEC_ADD_SHADER.spv.unwrap()),
             )
         }
     }
@@ -580,8 +580,8 @@ mod cpu_vs_vulkan_tests {
     fn mix64_spv_bytes() -> &'static [u8] {
         unsafe {
             from_raw_parts(
-                MIX64_SHADER.spv.as_ptr() as *const u8,
-                size_of_val(MIX64_SHADER.spv),
+                MIX64_SHADER.spv.unwrap().as_ptr() as *const u8,
+                size_of_val(MIX64_SHADER.spv.unwrap()),
             )
         }
     }

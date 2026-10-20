@@ -71,10 +71,42 @@ pub struct SharedDecl {
     pub len: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Spirv,
+    Hip,
+    Cuda,
+    Metal,
+}
+
+impl Backend {
+    /// Name in `@backends(...)` and diagnostics.
+    pub fn name(self) -> &'static str {
+        match self {
+            Backend::Spirv => "spirv",
+            Backend::Hip => "hip",
+            Backend::Cuda => "cuda",
+            Backend::Metal => "metal",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "spirv" => Some(Backend::Spirv),
+            "hip" => Some(Backend::Hip),
+            "cuda" => Some(Backend::Cuda),
+            "metal" => Some(Backend::Metal),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Module {
     pub entry: Entry,
     pub types: TypeArena,
+    /// Backends from `@backends(...)`. Empty means all enabled backends, best effort.
+    pub backends: Vec<Backend>,
 }
 
 #[derive(Debug)]
@@ -153,4 +185,5 @@ pub struct GfxOutput {
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
     pub types: TypeArena,
+    pub backends: Vec<Backend>,
 }
