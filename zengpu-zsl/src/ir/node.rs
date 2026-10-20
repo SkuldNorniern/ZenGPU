@@ -139,6 +139,11 @@ pub enum BuiltinFn {
     /// Fused `a * b + acc` with a single rounding. This is the F32-accumulate primitive for
     /// low-precision products. Compute only.
     MulAddF32,
+    /// Four-lane signed byte dot product. Results wrap without saturation. Compute only.
+    Dot4I8,
+    /// Four-lane unsigned byte dot product, otherwise as `dot4_i8`.
+    Dot4U8,
+    Dot4IU8,
     /// Subgroup index within the workgroup. A query, not a collective, so it is legal in any
     /// control flow.
     SubgroupId,
@@ -219,6 +224,9 @@ impl BuiltinFn {
             BuiltinFn::Dot => "dot",
             BuiltinFn::Extend => "extend",
             BuiltinFn::MulAddF32 => "mul_add_f32",
+            BuiltinFn::Dot4I8 => "dot4_i8",
+            BuiltinFn::Dot4U8 => "dot4_u8",
+            BuiltinFn::Dot4IU8 => "dot4_iu8",
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",

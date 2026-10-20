@@ -106,6 +106,8 @@ pub(crate) mod op {
     pub const BITWISE_OR: u32 = 197;
     pub const BITWISE_XOR: u32 = 198;
     pub const BITWISE_AND: u32 = 199;
+    pub const BITFIELD_SEXTRACT: u32 = 202;
+    pub const BITFIELD_UEXTRACT: u32 = 203;
     pub const EXT_INST: u32 = 12;
     pub const GROUP_NON_UNIFORM_ALL: u32 = 334;
     pub const GROUP_NON_UNIFORM_ANY: u32 = 335;
@@ -1179,6 +1181,26 @@ impl SpvBuilder {
             &mut self.functions,
             op::SHIFT_RIGHT_LOGICAL,
             &[ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
+    pub fn op_bitfield_sextract(&mut self, ty: Id, base: Id, offset: Id, count: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::BITFIELD_SEXTRACT,
+            &[ty.0, id.0, base.0, offset.0, count.0],
+        );
+        id
+    }
+
+    pub fn op_bitfield_uextract(&mut self, ty: Id, base: Id, offset: Id, count: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::BITFIELD_UEXTRACT,
+            &[ty.0, id.0, base.0, offset.0, count.0],
         );
         id
     }

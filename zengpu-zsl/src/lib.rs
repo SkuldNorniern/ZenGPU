@@ -1257,6 +1257,29 @@ int main() {{
         );
     }
 
+    const DOT4: &str = r#"
+        @workgroup_size(64)
+        kernel dot4(x: device buffer<i32>, y: device buffer<u32>, out_i: device mut buffer<i32>, out_iu: device mut buffer<i32>, out_u: device mut buffer<u32>, id: global_id) {
+            out_i[id.x] = dot4_i8(x[id.x], x[id.x], 0)
+            out_iu[id.x] = dot4_iu8(x[id.x], y[id.x], 0)
+            out_u[id.x] = dot4_u8(y[id.x], y[id.x], 0u32)
+        }
+    "#;
+
+    #[test]
+    fn dot4_lowers_on_all_compute_backends() {
+        let module = parse_compute(DOT4).expect("parse dot4");
+        let hip_source = hip::lower_compute(&module).expect("lower dot4 to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower dot4 to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower dot4 to MSL").source;
+        assert!(hip_source.contains("zsl_dot4_i8("));
+        assert!(hip_source.contains("zsl_dot4_iu8("));
+        assert!(hip_source.contains("zsl_dot4_u8("));
+        assert!(cuda_source.contains("__dp4a("));
+        assert!(msl_source.contains("zsl_dot4("));
+        spirv::lower_compute(&module).expect("lower dot4 to SPIR-V");
+    }
+
     #[test]
     fn subgroup_query_kernel_without_use_has_no_msl_simd_params() {
         let module = parse_compute(COPY_BF16).expect("parse copy_bf16");

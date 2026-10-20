@@ -878,6 +878,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::IsInf
         | BuiltinFn::IsFinite
         | BuiltinFn::MulAddF32
+        | BuiltinFn::Dot4I8
+        | BuiltinFn::Dot4U8
+        | BuiltinFn::Dot4IU8
         | BuiltinFn::SubgroupId
         | BuiltinFn::SubgroupLocalId
         | BuiltinFn::SubgroupSize

@@ -47,6 +47,8 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::SubgroupId
             | BuiltinFn::SubgroupLocalId
             | BuiltinFn::SubgroupSize => u32_id,
+            BuiltinFn::Dot4I8 | BuiltinFn::Dot4IU8 => i32_id,
+            BuiltinFn::Dot4U8 => u32_id,
             BuiltinFn::IsNan
             | BuiltinFn::IsInf
             | BuiltinFn::IsFinite

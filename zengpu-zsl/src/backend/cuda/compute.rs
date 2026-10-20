@@ -102,6 +102,20 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
         );
     }
 
+    s.push_str(
+        "__device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
+         \x20   return __dp4a(a, b, acc);\n\
+         }\n\
+         __device__ __forceinline__ unsigned int zsl_dot4_u8(unsigned int a, unsigned int b, unsigned int acc) {\n\
+         \x20   return __dp4a(a, b, acc);\n\
+         }\n\
+         __device__ __forceinline__ int zsl_dot4_iu8(int a, unsigned int b, int acc) {\n\
+         \x20   unsigned int s = (unsigned int)acc;\n\
+         \x20   for (int i = 0; i < 4; ++i) s += (unsigned int)(((signed char)(a >> (8 * i))) * (int)((b >> (8 * i)) & 0xffu));\n\
+         \x20   return (int)s;\n\
+         }\n",
+    );
+
     let threads = local_size[0] * local_size[1] * local_size[2];
     let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
     let _ = writeln!(s, "void {ENTRY}(");
@@ -528,6 +542,15 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Length => format!("sqrtf(dot({0}, {0}))", args_s[0]),
                 BuiltinFn::MulAddF32 => {
                     format!("fmaf({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4I8 => {
+                    format!("zsl_dot4_i8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4U8 => {
+                    format!("zsl_dot4_u8({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Dot4IU8 => {
+                    format!("zsl_dot4_iu8({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::SubgroupAny => {
                     format!("((bool)__any_sync(0xffffffffu, (int)({})))", args_s[0])

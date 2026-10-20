@@ -4002,6 +4002,109 @@ mod tests {
     }
 
     #[test]
+    fn zsl_dot4_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const DOT4_ZSL: ZslShader = zsl!(
+            push P { n: u32 }
+            @workgroup_size(64)
+            kernel dot4(x: device buffer<i32>, y: device buffer<u32>, k: device buffer<i32>, z: device buffer<u32>, out_i: device mut buffer<i32>, out_iu: device mut buffer<i32>, out_u: device mut buffer<u32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.n {
+                    out_i[i] = dot4_i8(x[i], x[i ^ 1], k[i])
+                    out_iu[i] = dot4_iu8(x[i], y[i], k[i])
+                    out_u[i] = dot4_u8(y[i], y[i ^ 1], z[i])
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 256u32;
+        let size = u64::from(n) * 4;
+        let input = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE,
+            memory: MemoryUsage::Upload,
+        };
+        let output = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        const EDGE: [u8; 4] = [0x80, 0x7f, 0xff, 0x00];
+        let word = |i: u32| {
+            u32::from_le_bytes([
+                EDGE[(i % 4) as usize],
+                EDGE[((i / 4 + 1) % 4) as usize],
+                EDGE[((i / 2 + 2) % 4) as usize],
+                (i.wrapping_mul(0x9e37_79b9) >> 24) as u8,
+            ])
+        };
+        let xs: Vec<u32> = (0..n).map(word).collect();
+        let ys: Vec<u32> = (0..n).map(|i| word(i + 7)).collect();
+        let ks: Vec<u32> = (0..n).map(|i| i32::MAX as u32 - i % 100).collect();
+        let zs: Vec<u32> = (0..n).map(|i| u32::MAX - i % 100).collect();
+        let inputs: Vec<_> = [&xs, &ys, &ks, &zs]
+            .iter()
+            .map(|data| {
+                let buf = dev.create_buffer(input).unwrap();
+                dev.write_buffer(buf, 0, u32s_to_bytes(data)).unwrap();
+                buf
+            })
+            .collect();
+        let outs: Vec<_> = (0..3).map(|_| dev.create_buffer(output).unwrap()).collect();
+
+        let shader = dev.create_shader(DOT4_ZSL.spirv_desc()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let slots: Vec<u32> = inputs.iter().chain(&outs).map(|b| b.index()).collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+
+        let words = |b| -> Vec<u32> {
+            dev.read_buffer(b, 0, size)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (got_i, got_iu, got_u) = (words(outs[0]), words(outs[1]), words(outs[2]));
+        let s8 = |w: u32, l: u32| ((w >> (8 * l)) as u8) as i8 as i32;
+        let u8l = |w: u32, l: u32| ((w >> (8 * l)) & 0xff) as i32;
+        for i in 0..n as usize {
+            let (x, x2, y, y2) = (xs[i], xs[i ^ 1], ys[i], ys[i ^ 1]);
+            let (mut want_i, mut want_iu, mut want_u) = (ks[i] as i32, ks[i] as i32, zs[i]);
+            for l in 0..4 {
+                want_i = want_i.wrapping_add(s8(x, l).wrapping_mul(s8(x2, l)));
+                want_iu = want_iu.wrapping_add(s8(x, l).wrapping_mul(u8l(y, l)));
+                want_u = want_u.wrapping_add((u8l(y, l) * u8l(y2, l)) as u32);
+            }
+            assert_eq!(got_i[i] as i32, want_i, "dot4_i8 at {i}");
+            assert_eq!(got_iu[i] as i32, want_iu, "dot4_iu8 at {i}");
+            assert_eq!(got_u[i], want_u, "dot4_u8 at {i}");
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for b in inputs.into_iter().chain(outs) {
+            dev.destroy_buffer(b);
+        }
+    }
+
+    #[test]
     fn zsl_finite_classification_runs_through_vulkan() {
         use zengpu_spirv::{ZslShader, zsl};
 
