@@ -2495,12 +2495,13 @@ fn hip_pipeline(
     device: &dyn zengpu_hal::GpuDevice,
     shader: zengpu_hal::ShaderHandle,
     entry: &str,
+    block: u32,
 ) -> zengpu_hal::PipelineHandle {
     device
         .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
             shader,
             entry: entry.to_string().leak(),
-            block: [256, 1, 1],
+            block: [block, 1, 1],
         })
         .unwrap()
 }
@@ -2522,12 +2523,12 @@ fn zsl_gemv_q8_q4k_matches_zetna() {
     let zetna = device
         .create_shader(zengpu_hal::ShaderDesc::hip(&src))
         .unwrap();
-    let z_quant = hip_pipeline(&*device, zetna, "quantize_q8");
-    let z_gemv = hip_pipeline(&*device, zetna, "gemv_q8_1_q4_k");
+    let z_quant = hip_pipeline(&*device, zetna, "quantize_q8", 256);
+    let z_gemv = hip_pipeline(&*device, zetna, "gemv_q8_1_q4_k", 256);
     let (qs, qe) = QUANT_Q8_ZSL.create(&*device).unwrap();
-    let s_quant = hip_pipeline(&*device, qs, qe);
+    let s_quant = hip_pipeline(&*device, qs, qe, 256);
     let (gs, ge) = GEMV_Q4K_Q8_ZSL.create(&*device).unwrap();
-    let s_gemv = hip_pipeline(&*device, gs, ge);
+    let s_gemv = hip_pipeline(&*device, gs, ge, 256);
     let pool = BufferPool::new(device.clone());
     let cols = 5120usize;
     let mut seed = 0x9e37_79b9_7f4a_7c15u64;
@@ -2804,3 +2805,120 @@ const GEMV_Q4K_Q8_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
         }
     }
 );
+
+const NORM_ROPE_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { d: u32, heads: u32, rope: u32, dk: u32, base: f32, eps: f32, flags: u32 }
+    @workgroup_size(128)
+    kernel norm_rope(x: device mut buffer<f32>, w: device buffer<f32>, factors: device buffer<f32>, meta: device buffer<u32>, p: P, id: global_id) {
+        shared t: array<f32, 512>
+        let b = id.x / 128
+        let tid = id.x % 128
+        let row = b / p.heads
+        let pos = f32(meta[2 * row])
+        let hb = b * p.d
+        let ss = 0.0
+        for k in 0..p.dk {
+            let v = x[hb + tid + k * 128]
+            t[tid + k * 128] = v
+            ss = ss + v * v
+        }
+        let inv = rsqrt(workgroup_reduce_add(ss) / f32(p.d) + p.eps)
+        for k in 0..p.dk {
+            let i = tid + k * 128
+            t[i] = t[i] * select((p.flags & 1) != 0, inv * w[i], inv)
+        }
+        barrier()
+        let half = p.rope / 2
+        for k in 0..p.dk {
+            let i = tid + k * 128
+            let pair = i % half
+            let theta0 = pos * pow(p.base, -2.0 * f32(pair) / f32(p.rope))
+            let theta = select((p.flags & 2) != 0, theta0 / factors[pair], theta0)
+            let c = cos(theta)
+            let s = sin(theta)
+            let rotated = select(i < half, t[i] * c - t[i + half] * s, t[i - half] * s + t[i] * c)
+            x[hb + i] = select(i < p.rope, rotated, t[i])
+        }
+    }
+);
+
+#[test]
+fn zsl_norm_rope_matches_zetna() {
+    let Some(device) = hip_device() else { return };
+    let Some(src) = zetna_hip_source(&["common.hip", "ops.hip"]) else {
+        return;
+    };
+    let zetna = device
+        .create_shader(zengpu_hal::ShaderDesc::hip(&src))
+        .unwrap();
+    let z_pipe = hip_pipeline(&*device, zetna, "norm_rope", 128);
+    let (ns, ne) = NORM_ROPE_ZSL.create(&*device).unwrap();
+    let s_pipe = hip_pipeline(&*device, ns, ne, 128);
+    let pool = BufferPool::new(device.clone());
+    let (rows, heads, d) = (3usize, 4usize, 128usize);
+    let x: Vec<f32> = (0..rows * heads * d)
+        .map(|i| ((i * 2_654_435_761usize) % 4001) as f32 / 1000.0 - 2.0)
+        .collect();
+    let wt: Vec<f32> = (0..d).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect();
+    let factors: Vec<f32> = (0..d / 2).map(|i| 1.0 + (i % 5) as f32 / 4.0).collect();
+    let x_bytes: Vec<u8> = x.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let xb = pool.alloc(vec![x.len() as u32], DType::F32).unwrap();
+    let wb = upload(&pool, vec![d as u32], &wt);
+    let fb = upload(&pool, vec![(d / 2) as u32], &factors);
+    let meta: Vec<u32> = (0..rows)
+        .flat_map(|r| [17 + 5 * r as u32, r as u32])
+        .collect();
+    let meta_bytes: Vec<u8> = meta.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let mb = pool.alloc(vec![meta.len() as u32], DType::U32).unwrap();
+    device.write_buffer(mb.buffer, 0, &meta_bytes).unwrap();
+    let slots = [
+        xb.buffer.index(),
+        wb.buffer.index(),
+        fb.buffer.index(),
+        mb.buffer.index(),
+    ];
+    let grid = [(rows * heads) as u32, 1, 1];
+    for rope in [128usize, 64] {
+        let scal = |dk: usize| {
+            [
+                zengpu_hal::Scalar::U32(d as u32),
+                zengpu_hal::Scalar::U32(heads as u32),
+                zengpu_hal::Scalar::U32(rope as u32),
+                zengpu_hal::Scalar::U32(dk as u32),
+                zengpu_hal::Scalar::F32(10000.0),
+                zengpu_hal::Scalar::F32(1e-6),
+                zengpu_hal::Scalar::U32(3),
+            ]
+        };
+        let zscal = [
+            zengpu_hal::Scalar::U32(d as u32),
+            zengpu_hal::Scalar::U32(heads as u32),
+            zengpu_hal::Scalar::U32(rope as u32),
+            zengpu_hal::Scalar::F32(10000.0),
+            zengpu_hal::Scalar::F32(1e-6),
+            zengpu_hal::Scalar::U32(3),
+        ];
+        device.write_buffer(xb.buffer, 0, &x_bytes).unwrap();
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(z_pipe, &slots, &zscal, grid);
+        ops.run(&*device).unwrap();
+        let want = download(&*device, &xb);
+        device.write_buffer(xb.buffer, 0, &x_bytes).unwrap();
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(s_pipe, &slots, &scal(d / 128), grid);
+        ops.run(&*device).unwrap();
+        let got = download(&*device, &xb);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(&a, &b)| ulp_gap(a, b))
+            .max()
+            .unwrap();
+        println!("norm_rope rope {rope}: max ulp vs zetna {worst}");
+        assert!(worst <= 2, "norm_rope rope {rope}: {worst} ulp");
+    }
+    device.destroy_pipeline(z_pipe);
+    device.destroy_pipeline(s_pipe);
+    device.destroy_shader(zetna);
+    device.destroy_shader(ns);
+}

@@ -432,6 +432,7 @@ fn builtin_requires_f32(func: BuiltinFn) -> bool {
             | BuiltinFn::Tan
             | BuiltinFn::Log
             | BuiltinFn::Sqrt
+            | BuiltinFn::Rsqrt
             | BuiltinFn::Floor
             | BuiltinFn::Ceil
             | BuiltinFn::Fract
@@ -798,6 +799,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::IsFinite => format!("isfinite({})", args_s[0]),
                 BuiltinFn::Log => format!("logf({})", args_s[0]),
                 BuiltinFn::Sqrt => format!("sqrtf({})", args_s[0]),
+                BuiltinFn::Rsqrt => format!("rsqrtf({})", args_s[0]),
                 BuiltinFn::Floor => format!("floorf({})", args_s[0]),
                 BuiltinFn::Ceil => format!("ceilf({})", args_s[0]),
                 BuiltinFn::Fract => format!("({0} - floorf({0}))", args_s[0]),
