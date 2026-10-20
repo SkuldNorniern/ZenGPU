@@ -1174,6 +1174,16 @@ int main() {{
         assert!(format!("{err:?}").contains("integer element type"));
     }
 
+    const OCCUPANCY_KERNEL: &str = r#"
+        @workgroup_size(256)
+        @launch_bounds(512)
+        @waves_per_eu(1, 2)
+        @min_blocks(4)
+        kernel occupancy(x: device mut buffer<f32>, id: global_id) {
+            x[id.x] = 1.0
+        }
+    "#;
+
     const REM_KERNEL: &str = r#"
         @workgroup_size(32)
         kernel rem_kernel(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, id: global_id) {
@@ -2607,7 +2617,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 33] = [
+        let kernels: [(&str, &str); 34] = [
             ("tiled_gemm", TILED_GEMM),
             ("vec_copy", VEC_COPY),
             ("typed_shared", TYPED_SHARED),
@@ -2641,6 +2651,7 @@ int main() {{
             ("byte_buffers", BYTE_KERNEL),
             ("packed", PACKED),
             ("texel_kernel", TEXEL_KERNEL),
+            ("occupancy", OCCUPANCY_KERNEL),
         ];
         let mut failures = Vec::new();
         let mut checked = 0;
