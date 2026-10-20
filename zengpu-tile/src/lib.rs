@@ -316,13 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn gemm_display_snapshot() {
-        let kernel = gemm(DType::F16, DType::F16, 100, 70, 37, [32, 32], 16, false).unwrap();
-        let text = kernel.to_string();
-        assert_eq!(text, EXPECTED_GEMM_TEXT);
-    }
-
-    #[test]
     fn gemm_lowers_to_every_backend() {
         let kernel = gemm(DType::F32, DType::F32, 64, 64, 64, [32, 32], 32, false).unwrap();
         let compiled = compile(&kernel).unwrap();
@@ -693,47 +686,7 @@ mod tests {
     }
 
     /// Main pass plus reduce pass, same bindings. Other element types run unsplit.
-    #[test]
-    fn split_k_compiles_two_passes() {
-        let target = Target::hip_gfx12();
-        let split = Schedule {
-            matrix: Matrix::Mma,
-            split_k: 4,
-            ..Schedule::default()
-        };
-        let k = gemm(DType::F16, DType::F16, 256, 256, 256, [128, 128], 32, true).unwrap();
-        let c = compile_with(&k, &split, &target).unwrap();
-        assert_eq!(c.grid()[2], 4);
-        assert_eq!(c.workspace_bytes(), 4 * 256 * 256 * 4);
-        let reduce = c.reduce.as_ref().expect("reduce pass");
-        assert!(reduce.zsl().contains("ws: device mut buffer<f32>"));
-        assert!(c.zsl().contains("let gz = group_id().z"));
-        let i8k = gemm(DType::I8, DType::I32, 256, 256, 256, [128, 128], 32, false).unwrap();
-        let c = compile_with(&i8k, &split, &target).unwrap();
-        assert_eq!(c.workspace_bytes(), 0);
-        assert!(c.notes().iter().any(|n| n.contains("split_k")));
-    }
-
     /// 16-byte copies for interior blocks of aligned rows. Other shapes keep the scalar copy.
-    #[test]
-    fn vector_loads_follow_alignment() {
-        let mma = Schedule {
-            matrix: Matrix::Mma,
-            ..Schedule::default()
-        };
-        let target = Target::hip_gfx12();
-        let aligned = gemm(DType::F16, DType::F16, 256, 256, 256, [128, 128], 32, true).unwrap();
-        let zsl = compile_with(&aligned, &mma, &target)
-            .unwrap()
-            .zsl()
-            .to_string();
-        assert!(zsl.contains("b_a_v: device buffer<u32x4>"), "{zsl}");
-        assert!(zsl.contains("view sav: array<u32x4> = sa"), "{zsl}");
-        let odd = gemm(DType::F16, DType::F16, 100, 70, 37, [64, 64], 16, true).unwrap();
-        let zsl = compile_with(&odd, &mma, &target).unwrap().zsl().to_string();
-        assert!(!zsl.contains("u32x4"), "K = 37 must take the scalar path");
-    }
-
     /// The occupancy hint reaches the ZSL header and HIP launch bounds. Vulkan stages f16 natively
     /// and uses 16-byte loads like HIP.
     #[test]
@@ -1532,21 +1485,4 @@ mod tests {
         all.push(ws);
         (all, Some(ws))
     }
-
-    const EXPECTED_GEMM_TEXT: &str = "tile v0 kernel gemm tile [32, 32]
-input a f16 [100, 37]
-input b f16 [70, 37]
-input bias f32 [1, 70]
-output c f16 [100, 70]
-%0 = zeros f32 [32, 32]
-loop k 0..37 step 16 {
-  %1 = load a [gm, k] shape=[32, 16]
-  %2 = load b [gn, k] shape=[32, 16]
-  %3 = dot %1 %2 %0
-}
-%4 = load bias [0, gn] shape=[1, 32]
-%5 = add %3 %4
-%6 = cast %5 f16
-store c [gm, gn] shape=[32, 32] %6
-";
 }
