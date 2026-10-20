@@ -181,6 +181,7 @@ mod tests {
 
     use super::*;
     use crate::backend::spirv::lower_compute;
+    use crate::backend::{cuda, hip, msl};
     use crate::ir::typeck::{ComputeTypeCtx, GraphicsTypeCtx};
 
     #[test]
@@ -237,8 +238,39 @@ mod tests {
             }
         "#;
         let m = parse_compute(src).expect("parse");
-        let EntryKind::Compute { local_size } = m.entry.kind;
+        let EntryKind::Compute { local_size, .. } = m.entry.kind;
         assert_eq!(local_size, [64, 1, 1]);
+    }
+
+    #[test]
+    fn occupancy_hints_parse_and_lower_per_backend() {
+        let src = r#"
+            @workgroup_size(256)
+            @launch_bounds(512)
+            @waves_per_eu(1, 2)
+            @min_blocks(4)
+            kernel k(x: device mut buffer<f32>, id: global_id) { x[id.x] = 1.0 }
+        "#;
+        let m = parse_compute(src).expect("parse");
+        let EntryKind::Compute {
+            local_size,
+            occupancy,
+        } = m.entry.kind;
+        assert_eq!(local_size, [256, 1, 1]);
+        assert_eq!(occupancy.max_threads, Some(512));
+        assert_eq!(occupancy.waves_per_eu, Some((1, Some(2))));
+        assert_eq!(occupancy.min_blocks, Some(4));
+        let hip = hip::lower_compute(&m).expect("hip").source;
+        assert!(hip.contains("__launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(1, 2)))"));
+        let cuda = cuda::lower_compute(&m).expect("cuda").source;
+        assert!(cuda.contains("__launch_bounds__(512, 4)"));
+        let msl = msl::lower_compute(&m).expect("msl").source;
+        assert!(msl.contains("[[max_total_threads_per_threadgroup(512)]] kernel void"));
+        assert!(
+            parse_compute("@workgroup_size(64)\n@launch_bounds(32)\nkernel k(id: global_id) { }")
+                .is_err()
+        );
+        assert!(parse_compute("@waves_per_eu(3, 2)\nkernel k(id: global_id) { }").is_err());
     }
 
     #[test]

@@ -18,7 +18,10 @@ mod frag;
 pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     check_uniformity(module)?;
     let e = &module.entry;
-    let EntryKind::Compute { local_size } = e.kind;
+    let EntryKind::Compute {
+        local_size,
+        occupancy,
+    } = e.kind;
     if e.params
         .iter()
         .any(|p| matches!(p.kind, ParamKind::Texture | ParamKind::Image))
@@ -224,9 +227,17 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
 }
 "#);
 
-    let threads = local_size[0] * local_size[1] * local_size[2];
     let kernel_start = s.len();
-    let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
+    let waves = match occupancy.waves_per_eu {
+        Some((min, Some(max))) => format!(" __attribute__((amdgpu_waves_per_eu({min}, {max})))"),
+        Some((min, None)) => format!(" __attribute__((amdgpu_waves_per_eu({min})))"),
+        None => String::new(),
+    };
+    let bounds = occupancy.launch_bounds(local_size);
+    let _ = writeln!(
+        s,
+        "extern \"C\" __global__ __launch_bounds__({bounds}){waves}"
+    );
     let _ = writeln!(s, "void {ENTRY}(");
 
     for (i, (name, mutability, elem)) in buffers.iter().enumerate() {

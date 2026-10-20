@@ -18,7 +18,10 @@ mod frag;
 pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     check_uniformity(module)?;
     let e = &module.entry;
-    let EntryKind::Compute { local_size } = e.kind;
+    let EntryKind::Compute {
+        local_size,
+        occupancy,
+    } = e.kind;
     if e.params
         .iter()
         .any(|p| matches!(p.kind, ParamKind::Texture | ParamKind::Image))
@@ -250,9 +253,15 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
 }
 "#);
 
-    let threads = local_size[0] * local_size[1] * local_size[2];
     let kernel_start = s.len();
-    let _ = writeln!(s, "extern \"C\" __global__ __launch_bounds__({threads})");
+    let bounds = occupancy.launch_bounds(local_size);
+    let _ = match occupancy.min_blocks {
+        Some(n) => writeln!(
+            s,
+            "extern \"C\" __global__ __launch_bounds__({bounds}, {n})"
+        ),
+        None => writeln!(s, "extern \"C\" __global__ __launch_bounds__({bounds})"),
+    };
     let _ = writeln!(s, "void {ENTRY}(");
 
     for (i, (name, mutability, elem)) in buffers.iter().enumerate() {

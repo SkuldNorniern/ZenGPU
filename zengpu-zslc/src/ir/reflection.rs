@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::ir::binding::{self, BindingInfo};
 use crate::ir::layout::{self, LayoutInfo};
-use crate::ir::{GraphicsModule, Module};
+use crate::ir::{EntryKind, GraphicsModule, Module};
 
 /// push-constant layout, plus the bindless SSBO table for buffer params.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +22,9 @@ pub struct ParamReflection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleReflection {
     pub params: Vec<ParamReflection>,
+    /// Hints that SPIR-V cannot express (`@waves_per_eu`, `@min_blocks`), which SPIR-V drops. Empty
+    /// if there are none.
+    pub spirv_ignored_hints: Vec<&'static str>,
 }
 
 fn merge(
@@ -40,14 +43,25 @@ fn merge(
             }
         })
         .collect();
-    ModuleReflection { params }
+    ModuleReflection {
+        params,
+        spirv_ignored_hints: Vec::new(),
+    }
 }
 
 pub fn reflect_compute(module: &Module) -> ModuleReflection {
-    merge(
+    let mut reflection = merge(
         layout::compute_layout(module),
         binding::compute_bindings(module),
-    )
+    );
+    let EntryKind::Compute { occupancy, .. } = module.entry.kind;
+    if occupancy.waves_per_eu.is_some() {
+        reflection.spirv_ignored_hints.push("waves_per_eu");
+    }
+    if occupancy.min_blocks.is_some() {
+        reflection.spirv_ignored_hints.push("min_blocks");
+    }
+    reflection
 }
 
 pub fn reflect_graphics(module: &GraphicsModule) -> ModuleReflection {
