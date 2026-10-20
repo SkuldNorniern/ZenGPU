@@ -15,7 +15,7 @@ use crate::ir::node::{IrBinOp, IrExpr, IrStmt};
 use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::TypeId;
 use crate::ir::uniformity::check_compute_uniformity;
-use crate::ir::{Entry, ParamKind};
+use crate::ir::{Entry, Module, ParamKind};
 
 fn compute_type_ctx(entry: &Entry) -> ComputeTypeCtx {
     let mut ctx = ComputeTypeCtx {
@@ -195,6 +195,12 @@ impl ValidatedModule {
     }
 }
 
+/// Run by every compute backend before lowering.
+pub fn check_uniformity(module: &Module) -> Result<(), Diagnostic> {
+    check_compute_uniformity(&module.entry)
+        .map_err(|msg| Diagnostic::new(DiagnosticCode::NonUniformControlFlow, msg))
+}
+
 /// Compute checks binary operand types and subgroup collectives in divergent flow. Graphics passes
 /// through unchanged.
 pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
@@ -206,8 +212,7 @@ pub fn validate(shader: Shader) -> Result<ValidatedModule, Diagnostic> {
             check_stmt(stmt, &ctx, &mut types, bool_id)
                 .map_err(|msg| Diagnostic::new(DiagnosticCode::TypeMismatch, msg))?;
         }
-        check_compute_uniformity(&module.entry)
-            .map_err(|msg| Diagnostic::new(DiagnosticCode::NonUniformControlFlow, msg))?;
+        check_uniformity(module)?;
     }
     Ok(ValidatedModule { shader })
 }

@@ -9,9 +9,11 @@ use crate::ir::node::{
     stmts_use_workgroup_reduce,
 };
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
+use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
 
 pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
+    check_uniformity(module)?;
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
 

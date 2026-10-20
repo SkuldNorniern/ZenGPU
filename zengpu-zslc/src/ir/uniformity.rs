@@ -1,9 +1,6 @@
-//! Conservative subgroup-uniformity validation: collectives need uniform control flow.
-//!
-//! Uniformity is tracked only as far as the one-workgroup-per-row kernels need. Buffer and shared
-//! loads count as divergent. There is no dataflow or alias analysis.
-
-#![allow(dead_code)]
+//! Subgroup-uniformity check: subgroup ops, barriers, workgroup reductions and coop-matrix fragment
+//! ops need uniform control flow. Conservative: buffer and shared loads count as divergent. No
+//! dataflow or alias analysis.
 
 use std::collections::HashMap;
 
@@ -65,6 +62,8 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     | BuiltinFn::WorkgroupReduceAdd
                     | BuiltinFn::WorkgroupReduceMin
                     | BuiltinFn::WorkgroupReduceMax
+                    | BuiltinFn::Mma
+                    | BuiltinFn::FragZeroAcc
             ) || args.iter().any(expr_contains_subgroup_collective)
         }
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {
@@ -85,9 +84,7 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     .is_some_and(expr_contains_subgroup_collective)
         }
         IrExpr::Texel { args, .. } => args.iter().any(expr_contains_subgroup_collective),
-        IrExpr::FragLoad { offset, ld, .. } => {
-            expr_contains_subgroup_collective(offset) || expr_contains_subgroup_collective(ld)
-        }
+        IrExpr::FragLoad { .. } => true,
         IrExpr::Neg(inner) => expr_contains_subgroup_collective(inner),
         IrExpr::Binary { lhs, rhs, .. } => {
             expr_contains_subgroup_collective(lhs) || expr_contains_subgroup_collective(rhs)
@@ -122,11 +119,22 @@ fn check_stmts(
 
 fn reject_if_divergent(expr: &IrExpr, divergent: bool) -> Result<(), String> {
     if divergent && expr_contains_subgroup_collective(expr) {
-        return Err(
-            "ZSL: subgroup collectives must occur in subgroup-uniform control flow".to_string(),
-        );
+        return Err(non_uniform_message("subgroup collective"));
     }
     Ok(())
+}
+
+fn reject_if_divergent_collective(what: &str, divergent: bool) -> Result<(), String> {
+    if divergent {
+        return Err(non_uniform_message(what));
+    }
+    Ok(())
+}
+
+fn non_uniform_message(what: &str) -> String {
+    format!(
+        "ZSL: {what} must occur in subgroup-uniform control flow (not under a local_id or a non-uniform loop bound)"
+    )
 }
 
 fn check_stmt(
@@ -137,19 +145,20 @@ fn check_stmt(
     match stmt {
         IrStmt::Let { name, init } => {
             reject_if_divergent(init, divergent)?;
-            let uniform = expr_is_uniform(init, locals);
+            let uniform = !divergent && expr_is_uniform(init, locals);
             locals.insert(name.clone(), uniform);
             Ok(())
         }
         IrStmt::AssignLocal { name, value } => {
             reject_if_divergent(value, divergent)?;
-            let uniform = expr_is_uniform(value, locals);
+            let uniform = !divergent && expr_is_uniform(value, locals);
             locals.insert(name.clone(), uniform);
             Ok(())
         }
         IrStmt::FragStore {
             offset, ld, value, ..
         } => {
+            reject_if_divergent_collective("frag_store", divergent)?;
             reject_if_divergent(offset, divergent)?;
             reject_if_divergent(ld, divergent)?;
             reject_if_divergent(value, divergent)
@@ -163,7 +172,8 @@ fn check_stmt(
         IrStmt::ImageStore { args, .. } => args
             .iter()
             .try_for_each(|arg| reject_if_divergent(arg, divergent)),
-        IrStmt::Barrier | IrStmt::Discard => Ok(()),
+        IrStmt::Barrier => reject_if_divergent_collective("workgroup barrier", divergent),
+        IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             reject_if_divergent(cond, divergent)?;
             let cond_uniform = expr_is_uniform(cond, locals);
@@ -373,6 +383,59 @@ mod tests {
         "#,
         )
         .expect("push-constant loop bounds are uniform");
+    }
+
+    #[test]
+    fn barrier_under_local_id_guard_is_rejected_on_every_backend() {
+        use crate::backend::{cuda, hip, msl, spirv};
+        let accepted = parse_compute(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, id: global_id) {
+                if group_id().x < 4u32 {
+                    barrier()
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect("parse");
+        let rejected = parse_compute(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    barrier()
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect("parse");
+        assert!(spirv::lower_compute(&accepted).is_ok());
+        assert!(hip::lower_compute(&accepted).is_ok());
+        assert!(cuda::lower_compute(&accepted).is_ok());
+        assert!(msl::lower_compute(&accepted).is_ok());
+        for msg in [
+            spirv::lower_compute(&rejected)
+                .map(|_| ())
+                .unwrap_err()
+                .message,
+            hip::lower_compute(&rejected)
+                .map(|_| ())
+                .unwrap_err()
+                .message,
+            cuda::lower_compute(&rejected)
+                .map(|_| ())
+                .unwrap_err()
+                .message,
+            msl::lower_compute(&rejected)
+                .map(|_| ())
+                .unwrap_err()
+                .message,
+        ] {
+            assert!(msg.contains("barrier") && msg.contains("uniform"), "{msg}");
+        }
     }
 
     #[test]
