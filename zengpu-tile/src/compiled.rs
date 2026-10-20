@@ -1,7 +1,7 @@
 
 use zengpu_hal::{
     BackendPreference, Bindings, BufferHandle, ComputePipelineDesc, ComputePipelineHints,
-    GpuDevice, PipelineHandle, ShaderDesc, ShaderHandle,
+    DispatchOp, GpuDevice, PipelineHandle, ShaderDesc, ShaderHandle,
 };
 
 use crate::TileError;
@@ -163,6 +163,35 @@ impl TileProgram {
             ..Bindings::default()
         };
         gpu(device.dispatch(self.pipeline, bindings, self.grid))
+    }
+
+    /// Runs `count` dispatches in one submission, with one host wait at the end.
+    pub fn dispatch_many(
+        &self,
+        device: &dyn GpuDevice,
+        buffers: &[BufferHandle],
+        count: usize,
+    ) -> Result<(), TileError> {
+        if buffers.len() != self.slots {
+            return Err(TileError::Unsupported(format!(
+                "dispatch got {} buffers, kernel takes {}",
+                buffers.len(),
+                self.slots
+            )));
+        }
+        let slots: Vec<u32> = buffers.iter().map(|b| b.index()).collect();
+        let bindings = Bindings {
+            buffers: &slots,
+            ..Bindings::default()
+        };
+        let ops: Vec<DispatchOp<'_>> = (0..count)
+            .map(|_| DispatchOp {
+                pipeline: self.pipeline,
+                bindings,
+                grid: self.grid,
+            })
+            .collect();
+        gpu(device.dispatch_batch(&ops))
     }
 
     pub fn destroy(self, device: &dyn GpuDevice) {
