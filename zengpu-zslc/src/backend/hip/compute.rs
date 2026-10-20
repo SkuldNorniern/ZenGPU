@@ -756,6 +756,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Select => {
                     format!("zsl_select({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
+                BuiltinFn::F16Round => format!("((float)((_Float16)({})))", args_s[0]),
                 BuiltinFn::I32 => {
                     if expr_is_f32(ctx, &args[0]) {
                         format!("zsl_f32_to_i32({})", args_s[0])

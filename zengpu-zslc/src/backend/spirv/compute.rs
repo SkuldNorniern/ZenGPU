@@ -1700,6 +1700,19 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             Ok(Val { id, ty: ctx.f32_id })
         }
 
+        BuiltinFn::F16Round => {
+            if args.len() != 1 {
+                return Err("ZSL: f16_round(x) takes 1 arg".into());
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let x = coerce(ctx, v, ctx.f32_id);
+            let bits = f32_to_f16_rne(ctx, x);
+            let (lo, _) = f16_lanes(ctx, bits);
+            Ok(Val {
+                id: lo,
+                ty: ctx.f32_id,
+            })
+        }
         BuiltinFn::Select => {
             if args.len() != 3 {
                 return Err("ZSL: select(cond, a, b) takes 3 args".into());

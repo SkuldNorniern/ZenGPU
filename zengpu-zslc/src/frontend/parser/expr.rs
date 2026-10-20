@@ -359,7 +359,7 @@ impl<'a> Parser<'a> {
             | BuiltinFn::Mma
             | BuiltinFn::FragSet => Some(3),
             BuiltinFn::FragRow | BuiltinFn::FragCol | BuiltinFn::FragGet => Some(2),
-            BuiltinFn::FragLen => Some(1),
+            BuiltinFn::FragLen | BuiltinFn::F16Round => Some(1),
             BuiltinFn::FragZeroAcc => Some(0),
             _ => None,
         };

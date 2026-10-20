@@ -4585,6 +4585,154 @@ mod tests {
         dev.destroy_buffer(out);
     }
 
+    /// f32 to nearest f16, ties to even, exact in f64. 65520 and up round to inf. NaN, inf,
+    /// zero pass.
+    fn f16_round_ref(x: f32) -> f32 {
+        if !x.is_finite() || x == 0.0 {
+            return x;
+        }
+        let mag = f64::from(x.abs());
+        if mag >= 65520.0 {
+            return f32::INFINITY.copysign(x);
+        }
+        let scale = 2f64.powf(mag.log2().floor() - 10.0);
+        let rounded = (mag / scale).round_ties_even() * scale;
+        (rounded as f32).copysign(x)
+    }
+
+    #[test]
+    fn zsl_scalar_features_run_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FEATURES_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel scalar_features(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, sb: device buffer<i8>, ub: device buffer<u8>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, ob: device mut buffer<i8>, oub: device mut buffer<u8>, oh: device mut buffer<i32>, oh2: device mut buffer<i32>, ofr: device mut buffer<f32>, osel: device mut buffer<i32>, id: global_id) {
+                let i = id.x
+                ou[i] = ua[i] % 7u
+                oi[i] = ia[i] % 5
+                of[i] = fa[i] % 2.5
+                ob[i] = sb[i] + 1
+                oub[i] = ub[i] + 1
+                oh[i] = i32(fa[i] * 3.0)
+                oh2[i] = i32(ua[i])
+                ofr[i] = f16_round(fa[i])
+                osel[i] = select(ia[i] < 0, ia[i] * 2, ia[i])
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 256usize;
+        let ua: Vec<u32> = (0..n as u32).map(|i| i * 37 + 5).collect();
+        let ia: Vec<i32> = (0..n as i32).map(|i| i * 13 - 1500).collect();
+        let fa: Vec<f32> = (0..n)
+            .map(|i| match i % 16 {
+                0 => 3.0e9,
+                1 => -3.0e9,
+                _ => i as f32 * 0.37 - 40.0,
+            })
+            .collect();
+        let sb: Vec<u8> = (0..n as i32).map(|i| (i * 7 - 500) as i8 as u8).collect();
+        let ub: Vec<u8> = (0..n).map(|i| (i * 11 % 256) as u8).collect();
+        let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let make = |data: &[u8], usage: BufferUsage| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size: data.len() as u64,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let inputs = [
+            make(&u32_bytes(&ua), input),
+            make(&i32_bytes(&ia), input),
+            make(&f32_bytes(&fa), input),
+            make(&sb, input),
+            make(&ub, input),
+        ];
+        let out_sizes = [1024u64, 1024, 1024, 256, 256, 1024, 1024, 1024, 1024];
+        let outs: Vec<_> = out_sizes
+            .iter()
+            .map(|&s| make(&vec![0u8; s as usize], output))
+            .collect();
+
+        let shader = dev
+            .create_shader(FEATURES_ZSL.spirv_desc().unwrap())
+            .unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        let slots: Vec<u32> = inputs
+            .iter()
+            .chain(outs.iter())
+            .map(|b| b.index())
+            .collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [8, 1, 1],
+        )
+        .unwrap();
+        let read = |b: zengpu_hal::BufferHandle, len: u64| dev.read_buffer(b, 0, len).unwrap();
+        let words = |b: zengpu_hal::BufferHandle| -> Vec<u32> {
+            read(b, 1024)
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ou = words(outs[0]);
+        let oi: Vec<i32> = words(outs[1]).into_iter().map(|w| w as i32).collect();
+        let of: Vec<f32> = words(outs[2]).into_iter().map(f32::from_bits).collect();
+        let ob = read(outs[3], 256);
+        let oub = read(outs[4], 256);
+        let oh: Vec<i32> = words(outs[5]).into_iter().map(|w| w as i32).collect();
+        let oh2: Vec<i32> = words(outs[6]).into_iter().map(|w| w as i32).collect();
+        let ofr: Vec<f32> = words(outs[7]).into_iter().map(f32::from_bits).collect();
+        let osel: Vec<i32> = words(outs[8]).into_iter().map(|w| w as i32).collect();
+        for i in 0..n {
+            assert_eq!(ou[i], ua[i] % 7, "u32 % at {i}");
+            assert_eq!(oi[i], ia[i] % 5, "i32 % at {i}");
+            assert!(
+                of[i] == fa[i] % 2.5,
+                "f32 % at {i}: {} vs {}",
+                of[i],
+                fa[i] % 2.5
+            );
+            assert_eq!(ob[i], sb[i].wrapping_add(1), "i8 store at {i}");
+            assert_eq!(oub[i], ub[i].wrapping_add(1), "u8 store at {i}");
+            assert_eq!(oh[i], (fa[i] * 3.0) as i32, "i32(f32) at {i}");
+            assert_eq!(oh2[i], ua[i] as i32, "i32(u32) at {i}");
+            let want_round = f16_round_ref(fa[i]);
+            assert!(
+                ofr[i] == want_round || (ofr[i].is_nan() && want_round.is_nan()),
+                "f16_round at {i}: {} vs {want_round}",
+                ofr[i]
+            );
+            let want_sel = if ia[i] < 0 { ia[i] * 2 } else { ia[i] };
+            assert_eq!(osel[i], want_sel, "select at {i}");
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for b in inputs.into_iter().chain(outs) {
+            dev.destroy_buffer(b);
+        }
+    }
+
     /// `frag_load_a/b` from f32 shared: each subgroup stages its tile in f16 workgroup memory.
     #[test]
     fn zsl_frag_ab_from_shared_runs_through_vulkan() {

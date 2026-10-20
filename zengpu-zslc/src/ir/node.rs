@@ -132,6 +132,9 @@ pub enum BuiltinFn {
     U32,
     /// f32 to i32 truncates, maps NaN to 0 and saturates. u32 to i32 reinterprets the bits.
     I32,
+    /// Rounds to the nearest f16, ties to even. The result stays f32: overflow gives inf, and NaN
+    /// stays NaN. Compute only.
+    F16Round,
     F32,
     Step,
     Smoothstep,
@@ -287,6 +290,7 @@ impl BuiltinFn {
             BuiltinFn::BytePerm => "byte_perm",
             BuiltinFn::Select => "select",
             BuiltinFn::I32 => "i32",
+            BuiltinFn::F16Round => "f16_round",
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",

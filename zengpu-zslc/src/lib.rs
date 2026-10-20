@@ -1164,6 +1164,25 @@ int main() {{
         assert!(ops.contains(&202) && ops.contains(&203));
     }
 
+    #[test]
+    fn f16_round_lowers_per_backend() {
+        const ROUND: &str = r#"
+            @workgroup_size(32)
+            kernel round_kernel(fa: device buffer<f32>, o: device mut buffer<f32>, id: global_id) {
+                o[id.x] = f16_round(fa[id.x] * 1.5)
+            }
+        "#;
+        let module = parse_compute(ROUND).expect("parse f16_round");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        assert!(hip_source.contains("(_Float16)"));
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        assert!(cuda_source.contains("__float2half("));
+        let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
+        assert!(msl_source.contains("float(half("));
+        spirv::lower_compute(&module).expect("lower to SPIR-V");
+        assert!(parse_compute("@workgroup_size(1)\nkernel k(o: device mut buffer<f32>) { o[0] = f16_round(1.0, 2.0) }").is_err());
+    }
+
     const FRAG_SHARED_AB: &str = r#"
         @workgroup_size(32)
         kernel frag_shared_ab(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, out: device mut buffer<f32>) {
