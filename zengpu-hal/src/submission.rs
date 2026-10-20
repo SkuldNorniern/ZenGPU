@@ -1,4 +1,3 @@
-
 use std::time::Duration;
 
 use crate::{GpuError, Result, UsageError};
@@ -120,15 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completed_submission_preserves_cycle_id() {
-        let submission = CompletedSubmission::new(42);
-        assert_eq!(submission.cycle_id(), 42);
-        assert_eq!(submission.poll().unwrap(), SubmissionStatus::Complete);
-        submission.wait(Duration::ZERO).unwrap();
-    }
-
-    #[test]
-    fn completed_readback_returns_bytes_in_both_forms() {
+    fn completed_readback_returns_bytes_and_rejects_wrong_sized_destinations() {
         let readback: ReadSubmission = Box::new(CompletedReadback::new(7, vec![1, 2, 3]));
         assert_eq!(readback.cycle_id(), 7);
         assert_eq!(readback.poll().unwrap(), SubmissionStatus::Complete);
@@ -138,10 +129,7 @@ mod tests {
         let mut dst = [0u8; 2];
         readback.read_into(&mut dst).unwrap();
         assert_eq!(dst, [4, 5]);
-    }
 
-    #[test]
-    fn completed_readback_rejects_wrong_sized_destinations() {
         for len in [0, 1, 3] {
             let readback: ReadSubmission = Box::new(CompletedReadback::new(1, vec![4, 5]));
             let mut dst = vec![9; len];

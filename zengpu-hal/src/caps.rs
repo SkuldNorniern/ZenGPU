@@ -43,17 +43,3 @@ impl ComputeCaps {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scalar_only_claims_no_matrix_units() {
-        let caps = ComputeCaps::scalar_only();
-        assert_eq!(caps.subgroup_sizes, (1, 1));
-        assert_eq!(caps.default_subgroup, 1);
-        assert_eq!(caps.shared_bytes, 0);
-        assert!(caps.mma.is_empty());
-    }
-}

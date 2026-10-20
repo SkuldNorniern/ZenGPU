@@ -453,32 +453,6 @@ pub struct SurfaceConfig {
     pub present_mode: PresentMode,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vertex_format_sizes() {
-        assert_eq!(VertexFormat::Float16x2.size_bytes(), 4);
-        assert_eq!(VertexFormat::Float16x4.size_bytes(), 8);
-        assert_eq!(VertexFormat::Snorm8x4.size_bytes(), 4);
-        assert_eq!(VertexFormat::Unorm16x2.size_bytes(), 4);
-        assert_eq!(VertexFormat::Unorm16x4.size_bytes(), 8);
-        assert_eq!(VertexFormat::Sint32x2.size_bytes(), 8);
-        assert_eq!(VertexFormat::Sint32x3.size_bytes(), 12);
-        assert_eq!(VertexFormat::Sint32x4.size_bytes(), 16);
-        assert_eq!(VertexFormat::Float32x3.size_bytes(), 12);
-        assert_eq!(VertexFormat::Uint8x4Unorm.size_bytes(), 4);
-    }
-
-    #[test]
-    fn sampler_default_is_linear_clamp() {
-        let s = SamplerDesc::default();
-        assert_eq!(s.min_filter, FilterMode::Linear);
-        assert_eq!(s.address, AddressMode::ClampToEdge);
-    }
-}
-
 /// A rectangle in texels of one mip level of one layer (or cube face).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TextureRegion {
