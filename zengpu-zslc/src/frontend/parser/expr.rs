@@ -355,6 +355,7 @@ impl<'a> Parser<'a> {
             | BuiltinFn::Dot2F16
             | BuiltinFn::FunnelShr
             | BuiltinFn::BytePerm
+            | BuiltinFn::Select
             | BuiltinFn::Mma
             | BuiltinFn::FragSet => Some(3),
             BuiltinFn::FragRow | BuiltinFn::FragCol | BuiltinFn::FragGet => Some(2),
@@ -368,6 +369,18 @@ impl<'a> Parser<'a> {
             return self.err(format!("{}() takes {n} args", func.name()));
         }
         self.check_frag_call(ctx, func, &args)?;
+        if func == BuiltinFn::Select {
+            let tc = ctx.type_ctx();
+            let cond = type_of_compute_expr(&args[0], &tc, &mut self.types);
+            let a = type_of_compute_expr(&args[1], &tc, &mut self.types);
+            let b = type_of_compute_expr(&args[2], &tc, &mut self.types);
+            if cond != self.types.bool_id() {
+                return self.err("select(cond, a, b): `cond` must be a bool");
+            }
+            if a != b {
+                return self.err("select(cond, a, b): both arms must have the same type");
+            }
+        }
         if matches!(
             func,
             BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize

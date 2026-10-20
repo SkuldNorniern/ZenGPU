@@ -36,6 +36,7 @@ pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "pk_fma_f16" => BuiltinFn::PkFmaF16,
         "dot2_f16" => BuiltinFn::Dot2F16,
         "funnel_shr" => BuiltinFn::FunnelShr,
+        "select" => BuiltinFn::Select,
         "byte_perm" => BuiltinFn::BytePerm,
         "frag_zero_acc" => BuiltinFn::FragZeroAcc,
         "mma" => BuiltinFn::Mma,

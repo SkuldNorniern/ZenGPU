@@ -538,6 +538,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::PkFmaF16 => format!("zsl_pk_fma_f16({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::Dot2F16 => format!("zsl_dot2_f16({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::FunnelShr => format!("zsl_funnel_shr({}, {}, {})", a[0], a[1], a[2]),
+                BuiltinFn::Select => format!("select({}, {}, {})", a[2], a[1], a[0]),
                 BuiltinFn::BytePerm => format!("zsl_byte_perm({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),

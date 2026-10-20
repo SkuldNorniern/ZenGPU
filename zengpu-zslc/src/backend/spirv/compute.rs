@@ -1630,6 +1630,18 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             Ok(Val { id, ty: ctx.f32_id })
         }
 
+        BuiltinFn::Select => {
+            if args.len() != 3 {
+                return Err("ZSL: select(cond, a, b) takes 3 args".into());
+            }
+            let cond = lower_expr(ctx, &args[0])?;
+            let a = lower_expr(ctx, &args[1])?;
+            let b = lower_expr(ctx, &args[2])?;
+            let (a, b) = unify(ctx, a, b);
+            let ty = ctx.spv_ty(a.ty);
+            let id = ctx.spv.op_select(ty, cond.id, a.id, b.id);
+            Ok(Val { id, ty: a.ty })
+        }
         BuiltinFn::FunnelShr => {
             if args.len() != 3 {
                 return Err("ZSL: funnel_shr(hi, lo, s) takes 3 args".into());

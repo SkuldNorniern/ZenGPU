@@ -129,6 +129,9 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
 
     s.push_str(r#"
 #include <cuda_fp16.h>
+__device__ __forceinline__ unsigned int zsl_select(bool c, unsigned int a, unsigned int b) { return c ? a : b; }
+__device__ __forceinline__ int zsl_select(bool c, int a, int b) { return c ? a : b; }
+__device__ __forceinline__ float zsl_select(bool c, float a, float b) { return c ? a : b; }
 __device__ __forceinline__ unsigned int zsl_pk_add_u16(unsigned int a, unsigned int b) {
     return ((a & 0x7fff7fffu) + (b & 0x7fff7fffu)) ^ ((a ^ b) & 0x80008000u);
 }
@@ -739,6 +742,9 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::Dot2F16 => {
                     format!("zsl_dot2_f16({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Select => {
+                    format!("zsl_select({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::FunnelShr => {
                     format!(

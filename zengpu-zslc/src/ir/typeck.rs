@@ -67,6 +67,10 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::TexSize { .. } => u32_id,
         IrExpr::FragLoad { ty, .. } => *ty,
         IrExpr::Builtin { func, args } => match func {
+            BuiltinFn::Select => args
+                .get(1)
+                .map(|a| type_of_compute_expr(a, ctx, arena))
+                .unwrap_or(u32_id),
             BuiltinFn::Mma => {
                 let int_operands = args
                     .first()

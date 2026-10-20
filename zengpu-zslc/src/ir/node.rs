@@ -180,6 +180,8 @@ pub enum BuiltinFn {
     FunnelShr,
     /// Like `__byte_perm` without sign mode. Byte i is picked by selector nibble i from `b:a`.
     BytePerm,
+    /// Both arms are evaluated, with no branch. The types must match.
+    Select,
     /// Subgroup index within the workgroup. A query, not a collective, so it is legal in any
     /// control flow.
     SubgroupId,
@@ -281,6 +283,7 @@ impl BuiltinFn {
             BuiltinFn::Dot2F16 => "dot2_f16",
             BuiltinFn::FunnelShr => "funnel_shr",
             BuiltinFn::BytePerm => "byte_perm",
+            BuiltinFn::Select => "select",
             BuiltinFn::SubgroupId => "subgroup_id",
             BuiltinFn::SubgroupLocalId => "subgroup_local_id",
             BuiltinFn::SubgroupSize => "subgroup_size",

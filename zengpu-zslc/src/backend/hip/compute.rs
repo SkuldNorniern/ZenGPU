@@ -152,6 +152,9 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     s.push_str(r#"
 typedef unsigned short zsl_u16x2 __attribute__((ext_vector_type(2)));
 typedef _Float16 zsl_f16x2 __attribute__((ext_vector_type(2)));
+__device__ __forceinline__ unsigned int zsl_select(bool c, unsigned int a, unsigned int b) { return c ? a : b; }
+__device__ __forceinline__ int zsl_select(bool c, int a, int b) { return c ? a : b; }
+__device__ __forceinline__ float zsl_select(bool c, float a, float b) { return c ? a : b; }
 __device__ __forceinline__ unsigned int zsl_pk_add_u16(unsigned int a, unsigned int b) {
     return __builtin_bit_cast(unsigned int, __builtin_bit_cast(zsl_u16x2, a) + __builtin_bit_cast(zsl_u16x2, b));
 }
@@ -722,6 +725,9 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 }
                 BuiltinFn::Dot2F16 => {
                     format!("zsl_dot2_f16({}, {}, {})", args_s[0], args_s[1], args_s[2])
+                }
+                BuiltinFn::Select => {
+                    format!("zsl_select({}, {}, {})", args_s[0], args_s[1], args_s[2])
                 }
                 BuiltinFn::FunnelShr => {
                     format!(
