@@ -129,6 +129,7 @@ impl CompiledTile {
         };
         let hints = ComputePipelineHints {
             subgroup_size: self.subgroup,
+            capture_stats: false,
         };
         match device.create_compute_pipeline_with(desc, hints) {
             Ok(pipeline) => Ok(TileProgram {

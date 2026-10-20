@@ -5322,6 +5322,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();
@@ -5475,6 +5476,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();
@@ -5610,6 +5612,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();
@@ -5766,6 +5769,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();
@@ -5932,6 +5936,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();
@@ -6035,6 +6040,7 @@ mod tests {
                 },
                 zengpu_hal::ComputePipelineHints {
                     subgroup_size: Some(32),
+                    capture_stats: false,
                 },
             )
             .unwrap();

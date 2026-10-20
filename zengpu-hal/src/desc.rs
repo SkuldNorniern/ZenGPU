@@ -111,6 +111,24 @@ pub struct ComputePipelineHints {
     /// lanes per subgroup, e.g. 64 for wave64 on RDNA (drivers often default to wave32). Ignored
     /// outside the device range.
     pub subgroup_size: Option<u32>,
+    /// Keeps the driver resource report for [`crate::GpuDevice::pipeline_stats`]. Ignored where it is
+    /// always reported.
+    pub capture_stats: bool,
+}
+
+/// Unreported fields are zero, and `waves_per_simd` is `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PipelineStats {
+    /// Vector registers per lane.
+    pub vgprs: u32,
+    /// Scalar registers per wave.
+    pub sgprs: u32,
+    /// Private (spill / stack) bytes per lane. Non-zero means spilling.
+    pub scratch_bytes: u32,
+    pub lds_bytes: u32,
+    pub max_threads: u32,
+    /// Waves resident per SIMD at this register use, when the driver says.
+    pub waves_per_simd: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
