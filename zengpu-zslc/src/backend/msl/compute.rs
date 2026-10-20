@@ -18,7 +18,10 @@ use std::cell::RefCell;
 pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     check_uniformity(module)?;
     let e = &module.entry;
-    let EntryKind::Compute { local_size } = e.kind;
+    let EntryKind::Compute {
+        local_size,
+        occupancy,
+    } = e.kind;
 
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
     let mut frags: HashMap<&str, FragTiles> = HashMap::new();
@@ -219,7 +222,11 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
         s.push_str("};\n\n");
     }
 
-    let _ = writeln!(s, "kernel void {ENTRY}(");
+    let _ = writeln!(
+        s,
+        "[[max_total_threads_per_threadgroup({})]] kernel void {ENTRY}(",
+        occupancy.launch_bounds(local_size)
+    );
     let mut slot = 0u32;
     for (b, buffer_elem) in &buffers {
         let elem = if atomic_buffers.contains(b) {

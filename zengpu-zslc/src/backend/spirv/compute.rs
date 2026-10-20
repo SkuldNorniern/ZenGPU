@@ -55,7 +55,7 @@ pub fn lower_compute(module: &Module) -> Result<Vec<u32>, Diagnostic> {
 
 fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let entry = &module.entry;
-    let EntryKind::Compute { local_size } = entry.kind;
+    let EntryKind::Compute { local_size, .. } = entry.kind;
 
     let mut spv = SpvBuilder::new();
 

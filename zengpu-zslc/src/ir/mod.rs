@@ -46,7 +46,29 @@ pub enum ParamKind {
 
 #[derive(Debug)]
 pub enum EntryKind {
-    Compute { local_size: [u32; 3] },
+    Compute {
+        local_size: [u32; 3],
+        occupancy: Occupancy,
+    },
+}
+
+impl Occupancy {
+    /// Block size for the launch bound: `@launch_bounds` if given, else the workgroup thread count.
+    pub fn launch_bounds(&self, local_size: [u32; 3]) -> u32 {
+        self.max_threads
+            .unwrap_or_else(|| local_size.iter().product())
+    }
+}
+
+/// Occupancy hints. Absent hints lower to nothing. `max_threads` defaults to the workgroup size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Occupancy {
+    /// Largest launched block, from `@launch_bounds(n)`. Must be at least the workgroup size.
+    pub max_threads: Option<u32>,
+    /// Wave-occupancy window from `@waves_per_eu(min[, max])`.
+    pub waves_per_eu: Option<(u32, Option<u32>)>,
+    /// Minimum number of resident blocks per SM (CUDA), from `@min_blocks(n)`.
+    pub min_blocks: Option<u32>,
 }
 
 #[derive(Debug)]

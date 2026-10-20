@@ -1,4 +1,5 @@
 use super::*;
+use crate::ir::Occupancy;
 
 impl<'a> Parser<'a> {
     pub(super) fn parse_shader(&mut self) -> Result<Shader, ParseError> {
@@ -18,6 +19,7 @@ impl<'a> Parser<'a> {
         }
 
         let mut local_size = [1u32, 1, 1];
+        let mut occupancy = Occupancy::default();
         let mut backends: Vec<Backend> = Vec::new();
         while self.eat(&Tok::At) {
             let name = self.ident()?;
@@ -26,6 +28,30 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::LParen, "`(` after @workgroup_size")?;
                     local_size = self.parse_workgroup_size()?;
                     self.expect(&Tok::RParen, "`)`")?;
+                }
+                "launch_bounds" => {
+                    self.expect(&Tok::LParen, "`(` after @launch_bounds")?;
+                    occupancy.max_threads = Some(self.parse_hint_int("@launch_bounds")?);
+                    self.expect(&Tok::RParen, "`)` closing @launch_bounds")?;
+                }
+                "min_blocks" => {
+                    self.expect(&Tok::LParen, "`(` after @min_blocks")?;
+                    occupancy.min_blocks = Some(self.parse_hint_int("@min_blocks")?);
+                    self.expect(&Tok::RParen, "`)` closing @min_blocks")?;
+                }
+                "waves_per_eu" => {
+                    self.expect(&Tok::LParen, "`(` after @waves_per_eu")?;
+                    let min = self.parse_hint_int("@waves_per_eu")?;
+                    let max = if self.eat(&Tok::Comma) {
+                        Some(self.parse_hint_int("@waves_per_eu")?)
+                    } else {
+                        None
+                    };
+                    if max.is_some_and(|m| m < min) {
+                        return self.err("@waves_per_eu max must be >= min");
+                    }
+                    occupancy.waves_per_eu = Some((min, max));
+                    self.expect(&Tok::RParen, "`)` closing @waves_per_eu")?;
                 }
                 "backends" => {
                     self.expect(&Tok::LParen, "`(` after @backends")?;
@@ -47,15 +73,24 @@ impl<'a> Parser<'a> {
                 }
                 other => {
                     return self.err(format!(
-                        "unknown attribute `@{other}`; expected @workgroup_size or @backends"
+                        "unknown attribute `@{other}`; expected @workgroup_size, @launch_bounds, @waves_per_eu, @min_blocks or @backends"
                     ));
                 }
             }
         }
 
+        if let Some(max) = occupancy.max_threads {
+            let threads = local_size.iter().product::<u32>();
+            if max < threads {
+                return self.err(format!(
+                    "@launch_bounds({max}) is smaller than the workgroup size ({threads} threads)"
+                ));
+            }
+        }
+
         let shader = if self.eat_kw("kernel") {
             let _name = self.ident()?;
-            Shader::Compute(self.parse_kernel_rest(local_size)?)
+            Shader::Compute(self.parse_kernel_rest(local_size, occupancy)?)
         } else if self.eat_kw("vertex") {
             let _name = self.ident()?;
             Shader::Graphics(self.parse_graphics_rest(false)?)
@@ -77,7 +112,11 @@ impl<'a> Parser<'a> {
         })
     }
 
-    pub(super) fn parse_kernel_rest(&mut self, local_size: [u32; 3]) -> Result<Module, ParseError> {
+    pub(super) fn parse_kernel_rest(
+        &mut self,
+        local_size: [u32; 3],
+        occupancy: Occupancy,
+    ) -> Result<Module, ParseError> {
         let mut ctx = Ctx {
             buffers: HashMap::new(),
             scalars: HashMap::new(),
@@ -131,7 +170,10 @@ impl<'a> Parser<'a> {
 
         Ok(Module {
             entry: Entry {
-                kind: EntryKind::Compute { local_size },
+                kind: EntryKind::Compute {
+                    local_size,
+                    occupancy,
+                },
                 params,
                 shared,
                 locals,
@@ -140,6 +182,17 @@ impl<'a> Parser<'a> {
             types: mem::replace(&mut self.types, TypeArena::new()),
             backends: Vec::new(),
         })
+    }
+
+    fn parse_hint_int(&mut self, attr: &str) -> Result<u32, ParseError> {
+        match self.peek() {
+            Some(Tok::Int(v)) if *v >= 1 && *v <= u32::MAX as u64 => {
+                let v = *v as u32;
+                self.pos += 1;
+                Ok(v)
+            }
+            _ => self.err(format!("{attr} expects a positive integer")),
+        }
     }
 
     pub(super) fn parse_workgroup_size(&mut self) -> Result<[u32; 3], ParseError> {
