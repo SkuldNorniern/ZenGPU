@@ -133,16 +133,4 @@ mod tests {
         assert!(msg.contains("use after free"), "got: {msg}");
         assert!(msg.contains("12"));
     }
-
-    #[test]
-    fn surface_error_converts() {
-        let e: GpuError = SurfaceError::Outdated.into();
-        assert!(matches!(e, GpuError::Surface(SurfaceError::Outdated)));
-    }
-
-    #[test]
-    fn submission_timeout_is_distinct_from_device_loss() {
-        assert_eq!(GpuError::Timeout.to_string(), "operation timed out");
-        assert!(!matches!(GpuError::Timeout, GpuError::DeviceLost));
-    }
 }

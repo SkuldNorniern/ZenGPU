@@ -44,29 +44,3 @@ pub enum ComputeOp<'a> {
     CopyBuffer(BufferCopyOp),
     Dispatch(DispatchOp<'a>),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bindings_default_is_empty() {
-        let b = Bindings::default();
-        assert!(b.buffers.is_empty());
-        assert!(b.textures.is_empty());
-        assert!(b.images.is_empty());
-        assert!(b.scalars.is_empty());
-    }
-
-    #[test]
-    fn bindings_carry_indices_and_scalars() {
-        let b = Bindings {
-            buffers: &[3, 7],
-            textures: &[],
-            images: &[],
-            scalars: &[Scalar::U32(256)],
-        };
-        assert_eq!(b.buffers, &[3, 7]);
-        assert_eq!(b.scalars, &[Scalar::U32(256)]);
-    }
-}

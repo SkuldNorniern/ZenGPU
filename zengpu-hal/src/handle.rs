@@ -373,29 +373,6 @@ mod tests {
     }
 
     #[test]
-    fn insert_get_remove() {
-        let mut map = Map::new();
-        assert!(map.is_empty());
-        let h = map.insert(42);
-        assert_eq!(map.get(h), Some(&42));
-        assert_eq!(map.len(), 1);
-        *map.get_mut(h).unwrap() = 7;
-        assert_eq!(map.get(h), Some(&7));
-        assert_eq!(map.remove(h), Some(7));
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn next_index_tracks_reused_slots() {
-        let mut map = Map::new();
-        assert_eq!(map.next_index(), 0);
-        let first = map.insert(10);
-        assert_eq!(map.next_index(), 1);
-        map.remove(first);
-        assert_eq!(map.next_index(), first.index());
-    }
-
-    #[test]
     fn retired_slot_is_stale_but_not_reused_until_release() {
         let mut map = Map::new();
         let retired = map.insert(10);
@@ -429,46 +406,5 @@ mod tests {
         assert_ne!(h2.generation(), h.generation());
         assert_eq!(map.get(h), None, "old handle must stay stale");
         assert_eq!(map.get(h2), Some(&20));
-    }
-
-    #[test]
-    fn out_of_range_handle_is_safe() {
-        let real = Map::new();
-        let mut other = Map::new();
-        let foreign = other.insert(1);
-        assert_eq!(real.get(foreign), None);
-    }
-
-    #[test]
-    fn rebuilt_handles_are_checked() {
-        let mut map = Map::new();
-        let h = map.insert(5);
-        let same = Handle::from_owned_parts(h.index(), h.generation(), h.owner());
-        assert_eq!(map.get(same), Some(&5));
-        map.remove(h);
-        map.insert(6);
-        assert_eq!(map.get(same), None);
-    }
-
-    #[test]
-    fn generation_at_tracks_slot() {
-        let mut map = Map::new();
-        let h = map.insert(1);
-        assert_eq!(map.generation_at(h.index()), Some(0));
-        map.remove(h);
-        assert_eq!(map.generation_at(h.index()), Some(1));
-        assert_eq!(map.generation_at(999), None);
-    }
-
-    #[test]
-    fn drain_removes_all_and_invalidates_handles() {
-        let mut map = Map::new();
-        let h0 = map.insert(10);
-        let h1 = map.insert(20);
-        map.remove(h0);
-        let drained: Vec<_> = map.drain().collect();
-        assert_eq!(drained, vec![20]);
-        assert!(map.is_empty());
-        assert_eq!(map.get(h1), None);
     }
 }

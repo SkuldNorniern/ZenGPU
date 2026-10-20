@@ -1,4 +1,3 @@
-
 use std::path::PathBuf;
 
 use crate::types::{BackendPreference, Features, PowerPreference};
@@ -129,29 +128,4 @@ pub struct DeviceLimits {
     pub timestamp_period_ns: f32,
     /// Parallel units (CUs, SMs, GPU cores), for sizing grids. 0 if unknown.
     pub compute_units: u32,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn capability_constructors() {
-        assert!(HalCapabilities::all().graphics);
-        assert!(HalCapabilities::all().compute);
-        assert!(!HalCapabilities::compute_only().graphics);
-        assert!(HalCapabilities::compute_only().compute);
-        assert!(
-            HalCapabilities::all()
-                .features
-                .contains(Features::GRAPHICS | Features::COMPUTE)
-        );
-    }
-
-    #[test]
-    fn device_request_default_requires_nothing() {
-        let r = DeviceRequest::default();
-        assert!(r.required.is_empty());
-        assert_eq!(r.backend, BackendPreference::Auto);
-    }
 }

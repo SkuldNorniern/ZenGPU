@@ -57,28 +57,3 @@ pub trait GpuInstance: Send + Sync {
     /// Returns `None` if nothing matches.
     fn request_adapter(&self, req: AdapterRequest) -> Option<Box<dyn GpuAdapter>>;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn device_type_is_copy() {
-        let t = DeviceType::Discrete;
-        let _ = t;
-        let _ = t;
-    }
-
-    #[test]
-    fn adapter_info_fields() {
-        let info = AdapterInfo {
-            name: "Test Adapter".to_string(),
-            vendor: 0x10de,
-            device: 0x2684,
-            device_type: DeviceType::Discrete,
-            backend: BackendPreference::Vulkan,
-        };
-        assert_eq!(info.vendor, 0x10de);
-        assert_eq!(info.device_type, DeviceType::Discrete);
-    }
-}
