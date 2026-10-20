@@ -83,6 +83,11 @@ fn overheads() {
     println!("hip: batched launch             {:?}", per_iter(t, N));
 
     let t = Instant::now();
+    let sub = dev.submit_batch(0, &ops).unwrap();
+    println!("hip: enqueue N dispatches (CPU) {:?}", per_iter(t, N));
+    sub.wait(Duration::from_secs(10)).unwrap();
+
+    let t = Instant::now();
     for _ in 0..N {
         let sub = dev.submit(0, pipeline, bindings, [1, 1, 1]).unwrap();
         sub.wait(Duration::from_secs(10)).unwrap();
