@@ -367,15 +367,8 @@ mod tests {
         adapter.open(DeviceRequest::default()).ok()
     }
 
-    /// The HAL does not report this. RADV on gfx1200 has f16 cooperative matrix, wave32 by default.
-    fn vulkan_target() -> Target {
-        Target {
-            backend: BackendPreference::Vulkan,
-            wave_size: 32,
-            lds_bytes: 32768,
-            has_mma_f16: true,
-            has_mma_i8: false,
-        }
+    fn caps_target(dev: &dyn GpuDevice, backend: BackendPreference) -> Target {
+        Target::from_caps(backend, &dev.compute_caps())
     }
 
     #[derive(Clone, Copy)]
@@ -474,29 +467,33 @@ mod tests {
     #[test]
     fn gemm_on_hip() {
         let Some(dev) = hip_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Hip);
         for case in CASES {
-            run_case(&*dev, &Target::hip_gfx12(), case, &Schedule::o0()).unwrap();
+            run_case(&*dev, &target, case, &Schedule::o0()).unwrap();
         }
     }
 
     #[test]
     fn gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Vulkan);
         for case in CASES {
-            run_case(&*dev, &vulkan_target(), case, &Schedule::o0()).unwrap();
+            run_case(&*dev, &target, case, &Schedule::o0()).unwrap();
         }
     }
 
     #[test]
     fn scheduled_gemm_on_hip() {
         let Some(dev) = hip_device() else { return };
-        check_scheduled(&*dev, &Target::hip_gfx12());
+        let target = caps_target(&*dev, BackendPreference::Hip);
+        check_scheduled(&*dev, &target);
     }
 
     #[test]
     fn scheduled_gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
-        check_scheduled(&*dev, &vulkan_target());
+        let target = caps_target(&*dev, BackendPreference::Vulkan);
+        check_scheduled(&*dev, &target);
     }
 
     fn check_scheduled(dev: &dyn GpuDevice, target: &Target) {
