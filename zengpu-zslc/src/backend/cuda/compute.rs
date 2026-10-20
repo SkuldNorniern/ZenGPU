@@ -289,6 +289,7 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
         },
         types: RefCell::new(module.types.clone()),
         block_size,
+        local_size,
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
@@ -315,6 +316,8 @@ struct Ctx<'a> {
     type_ctx: ComputeTypeCtx,
     types: RefCell<TypeArena>,
     block_size: u32,
+    /// Workgroup dimensions, to linearize `threadIdx` for fragment staging.
+    local_size: [u32; 3],
 }
 
 fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {

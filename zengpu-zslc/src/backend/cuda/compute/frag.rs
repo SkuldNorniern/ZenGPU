@@ -12,7 +12,16 @@ use crate::ir::node::{BuiltinFn, FragSrc, IrExpr};
 use crate::ir::typeck::frag_parts;
 use crate::ir::types::{FloatFormat, FragUse, IntWidth, Type, TypeId};
 
-pub(super) const FRAG_PRELUDE: &str = "#include <cuda_fp16.h>\n#include <mma.h>\n";
+pub(super) const FRAG_PRELUDE: &str = r#"#include <cuda_fp16.h>
+#include <mma.h>
+// wmma cannot convert on load, so `zsl_load` reads the staged `__half` tile.
+__device__ __forceinline__ void zsl_stage_tile(__half* dst, const float* src, unsigned int off, unsigned int ld, unsigned int lane) {
+    for (unsigned int i = 0; i < 8u; ++i) {
+        unsigned int e = lane + 32u * i;
+        dst[e] = __float2half(src[off + (e >> 4) * ld + (e & 15u)]);
+    }
+}
+"#;
 
 const LAYOUT_ROW: &str = "nvcuda::wmma::mem_row_major";
 
@@ -165,6 +174,34 @@ fn load_args(
     Ok(format!("({ptr} + ({offset})), {ld}{layout}"))
 }
 
+/// A and B load from shared f32 through a per-warp `__half` tile, because `load_matrix_sync` reads
+/// the fragment's element type.
+fn load_stmt(
+    ctx: &Ctx<'_>,
+    name: &str,
+    usage: FragUse,
+    src: &FragSrc,
+    off: &str,
+    ldv: &str,
+) -> Result<String, Diagnostic> {
+    if let FragSrc::Shared(tile) = src
+        && matches!(usage, FragUse::A | FragUse::B)
+    {
+        let warps = ctx.block_size.div_ceil(32);
+        let [lx, ly, _] = ctx.local_size;
+        return Ok(format!(
+            "{{ __shared__ __half zsl_stage[{warps}][256]; \
+             const unsigned int zsl_lin = threadIdx.x + {lx}u * (threadIdx.y + {ly}u * threadIdx.z); \
+             zsl_stage_tile(zsl_stage[zsl_lin >> 5], {tile}, {off}, {ldv}, zsl_lin & 31u); \
+             __syncwarp(); \
+             nvcuda::wmma::load_matrix_sync({name}, zsl_stage[zsl_lin >> 5], 16); \
+             __syncwarp(); }}"
+        ));
+    }
+    let args = load_args(ctx, src, usage, off, ldv)?;
+    Ok(format!("nvcuda::wmma::load_matrix_sync({name}, {args});"))
+}
+
 pub(super) fn let_stmt(
     ctx: &Ctx<'_>,
     ty: &str,
@@ -182,8 +219,7 @@ pub(super) fn let_stmt(
             let usage = usage_from(ctx, *fty)?;
             let off = emit_expr(ctx, offset)?;
             let ldv = emit_expr(ctx, ld)?;
-            let args = load_args(ctx, src, usage, &off, &ldv)?;
-            let _ = write!(out, " nvcuda::wmma::load_matrix_sync({name}, {args});");
+            let _ = write!(out, " {}", load_stmt(ctx, name, usage, src, &off, &ldv)?);
         }
         _ => out.push_str(&mma_or_zero(ctx, name, init)?),
     }
@@ -201,8 +237,7 @@ pub(super) fn assign_stmt(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<S
             let usage = usage_from(ctx, *fty)?;
             let off = emit_expr(ctx, offset)?;
             let ldv = emit_expr(ctx, ld)?;
-            let args = load_args(ctx, src, usage, &off, &ldv)?;
-            Ok(format!("nvcuda::wmma::load_matrix_sync({name}, {args});"))
+            load_stmt(ctx, name, usage, src, &off, &ldv)
         }
         _ => mma_or_zero(ctx, name, value),
     }
