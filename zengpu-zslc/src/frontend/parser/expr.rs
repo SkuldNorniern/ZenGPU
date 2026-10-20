@@ -102,6 +102,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Tok::Star) => IrBinOp::Mul,
                 Some(Tok::Slash) => IrBinOp::Div,
+                Some(Tok::Percent) => IrBinOp::Rem,
                 _ => break,
             };
             self.pos += 1;

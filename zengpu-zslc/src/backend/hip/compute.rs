@@ -311,6 +311,7 @@ fn is_mixed_sign_checked_op(op: IrBinOp) -> bool {
             | IrBinOp::Sub
             | IrBinOp::Mul
             | IrBinOp::Div
+            | IrBinOp::Rem
             | IrBinOp::Lt
             | IrBinOp::Le
             | IrBinOp::Gt
@@ -824,11 +825,19 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
         }
         IrExpr::Neg(inner) => format!("(-{})", emit_expr(ctx, inner)?),
         IrExpr::Binary { op, lhs, rhs } => {
+            if *op == IrBinOp::Rem && expr_is_f32(ctx, lhs) {
+                return Ok(format!(
+                    "fmodf({}, {})",
+                    emit_expr(ctx, lhs)?,
+                    emit_expr(ctx, rhs)?
+                ));
+            }
             let op_s = match op {
                 IrBinOp::Add => "+",
                 IrBinOp::Sub => "-",
                 IrBinOp::Mul => "*",
                 IrBinOp::Div => "/",
+                IrBinOp::Rem => "%",
                 IrBinOp::Lt => "<",
                 IrBinOp::Le => "<=",
                 IrBinOp::Gt => ">",

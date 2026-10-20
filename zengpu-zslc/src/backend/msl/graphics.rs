@@ -412,6 +412,12 @@ fn binop(op: IrBinOp) -> Result<&'static str, Diagnostic> {
         IrBinOp::Sub => "-",
         IrBinOp::Mul => "*",
         IrBinOp::Div => "/",
+        IrBinOp::Rem => {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                "MSL graphics: `%` is compute-only".to_string(),
+            ));
+        }
         IrBinOp::Lt => "<",
         IrBinOp::Le => "<=",
         IrBinOp::Gt => ">",

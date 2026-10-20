@@ -1165,6 +1165,20 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
             };
             Ok(Val { id, ty: lhs.ty })
         }
+        IrBinOp::Rem => {
+            let (lhs, rhs) = unify(ctx, lhs, rhs);
+            let ty = ctx.spv_ty(lhs.ty);
+            let id = if lhs.ty == ctx.f32_id {
+                ctx.spv.op_frem(ty, lhs.id, rhs.id)
+            } else if lhs.ty == ctx.i32_id {
+                ctx.spv.op_srem(ty, lhs.id, rhs.id)
+            } else if lhs.ty == ctx.u32_id {
+                ctx.spv.op_umod(ty, lhs.id, rhs.id)
+            } else {
+                return Err("ZSL: remainder is not supported on bool".into());
+            };
+            Ok(Val { id, ty: lhs.ty })
+        }
         IrBinOp::Lt | IrBinOp::Le | IrBinOp::Gt | IrBinOp::Ge | IrBinOp::Eq | IrBinOp::Ne => {
             let (lhs, rhs) = unify(ctx, lhs, rhs);
             let bool_ty = ctx.t_bool;

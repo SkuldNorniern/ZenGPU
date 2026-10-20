@@ -53,6 +53,9 @@ pub(crate) mod op {
     pub const UDIV: u32 = 134;
     pub const SDIV: u32 = 135;
     pub const FDIV: u32 = 136;
+    pub const UMOD: u32 = 137;
+    pub const SREM: u32 = 138;
+    pub const FREM: u32 = 140;
     pub const ULESS_THAN: u32 = 176;
     pub const ULESS_THAN_EQ: u32 = 178;
     pub const UGREATER_THAN: u32 = 172;
@@ -942,6 +945,25 @@ impl SpvBuilder {
     pub fn op_udiv(&mut self, ty: Id, a: Id, b: Id) -> Id {
         let id = self.fresh_id();
         emit(&mut self.functions, op::UDIV, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    pub fn op_umod(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::UMOD, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    /// Sign follows the dividend (C and Rust `%`), unlike `OpSMod`.
+    pub fn op_srem(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::SREM, &[ty.0, id.0, a.0, b.0]);
+        id
+    }
+
+    pub fn op_frem(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::FREM, &[ty.0, id.0, a.0, b.0]);
         id
     }
 
