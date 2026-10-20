@@ -1228,11 +1228,10 @@ mod tests {
         })
     }
 
-    /// Fastest non-spilling config. Spilling configs appear in the table but are never picked.
+    /// Fastest measured config. Ties go to less scratch. A faster spilling config is kept.
     fn pick_best(rows: &[Measured]) -> Option<&Measured> {
         rows.iter()
-            .filter(|r| r.scratch == 0)
-            .min_by(|a, b| a.ms.total_cmp(&b.ms))
+            .min_by(|a, b| a.ms.total_cmp(&b.ms).then(a.scratch.cmp(&b.scratch)))
     }
 
     /// Times `grid`, then tries split-K variants of the four fastest unsplit configs whose tiles
@@ -1297,7 +1296,6 @@ mod tests {
         }
         let mut short: Vec<(MmaCfg, f64)> = rows
             .iter()
-            .filter(|r| r.scratch == 0)
             .filter_map(|r| r.cfg.map(|c| (c, r.ms)))
             .filter(|(c, _)| m.div_ceil(c.tile[0]) * n.div_ceil(c.tile[1]) < 128)
             .collect();
@@ -1325,12 +1323,12 @@ mod tests {
         rows
     }
 
-    /// Benchmarks the f16 GEMM schedules per shape.
+    /// Benchmarks f16 GEMM schedules per shape and prints the results.
     ///
     /// Run with `cargo test --release -p zengpu-tile bench_f16_gemm -- --ignored --nocapture`. Each
-    /// shape tries HIP O0 (up to 2048), scalar-staged, and mma search. Vulkan gets a smaller mma
-    /// search. Spilling configs print SPILL and are never picked. The best HIP config is re-run 3x
-    /// for spread.
+    /// shape runs HIP O0 (to 2048), scalar-staged and an mma search. Vulkan gets a smaller mma
+    /// search. `SPILL` marks spilling configs. The fastest measured config wins. The best HIP
+    /// config is re-run 3x for spread.
     #[test]
     #[ignore]
     fn bench_f16_gemm() {
