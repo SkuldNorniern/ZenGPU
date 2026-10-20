@@ -916,7 +916,7 @@ fn zsl_packed_ops_match_cpu() {
         0x3c00, 0xbc00, 0x3555, 0x4000, 0x0200,
     ];
     let half = |s: u32| -> u16 {
-        if s % 3 == 0 {
+        if s.is_multiple_of(3) {
             (s.wrapping_mul(0x9e37_79b9) >> 16) as u16
         } else {
             F16_EDGE[(s % 16) as usize]

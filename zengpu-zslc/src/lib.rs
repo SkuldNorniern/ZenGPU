@@ -2010,6 +2010,7 @@ int main() {{
     /// Loads NVRTC via `dlopen`, with no link-time dependency.
     mod nvrtc {
         use std::ffi::{CString, c_char, c_int, c_void};
+        use std::mem::transmute;
         use std::ptr::{null, null_mut};
 
         #[cfg_attr(target_os = "linux", link(name = "dl"))]
@@ -2056,19 +2057,11 @@ int main() {{
                 // SAFETY: each symbol has the NVRTC C signature declared above.
                 unsafe {
                     Some(Self {
-                        create: std::mem::transmute::<*mut c_void, Create>(sym(
-                            "nvrtcCreateProgram",
-                        )?),
-                        compile: std::mem::transmute::<*mut c_void, Compile>(sym(
-                            "nvrtcCompileProgram",
-                        )?),
-                        log_size: std::mem::transmute::<*mut c_void, LogSize>(sym(
-                            "nvrtcGetProgramLogSize",
-                        )?),
-                        log: std::mem::transmute::<*mut c_void, Log>(sym("nvrtcGetProgramLog")?),
-                        destroy: std::mem::transmute::<*mut c_void, Destroy>(sym(
-                            "nvrtcDestroyProgram",
-                        )?),
+                        create: transmute::<*mut c_void, Create>(sym("nvrtcCreateProgram")?),
+                        compile: transmute::<*mut c_void, Compile>(sym("nvrtcCompileProgram")?),
+                        log_size: transmute::<*mut c_void, LogSize>(sym("nvrtcGetProgramLogSize")?),
+                        log: transmute::<*mut c_void, Log>(sym("nvrtcGetProgramLog")?),
+                        destroy: transmute::<*mut c_void, Destroy>(sym("nvrtcDestroyProgram")?),
                     })
                 }
             }
