@@ -81,32 +81,17 @@ mod tests {
     }
 
     #[test]
-    fn catches_dangling_reference() {
-        let mut words = vec![decode::MAGIC, 0x0001_0300, 0, 3, 0];
-        words.extend([(2u32 << 16) | 19, 1]);
-        words.extend([(3u32 << 16) | 33, 2, 99]);
-        match validate(&words) {
-            Err(ValidateError::Structural(issues)) => {
-                assert!(
-                    issues
-                        .iter()
-                        .any(|i| i.message.contains("undefined id %99"))
-                );
+    fn catches_dangling_and_zero_references() {
+        for (bad_id, needle) in [(99, "undefined id %99"), (0, "id 0")] {
+            let mut words = vec![decode::MAGIC, 0x0001_0300, 0, 3, 0];
+            words.extend([(2u32 << 16) | 19, 1]);
+            words.extend([(3u32 << 16) | 33, 2, bad_id]);
+            match validate(&words) {
+                Err(ValidateError::Structural(issues)) => {
+                    assert!(issues.iter().any(|i| i.message.contains(needle)));
+                }
+                other => panic!("expected structural issue, got {other:?}"),
             }
-            other => panic!("expected structural issue, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn catches_id_zero_reference() {
-        let mut words = vec![decode::MAGIC, 0x0001_0300, 0, 3, 0];
-        words.extend([(2u32 << 16) | 19, 1]);
-        words.extend([(3u32 << 16) | 33, 2, 0]);
-        match validate(&words) {
-            Err(ValidateError::Structural(issues)) => {
-                assert!(issues.iter().any(|i| i.message.contains("id 0")));
-            }
-            other => panic!("expected structural issue, got {other:?}"),
         }
     }
 
