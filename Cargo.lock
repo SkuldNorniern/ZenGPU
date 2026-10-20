@@ -1844,6 +1844,7 @@ name = "zengpu-compute"
 version = "0.0.1"
 dependencies = [
  "zengpu-hal",
+ "zengpu-hip",
  "zengpu-spirv",
 ]
 
