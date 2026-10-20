@@ -20,7 +20,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
 
 [workspace.package]
 version = "0.0.1"
@@ -50,6 +50,7 @@ zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
 zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
 zengpu-spv = { path = "zengpu-spv", version = "0.0.1" }
 zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
+zengpu-zslc = { path = "zengpu-zslc", version = "0.0.1" }
 zengpu-cuda = { path = "zengpu-cuda", version = "0.0.1" }
 zengpu-metal = { path = "zengpu-metal", version = "0.0.1" }
 zengpu-hip = { path = "zengpu-hip", version = "0.0.1" }

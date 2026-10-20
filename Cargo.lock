@@ -1945,6 +1945,13 @@ dependencies = [
 [[package]]
 name = "zengpu-zsl"
 version = "0.0.1"
+dependencies = [
+ "zengpu-zslc",
+]
+
+[[package]]
+name = "zengpu-zslc"
+version = "0.0.1"
 
 [[package]]
 name = "zerocopy"

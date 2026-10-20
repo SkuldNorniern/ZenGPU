@@ -36,7 +36,7 @@ workspace version. Publish dependencies before their consumers in this order
 (including dependencies needed to verify packaged tests/examples):
 
 1. `zen-window-handle`
-2. `zengpu-hal`, `zengpu-spv`, `zengpu-zsl`
+2. `zengpu-hal`, `zengpu-spv`, `zengpu-zslc`, `zengpu-zsl`
 3. `zengpu-spirv`
 4. `zengpu-compute`
 5. `zengpu-cpu`, `zengpu-vulkan`, `zengpu-metal`, `zengpu-hip`, `zengpu-cuda`,
