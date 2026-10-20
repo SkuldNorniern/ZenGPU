@@ -32,6 +32,11 @@ pub(crate) struct Plan {
     /// Without native shared arrays (Vulkan), f16 stages as f32, and B stages K x
     /// N for `frag_load_b`.
     pub native_shared: bool,
+    /// `Mma` only: `wave_rows * wave_cols = waves`. Stages per operand: 1, or 2 for
+    /// double buffering.
+    pub wave_rows: usize,
+    pub wave_cols: usize,
+    pub stages: usize,
 }
 
 impl Plan {
@@ -45,6 +50,9 @@ impl Plan {
             waves: 1,
             wave_size: 0,
             native_shared: false,
+            wave_rows: 1,
+            wave_cols: 1,
+            stages: 1,
         }
     }
 }
@@ -170,12 +178,12 @@ fn zero(dtype: DType) -> &'static str {
     }
 }
 
-fn affine(a: Affine) -> String {
+fn affine(a: Affine, kt: &str) -> String {
     let mut terms = Vec::new();
     if a.c0 != 0 || (a.c_m == 0 && a.c_n == 0 && a.c_k == 0) {
         terms.push(a.c0.to_string());
     }
-    for (c, name) in [(a.c_m, "gm"), (a.c_n, "gn"), (a.c_k, "kt")] {
+    for (c, name) in [(a.c_m, "gm"), (a.c_n, "gn"), (a.c_k, kt)] {
         match c {
             0 => {}
             1 => terms.push(name.to_string()),
@@ -222,6 +230,7 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
         kernel,
         values: vec![None; kernel.values.len()],
         fresh: 0,
+        kt: "kt".to_string(),
     };
     let mut body = String::new();
     for stmt in &kernel.body {
@@ -245,112 +254,45 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
 /// The k loop stages A and B to shared memory (masked, zero outside the tensor), then runs a
 /// barrier, compute, and barrier. The epilogue runs the kernel's ops per output element.
 fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
+    if plan.mode == Mode::Mma {
+        return mma_source(kernel, plan, parts);
+    }
     let [bm, bn] = kernel.tile;
     let bk = parts.step;
     let wg = plan.workgroup;
-    let mma = plan.mode == Mode::Mma;
     let elems = bm * bn;
     let per_thread = elems.div_ceil(wg);
     let ksteps = parts.extent.div_ceil(bk);
-    let fn_cols = bn / 16;
-    let frags = (bm / 16) * fn_cols;
-    let waves = plan.waves;
-    let frags_per_wave = if mma { frags / waves } else { 0 };
 
-    let mut g = Gen {
-        kernel,
-        values: vec![None; kernel.values.len()],
-        fresh: 0,
-    };
+    let mut g = Gen::new(kernel);
     let mut src = String::new();
     header(kernel, wg, &mut src);
-    let native = mma && plan.native_shared;
-    let (ea, eb) = if native {
-        (parts.a_dtype, parts.b_dtype)
-    } else {
-        let scalar_staged = |d: DType| if d == DType::F16 { DType::F32 } else { d };
-        if mma {
-            (scalar_staged(parts.a_dtype), scalar_staged(parts.b_dtype))
-        } else {
-            (DType::F32, DType::F32)
-        }
-    };
-    let acc = kernel.values[parts.dot_out.0].dtype;
-    let _ = writeln!(src, "shared sa: array<{}, {}>", buffer_elem(ea), bm * bk);
-    let _ = writeln!(src, "shared sb: array<{}, {}>", buffer_elem(eb), bk * bn);
-    if mma {
-        let _ = writeln!(src, "shared sc: array<{}, {elems}>", buffer_elem(acc));
-        let _ = writeln!(src, "let lid = local_id().x");
-        let _ = writeln!(src, "let wv = lid / {}", plan.wave_size);
-        for j in 0..frags_per_wave {
-            let _ = writeln!(src, "let f{j}: u32 = wv + {}", j * waves);
-            let _ = writeln!(
-                src,
-                "let c{j}: frag<{}, 16, 16, acc> = frag_zero_acc()",
-                buffer_elem(acc)
-            );
-        }
-    } else {
-        let _ = writeln!(src, "let lid = local_id().x");
-        for p in 0..per_thread {
-            let _ = writeln!(src, "let acc{p}: f32 = 0.0");
-        }
+    let _ = writeln!(src, "shared sa: array<f32, {}>", bm * bk);
+    let _ = writeln!(src, "shared sb: array<f32, {}>", bk * bn);
+    let _ = writeln!(src, "let lid = local_id().x");
+    for p in 0..per_thread {
+        let _ = writeln!(src, "let acc{p}: f32 = 0.0");
     }
 
     let _ = writeln!(src, "for kt in 0..{ksteps} {{");
     g.stage(&mut src, "sa", parts.a, [bm, bk], false, wg);
-    g.stage(&mut src, "sb", parts.b, [bn, bk], mma && !native, wg);
+    g.stage(&mut src, "sb", parts.b, [bn, bk], false, wg);
     let _ = writeln!(src, "barrier()");
-    if mma {
-        let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
-        for j in 0..frags_per_wave {
-            let _ = writeln!(
-                src,
-                "let fa{j}: frag<{ea}, 16, 16, a> = frag_load_a(sa, (f{j} / {fn_cols}) * {} + kq * 16, {bk})",
-                16 * bk,
-                ea = buffer_elem(parts.a_dtype),
-            );
-            let fb = if native {
-                format!("frag_load_b_t(sb, (f{j} % {fn_cols}) * {} + kq * 16, {bk})", 16 * bk)
-            } else {
-                format!("frag_load_b(sb, kq * {} + (f{j} % {fn_cols}) * 16, {bn})", 16 * bn)
-            };
-            let _ = writeln!(
-                src,
-                "let fb{j}: frag<{}, 16, 16, b> = {fb}",
-                buffer_elem(parts.b_dtype)
-            );
-            let _ = writeln!(src, "c{j} = mma(fa{j}, fb{j}, c{j})");
-        }
+    for p in 0..per_thread {
+        let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
+        let _ = writeln!(src, "if e{p} < {elems} {{");
+        let _ = writeln!(src, "let tr = e{p} / {bn}");
+        let _ = writeln!(src, "let tc = e{p} % {bn}");
+        let _ = writeln!(src, "for kk in 0..{bk} {{");
+        let _ = writeln!(
+            src,
+            "acc{p} = acc{p} + sa[tr * {bk} + kk] * sb[tc * {bk} + kk]"
+        );
         let _ = writeln!(src, "}}");
-    } else {
-        for p in 0..per_thread {
-            let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
-            let _ = writeln!(src, "if e{p} < {elems} {{");
-            let _ = writeln!(src, "let tr = e{p} / {bn}");
-            let _ = writeln!(src, "let tc = e{p} % {bn}");
-            let _ = writeln!(src, "for kk in 0..{bk} {{");
-            let _ = writeln!(
-                src,
-                "acc{p} = acc{p} + sa[tr * {bk} + kk] * sb[tc * {bk} + kk]"
-            );
-            let _ = writeln!(src, "}}");
-            let _ = writeln!(src, "}}");
-        }
+        let _ = writeln!(src, "}}");
     }
     let _ = writeln!(src, "barrier()");
     let _ = writeln!(src, "}}");
-
-    if mma {
-        for j in 0..frags_per_wave {
-            let _ = writeln!(
-                src,
-                "frag_store(sc, (f{j} / {fn_cols}) * {} + (f{j} % {fn_cols}) * 16, {bn}, c{j})",
-                16 * bn
-            );
-        }
-        let _ = writeln!(src, "barrier()");
-    }
 
     let loop_at = parts.loop_at;
     for p in 0..per_thread {
@@ -358,16 +300,153 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
         let _ = writeln!(src, "if e{p} < {elems} {{");
         let _ = writeln!(src, "let tr = e{p} / {bn}");
         let _ = writeln!(src, "let tc = e{p} % {bn}");
-        let dot_expr = if mma {
-            format!("sc[tr * {bn} + tc]")
-        } else {
-            format!("acc{p}")
-        };
-        g.values[parts.dot_out.0] = Some(dot_expr);
+        g.values[parts.dot_out.0] = Some(format!("acc{p}"));
         for stmt in &kernel.body[loop_at + 1..] {
             g.stmt(&mut src, stmt)?;
         }
         let _ = writeln!(src, "}}");
+    }
+    let _ = writeln!(src, "}}");
+    Ok(src)
+}
+
+/// Each wave owns a `WM x WN` grid of 16x16 fragments.
+///
+/// The loop has two stages: compute one while loading the next. The epilogue goes through a shared
+/// `BM x (WN_waves * 16)` slice, one per fragment column.
+fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
+    let [bm, bn] = kernel.tile;
+    let bk = parts.step;
+    let wg = plan.workgroup;
+    let ksteps = parts.extent.div_ceil(bk);
+    let (nwr, nwc) = (plan.wave_rows, plan.wave_cols);
+    let wm = bm / 16 / nwr;
+    let wn = bn / 16 / nwc;
+    let wave = plan.wave_size;
+    let native = plan.native_shared;
+    let (ea, eb) = if native {
+        (parts.a_dtype, parts.b_dtype)
+    } else {
+        let staged = |d: DType| if d == DType::F16 { DType::F32 } else { d };
+        (staged(parts.a_dtype), staged(parts.b_dtype))
+    };
+    let acc = kernel.values[parts.dot_out.0].dtype;
+    let (fa, fb, fc) = (
+        buffer_elem(parts.a_dtype),
+        buffer_elem(parts.b_dtype),
+        buffer_elem(acc),
+    );
+    let scw = nwc * 16;
+    let slice = bm * scw;
+    let per_slice = slice.div_ceil(wg);
+    let double = plan.stages == 2;
+    let bufs: Vec<(String, String)> = if double {
+        vec![("sa0".into(), "sb0".into()), ("sa1".into(), "sb1".into())]
+    } else {
+        vec![("sa".into(), "sb".into())]
+    };
+
+    let mut g = Gen::new(kernel);
+    let mut src = String::new();
+    header(kernel, wg, &mut src);
+    for (sa, sb) in &bufs {
+        let _ = writeln!(src, "shared {sa}: array<{}, {}>", buffer_elem(ea), bm * bk);
+        let _ = writeln!(src, "shared {sb}: array<{}, {}>", buffer_elem(eb), bk * bn);
+    }
+    let _ = writeln!(src, "shared sc: array<{fc}, {slice}>");
+    let _ = writeln!(src, "let lid = local_id().x");
+    let _ = writeln!(src, "let wv = lid / {wave}");
+    let _ = writeln!(src, "let wr = wv / {nwc}");
+    let _ = writeln!(src, "let wc = wv % {nwc}");
+    for i in 0..wm {
+        for j in 0..wn {
+            let _ = writeln!(
+                src,
+                "let c{i}_{j}: frag<{fc}, 16, 16, acc> = frag_zero_acc()"
+            );
+        }
+    }
+
+    let stage = |g: &mut Gen, src: &mut String, (sa, sb): &(String, String), kt: &str| {
+        g.kt = kt.to_string();
+        g.stage(src, sa, parts.a, [bm, bk], false, wg);
+        g.stage(src, sb, parts.b, [bn, bk], !native, wg);
+    };
+    let compute = |src: &mut String, (sa, sb): &(String, String)| {
+        let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
+        for i in 0..wm {
+            let _ = writeln!(
+                src,
+                "let fa{i}: frag<{fa}, 16, 16, a> = frag_load_a({sa}, (wr * {wm} + {i}) * {} + kq * 16, {bk})",
+                16 * bk
+            );
+        }
+        for j in 0..wn {
+            let col = format!("(wc * {wn} + {j}) * 16");
+            let load = if native {
+                format!("frag_load_b_t({sb}, {col} * {bk} + kq * 16, {bk})")
+            } else {
+                format!("frag_load_b({sb}, kq * {} + {col}, {bn})", 16 * bn)
+            };
+            let _ = writeln!(src, "let fb{j}: frag<{fb}, 16, 16, b> = {load}");
+        }
+        for i in 0..wm {
+            for j in 0..wn {
+                let _ = writeln!(src, "c{i}_{j} = mma(fa{i}, fb{j}, c{i}_{j})");
+            }
+        }
+        let _ = writeln!(src, "}}");
+    };
+
+    if !double {
+        let _ = writeln!(src, "for kt in 0..{ksteps} {{");
+        stage(&mut g, &mut src, &bufs[0], "kt");
+        let _ = writeln!(src, "barrier()");
+        compute(&mut src, &bufs[0]);
+        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "}}");
+    } else {
+        let pairs = ksteps / 2;
+        stage(&mut g, &mut src, &bufs[0], "0");
+        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "for kp in 0..{pairs} {{");
+        let _ = writeln!(src, "let kn: u32 = kp * 2 + 1");
+        let _ = writeln!(src, "let kn2: u32 = kp * 2 + 2");
+        stage(&mut g, &mut src, &bufs[1], "kn");
+        compute(&mut src, &bufs[0]);
+        let _ = writeln!(src, "barrier()");
+        stage(&mut g, &mut src, &bufs[0], "kn2");
+        compute(&mut src, &bufs[1]);
+        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "}}");
+        if ksteps % 2 == 1 {
+            compute(&mut src, &bufs[0]);
+        }
+    }
+
+    let loop_at = parts.loop_at;
+    for j in 0..wn {
+        for i in 0..wm {
+            let _ = writeln!(
+                src,
+                "frag_store(sc, (wr * {wm} + {i}) * {} + wc * 16, {scw}, c{i}_{j})",
+                16 * scw
+            );
+        }
+        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "for it in 0..{per_slice} {{");
+        let _ = writeln!(src, "let e = lid + it * {wg}");
+        let _ = writeln!(src, "if e < {slice} {{");
+        let _ = writeln!(src, "let tr = e / {scw}");
+        let _ = writeln!(src, "let ts = e % {scw}");
+        let _ = writeln!(src, "let tc = ((ts / 16) * {wn} + {j}) * 16 + ts % 16");
+        g.values[parts.dot_out.0] = Some(format!("sc[tr * {scw} + ts]"));
+        for stmt in &kernel.body[loop_at + 1..] {
+            g.stmt(&mut src, stmt)?;
+        }
+        let _ = writeln!(src, "}}");
+        let _ = writeln!(src, "}}");
+        let _ = writeln!(src, "barrier()");
     }
     let _ = writeln!(src, "}}");
     Ok(src)
@@ -382,9 +461,19 @@ struct Gen<'a> {
     /// A local or expression per materialized value. Loads have none: they are read on demand.
     values: Vec<Option<String>>,
     fresh: usize,
+    kt: String,
 }
 
-impl Gen<'_> {
+impl<'a> Gen<'a> {
+    fn new(kernel: &'a TileKernel) -> Self {
+        Gen {
+            kernel,
+            values: vec![None; kernel.values.len()],
+            fresh: 0,
+            kt: "kt".to_string(),
+        }
+    }
+
     fn name(&mut self, prefix: &str) -> String {
         self.fresh += 1;
         format!("{prefix}{}", self.fresh)
@@ -481,8 +570,16 @@ impl Gen<'_> {
         let v = self.name("ld");
         let (ty, zero) = (scalar(decl.dtype), zero(decl.dtype));
         let _ = writeln!(out, "let {v}: {ty} = {zero}");
-        let gr = format!("({} * {} + {r})", affine(block.rows), block.shape[0]);
-        let gc = format!("({} * {} + {c})", affine(block.cols), block.shape[1]);
+        let gr = format!(
+            "({} * {} + {r})",
+            affine(block.rows, &self.kt),
+            block.shape[0]
+        );
+        let gc = format!(
+            "({} * {} + {c})",
+            affine(block.cols, &self.kt),
+            block.shape[1]
+        );
         let (rows, cols) = (decl.shape[0], decl.shape[1]);
         let _ = writeln!(out, "if {gr} < {rows} && {gc} < {cols} {{");
         let _ = writeln!(out, "{v} = b_{}[{gr} * {cols} + {gc}]", decl.name);
@@ -525,8 +622,16 @@ impl Gen<'_> {
         let (tr, tc) = ("tr", "tc");
         let v = self.elem(out, value, tr, tc)?;
         let decl = &self.kernel.tensors[block.tensor.0];
-        let gr = format!("({} * {} + {tr})", affine(block.rows), block.shape[0]);
-        let gc = format!("({} * {} + {tc})", affine(block.cols), block.shape[1]);
+        let gr = format!(
+            "({} * {} + {tr})",
+            affine(block.rows, &self.kt),
+            block.shape[0]
+        );
+        let gc = format!(
+            "({} * {} + {tc})",
+            affine(block.cols, &self.kt),
+            block.shape[1]
+        );
         let (rows, cols) = (decl.shape[0], decl.shape[1]);
         let _ = writeln!(out, "if {gr} < {rows} && {gc} < {cols} {{");
         let _ = writeln!(out, "b_{}[{gr} * {cols} + {gc}] = {v}", decl.name);
