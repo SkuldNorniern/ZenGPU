@@ -447,6 +447,12 @@ impl<'a> Parser<'a> {
             | BuiltinFn::Select
             | BuiltinFn::Mma
             | BuiltinFn::FragSet => Some(3),
+            BuiltinFn::PackF16x2 | BuiltinFn::Byte | BuiltinFn::SByte => Some(2),
+            BuiltinFn::F16Lo
+            | BuiltinFn::F16Hi
+            | BuiltinFn::BitcastF32
+            | BuiltinFn::BitcastU32
+            | BuiltinFn::BitcastI32 => Some(1),
             BuiltinFn::FragRow | BuiltinFn::FragCol | BuiltinFn::FragGet => Some(2),
             BuiltinFn::FragLen | BuiltinFn::F16Round => Some(1),
             BuiltinFn::FragZeroAcc => Some(0),

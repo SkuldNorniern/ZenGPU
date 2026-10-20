@@ -1022,6 +1022,45 @@ int main() {{
         spirv::lower_compute(&module).expect("lower dot4 to SPIR-V");
     }
 
+    const BITCAST_PACK: &str = r#"
+        @workgroup_size(64)
+        kernel bitcast_pack(x: device buffer<u32>, y: device buffer<f32>, out_f: device mut buffer<f32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, out_b: device mut buffer<u32>, out_s: device mut buffer<i32>, id: global_id) {
+            out_f[id.x] = bitcast_f32(x[id.x]) + f16_lo(x[id.x]) + f16_hi(x[id.x])
+            out_u[id.x] = pack_f16x2(y[id.x], y[id.x]) + byte(x[id.x], id.x)
+            out_i[id.x] = bitcast_i32(x[id.x])
+            out_b[id.x] = bitcast_u32(y[id.x]) + bitcast_u32(out_i[id.x])
+            out_s[id.x] = sbyte(x[id.x], 3)
+        }
+    "#;
+
+    #[test]
+    fn bitcast_pack_lowers_on_all_compute_backends() {
+        let module = parse_compute(BITCAST_PACK).expect("parse bitcast_pack");
+        let hip_source = hip::lower_compute(&module)
+            .expect("lower bitcast_pack to HIP")
+            .source;
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower bitcast_pack to CUDA")
+            .source;
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower bitcast_pack to MSL")
+            .source;
+        for name in [
+            "zsl_f16_lo(",
+            "zsl_f16_hi(",
+            "zsl_pack_f16x2(",
+            "zsl_bitcast_f32(",
+            "zsl_bitcast_i32(",
+            "zsl_byte(",
+            "zsl_sbyte(",
+        ] {
+            assert!(hip_source.contains(name), "HIP missing {name}");
+            assert!(cuda_source.contains(name), "CUDA missing {name}");
+            assert!(msl_source.contains(name), "MSL missing {name}");
+        }
+        spirv::lower_compute(&module).expect("lower bitcast_pack to SPIR-V");
+    }
+
     const FRAG_MMA: &str = r#"
         @workgroup_size(32)
         kernel frag_mma(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
@@ -2529,7 +2568,7 @@ int main() {{
             return;
         };
         let nvrtc = nvrtc::Nvrtc::open(&lib).expect("load ZENGPU_NVRTC");
-        let kernels: [(&str, &str); 31] = [
+        let kernels: [(&str, &str); 32] = [
             ("tiled_gemm", TILED_GEMM),
             ("vec_copy", VEC_COPY),
             ("typed_shared", TYPED_SHARED),
@@ -2551,6 +2590,7 @@ int main() {{
             ("workgroup_reduce", WORKGROUP_REDUCE),
             ("workgroup_reduce_proof", WORKGROUP_REDUCE_PROOF),
             ("dot4", DOT4),
+            ("bitcast_pack", BITCAST_PACK),
             ("frag_mma", FRAG_MMA),
             ("frag_i8", FRAG_I8),
             ("frag_fn", FRAG_FN),

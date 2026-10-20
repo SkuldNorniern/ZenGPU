@@ -1926,3 +1926,196 @@ fn zsl_u32x4_copy_matches_cpu() {
     }
     assert!(got_words[..tail_start].iter().all(|&w| w == 0));
 }
+
+/// Expected f16 decode results: exact, with NaN staying NaN.
+fn f16_decode(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = i32::from((h >> 10) & 0x1f);
+    let m = f32::from(h & 0x3ff);
+    if e == 0 {
+        sign * m * 2f32.powi(-24)
+    } else if e == 31 {
+        if m == 0.0 {
+            sign * f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    }
+}
+
+/// Inputs for `pack_f16x2`: subnormal, inf and tie edges.
+const BIT_HALVES: [u16; 16] = [
+    0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00, 0x3c00,
+    0xbc00, 0x3555, 0x0200, 0x7d00,
+];
+const BIT_F32: [f32; 16] = [
+    0.0,
+    -0.0,
+    1.000_488_3,
+    1.001_464_8,
+    65520.0,
+    2.980_232_2e-8,
+    8.940_697e-8,
+    1.0,
+    -2.5,
+    65504.0,
+    f32::INFINITY,
+    f32::NAN,
+    1.0e-8,
+    -1.0e-8,
+    0.333_333_34,
+    3.0e-5,
+];
+/// Expected `pack_f16x2` bits for `BIT_F32`. 0x7e00 matches any NaN.
+const BIT_F32_F16: [u16; 16] = [
+    0x0000, 0x8000, 0x3c00, 0x3c02, 0x7c00, 0x0000, 0x0002, 0x3c00, 0xc100, 0x7bff, 0x7c00, 0x7e00,
+    0x0000, 0x8000, 0x3555, 0x01f7,
+];
+
+const BITS_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel bits(x: device buffer<u32>, y: device buffer<f32>, z: device buffer<f32>, lo: device mut buffer<f32>, hi: device mut buffer<f32>, packed: device mut buffer<u32>, bf: device mut buffer<f32>, bu: device mut buffer<u32>, bi: device mut buffer<i32>, sb: device mut buffer<i32>, ub: device mut buffer<u32>, id: global_id) {
+        lo[id.x] = f16_lo(x[id.x])
+        hi[id.x] = f16_hi(x[id.x])
+        packed[id.x] = pack_f16x2(y[id.x], z[id.x])
+        bf[id.x] = bitcast_f32(x[id.x])
+        bu[id.x] = bitcast_u32(y[id.x])
+        bi[id.x] = bitcast_i32(x[id.x])
+        sb[id.x] = sbyte(x[id.x], id.x)
+        ub[id.x] = byte(x[id.x], id.x)
+    }
+);
+
+#[test]
+fn zsl_bit_builtins_match_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = BITS_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let n = 256usize;
+    let xs: Vec<u32> = (0..n)
+        .map(|i| {
+            let lo = BIT_HALVES[i % 16];
+            let hi = BIT_HALVES[(i * 7 + 3) % 16];
+            u32::from(lo) | (u32::from(hi) << 16)
+        })
+        .collect();
+    let ys: Vec<f32> = (0..n).map(|i| BIT_F32[i % 16]).collect();
+    let zs: Vec<f32> = (0..n).map(|i| BIT_F32[(i * 5 + 1) % 16]).collect();
+    let words = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let x = pool.alloc(vec![n as u32], DType::U32).unwrap();
+    device.write_buffer(x.buffer, 0, &words(&xs)).unwrap();
+    let y = upload(&pool, vec![n as u32], &ys);
+    let z = upload(&pool, vec![n as u32], &zs);
+    let lo = upload(&pool, vec![n as u32], &vec![0.0; n]);
+    let hi = upload(&pool, vec![n as u32], &vec![0.0; n]);
+    let packed = pool.alloc(vec![n as u32], DType::U32).unwrap();
+    let bf = upload(&pool, vec![n as u32], &vec![0.0; n]);
+    let bu = pool.alloc(vec![n as u32], DType::U32).unwrap();
+    let bi = pool.alloc(vec![n as u32], DType::I32).unwrap();
+    let sb = pool.alloc(vec![n as u32], DType::I32).unwrap();
+    let ub = pool.alloc(vec![n as u32], DType::U32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            x.buffer.index(),
+            y.buffer.index(),
+            z.buffer.index(),
+            lo.buffer.index(),
+            hi.buffer.index(),
+            packed.buffer.index(),
+            bf.buffer.index(),
+            bu.buffer.index(),
+            bi.buffer.index(),
+            sb.buffer.index(),
+            ub.buffer.index(),
+        ],
+        &[],
+        [(n / 32) as u32, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |arr: &DeviceArray| device.read_buffer(arr.buffer, 0, arr.size_bytes()).unwrap();
+    let as_f32 = |b: Vec<u8>| -> Vec<f32> {
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let as_u32 = |b: Vec<u8>| -> Vec<u32> {
+        b.chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let (got_lo, got_hi) = (as_f32(read(&lo)), as_f32(read(&hi)));
+    let got_packed = as_u32(read(&packed));
+    let got_bf = as_f32(read(&bf));
+    let got_bu = as_u32(read(&bu));
+    let got_bi = as_u32(read(&bi));
+    let got_sb = as_u32(read(&sb));
+    let got_ub = as_u32(read(&ub));
+    let same_f32 = |got: f32, want: f32| {
+        if want.is_nan() {
+            got.is_nan()
+        } else {
+            got.to_bits() == want.to_bits()
+        }
+    };
+    let same_f16 = |got: u16, want: u16| {
+        if want == 0x7e00 {
+            got & 0x7fff > 0x7c00
+        } else {
+            got == want
+        }
+    };
+    for i in 0..n {
+        let x_bits = xs[i];
+        let (lo_h, hi_h) = ((x_bits & 0xffff) as u16, (x_bits >> 16) as u16);
+        assert!(
+            same_f32(got_lo[i], f16_decode(lo_h)),
+            "f16_lo {lo_h:#06x}: {}",
+            got_lo[i]
+        );
+        assert!(
+            same_f32(got_hi[i], f16_decode(hi_h)),
+            "f16_hi {hi_h:#06x}: {}",
+            got_hi[i]
+        );
+        let k = i % 16;
+        let k2 = (i * 5 + 1) % 16;
+        let (g_lo, g_hi) = (
+            (got_packed[i] & 0xffff) as u16,
+            (got_packed[i] >> 16) as u16,
+        );
+        assert!(
+            same_f16(g_lo, BIT_F32_F16[k]),
+            "pack lo {}: {g_lo:#06x}",
+            BIT_F32[k]
+        );
+        assert!(
+            same_f16(g_hi, BIT_F32_F16[k2]),
+            "pack hi {}: {g_hi:#06x}",
+            BIT_F32[k2]
+        );
+        assert_eq!(got_bf[i].to_bits(), x_bits, "bitcast_f32 at {i}");
+        assert_eq!(got_bu[i], ys[i].to_bits(), "bitcast_u32 at {i}");
+        assert_eq!(got_bi[i], x_bits, "bitcast_i32 at {i}");
+        let lane = (i % 4) as u32;
+        let byte = (x_bits >> (8 * lane)) & 0xff;
+        assert_eq!(got_ub[i], byte, "byte at {i}");
+        assert_eq!(got_sb[i], (byte as u8 as i8 as i32) as u32, "sbyte at {i}");
+    }
+    drop(ops);
+    for arr in [x, y, z, lo, hi, bf] {
+        pool.free(arr);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}

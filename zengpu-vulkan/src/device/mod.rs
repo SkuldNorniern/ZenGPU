@@ -5649,6 +5649,198 @@ mod tests {
         }
     }
 
+    /// Compares bit builtins on RADV with the CPU: f16 decode and RNE pack on subnormal, inf, NaN
+    /// and tie inputs.
+    #[test]
+    fn zsl_bit_builtins_run_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const BITS_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel bits(x: device buffer<u32>, y: device buffer<f32>, z: device buffer<f32>, lo: device mut buffer<f32>, hi: device mut buffer<f32>, packed: device mut buffer<u32>, bf: device mut buffer<f32>, bu: device mut buffer<u32>, bi: device mut buffer<i32>, sb: device mut buffer<i32>, ub: device mut buffer<u32>, id: global_id) {
+                lo[id.x] = f16_lo(x[id.x])
+                hi[id.x] = f16_hi(x[id.x])
+                packed[id.x] = pack_f16x2(y[id.x], z[id.x])
+                bf[id.x] = bitcast_f32(x[id.x])
+                bu[id.x] = bitcast_u32(y[id.x])
+                bi[id.x] = bitcast_i32(x[id.x])
+                sb[id.x] = sbyte(x[id.x], id.x)
+                ub[id.x] = byte(x[id.x], id.x)
+            }
+        );
+        const HALVES: [u16; 16] = [
+            0x0000, 0x8000, 0x0001, 0x8001, 0x03ff, 0x0400, 0x7bff, 0xfbff, 0x7c00, 0xfc00, 0x7e00,
+            0x3c00, 0xbc00, 0x3555, 0x0200, 0x7d00,
+        ];
+        const F32S: [f32; 16] = [
+            0.0,
+            -0.0,
+            1.000_488_3,
+            1.001_464_8,
+            65520.0,
+            2.980_232_2e-8,
+            8.940_697e-8,
+            1.0,
+            -2.5,
+            65504.0,
+            f32::INFINITY,
+            f32::NAN,
+            1.0e-8,
+            -1.0e-8,
+            0.333_333_34,
+            3.0e-5,
+        ];
+        const F32S_F16: [u16; 16] = [
+            0x0000, 0x8000, 0x3c00, 0x3c02, 0x7c00, 0x0000, 0x0002, 0x3c00, 0xc100, 0x7bff, 0x7c00,
+            0x7e00, 0x0000, 0x8000, 0x3555, 0x01f7,
+        ];
+        let f16_decode = |h: u16| -> f32 {
+            let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+            let e = i32::from((h >> 10) & 0x1f);
+            let m = f32::from(h & 0x3ff);
+            if e == 0 {
+                sign * m * 2f32.powi(-24)
+            } else if e == 31 {
+                if m == 0.0 {
+                    sign * f32::INFINITY
+                } else {
+                    f32::NAN
+                }
+            } else {
+                sign * (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+            }
+        };
+
+        let Some(dev) = try_device() else { return };
+        let n = 256usize;
+        let xs: Vec<u32> = (0..n)
+            .map(|i| u32::from(HALVES[i % 16]) | (u32::from(HALVES[(i * 7 + 3) % 16]) << 16))
+            .collect();
+        let ys: Vec<f32> = (0..n).map(|i| F32S[i % 16]).collect();
+        let zs: Vec<f32> = (0..n).map(|i| F32S[(i * 5 + 1) % 16]).collect();
+        let words = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let floats = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let make = |size: u64, usage: BufferUsage, data: &[u8]| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let size = (n * 4) as u64;
+        let x = make(size, input, &words(&xs));
+        let y = make(size, input, &floats(&ys));
+        let z = make(size, input, &floats(&zs));
+        let outs: Vec<_> = (0..8).map(|_| make(size, output, &[0u8; 1024])).collect();
+        let shader = dev.create_shader(BITS_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry: "main",
+                    block: [32, 1, 1],
+                },
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(32),
+                },
+            )
+            .unwrap();
+        let mut slots = vec![x.index(), y.index(), z.index()];
+        slots.extend(outs.iter().map(|b| b.index()));
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [(n / 32) as u32, 1, 1],
+        )
+        .unwrap();
+        let bytes = |b| dev.read_buffer(b, 0, size).unwrap();
+        let floats_of = |b| -> Vec<f32> {
+            bytes(b)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let words_of = |b| -> Vec<u32> {
+            bytes(b)
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let got_lo = floats_of(outs[0]);
+        let got_hi = floats_of(outs[1]);
+        let got_packed = words_of(outs[2]);
+        let got_bf = floats_of(outs[3]);
+        let got_bu = words_of(outs[4]);
+        let got_bi = words_of(outs[5]);
+        let got_sb = words_of(outs[6]);
+        let got_ub = words_of(outs[7]);
+        for i in 0..n {
+            let x_bits = xs[i];
+            let (lo_h, hi_h) = ((x_bits & 0xffff) as u16, (x_bits >> 16) as u16);
+            let want_lo = f16_decode(lo_h);
+            let want_hi = f16_decode(hi_h);
+            assert!(
+                if want_lo.is_nan() {
+                    got_lo[i].is_nan()
+                } else {
+                    got_lo[i].to_bits() == want_lo.to_bits()
+                },
+                "f16_lo {lo_h:#06x}: {}",
+                got_lo[i]
+            );
+            assert!(
+                if want_hi.is_nan() {
+                    got_hi[i].is_nan()
+                } else {
+                    got_hi[i].to_bits() == want_hi.to_bits()
+                },
+                "f16_hi {hi_h:#06x}: {}",
+                got_hi[i]
+            );
+            let k = i % 16;
+            let k2 = (i * 5 + 1) % 16;
+            let (g_lo, g_hi) = (
+                (got_packed[i] & 0xffff) as u16,
+                (got_packed[i] >> 16) as u16,
+            );
+            for (got, want) in [(g_lo, F32S_F16[k]), (g_hi, F32S_F16[k2])] {
+                let ok = if want == 0x7e00 {
+                    got & 0x7fff > 0x7c00
+                } else {
+                    got == want
+                };
+                assert!(ok, "pack_f16x2 at {i}: got {got:#06x} want {want:#06x}");
+            }
+            assert_eq!(got_bf[i].to_bits(), x_bits, "bitcast_f32 at {i}");
+            assert_eq!(got_bu[i], ys[i].to_bits(), "bitcast_u32 at {i}");
+            assert_eq!(got_bi[i], x_bits, "bitcast_i32 at {i}");
+            let lane = (i % 4) as u32;
+            let byte = (x_bits >> (8 * lane)) & 0xff;
+            assert_eq!(got_ub[i], byte, "byte at {i}");
+            assert_eq!(
+                got_sb[i] as i32,
+                i32::from(byte as u8 as i8),
+                "sbyte at {i}"
+            );
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [x, y, z].into_iter().chain(outs) {
+            dev.destroy_buffer(buf);
+        }
+    }
+
     #[test]
     fn compute_caps_are_reported_on_radv() {
         let Some(dev) = try_device() else { return };

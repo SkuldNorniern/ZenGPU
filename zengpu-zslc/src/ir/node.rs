@@ -187,6 +187,20 @@ pub enum BuiltinFn {
     FunnelShr,
     /// Like `__byte_perm` without sign mode. Byte i is picked by selector nibble i from `b:a`.
     BytePerm,
+    /// Low 16 bits read as f16, widened exactly. Compute only.
+    F16Lo,
+    /// High 16 bits read as f16, widened exactly.
+    F16Hi,
+    /// Packs `lo` into the low half, rounded to f16 with ties to even. Compute only.
+    PackF16x2,
+    BitcastF32,
+    /// overload by argument type.
+    BitcastU32,
+    BitcastI32,
+    /// Byte `i & 3`, zero extended.
+    Byte,
+    /// Byte `i & 3`, sign extended.
+    SByte,
     /// Both arms are evaluated, with no branch. The types must match.
     Select,
     /// Subgroup index within the workgroup. A query, not a collective, so it is legal in any
@@ -290,6 +304,14 @@ impl BuiltinFn {
             BuiltinFn::Dot2F16 => "dot2_f16",
             BuiltinFn::FunnelShr => "funnel_shr",
             BuiltinFn::BytePerm => "byte_perm",
+            BuiltinFn::F16Lo => "f16_lo",
+            BuiltinFn::F16Hi => "f16_hi",
+            BuiltinFn::PackF16x2 => "pack_f16x2",
+            BuiltinFn::BitcastF32 => "bitcast_f32",
+            BuiltinFn::BitcastU32 => "bitcast_u32",
+            BuiltinFn::BitcastI32 => "bitcast_i32",
+            BuiltinFn::Byte => "byte",
+            BuiltinFn::SByte => "sbyte",
             BuiltinFn::Select => "select",
             BuiltinFn::I32 => "i32",
             BuiltinFn::F16Round => "f16_round",
