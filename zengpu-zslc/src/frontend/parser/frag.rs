@@ -4,11 +4,12 @@ use super::*;
 use crate::ir::typeck::{frag_parts, frag16_id, i8_type};
 use crate::ir::types::FragUse;
 
-fn frag_use_of_load(name: &str) -> Option<FragUse> {
+fn frag_use_of_load(name: &str) -> Option<(FragUse, bool)> {
     Some(match name {
-        "frag_load_a" => FragUse::A,
-        "frag_load_b" => FragUse::B,
-        "frag_load_acc" => FragUse::Acc,
+        "frag_load_a" => (FragUse::A, false),
+        "frag_load_b" => (FragUse::B, false),
+        "frag_load_b_t" => (FragUse::B, true),
+        "frag_load_acc" => (FragUse::Acc, false),
         _ => return None,
     })
 }
@@ -82,9 +83,9 @@ impl<'a> Parser<'a> {
         if let Some(buffer) = ctx.buffers.get(&name) {
             return Ok((FragSrc::Buffer(name), buffer.elem));
         }
-        if ctx.shared.contains_key(&name) {
-            let f32_id = self.types.f32_id();
-            return Ok((FragSrc::Shared(name), f32_id));
+        if let Some(shared) = ctx.shared.get(&name) {
+            let elem = shared.elem;
+            return Ok((FragSrc::Shared(name), elem));
         }
         self.err(format!("`{name}` is not a buffer or shared array"))
     }
@@ -110,7 +111,7 @@ impl<'a> Parser<'a> {
         ctx: &Ctx,
         name: &str,
     ) -> Result<Option<IrExpr>, ParseError> {
-        let Some(usage) = frag_use_of_load(name) else {
+        let Some((usage, trans)) = frag_use_of_load(name) else {
             return Ok(None);
         };
         self.expect(&Tok::LParen, "`(` after frag_load")?;
@@ -121,15 +122,18 @@ impl<'a> Parser<'a> {
         let f32 = self.types.f32_id();
         let i32 = self.types.i32_id();
         let u32 = self.types.u32_id();
+        let shared = matches!(src, FragSrc::Shared(_));
+        let i8 = self.i8_id();
         let element = match (usage, buf_elem) {
             (FragUse::A | FragUse::B, e) if e == f16 => f16,
-            (FragUse::A | FragUse::B, e) if e == f32 && matches!(src, FragSrc::Shared(_)) => f16,
-            (FragUse::A | FragUse::B, e) if e == u32 || e == i32 => self.i8_id(),
+            (FragUse::A | FragUse::B, e) if e == f32 && shared => f16,
+            (FragUse::A | FragUse::B, e) if e == i8 && shared => i8,
+            (FragUse::A | FragUse::B, e) if (e == u32 || e == i32) && !shared => i8,
             (FragUse::Acc, e) if e == f32 => f32,
             (FragUse::Acc, e) if e == i32 => i32,
             _ => {
                 return self.err(format!(
-                    "{name}: source element does not fit this use (a/b: f16 buffer, u32/i32 buffer for packed i8, or shared f32; acc: f32 or i32 buffer or shared f32)"
+                    "{name}: source element does not fit this use (a/b: f16 buffer or shared array, i8 shared array, u32/i32 buffer for packed i8, or shared f32; acc: f32 or i32)"
                 ));
             }
         };
@@ -139,6 +143,7 @@ impl<'a> Parser<'a> {
             src,
             offset: Box::new(offset),
             ld: Box::new(ld),
+            trans,
         }))
     }
 

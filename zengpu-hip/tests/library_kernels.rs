@@ -1153,6 +1153,279 @@ fn zsl_frag_ab_from_shared_matches_cpu() {
     device.destroy_shader(shader);
 }
 
+const TYPED_SHARED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel typed_shared(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, ia: device buffer<i8>, ib: device buffer<i8>, ci: device buffer<i32>, wide: device buffer<i32>, ui: device buffer<u8>, e: device buffer<f32>, out: device mut buffer<f32>, oi: device mut buffer<i32>, rh: device mut buffer<f32>, rq: device mut buffer<i32>, ru: device mut buffer<u32>) {
+        shared sa: array<f16, 256>
+        shared sb: array<f16, 256>
+        shared qa: array<i8, 256>
+        shared qb: array<i8, 256>
+        shared qw: array<i8, 256>
+        shared us: array<u8, 256>
+        shared he: array<f16, 256>
+        let lane = local_id().x
+        for i in 0..8 {
+            sa[lane + i * 32] = a[lane + i * 32]
+            sb[lane + i * 32] = b[lane + i * 32]
+            qa[lane + i * 32] = ia[lane + i * 32]
+            qb[lane + i * 32] = ib[lane + i * 32]
+            qw[lane + i * 32] = wide[lane + i * 32]
+            us[lane + i * 32] = ui[lane + i * 32]
+            he[lane + i * 32] = e[lane + i * 32]
+        }
+        barrier()
+        let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        let d = mma(fa, fb, acc)
+        frag_store(out, 0, 16, d)
+        let ga: frag<i8, 16, 16, a> = frag_load_a(qa, 0, 16)
+        let gb: frag<i8, 16, 16, b> = frag_load_b(qb, 0, 16)
+        let iacc: frag<i32, 16, 16, acc> = frag_load_acc(ci, 0, 16)
+        let id2 = mma(ga, gb, iacc)
+        frag_store(oi, 0, 16, id2)
+        for i in 0..8 {
+            rh[lane + i * 32] = he[lane + i * 32]
+            rq[lane + i * 32] = qw[lane + i * 32]
+            ru[lane + i * 32] = us[lane + i * 32]
+        }
+    }
+);
+
+#[test]
+fn zsl_typed_shared_round_trips_and_feeds_frags() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = TYPED_SHARED_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let ia: Vec<i8> = (0..256).map(|i| ((i * 5 + 2) % 16) as i8 - 8).collect();
+    let ib: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
+    let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
+    let wide: Vec<i32> = (0..256i32).map(|i| i * 37 - 4000).collect();
+    let ui: Vec<u8> = (0..256u32).map(|i| (i * 53 % 256) as u8).collect();
+    let edge: Vec<f32> = (0..256)
+        .map(|i| {
+            [
+                0.1,
+                65504.0,
+                65520.0,
+                1.0 + 2f32.powi(-11),
+                1.0 + 3.0 * 2f32.powi(-11),
+                1e-5,
+                -2.5e-7,
+                123.456,
+                2.75,
+                -0.0,
+            ][i % 10]
+        })
+        .collect();
+    let f32s = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let i32s = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let i8s = |v: &[i8]| -> Vec<u8> { v.iter().map(|&x| x as u8).collect() };
+    let make = |dtype: DType, bytes: &[u8]| {
+        let arr = pool.alloc(vec![256], dtype).unwrap();
+        device.write_buffer(arr.buffer, 0, bytes).unwrap();
+        arr
+    };
+    let a = make(DType::F32, &f32s(&fa));
+    let b = make(DType::F32, &f32s(&fb));
+    let c = make(DType::F32, &f32s(&fc));
+    let ga = make(DType::I8, &i8s(&ia));
+    let gb = make(DType::I8, &i8s(&ib));
+    let gci = make(DType::I32, &i32s(&ci));
+    let gw = make(DType::I32, &i32s(&wide));
+    let gu = make(DType::U8, &ui);
+    let ge = make(DType::F32, &f32s(&edge));
+    let out = pool.alloc(vec![256], DType::F32).unwrap();
+    let oi = pool.alloc(vec![256], DType::I32).unwrap();
+    let rh = pool.alloc(vec![256], DType::F32).unwrap();
+    let rq = pool.alloc(vec![256], DType::I32).unwrap();
+    let ru = pool.alloc(vec![256], DType::U32).unwrap();
+    let bufs = [a, b, c, ga, gb, gci, gw, gu, ge, out, oi, rh, rq, ru];
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &bufs.iter().map(|x| x.buffer.index()).collect::<Vec<_>>(),
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let read = |x: &DeviceArray| device.read_buffer(x.buffer, 0, x.size_bytes()).unwrap();
+    let floats = |bytes: Vec<u8>| -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let ints = |bytes: Vec<u8>| -> Vec<i32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    };
+    let (got_out, got_oi) = (floats(read(&bufs[9])), ints(read(&bufs[10])));
+    let (got_rh, got_rq) = (floats(read(&bufs[11])), ints(read(&bufs[12])));
+    let got_ru: Vec<u32> = read(&bufs[13])
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            let mut si = ci[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[k * 16 + n];
+                si = si.wrapping_add(i32::from(ia[m * 16 + k]) * i32::from(ib[k * 16 + n]));
+            }
+            let at = m * 16 + n;
+            assert!(
+                close(got_out[at], s),
+                "f16 mma from shared at ({m}, {n}): {} vs {s}",
+                got_out[at]
+            );
+            assert_eq!(got_oi[at], si, "i8 mma from shared at ({m}, {n})");
+        }
+    }
+    for i in 0..256 {
+        let want = f16_bits_to_f32(f32_to_f16_bits(edge[i]));
+        assert_eq!(
+            got_rh[i].to_bits(),
+            want.to_bits(),
+            "f16 round trip of {}",
+            edge[i]
+        );
+        assert_eq!(
+            got_rq[i],
+            i32::from(wide[i] as i8),
+            "i8 narrowing of {}",
+            wide[i]
+        );
+        assert_eq!(got_ru[i], u32::from(ui[i]), "u8 round trip");
+    }
+    drop(ops);
+    for x in bufs {
+        pool.free(x);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
+/// Loads B from an N x K row-major source with `frag_load_b_t`, with no transpose stage.
+const FRAG_BT_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    @workgroup_size(32)
+    kernel frag_bt(a: device buffer<f16>, b: device buffer<f16>, ai: device buffer<u32>, bi: device buffer<u32>, c: device buffer<f32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+        let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+        let fb: frag<f16, 16, 16, b> = frag_load_b_t(b, 0, 16)
+        let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+        frag_store(out, 0, 16, mma(fa, fb, acc))
+        let ia: frag<i8, 16, 16, a> = frag_load_a(ai, 0, 16)
+        let ib: frag<i8, 16, 16, b> = frag_load_b_t(bi, 0, 16)
+        let iacc: frag<i32, 16, 16, acc> = frag_load_acc(ci, 0, 16)
+        frag_store(oi, 0, 16, mma(ia, ib, iacc))
+    }
+);
+
+#[test]
+fn zsl_frag_load_b_t_matches_cpu() {
+    let Some(device) = hip_device() else { return };
+    let (shader, entry) = FRAG_BT_ZSL.create(&*device).unwrap();
+    let pipeline = device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry,
+            block: [32, 1, 1],
+        })
+        .unwrap();
+    let pool = BufferPool::new(device.clone());
+    let fa: Vec<f32> = (0..256)
+        .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fb: Vec<f32> = (0..256)
+        .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+        .collect();
+    let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+    let ia: Vec<i8> = (0..256).map(|i| ((i * 5 + 2) % 16) as i8 - 8).collect();
+    let ib: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
+    let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
+    let bits_a: Vec<u16> = fa.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let bits_b: Vec<u16> = fb.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let pack = |v: &[i8]| -> Vec<u8> { v.iter().map(|&x| x as u8).collect() };
+    let a = upload_half(&pool, vec![256], DType::F16, &bits_a);
+    let b = upload_half(&pool, vec![256], DType::F16, &bits_b);
+    let ai = pool.alloc(vec![64], DType::U32).unwrap();
+    let bi = pool.alloc(vec![64], DType::U32).unwrap();
+    device.write_buffer(ai.buffer, 0, &pack(&ia)).unwrap();
+    device.write_buffer(bi.buffer, 0, &pack(&ib)).unwrap();
+    let c = upload(&pool, vec![256], &fc);
+    let ci_buf = pool.alloc(vec![256], DType::I32).unwrap();
+    let ci_bytes: Vec<u8> = ci.iter().flat_map(|x| x.to_le_bytes()).collect();
+    device.write_buffer(ci_buf.buffer, 0, &ci_bytes).unwrap();
+    let out = upload(&pool, vec![256], &[0.0; 256]);
+    let oi = pool.alloc(vec![256], DType::I32).unwrap();
+    let mut ops = OpList::new(&pool);
+    ops.dispatch(
+        pipeline,
+        &[
+            a.buffer.index(),
+            b.buffer.index(),
+            ai.buffer.index(),
+            bi.buffer.index(),
+            c.buffer.index(),
+            ci_buf.buffer.index(),
+            out.buffer.index(),
+            oi.buffer.index(),
+        ],
+        &[],
+        [1, 1, 1],
+    );
+    ops.run(&*device).unwrap();
+    let got = download(&*device, &out);
+    let got_i: Vec<i32> = device
+        .read_buffer(oi.buffer, 0, 1024)
+        .unwrap()
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    for m in 0..16 {
+        for n in 0..16 {
+            let mut s = fc[m * 16 + n];
+            let mut si = ci[m * 16 + n];
+            for k in 0..16 {
+                s += fa[m * 16 + k] * fb[n * 16 + k];
+                si = si.wrapping_add(i32::from(ia[m * 16 + k]) * i32::from(ib[n * 16 + k]));
+            }
+            assert!(
+                close(got[m * 16 + n], s),
+                "f16 ({m}, {n}): {} vs {s}",
+                got[m * 16 + n]
+            );
+            assert_eq!(got_i[m * 16 + n], si, "i8 ({m}, {n})");
+        }
+    }
+    drop(ops);
+    for buf in [a, b, c, out] {
+        pool.free(buf);
+    }
+    for buf in [ai, bi, ci_buf, oi] {
+        pool.free(buf);
+    }
+    device.destroy_pipeline(pipeline);
+    device.destroy_shader(shader);
+}
+
 const FEATURES_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
     @workgroup_size(32)
     kernel scalar_features(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, sb: device buffer<i8>, ub: device buffer<u8>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, ob: device mut buffer<i8>, oub: device mut buffer<u8>, oh: device mut buffer<i32>, oh2: device mut buffer<i32>, ofr: device mut buffer<f32>, osel: device mut buffer<i32>, id: global_id) {

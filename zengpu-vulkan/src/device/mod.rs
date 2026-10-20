@@ -940,12 +940,13 @@ impl VulkanDevice {
             subgroup_size_feat.p_next = features2.p_next;
             features2.p_next = &mut subgroup_size_feat as *mut _ as *mut c_void;
         }
-        let coop_supported = supports_extension(khr::cooperative_matrix::NAME)
-            && supported_coop.cooperative_matrix == vk::TRUE
-            && supported_storage16.storage_buffer16_bit_access == vk::TRUE
+        let f16i8_supported = supported_storage16.storage_buffer16_bit_access == vk::TRUE
             && supported_storage8.storage_buffer8_bit_access == vk::TRUE
             && supported_f16i8.shader_float16 == vk::TRUE
             && supported_f16i8.shader_int8 == vk::TRUE;
+        let coop_supported = supports_extension(khr::cooperative_matrix::NAME)
+            && supported_coop.cooperative_matrix == vk::TRUE
+            && f16i8_supported;
         let mut coop_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
             cooperative_matrix: vk::TRUE,
             ..Default::default()
@@ -963,12 +964,15 @@ impl VulkanDevice {
             shader_int8: vk::TRUE,
             ..Default::default()
         };
-        if coop_supported {
-            extensions.push(khr::cooperative_matrix::NAME.as_ptr());
+        if f16i8_supported {
             f16i8_feat.p_next = features2.p_next;
             storage8_feat.p_next = &mut f16i8_feat as *mut _ as *mut c_void;
             storage16_feat.p_next = &mut storage8_feat as *mut _ as *mut c_void;
-            coop_feat.p_next = &mut storage16_feat as *mut _ as *mut c_void;
+            features2.p_next = &mut storage16_feat as *mut _ as *mut c_void;
+        }
+        if coop_supported {
+            extensions.push(khr::cooperative_matrix::NAME.as_ptr());
+            coop_feat.p_next = features2.p_next;
             features2.p_next = &mut coop_feat as *mut _ as *mut c_void;
         }
 
@@ -4975,6 +4979,459 @@ mod tests {
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
         for buf in [a, b, c, out, ba, bb, ci_buf, oi, zout] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
+    /// Stores narrow into shared arrays on RADV (RNE for f16 and bf16).
+    #[test]
+    fn zsl_typed_shared_round_trips_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const TYPED_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel typed_rt(a: device buffer<f32>, ci: device buffer<i32>, ui: device buffer<u8>, ub: device buffer<u32>, oh: device mut buffer<f32>, oq: device mut buffer<i32>, ou: device mut buffer<u32>, ow: device mut buffer<f32>, on: device mut buffer<u32>) {
+                shared sh: array<f16, 256>
+                shared sq: array<i8, 256>
+                shared su: array<u8, 256>
+                shared sw: array<bf16, 256>
+                shared sn: array<u32, 256>
+                let lane = local_id().x
+                for i in 0..8 {
+                    sh[lane + i * 32] = a[lane + i * 32]
+                    sq[lane + i * 32] = ci[lane + i * 32]
+                    su[lane + i * 32] = ui[lane + i * 32]
+                    sw[lane + i * 32] = a[lane + i * 32]
+                    sn[lane + i * 32] = ub[lane + i * 32]
+                }
+                barrier()
+                for i in 0..8 {
+                    oh[lane + i * 32] = sh[lane + i * 32]
+                    oq[lane + i * 32] = sq[lane + i * 32]
+                    ou[lane + i * 32] = su[lane + i * 32]
+                    ow[lane + i * 32] = sw[lane + i * 32]
+                    on[lane + i * 32] = sn[lane + i * 32]
+                }
+            }
+        );
+
+        let f16_round = |x: f32| -> f32 {
+            if !x.is_finite() || x == 0.0 {
+                return x;
+            }
+            let a = x.abs();
+            if a >= 65520.0 {
+                return f32::INFINITY.copysign(x);
+            }
+            let e = a.log2().floor().max(-14.0);
+            let q = 2f32.powf(e - 10.0);
+            ((a / q).round_ties_even() * q).copysign(x)
+        };
+        let bf16_round = |x: f32| -> f32 {
+            if !x.is_finite() {
+                return x;
+            }
+            let b = x.to_bits();
+            f32::from_bits((b + 0x7fff + ((b >> 16) & 1)) & 0xffff_0000)
+        };
+
+        let Some(dev) = try_device() else { return };
+        let a_vals: Vec<f32> = (0..256)
+            .map(|i| {
+                [
+                    0.1,
+                    65504.0,
+                    65520.0,
+                    1.0 + 2f32.powi(-11),
+                    1.0 + 3.0 * 2f32.powi(-11),
+                    1e-5,
+                    -2.5e-7,
+                    123.456,
+                    2.75,
+                    -0.0,
+                ][i % 10]
+            })
+            .collect();
+        let ci: Vec<i32> = (0..256i32).map(|i| i * 37 - 4000).collect();
+        let ui: Vec<u8> = (0..256u32).map(|i| (i * 53 % 256) as u8).collect();
+        let ub: Vec<u32> = (0..256u32).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let u32_bytes = |v: &[u32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let make = |size: u64, usage: BufferUsage, data: &[u8]| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let a = make(1024, input, &f32_bytes(&a_vals));
+        let c = make(1024, input, &i32_bytes(&ci));
+        let u8s = make(256, input, &ui);
+        let uw = make(1024, input, &u32_bytes(&ub));
+        let oh = make(1024, output, &[0u8; 1024]);
+        let oq = make(1024, output, &[0u8; 1024]);
+        let ou = make(1024, output, &[0u8; 1024]);
+        let ow = make(1024, output, &[0u8; 1024]);
+        let on = make(1024, output, &[0u8; 1024]);
+
+        let shader = dev.create_shader(TYPED_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry: "main",
+                    block: [32, 1, 1],
+                },
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(32),
+                },
+            )
+            .unwrap();
+        let slots: Vec<u32> = [a, c, u8s, uw, oh, oq, ou, ow, on]
+            .iter()
+            .map(|b| b.index())
+            .collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let read = |b| dev.read_buffer(b, 0, 1024).unwrap();
+        let floats = |b| -> Vec<f32> {
+            read(b)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ints = |b| -> Vec<i32> {
+            read(b)
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let uints = |b| -> Vec<u32> {
+            read(b)
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (got_h, got_q, got_u) = (floats(oh), ints(oq), uints(ou));
+        let (got_w, got_n) = (floats(ow), uints(on));
+        for i in 0..256 {
+            assert_eq!(
+                got_h[i].to_bits(),
+                f16_round(a_vals[i]).to_bits(),
+                "f16 shared at {i}"
+            );
+            assert_eq!(got_q[i], i32::from(ci[i] as i8), "i8 narrowing at {i}");
+            assert_eq!(got_u[i], u32::from(ui[i]), "u8 shared at {i}");
+            assert_eq!(
+                got_w[i].to_bits(),
+                bf16_round(a_vals[i]).to_bits(),
+                "bf16 shared at {i}"
+            );
+            assert_eq!(got_n[i], ub[i], "u32 shared at {i}");
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [a, c, u8s, uw, oh, oq, ou, ow, on] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
+    /// `frag_load_a/b` load straight from f16 and i8 shared arrays, with no f16 stage.
+    #[test]
+    fn zsl_frag_from_typed_shared_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const SHARED_FRAG: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel shared_frag(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, ba: device buffer<i32>, bb: device buffer<i32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+                shared sa: array<f16, 256>
+                shared sb: array<f16, 256>
+                shared qa: array<i8, 256>
+                shared qb: array<i8, 256>
+                let lane = local_id().x
+                for i in 0..8 {
+                    sa[lane + i * 32] = a[lane + i * 32]
+                    sb[lane + i * 32] = b[lane + i * 32]
+                    qa[lane + i * 32] = ba[lane + i * 32]
+                    qb[lane + i * 32] = bb[lane + i * 32]
+                }
+                barrier()
+                let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+                let ia: frag<i8, 16, 16, a> = frag_load_a(qa, 0, 16)
+                let ib: frag<i8, 16, 16, b> = frag_load_b(qb, 0, 16)
+                let iacc: frag<i32, 16, 16, acc> = frag_load_acc(ci, 0, 16)
+                frag_store(oi, 0, 16, mma(ia, ib, iacc))
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let f16_bits = |x: f32| -> u16 {
+            if x == 0.0 {
+                return 0;
+            }
+            let b = x.to_bits();
+            let sign = (b >> 16) & 0x8000;
+            let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+            let m = (b >> 13) & 0x3ff;
+            (sign | ((e as u32) << 10) | m) as u16
+        };
+        let fa: Vec<f32> = (0..256)
+            .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+            .collect();
+        let fb: Vec<f32> = (0..256)
+            .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+            .collect();
+        let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+        let ba8: Vec<i8> = (0..256).map(|i| ((i * 5 + 2) % 16) as i8 - 8).collect();
+        let bb8: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
+        let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
+        let f16_bytes =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&x| f16_bits(x).to_le_bytes()).collect() };
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let make = |size: u64, usage: BufferUsage, data: &[u8]| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let a = make(512, input, &f16_bytes(&fa));
+        let b = make(512, input, &f16_bytes(&fb));
+        let c = make(1024, input, &f32_bytes(&fc));
+        let ba32: Vec<i32> = ba8.iter().map(|&x| i32::from(x)).collect();
+        let bb32: Vec<i32> = bb8.iter().map(|&x| i32::from(x)).collect();
+        let ba = make(1024, input, &i32_bytes(&ba32));
+        let bb = make(1024, input, &i32_bytes(&bb32));
+        let ci_buf = make(1024, input, &i32_bytes(&ci));
+        let out = make(1024, output, &[0u8; 1024]);
+        let oi = make(1024, output, &[0u8; 1024]);
+
+        let shader = dev
+            .create_shader(SHARED_FRAG.spirv_desc().unwrap())
+            .unwrap();
+        let pipeline = dev
+            .create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry: "main",
+                    block: [32, 1, 1],
+                },
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(32),
+                },
+            )
+            .unwrap();
+        let slots: Vec<u32> = [a, b, c, ba, bb, ci_buf, out, oi]
+            .iter()
+            .map(|b| b.index())
+            .collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let floats = |b| -> Vec<f32> {
+            dev.read_buffer(b, 0, 1024)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ints = |b| -> Vec<i32> {
+            dev.read_buffer(b, 0, 1024)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (got_f, got_i) = (floats(out), ints(oi));
+        for m in 0..16 {
+            for n in 0..16 {
+                let mut s = fc[m * 16 + n];
+                let mut si = ci[m * 16 + n];
+                for k in 0..16 {
+                    s += fa[m * 16 + k] * fb[k * 16 + n];
+                    si = si.wrapping_add(i32::from(ba8[m * 16 + k]) * i32::from(bb8[k * 16 + n]));
+                }
+                let at = m * 16 + n;
+                assert!(
+                    (got_f[at] - s).abs() <= 1e-3 * s.abs().max(1.0),
+                    "f16 mma from shared at ({m}, {n}): got {} want {s}",
+                    got_f[at]
+                );
+                assert_eq!(got_i[at], si, "i8 mma from shared at ({m}, {n})");
+            }
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [a, b, c, ba, bb, ci_buf, out, oi] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
+    /// `frag_load_b_t` on RADV: N x K row-major f16 or packed i8 B, loaded as a ColumnMajor
+    /// cooperative load.
+    #[test]
+    fn zsl_frag_load_b_t_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const BT_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel frag_bt(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, ba: device buffer<u32>, bb: device buffer<u32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+                let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b_t(b, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+                let ia: frag<i8, 16, 16, a> = frag_load_a(ba, 0, 16)
+                let ib: frag<i8, 16, 16, b> = frag_load_b_t(bb, 0, 16)
+                let iacc: frag<i32, 16, 16, acc> = frag_load_acc(ci, 0, 16)
+                frag_store(oi, 0, 16, mma(ia, ib, iacc))
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let f16_bits = |x: f32| -> u16 {
+            if x == 0.0 {
+                return 0;
+            }
+            let b = x.to_bits();
+            let sign = (b >> 16) & 0x8000;
+            let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+            let m = (b >> 13) & 0x3ff;
+            (sign | ((e as u32) << 10) | m) as u16
+        };
+        let fa: Vec<f32> = (0..256)
+            .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+            .collect();
+        let fb: Vec<f32> = (0..256)
+            .map(|i| ((i * 5 + 1) % 9 - 4) as f32 / 4.0)
+            .collect();
+        let fc: Vec<f32> = (0..256).map(|i| ((i * 3) % 11) as f32 - 5.0).collect();
+        let ba8: Vec<i8> = (0..256).map(|i| ((i * 5 + 2) % 16) as i8 - 8).collect();
+        let bb8: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
+        let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
+        let f16_bytes =
+            |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&x| f16_bits(x).to_le_bytes()).collect() };
+        let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let pack = |v: &[i8]| -> Vec<u8> { v.iter().map(|&x| x as u8).collect() };
+        let make = |size: u64, usage: BufferUsage, data: &[u8]| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let input = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let a = make(512, input, &f16_bytes(&fa));
+        let b = make(512, input, &f16_bytes(&fb));
+        let c = make(1024, input, &f32_bytes(&fc));
+        let ba = make(256, input, &pack(&ba8));
+        let bb = make(256, input, &pack(&bb8));
+        let ci_buf = make(1024, input, &i32_bytes(&ci));
+        let out = make(1024, output, &[0u8; 1024]);
+        let oi = make(1024, output, &[0u8; 1024]);
+
+        let shader = dev.create_shader(BT_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry: "main",
+                    block: [32, 1, 1],
+                },
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(32),
+                },
+            )
+            .unwrap();
+        let slots: Vec<u32> = [a, b, c, ba, bb, ci_buf, out, oi]
+            .iter()
+            .map(|b| b.index())
+            .collect();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let floats = |b| -> Vec<f32> {
+            dev.read_buffer(b, 0, 1024)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let ints = |b| -> Vec<i32> {
+            dev.read_buffer(b, 0, 1024)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        };
+        let (got_f, got_i) = (floats(out), ints(oi));
+        for m in 0..16 {
+            for n in 0..16 {
+                let mut s = fc[m * 16 + n];
+                let mut si = ci[m * 16 + n];
+                for k in 0..16 {
+                    s += fa[m * 16 + k] * fb[n * 16 + k];
+                    si = si.wrapping_add(i32::from(ba8[m * 16 + k]) * i32::from(bb8[n * 16 + k]));
+                }
+                let at = m * 16 + n;
+                assert!(
+                    (got_f[at] - s).abs() <= 1e-3 * s.abs().max(1.0),
+                    "f16 b_t at ({m}, {n}): got {} want {s}",
+                    got_f[at]
+                );
+                assert_eq!(got_i[at], si, "i8 b_t at ({m}, {n})");
+            }
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [a, b, c, ba, bb, ci_buf, out, oi] {
             dev.destroy_buffer(buf);
         }
     }

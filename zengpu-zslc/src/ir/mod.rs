@@ -62,11 +62,8 @@ pub struct Entry {
 #[derive(Debug)]
 pub struct SharedDecl {
     pub name: String,
-    /// Interned in `Module::types`.
-    ///
-    /// Not yet read by any backend, which all hardcode f32 shared memory. Meant for future non-f32
-    /// shared arrays.
-    #[allow(dead_code)]
+    /// Storage element type: f32, f16, bf16, i8, u8, i32 or u32. Loads and stores go
+    /// through `storage_value_type`.
     pub elem: TypeId,
     pub len: u32,
 }

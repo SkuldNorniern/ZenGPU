@@ -117,18 +117,28 @@ fn load_args(
     };
     let elem = match src {
         FragSrc::Buffer(n) => ctx.type_ctx.buffers.get(n).copied(),
-        FragSrc::Shared(_) => None,
+        FragSrc::Shared(n) => ctx.type_ctx.shared.get(n).copied(),
     };
     let elem_ty = elem.map(|t| ctx.types.borrow().get(t).clone());
     let ptr = match (usage, src, elem_ty) {
         (
             FragUse::A | FragUse::B,
-            FragSrc::Buffer(_),
+            _,
             Some(Type::Float {
                 format: FloatFormat::F16,
             }),
         ) => {
             format!("(const __half*){name}")
+        }
+        (
+            FragUse::A | FragUse::B,
+            FragSrc::Shared(_),
+            Some(Type::Int {
+                width: IntWidth::W8,
+                ..
+            }),
+        ) => {
+            format!("(const signed char*){name}")
         }
         (
             FragUse::A | FragUse::B,
@@ -162,7 +172,7 @@ fn load_args(
         (FragUse::Acc, FragSrc::Shared(_), _) => name.to_string(),
         _ => {
             return Err(unsupported(format!(
-                "frag load from `{name}`: CUDA loads f16 or packed-i8 buffers into a/b, and f32 or i32 buffers or shared f32 into acc"
+                "frag load from `{name}`: CUDA loads f16 shared or buffers and packed-i8 buffers into a/b, i8 shared into a/b, and f32 or i32 buffers or shared arrays into acc"
             )));
         }
     };
@@ -174,8 +184,17 @@ fn load_args(
     Ok(format!("({ptr} + ({offset})), {ld}{layout}"))
 }
 
-/// A and B load from shared f32 through a per-warp `__half` tile, because `load_matrix_sync` reads
-/// the fragment's element type.
+fn is_shared_f32(ctx: &Ctx<'_>, name: &str) -> bool {
+    ctx.type_ctx.shared.get(name).is_some_and(|elem| {
+        ctx.types.borrow().get(*elem)
+            == &Type::Float {
+                format: FloatFormat::F32,
+            }
+    })
+}
+
+/// A/B from f32 shared go through a per-warp `__half` tile: `load_matrix_sync` reads the fragment's
+/// element type. f16 and i8 load directly.
 fn load_stmt(
     ctx: &Ctx<'_>,
     name: &str,
@@ -186,6 +205,7 @@ fn load_stmt(
 ) -> Result<String, Diagnostic> {
     if let FragSrc::Shared(tile) = src
         && matches!(usage, FragUse::A | FragUse::B)
+        && is_shared_f32(ctx, tile)
     {
         let warps = ctx.block_size.div_ceil(32);
         let [lx, ly, _] = ctx.local_size;
@@ -215,10 +235,21 @@ pub(super) fn let_stmt(
             src,
             offset,
             ld,
+            trans,
         } => {
             let usage = usage_from(ctx, *fty)?;
             let off = emit_expr(ctx, offset)?;
             let ldv = emit_expr(ctx, ld)?;
+            if *trans {
+                if !matches!(src, FragSrc::Buffer(_) | FragSrc::Shared(_))
+                    || matches!(src, FragSrc::Shared(t) if is_shared_f32(ctx, t))
+                {
+                    return Err(unsupported(
+                        "frag_load_b_t from an f32 shared array is not lowered on CUDA",
+                    ));
+                }
+                out = format!("{} {name};", ty.replace("row_major>", "col_major>"));
+            }
             let _ = write!(out, " {}", load_stmt(ctx, name, usage, src, &off, &ldv)?);
         }
         _ => out.push_str(&mma_or_zero(ctx, name, init)?),
@@ -228,11 +259,15 @@ pub(super) fn let_stmt(
 
 pub(super) fn assign_stmt(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<String, Diagnostic> {
     match value {
+        IrExpr::FragLoad { trans: true, .. } => Err(unsupported(
+            "frag_load_b_t must initialize a let local on CUDA (its wmma layout is part of the declaration)",
+        )),
         IrExpr::FragLoad {
             ty: fty,
             src,
             offset,
             ld,
+            trans: false,
         } => {
             let usage = usage_from(ctx, *fty)?;
             let off = emit_expr(ctx, offset)?;
@@ -290,13 +325,19 @@ pub(super) fn store_stmt(
     let off = emit_expr(ctx, offset)?;
     let ldv = emit_expr(ctx, ld)?;
     let val = emit_expr(ctx, value)?;
-    let int_acc = matches!(
-        src,
-        FragSrc::Buffer(n) if ctx.type_ctx.buffers.get(n).is_some_and(|t| matches!(
+    let elem = match src {
+        FragSrc::Buffer(n) => ctx.type_ctx.buffers.get(n),
+        FragSrc::Shared(n) => ctx.type_ctx.shared.get(n),
+    };
+    let int_acc = elem.is_some_and(|t| {
+        matches!(
             ctx.types.borrow().get(*t),
-            Type::Int { width: IntWidth::W32, .. }
-        ))
-    );
+            Type::Int {
+                width: IntWidth::W32,
+                ..
+            }
+        )
+    });
     let ptr_ty = if int_acc { "int" } else { "float" };
     Ok(format!(
         "nvcuda::wmma::store_matrix_sync(({ptr_ty}*){name} + ({off}), {val}, {ldv}, {LAYOUT_ROW});"

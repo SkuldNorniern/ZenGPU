@@ -81,6 +81,13 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     for (name, elem) in &buffers {
         buffer_elems.insert(name, msl_buffer_elem(module.types.get(*elem))?);
     }
+    let mut shared_elems: HashMap<&str, &'static str> = HashMap::new();
+    for decl in &e.shared {
+        shared_elems.insert(
+            decl.name.as_str(),
+            msl_buffer_elem(module.types.get(decl.elem))?,
+        );
+    }
     let uses_workgroup_reduce = stmts_use_workgroup_reduce(&e.body);
     let block_size = local_size[0] * local_size[1] * local_size[2];
     if uses_workgroup_reduce && !block_size.is_power_of_two() {
@@ -170,7 +177,8 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
 "#,
     );
 
-    if !bf16_buffers.is_empty() {
+    let shared_bf16 = shared_elems.values().any(|t| *t == "ushort");
+    if !bf16_buffers.is_empty() || shared_bf16 {
         s.push_str(
             "inline ushort f32_to_bf16(float x) {\n\
              \x20   uint bits = as_type<uint>(x);\n\
@@ -235,7 +243,13 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
     }
 
     for shared in &e.shared {
-        let _ = writeln!(s, "    threadgroup float {}[{}];", shared.name, shared.len);
+        let _ = writeln!(
+            s,
+            "    threadgroup {} {}[{}];",
+            shared_elems[shared.name.as_str()],
+            shared.name,
+            shared.len
+        );
     }
     if uses_workgroup_reduce {
         let _ = writeln!(
@@ -245,6 +259,7 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
     }
 
     let type_ctx = ComputeTypeCtx {
+        shared: e.shared.iter().map(|d| (d.name.clone(), d.elem)).collect(),
         locals: e.locals.iter().cloned().collect(),
         scalars: scalars
             .iter()
@@ -261,6 +276,7 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
         locals,
         frags,
         buffer_elems,
+        shared_elems,
         bf16_buffers,
         f16_buffers,
         block_size,
@@ -296,6 +312,7 @@ struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
     frags: HashMap<&'a str, FragTiles>,
     buffer_elems: HashMap<&'a str, &'static str>,
+    shared_elems: HashMap<&'a str, &'static str>,
     bf16_buffers: HashSet<&'a str>,
     f16_buffers: HashSet<&'a str>,
     block_size: u32,
@@ -398,13 +415,15 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
-            let _ = writeln!(
-                s,
-                "{}[{}] = {};",
-                name,
-                emit_expr(ctx, index)?,
-                emit_expr(ctx, value)?
-            );
+            let val = emit_expr(ctx, value)?;
+            let val = match ctx.shared_elems.get(name.as_str()).copied() {
+                Some("ushort") => format!("f32_to_bf16({val})"),
+                Some("half") => format!("half({val})"),
+                Some("char") => format!("char({val})"),
+                Some("uchar") => format!("uchar({val})"),
+                _ => val,
+            };
+            let _ = writeln!(s, "{}[{}] = {};", name, emit_expr(ctx, index)?, val);
         }
         IrStmt::ImageStore { image, args } => {
             let a = args
@@ -505,7 +524,16 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 inner
             }
         }
-        IrExpr::SharedLoad { name, index } => format!("{name}[{}]", emit_expr(ctx, index)?),
+        IrExpr::SharedLoad { name, index } => {
+            let inner = format!("{name}[{}]", emit_expr(ctx, index)?);
+            match ctx.shared_elems.get(name.as_str()).copied() {
+                Some("ushort") => format!("bf16_to_f32({inner})"),
+                Some("half") => format!("float({inner})"),
+                Some("char") => format!("int({inner})"),
+                Some("uchar") => format!("uint({inner})"),
+                _ => inner,
+            }
+        }
         IrExpr::GlobalId(c) => format!("gid.{}", component(*c)),
         IrExpr::LocalId(c) => format!("lid.{}", component(*c)),
         IrExpr::GroupId(c) => format!("group.{}", component(*c)),
@@ -808,10 +836,20 @@ fn frag_fill_lines(
 ) -> Result<Vec<String>, Diagnostic> {
     match value {
         IrExpr::FragLoad {
-            src, offset, ld, ..
+            src,
+            offset,
+            ld,
+            trans,
+            ..
         } => {
             let off = emit_expr(ctx, offset)?;
             let ld = emit_expr(ctx, ld)?;
+            if *trans && frag.elem != "half" {
+                return Err(frag_rejected(
+                    "frag_load_b_t",
+                    "the transposed B load takes f16 operands",
+                ));
+            }
             let base = match src {
                 FragSrc::Buffer(buf) => {
                     let elem = ctx.buffer_elems.get(buf.as_str()).copied().unwrap_or("");
@@ -824,10 +862,16 @@ fn frag_fill_lines(
                     format!("({buf} + ({off}))")
                 }
                 FragSrc::Shared(tile) => {
-                    if frag.elem != "float" {
+                    let elem = ctx.shared_elems.get(tile.as_str()).copied();
+                    let fits = if frag.elem == "half" {
+                        elem == Some("half")
+                    } else {
+                        frag.elem == "float" && elem == Some("float")
+                    };
+                    if !fits {
                         return Err(frag_rejected(
                             &format!("frag load from shared `{tile}`"),
-                            "only accumulators load from shared arrays on MSL (a/b would need an f16 stage)",
+                            "a/b load f16 shared arrays and accumulators load f32 shared arrays on MSL (f32 a/b would need an f16 stage)",
                         ));
                     }
                     format!("({tile} + ({off}))")
@@ -836,7 +880,13 @@ fn frag_fill_lines(
             Ok((0..TILES)
                 .map(|t| {
                     let (r, c) = tile_origin(t);
-                    format!("simdgroup_load({name}[{t}], {base} + {r}u * ({ld}) + {c}u, ({ld}));")
+                    if *trans {
+                        format!(
+                            "simdgroup_load({name}[{t}], {base} + {c}u * ({ld}) + {r}u, ({ld}), ulong2(0, 0), true);"
+                        )
+                    } else {
+                        format!("simdgroup_load({name}[{t}], {base} + {r}u * ({ld}) + {c}u, ({ld}));")
+                    }
                 })
                 .collect())
         }
@@ -982,7 +1032,15 @@ fn frag_store_lines(
             }
             format!("({buf} + ({off}))")
         }
-        FragSrc::Shared(tile) => format!("({tile} + ({off}))"),
+        FragSrc::Shared(tile) => {
+            if ctx.shared_elems.get(tile.as_str()).copied() != Some("float") {
+                return Err(frag_rejected(
+                    &format!("frag_store to shared `{tile}`"),
+                    "accumulators are stored to f32 shared arrays",
+                ));
+            }
+            format!("({tile} + ({off}))")
+        }
     };
     Ok((0..TILES)
         .map(|t| {

@@ -45,6 +45,11 @@ impl Ctx {
                 .iter()
                 .map(|(k, v)| (k.clone(), v.elem))
                 .collect(),
+            shared: self
+                .shared
+                .iter()
+                .map(|(k, v)| (k.clone(), v.elem))
+                .collect(),
         }
     }
 }
@@ -56,8 +61,6 @@ pub(super) struct BufferSymbol {
 }
 
 pub(super) struct PendingShared {
-    #[allow(dead_code)]
-    pub(super) name: String,
     pub(super) elem: TypeId,
     pub(super) len: u32,
 }

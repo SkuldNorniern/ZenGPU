@@ -27,7 +27,7 @@ mod glsl_op {
 
 use std::collections::HashMap;
 
-use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, op, sc};
+use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, cap, deco, op, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::arena::TypeArena;
 use crate::ir::binding::{IMAGE_BINDING, TEXTURE_BINDING, ssbo_binding_for};
@@ -36,7 +36,7 @@ use crate::ir::node::{
     stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::frag_parts;
-use crate::ir::typeck::{i8_type, u8_type};
+use crate::ir::typeck::{StorageElem, i8_type, storage_elem, storage_value_type, u8_type};
 use crate::ir::types::TypeId;
 use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
@@ -300,11 +300,35 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let t_ptr_wg_f32 = spv.type_pointer(sc::WORKGROUP, t_f32);
     let mut shared = HashMap::new();
     for decl in &entry.shared {
+        let elem_spv = match storage_elem(&types, decl.elem) {
+            Some(StorageElem::F32) => t_f32,
+            Some(StorageElem::F16) => {
+                spv.capability(cap::FLOAT16);
+                spv.type_float(16)
+            }
+            Some(StorageElem::I8 | StorageElem::U8) => {
+                spv.capability(cap::INT8);
+                spv.type_int(8, true)
+            }
+            Some(StorageElem::I32) => t_i32,
+            Some(StorageElem::U32 | StorageElem::Bf16) => t_u32,
+            None => return Err(format!("ZSL: unsupported shared element `{}`", decl.name)),
+        };
         let len = spv.constant_u32(t_u32, decl.len);
-        let array_ty = spv.type_array(t_f32, len);
+        let array_ty = spv.type_array(elem_spv, len);
         let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
         let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
-        shared.insert(decl.name.clone(), var);
+        let elem_ptr = spv.type_pointer(sc::WORKGROUP, elem_spv);
+        shared.insert(
+            decl.name.clone(),
+            SharedVar {
+                var,
+                elem_ptr,
+                elem_spv,
+                elem: decl.elem,
+                value_ty: storage_value_type(&mut types, decl.elem),
+            },
+        );
     }
     let uses_workgroup_reduce = stmts_use_workgroup_reduce(&entry.body);
     let workgroup_reduce_len = local_size[0] * local_size[1] * local_size[2];
@@ -608,7 +632,7 @@ struct LowerCtx<'a> {
     lid_var: Id,
     group_var: Id,
     subgroup_vars: Option<SubgroupVars>,
-    shared: HashMap<String, Id>,
+    shared: HashMap<String, SharedVar>,
     workgroup_reduce_var: Option<Id>,
     workgroup_reduce_len: u32,
     t_ptr_wg_f32: Id,
@@ -803,16 +827,16 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
         }
 
         IrStmt::AssignShared { name, index, value } => {
-            let var = *ctx
+            let sv = *ctx
                 .shared
                 .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ctx.u32_id);
-            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
+            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &[idx]);
             let rhs = lower_expr(ctx, value)?;
-            let rhs = coerce(ctx, rhs, ctx.f32_id);
-            ctx.spv.op_store(ptr, rhs);
+            let stored = store_shared_value(ctx, sv, rhs)?;
+            ctx.spv.op_store(ptr, stored);
             Ok(())
         }
 
@@ -915,7 +939,8 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
             src,
             offset,
             ld,
-        } => ctx.lower_frag_load(*ty, src, offset, ld),
+            trans,
+        } => ctx.lower_frag_load(*ty, src, offset, ld, *trans),
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
             Ok(Val { id, ty: ctx.u32_id })
@@ -1004,15 +1029,19 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         }
 
         IrExpr::SharedLoad { name, index } => {
-            let var = *ctx
+            let sv = *ctx
                 .shared
                 .get(name)
                 .ok_or_else(|| format!("ZSL: `{name}` is not a shared array"))?;
             let idx = lower_expr(ctx, index)?;
             let idx = coerce(ctx, idx, ctx.u32_id);
-            let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &[idx]);
-            let id = ctx.spv.op_load(ctx.t_f32, ptr);
-            Ok(Val { id, ty: ctx.f32_id })
+            let ptr = ctx.spv.op_access_chain(sv.elem_ptr, sv.var, &[idx]);
+            let loaded = ctx.spv.op_load(sv.elem_spv, ptr);
+            let id = load_shared_value(ctx, sv, loaded);
+            Ok(Val {
+                id,
+                ty: sv.value_ty,
+            })
         }
 
         IrExpr::GlobalId(component) => {
@@ -1982,6 +2011,75 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
 const NO_CONTRACTION: u32 = 42;
 const GLSL_UNPACK_HALF_2X16: u32 = 62;
 
+#[derive(Clone, Copy)]
+struct SharedVar {
+    var: Id,
+    elem_ptr: Id,
+    elem_spv: Id,
+    elem: TypeId,
+    value_ty: TypeId,
+}
+
+fn store_shared_value(ctx: &mut LowerCtx<'_>, sv: SharedVar, rhs: Val) -> Result<Id, String> {
+    let kind = storage_elem(&ctx.types, sv.elem);
+    Ok(match kind {
+        Some(StorageElem::F16) => {
+            let f = coerce(ctx, rhs, ctx.f32_id);
+            ctx.spv.op_convert_f_to_f(sv.elem_spv, f)
+        }
+        Some(StorageElem::Bf16) => {
+            let f = coerce(ctx, rhs, ctx.f32_id);
+            bf16_bits(ctx, f)
+        }
+        Some(StorageElem::I8) => {
+            let v = coerce(ctx, rhs, ctx.i32_id);
+            ctx.spv.op_sconvert(sv.elem_spv, v)
+        }
+        Some(StorageElem::U8) => {
+            let v = coerce(ctx, rhs, ctx.u32_id);
+            ctx.spv.op_uconvert(sv.elem_spv, v)
+        }
+        Some(StorageElem::I32) => coerce(ctx, rhs, ctx.i32_id),
+        Some(StorageElem::U32) => coerce(ctx, rhs, ctx.u32_id),
+        _ => coerce(ctx, rhs, ctx.f32_id),
+    })
+}
+
+fn load_shared_value(ctx: &mut LowerCtx<'_>, sv: SharedVar, id: Id) -> Id {
+    match storage_elem(&ctx.types, sv.elem) {
+        Some(StorageElem::F16) => ctx.spv.op_convert_f_to_f(ctx.t_f32, id),
+        Some(StorageElem::Bf16) => {
+            let c16 = ctx.spv.constant_u32(ctx.t_u32, 16);
+            let high = ctx.spv.op_shift_left_logical(ctx.t_u32, id, c16);
+            ctx.spv.op_bitcast(ctx.t_f32, high)
+        }
+        Some(StorageElem::I8) => ctx.spv.op_sconvert(ctx.t_i32, id),
+        Some(StorageElem::U8) => ctx.spv.op_uconvert(ctx.t_u32, id),
+        _ => id,
+    }
+}
+
+/// RNE bf16 bits of f32 `value`, low 16 bits of a u32, same rounding as HIP/CUDA/MSL
+fn bf16_bits(ctx: &mut LowerCtx<'_>, value: Id) -> Id {
+    let t_u32 = ctx.t_u32;
+    let c16 = ctx.spv.constant_u32(t_u32, 16);
+    let c1 = ctx.spv.constant_u32(t_u32, 1);
+    let c7fff = ctx.spv.constant_u32(t_u32, 0x7fff);
+    let raw = ctx.spv.op_bitcast(t_u32, value);
+    let upper = ctx.spv.op_shift_right_logical(t_u32, raw, c16);
+    let lsb = ctx.spv.op_bitwise_and(t_u32, upper, c1);
+    let bias = ctx.spv.op_iadd(t_u32, c7fff, lsb);
+    let rounded = ctx.spv.op_iadd(t_u32, raw, bias);
+    let rounded = ctx.spv.op_shift_right_logical(t_u32, rounded, c16);
+    let mag_mask = ctx.spv.constant_u32(t_u32, 0x7fff_ffff);
+    let inf = ctx.spv.constant_u32(t_u32, 0x7f80_0000);
+    let quiet_bit = ctx.spv.constant_u32(t_u32, 0x40);
+    let mag = ctx.spv.op_bitwise_and(t_u32, raw, mag_mask);
+    let is_nan = ctx.spv.op_ult(ctx.t_bool, inf, mag);
+    let upper_quiet = ctx.spv.op_bitwise_or(t_u32, upper, quiet_bit);
+    ctx.spv.op_select(t_u32, is_nan, upper_quiet, rounded)
+}
+
 /// `u32` word holding half element `idx`, and its bit offset (0 or 16).
 fn half_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> (Id, Id) {
     let t_u32 = ctx.t_u32;
@@ -2076,26 +2174,9 @@ fn store_half(
     value: Id,
 ) {
     let t_u32 = ctx.t_u32;
-    let c16 = ctx.spv.constant_u32(t_u32, 16);
     let bits = match half {
         Half::F16 => f32_to_f16_rne(ctx, value),
-        Half::Bf16 => {
-            let c1 = ctx.spv.constant_u32(t_u32, 1);
-            let c7fff = ctx.spv.constant_u32(t_u32, 0x7fff);
-            let raw = ctx.spv.op_bitcast(t_u32, value);
-            let upper = ctx.spv.op_shift_right_logical(t_u32, raw, c16);
-            let lsb = ctx.spv.op_bitwise_and(t_u32, upper, c1);
-            let bias = ctx.spv.op_iadd(t_u32, c7fff, lsb);
-            let rounded = ctx.spv.op_iadd(t_u32, raw, bias);
-            let rounded = ctx.spv.op_shift_right_logical(t_u32, rounded, c16);
-            let mag_mask = ctx.spv.constant_u32(t_u32, 0x7fff_ffff);
-            let inf = ctx.spv.constant_u32(t_u32, 0x7f80_0000);
-            let quiet_bit = ctx.spv.constant_u32(t_u32, 0x40);
-            let mag = ctx.spv.op_bitwise_and(t_u32, raw, mag_mask);
-            let is_nan = ctx.spv.op_ult(ctx.t_bool, inf, mag);
-            let upper_quiet = ctx.spv.op_bitwise_or(t_u32, upper, quiet_bit);
-            ctx.spv.op_select(t_u32, is_nan, upper_quiet, rounded)
-        }
+        Half::Bf16 => bf16_bits(ctx, value),
     };
     let (ptr, shift) = half_word(ctx, table, buf_idx, idx);
     let lane_mask = ctx.spv.constant_u32(t_u32, 0xffff);

@@ -96,6 +96,8 @@ pub(crate) mod op {
     pub const CONVERT_S_TO_F: u32 = 111;
     pub const CONVERT_U_TO_F: u32 = 112;
     pub const CONVERT_F_TO_F: u32 = 115;
+    pub const U_CONVERT: u32 = 113;
+    pub const S_CONVERT: u32 = 114;
     pub const BITCAST: u32 = 124;
     pub const SNEGATE: u32 = 126;
     pub const FNEGATE: u32 = 127;
@@ -223,6 +225,8 @@ pub struct SpvBuilder {
     functions: Vec<u32>,
     constant_cache: HashMap<(u32, u32), Id>,
     type_constant_cache: HashMap<(u32, u32), Id>,
+    scalar_type_cache: HashMap<(u32, u32, bool), Id>,
+    capabilities_seen: Vec<u32>,
 }
 
 #[allow(dead_code)]
@@ -240,6 +244,8 @@ impl SpvBuilder {
             types: Vec::new(),
             constants_globals: Vec::new(),
             functions: Vec::new(),
+            scalar_type_cache: HashMap::new(),
+            capabilities_seen: Vec::new(),
             constant_cache: HashMap::new(),
             type_constant_cache: HashMap::new(),
         }
@@ -419,18 +425,28 @@ impl SpvBuilder {
     }
 
     pub fn type_int(&mut self, width: u32, signed: bool) -> Id {
+        if let Some(&id) = self.scalar_type_cache.get(&(op::TYPE_INT, width, signed)) {
+            return id;
+        }
         let id = self.fresh_id();
         emit(
             &mut self.types,
             op::TYPE_INT,
             &[id.0, width, if signed { 1 } else { 0 }],
         );
+        self.scalar_type_cache
+            .insert((op::TYPE_INT, width, signed), id);
         id
     }
 
     pub fn type_float(&mut self, width: u32) -> Id {
+        if let Some(&id) = self.scalar_type_cache.get(&(op::TYPE_FLOAT, width, false)) {
+            return id;
+        }
         let id = self.fresh_id();
         emit(&mut self.types, op::TYPE_FLOAT, &[id.0, width]);
+        self.scalar_type_cache
+            .insert((op::TYPE_FLOAT, width, false), id);
         id
     }
 
@@ -727,6 +743,10 @@ impl SpvBuilder {
     }
 
     pub fn capability(&mut self, capability: u32) {
+        if self.capabilities_seen.contains(&capability) {
+            return;
+        }
+        self.capabilities_seen.push(capability);
         emit(&mut self.capabilities, op::CAPABILITY, &[capability]);
     }
 
@@ -1144,6 +1164,18 @@ impl SpvBuilder {
             op::CONVERT_S_TO_F,
             &[f32_ty.0, id.0, val.0],
         );
+        id
+    }
+
+    pub fn op_uconvert(&mut self, ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::U_CONVERT, &[ty.0, id.0, val.0]);
+        id
+    }
+
+    pub fn op_sconvert(&mut self, ty: Id, val: Id) -> Id {
+        let id = self.fresh_id();
+        emit(&mut self.functions, op::S_CONVERT, &[ty.0, id.0, val.0]);
         id
     }
 
