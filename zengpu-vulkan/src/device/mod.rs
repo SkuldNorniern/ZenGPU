@@ -5974,6 +5974,98 @@ mod tests {
         }
     }
 
+    /// One buffer, two params (u32x4 writes, f16 reads after a barrier), on RADV.
+    #[test]
+    fn zsl_one_buffer_two_element_types_runs_through_vulkan() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const ALIAS_ZSL: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel alias_buf(src: device buffer<u32x4>, x: device mut buffer<u32x4>, xh: device buffer<f16>, out: device mut buffer<f32>, id: global_id) {
+                x[id.x] = src[id.x]
+                barrier()
+                for j in 0..8 {
+                    out[id.x * 8 + j] = xh[id.x * 8 + j]
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let vals: Vec<f32> = (0..256)
+            .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
+            .collect();
+        let f16_bits = |x: f32| -> u16 {
+            if x == 0.0 {
+                return 0;
+            }
+            let b = x.to_bits();
+            let sign = (b >> 16) & 0x8000;
+            let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+            let m = (b >> 13) & 0x3ff;
+            (sign | ((e as u32) << 10) | m) as u16
+        };
+        let src_bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|&x| f16_bits(x).to_le_bytes())
+            .collect();
+        let make = |size: u64, usage: BufferUsage, data: &[u8]| {
+            let buf = dev
+                .create_buffer(BufferDesc {
+                    size,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buf, 0, data).unwrap();
+            buf
+        };
+        let rw = BufferUsage::STORAGE;
+        let output = BufferUsage::STORAGE | BufferUsage::READBACK;
+        let src = make(512, rw, &src_bytes);
+        let x = make(512, rw, &[0u8; 512]);
+        let out = make(1024, output, &[0u8; 1024]);
+
+        let shader = dev.create_shader(ALIAS_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline_with(
+                ComputePipelineDesc {
+                    shader,
+                    entry: "main",
+                    block: [32, 1, 1],
+                },
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(32),
+                },
+            )
+            .unwrap();
+        let slots = [src.index(), x.index(), x.index(), out.index()];
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[],
+                textures: &[],
+                images: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let got: Vec<f32> = dev
+            .read_buffer(out, 0, 1024)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        for (h, (&g, &v)) in got.iter().zip(&vals).enumerate() {
+            assert_eq!(g, v, "half {h}");
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buf in [src, x, out] {
+            dev.destroy_buffer(buf);
+        }
+    }
+
     #[test]
     fn compute_caps_are_reported_on_radv() {
         let Some(dev) = try_device() else { return };
