@@ -2452,3 +2452,355 @@ fn zsl_round_even_matches_cpu() {
     device.destroy_pipeline(pipeline);
     device.destroy_shader(shader);
 }
+
+const QUANT_Q8_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { n: u32 }
+    @workgroup_size(256)
+    kernel quantize_q8(x: device buffer<f32>, xq: device mut buffer<i8>, xs: device mut buffer<f32>, p: P, id: global_id) {
+        let i = id.x
+        let v = x[i]
+        let amax = subgroup_reduce_max(abs(v))
+        let d = amax / 127.0
+        let qi = i32(select(d > 0.0, round_even(v / d), 0.0))
+        let qsum = subgroup_reduce_add(qi)
+        xq[i] = qi
+        if i % 32 == 0 {
+            xs[p.n / 4 + 2 * (i / 32)] = d
+            xs[p.n / 4 + 2 * (i / 32) + 1] = d * f32(qsum)
+        }
+    }
+);
+
+fn q4k_weights(seed: &mut u64, rows: usize, cols: usize) -> Vec<u8> {
+    let mut next = || {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    };
+    let mut w = vec![0u8; rows * cols / 256 * 144];
+    for blk in w.chunks_exact_mut(144) {
+        let d = 0x1C00u16 | (next() as u16 & 0x3F);
+        let dmin = 0x1C00u16 | (next() as u16 & 0x3F);
+        blk[0..2].copy_from_slice(&d.to_le_bytes());
+        blk[2..4].copy_from_slice(&dmin.to_le_bytes());
+        for byte in &mut blk[4..] {
+            *byte = next() as u8;
+        }
+    }
+    w
+}
+
+fn hip_pipeline(
+    device: &dyn zengpu_hal::GpuDevice,
+    shader: zengpu_hal::ShaderHandle,
+    entry: &str,
+) -> zengpu_hal::PipelineHandle {
+    device
+        .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+            shader,
+            entry: entry.to_string().leak(),
+            block: [256, 1, 1],
+        })
+        .unwrap()
+}
+
+fn words_buffer(pool: &BufferPool, bytes: &[u8]) -> DeviceArray {
+    let arr = pool
+        .alloc(vec![(bytes.len() / 4) as u32], DType::U32)
+        .unwrap();
+    pool.device().write_buffer(arr.buffer, 0, bytes).unwrap();
+    arr
+}
+
+#[test]
+fn zsl_gemv_q8_q4k_matches_zetna() {
+    let Some(device) = hip_device() else { return };
+    let Some(src) = zetna_hip_source(&["common.hip", "quant.hip"]) else {
+        return;
+    };
+    let zetna = device
+        .create_shader(zengpu_hal::ShaderDesc::hip(&src))
+        .unwrap();
+    let z_quant = hip_pipeline(&*device, zetna, "quantize_q8");
+    let z_gemv = hip_pipeline(&*device, zetna, "gemv_q8_1_q4_k");
+    let (qs, qe) = QUANT_Q8_ZSL.create(&*device).unwrap();
+    let s_quant = hip_pipeline(&*device, qs, qe);
+    let (gs, ge) = GEMV_Q4K_Q8_ZSL.create(&*device).unwrap();
+    let s_gemv = hip_pipeline(&*device, gs, ge);
+    let pool = BufferPool::new(device.clone());
+    let cols = 5120usize;
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let x: Vec<f32> = (0..cols)
+        .map(|i| ((i * 2_654_435_761usize) % 2001) as f32 / 1000.0 - 1.0)
+        .collect();
+    let x_buf = upload(&pool, vec![cols as u32], &x);
+    let act_bytes = cols + cols / 32 * 8;
+    let act = pool
+        .alloc(vec![(act_bytes / 4) as u32], DType::U32)
+        .unwrap();
+    for rows in [5120usize, 17408] {
+        let w_bytes = q4k_weights(&mut seed, rows, cols);
+        let w = words_buffer(&pool, &w_bytes);
+        let y_z = pool.alloc(vec![rows as u32], DType::F32).unwrap();
+        let y_s = pool.alloc(vec![rows as u32], DType::F32).unwrap();
+        let quant_grid = [(cols / 256) as u32, 1, 1];
+        let gemv_grid = [(rows / 16) as u32, 1, 1];
+        let zslots = [x_buf.buffer.index(), act.buffer.index()];
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(
+            z_quant,
+            &zslots,
+            &[
+                zengpu_hal::Scalar::U32(1),
+                zengpu_hal::Scalar::U32(cols as u32),
+            ],
+            quant_grid,
+        );
+        ops.run(&*device).unwrap();
+        let zq_bytes = device.read_buffer(act.buffer, 0, act_bytes as u64).unwrap();
+        let zslots = [
+            w.buffer.index(),
+            w.buffer.index(),
+            w.buffer.index(),
+            act.buffer.index(),
+            y_z.buffer.index(),
+            y_z.buffer.index(),
+            y_z.buffer.index(),
+        ];
+        let zscal = [
+            zengpu_hal::Scalar::U32(rows as u32),
+            zengpu_hal::Scalar::U32(0),
+            zengpu_hal::Scalar::U32(0),
+            zengpu_hal::Scalar::U32(1),
+            zengpu_hal::Scalar::U32(cols as u32),
+        ];
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(z_gemv, &zslots, &zscal, gemv_grid);
+        ops.run(&*device).unwrap();
+        let want = download(&*device, &y_z);
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(
+            s_quant,
+            &zslots[..0]
+                .iter()
+                .copied()
+                .chain([x_buf.buffer.index(), act.buffer.index(), act.buffer.index()])
+                .collect::<Vec<u32>>(),
+            &[zengpu_hal::Scalar::U32(cols as u32)],
+            quant_grid,
+        );
+        ops.run(&*device).unwrap();
+        let s_q_bytes = device.read_buffer(act.buffer, 0, act_bytes as u64).unwrap();
+        let mismatch = zq_bytes[..cols]
+            .iter()
+            .zip(&s_q_bytes[..cols])
+            .filter(|(a, b)| a != b)
+            .count();
+        let scale_gap = zq_bytes[cols..]
+            .chunks_exact(4)
+            .zip(s_q_bytes[cols..].chunks_exact(4))
+            .map(|(a, b)| {
+                ulp_gap(
+                    f32::from_le_bytes(a.try_into().unwrap()),
+                    f32::from_le_bytes(b.try_into().unwrap()),
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        println!("quantize cols {cols}: {mismatch} int8 mismatches, scale max ulp {scale_gap}");
+        let gslots = [
+            w.buffer.index(),
+            act.buffer.index(),
+            act.buffer.index(),
+            y_s.buffer.index(),
+        ];
+        let sscal = [
+            zengpu_hal::Scalar::U32(rows as u32),
+            zengpu_hal::Scalar::U32((cols / 256) as u32),
+            zengpu_hal::Scalar::U32((cols / 64) as u32),
+            zengpu_hal::Scalar::U32(((cols / 64) as u32).div_ceil(32)),
+            zengpu_hal::Scalar::U32((cols / 4) as u32),
+        ];
+        let mut ops = OpList::new(&pool);
+        ops.dispatch(s_gemv, &gslots, &sscal, gemv_grid);
+        ops.run(&*device).unwrap();
+        let got = download(&*device, &y_s);
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-6);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+            / scale;
+        println!("gemv rows {rows}: max abs y {scale:e}, worst |zsl - zetna| / max|y| = {worst:e}");
+        assert!(worst < 1e-4, "gemv rows {rows}: {worst}");
+        let t_z = hip_time_ms(&*device, z_gemv, gemv_grid, &zslots, &zscal);
+        let t_s = hip_time_ms(&*device, s_gemv, gemv_grid, &gslots, &sscal);
+        let bytes = w_bytes.len() as f64;
+        println!(
+            "gemv q4_k rows {rows} cols {cols}: zetna {:.4} ms ({:.0} GB/s), zsl {:.4} ms ({:.0} GB/s), zsl/zetna {:.2}",
+            t_z,
+            bytes / t_z / 1e6,
+            t_s,
+            bytes / t_s / 1e6,
+            t_z / t_s
+        );
+        drop(ops);
+        for b in [w, y_z, y_s] {
+            pool.free(b);
+        }
+    }
+    pool.free(act);
+    pool.free(x_buf);
+    for p in [z_quant, z_gemv, s_quant, s_gemv] {
+        device.destroy_pipeline(p);
+    }
+    device.destroy_shader(zetna);
+    device.destroy_shader(qs);
+    device.destroy_shader(gs);
+}
+
+const GEMV_Q4K_Q8_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    push P { rows: u32, nb: u32, units: u32, iters: u32, xbase: u32 }
+    @workgroup_size(256)
+    kernel gemv_q8_q4k(w: device buffer<u32x4>, xq: device buffer<u32x4>, xs: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
+        let lane = id.x % 32
+        let r0 = id.x / 32 * 2
+        let r1 = r0 + 1
+        let rb0 = r0 * p.nb * 9
+        let rb1 = r1 * p.nb * 9
+        let accA = 0.0
+        let accB = 0.0
+        for it in 0..p.iters {
+            let u = lane + it * 32
+            if u < p.units {
+            let blk = (u / 4) * 9
+            let qq = u % 4
+            let x0 = xq[4 * u]
+            let x1 = xq[4 * u + 1]
+            let x2 = xq[4 * u + 2]
+            let x3 = xq[4 * u + 3]
+            let dx = xs[p.xbase + 4 * u]
+            let dy = xs[p.xbase + 4 * u + 1]
+            let dz = xs[p.xbase + 4 * u + 2]
+            let dw = xs[p.xbase + 4 * u + 3]
+            let hA = w[rb0 + blk]
+            let aA = w[rb0 + blk + 1 + 2 * qq]
+            let bA = w[rb0 + blk + 2 + 2 * qq]
+            let jA0 = 2 * qq + 0
+            let jA0p = jA0 + 4
+            let jA0m = jA0 - 4
+            let tA0a = byte(select((jA0) < 4, hA.y, select((jA0) < 8, hA.z, hA.w)), (jA0) % 4)
+            let tA0b = byte(select((jA0p) < 4, hA.y, select((jA0p) < 8, hA.z, hA.w)), (jA0p) % 4)
+            let tA0c = byte(select((jA0m) < 4, hA.y, select((jA0m) < 8, hA.z, hA.w)), (jA0m) % 4)
+            let scA0 = select(jA0 < 4, tA0a & 63, (tA0b & 15) | ((tA0c >> 6) << 4))
+            let mA0 = select(jA0 < 4, tA0b & 63, (tA0b >> 4) | ((tA0a >> 6) << 4))
+            let jA1 = 2 * qq + 1
+            let jA1p = jA1 + 4
+            let jA1m = jA1 - 4
+            let tA1a = byte(select((jA1) < 4, hA.y, select((jA1) < 8, hA.z, hA.w)), (jA1) % 4)
+            let tA1b = byte(select((jA1p) < 4, hA.y, select((jA1p) < 8, hA.z, hA.w)), (jA1p) % 4)
+            let tA1c = byte(select((jA1m) < 4, hA.y, select((jA1m) < 8, hA.z, hA.w)), (jA1m) % 4)
+            let scA1 = select(jA1 < 4, tA1a & 63, (tA1b & 15) | ((tA1c >> 6) << 4))
+            let mA1 = select(jA1 < 4, tA1b & 63, (tA1b >> 4) | ((tA1a >> 6) << 4))
+            let dA = f16_lo(hA.x)
+            let dmA = f16_hi(hA.x)
+            let loA0 = bitcast_i32(aA.x & 0x0F0F0F0F)
+            let hiA0 = bitcast_i32((aA.x >> 4) & 0x0F0F0F0F)
+            let loA1 = bitcast_i32(aA.y & 0x0F0F0F0F)
+            let hiA1 = bitcast_i32((aA.y >> 4) & 0x0F0F0F0F)
+            let loA2 = bitcast_i32(aA.z & 0x0F0F0F0F)
+            let hiA2 = bitcast_i32((aA.z >> 4) & 0x0F0F0F0F)
+            let loA3 = bitcast_i32(aA.w & 0x0F0F0F0F)
+            let hiA3 = bitcast_i32((aA.w >> 4) & 0x0F0F0F0F)
+            let loA4 = bitcast_i32(bA.x & 0x0F0F0F0F)
+            let hiA4 = bitcast_i32((bA.x >> 4) & 0x0F0F0F0F)
+            let loA5 = bitcast_i32(bA.y & 0x0F0F0F0F)
+            let hiA5 = bitcast_i32((bA.y >> 4) & 0x0F0F0F0F)
+            let loA6 = bitcast_i32(bA.z & 0x0F0F0F0F)
+            let hiA6 = bitcast_i32((bA.z >> 4) & 0x0F0F0F0F)
+            let loA7 = bitcast_i32(bA.w & 0x0F0F0F0F)
+            let hiA7 = bitcast_i32((bA.w >> 4) & 0x0F0F0F0F)
+            let pA0 = dot4_i8(loA0, bitcast_i32(x0.x), 0)
+            let pA1 = dot4_i8(loA1, bitcast_i32(x0.y), pA0)
+            let pA2 = dot4_i8(loA2, bitcast_i32(x0.z), pA1)
+            let pA3 = dot4_i8(loA3, bitcast_i32(x0.w), pA2)
+            let pA4 = dot4_i8(loA4, bitcast_i32(x1.x), pA3)
+            let pA5 = dot4_i8(loA5, bitcast_i32(x1.y), pA4)
+            let pA6 = dot4_i8(loA6, bitcast_i32(x1.z), pA5)
+            let pA7 = dot4_i8(loA7, bitcast_i32(x1.w), pA6)
+            let qA0 = dot4_i8(hiA0, bitcast_i32(x2.x), 0)
+            let qA1 = dot4_i8(hiA1, bitcast_i32(x2.y), qA0)
+            let qA2 = dot4_i8(hiA2, bitcast_i32(x2.z), qA1)
+            let qA3 = dot4_i8(hiA3, bitcast_i32(x2.w), qA2)
+            let qA4 = dot4_i8(hiA4, bitcast_i32(x3.x), qA3)
+            let qA5 = dot4_i8(hiA5, bitcast_i32(x3.y), qA4)
+            let qA6 = dot4_i8(hiA6, bitcast_i32(x3.z), qA5)
+            let qA7 = dot4_i8(hiA7, bitcast_i32(x3.w), qA6)
+            let addA = dA * scA0 * dx * f32(pA7) + dA * scA1 * dz * f32(qA7) - (dmA * mA0 * dy + dmA * mA1 * dw)
+            accA = accA + addA
+            let hB = w[rb1 + blk]
+            let aB = w[rb1 + blk + 1 + 2 * qq]
+            let bB = w[rb1 + blk + 2 + 2 * qq]
+            let jB0 = 2 * qq + 0
+            let jB0p = jB0 + 4
+            let jB0m = jB0 - 4
+            let tB0a = byte(select((jB0) < 4, hB.y, select((jB0) < 8, hB.z, hB.w)), (jB0) % 4)
+            let tB0b = byte(select((jB0p) < 4, hB.y, select((jB0p) < 8, hB.z, hB.w)), (jB0p) % 4)
+            let tB0c = byte(select((jB0m) < 4, hB.y, select((jB0m) < 8, hB.z, hB.w)), (jB0m) % 4)
+            let scB0 = select(jB0 < 4, tB0a & 63, (tB0b & 15) | ((tB0c >> 6) << 4))
+            let mB0 = select(jB0 < 4, tB0b & 63, (tB0b >> 4) | ((tB0a >> 6) << 4))
+            let jB1 = 2 * qq + 1
+            let jB1p = jB1 + 4
+            let jB1m = jB1 - 4
+            let tB1a = byte(select((jB1) < 4, hB.y, select((jB1) < 8, hB.z, hB.w)), (jB1) % 4)
+            let tB1b = byte(select((jB1p) < 4, hB.y, select((jB1p) < 8, hB.z, hB.w)), (jB1p) % 4)
+            let tB1c = byte(select((jB1m) < 4, hB.y, select((jB1m) < 8, hB.z, hB.w)), (jB1m) % 4)
+            let scB1 = select(jB1 < 4, tB1a & 63, (tB1b & 15) | ((tB1c >> 6) << 4))
+            let mB1 = select(jB1 < 4, tB1b & 63, (tB1b >> 4) | ((tB1a >> 6) << 4))
+            let dB = f16_lo(hB.x)
+            let dmB = f16_hi(hB.x)
+            let loB0 = bitcast_i32(aB.x & 0x0F0F0F0F)
+            let hiB0 = bitcast_i32((aB.x >> 4) & 0x0F0F0F0F)
+            let loB1 = bitcast_i32(aB.y & 0x0F0F0F0F)
+            let hiB1 = bitcast_i32((aB.y >> 4) & 0x0F0F0F0F)
+            let loB2 = bitcast_i32(aB.z & 0x0F0F0F0F)
+            let hiB2 = bitcast_i32((aB.z >> 4) & 0x0F0F0F0F)
+            let loB3 = bitcast_i32(aB.w & 0x0F0F0F0F)
+            let hiB3 = bitcast_i32((aB.w >> 4) & 0x0F0F0F0F)
+            let loB4 = bitcast_i32(bB.x & 0x0F0F0F0F)
+            let hiB4 = bitcast_i32((bB.x >> 4) & 0x0F0F0F0F)
+            let loB5 = bitcast_i32(bB.y & 0x0F0F0F0F)
+            let hiB5 = bitcast_i32((bB.y >> 4) & 0x0F0F0F0F)
+            let loB6 = bitcast_i32(bB.z & 0x0F0F0F0F)
+            let hiB6 = bitcast_i32((bB.z >> 4) & 0x0F0F0F0F)
+            let loB7 = bitcast_i32(bB.w & 0x0F0F0F0F)
+            let hiB7 = bitcast_i32((bB.w >> 4) & 0x0F0F0F0F)
+            let pB0 = dot4_i8(loB0, bitcast_i32(x0.x), 0)
+            let pB1 = dot4_i8(loB1, bitcast_i32(x0.y), pB0)
+            let pB2 = dot4_i8(loB2, bitcast_i32(x0.z), pB1)
+            let pB3 = dot4_i8(loB3, bitcast_i32(x0.w), pB2)
+            let pB4 = dot4_i8(loB4, bitcast_i32(x1.x), pB3)
+            let pB5 = dot4_i8(loB5, bitcast_i32(x1.y), pB4)
+            let pB6 = dot4_i8(loB6, bitcast_i32(x1.z), pB5)
+            let pB7 = dot4_i8(loB7, bitcast_i32(x1.w), pB6)
+            let qB0 = dot4_i8(hiB0, bitcast_i32(x2.x), 0)
+            let qB1 = dot4_i8(hiB1, bitcast_i32(x2.y), qB0)
+            let qB2 = dot4_i8(hiB2, bitcast_i32(x2.z), qB1)
+            let qB3 = dot4_i8(hiB3, bitcast_i32(x2.w), qB2)
+            let qB4 = dot4_i8(hiB4, bitcast_i32(x3.x), qB3)
+            let qB5 = dot4_i8(hiB5, bitcast_i32(x3.y), qB4)
+            let qB6 = dot4_i8(hiB6, bitcast_i32(x3.z), qB5)
+            let qB7 = dot4_i8(hiB7, bitcast_i32(x3.w), qB6)
+            let addB = dB * scB0 * dx * f32(pB7) + dB * scB1 * dz * f32(qB7) - (dmB * mB0 * dy + dmB * mB1 * dw)
+            accB = accB + addB
+            }
+        }
+        let tA = subgroup_reduce_add(accA)
+        let tB = subgroup_reduce_add(accB)
+        if lane == 0 {
+            y[r0] = tA
+            y[r1] = tB
+        }
+    }
+);
