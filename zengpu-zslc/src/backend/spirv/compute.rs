@@ -1990,7 +1990,6 @@ fn byte_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> 
     let t_u32 = ctx.t_u32;
     let c2 = ctx.spv.constant_u32(t_u32, 2);
     let c3 = ctx.spv.constant_u32(t_u32, 3);
-    let c8 = ctx.spv.constant_u32(t_u32, 8);
     let word = ctx.spv.op_shift_right_logical(t_u32, idx, c2);
     let ptr = ctx.spv.op_access_chain(
         table.t_ptr_elem,
@@ -1998,7 +1997,7 @@ fn byte_word(ctx: &mut LowerCtx<'_>, table: SsboTable, buf_idx: Id, idx: Id) -> 
         &[buf_idx, ctx.const_0_u32, word],
     );
     let lane = ctx.spv.op_bitwise_and(t_u32, idx, c3);
-    let shift = ctx.spv.op_shift_left_logical(t_u32, lane, c8);
+    let shift = ctx.spv.op_shift_left_logical(t_u32, lane, c3);
     (ptr, shift)
 }
 
