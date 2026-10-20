@@ -8,11 +8,13 @@ use crate::ir::arena::TypeArena;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
 use crate::ir::typeck::{ComputeTypeCtx, type_of_compute_expr};
 use crate::ir::types::{FloatFormat, IntWidth, Signedness, Type, TypeId};
+use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 
 mod frag;
 
 pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
+    check_uniformity(module)?;
     let e = &module.entry;
     let EntryKind::Compute { local_size } = e.kind;
     if e.params

@@ -1048,13 +1048,13 @@ int main() {{
         "#;
         let module = parse_compute(ROW).expect("parse frag_row probe");
         assert!(hip::lower_compute(&module).is_ok());
-        let err = cuda::lower_compute(&module)
-            .err()
-            .expect("CUDA has no frag_row lowering");
+        let Err(err) = cuda::lower_compute(&module) else {
+            panic!("CUDA has no frag_row lowering");
+        };
         assert!(format!("{err:?}").contains("frag_row"));
-        let err = spirv::lower_compute(&module)
-            .err()
-            .expect("SPIR-V has no frag_row lowering");
+        let Err(err) = spirv::lower_compute(&module) else {
+            panic!("SPIR-V has no frag_row lowering");
+        };
         assert!(format!("{err:?}").contains("frag_row"));
     }
 

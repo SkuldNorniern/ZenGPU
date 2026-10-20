@@ -37,6 +37,7 @@ use crate::ir::node::{
 };
 use crate::ir::typeck::frag_parts;
 use crate::ir::types::TypeId;
+use crate::ir::validate::check_uniformity;
 use crate::ir::{EntryKind, Module, ParamKind};
 
 mod coop;
@@ -44,6 +45,7 @@ mod coop;
 use coop::Coop;
 
 pub fn lower_compute(module: &Module) -> Result<Vec<u32>, Diagnostic> {
+    check_uniformity(module)?;
     lower_compute_inner(module).map_err(Diagnostic::from)
 }
 
