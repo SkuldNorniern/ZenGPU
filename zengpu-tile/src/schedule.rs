@@ -32,6 +32,12 @@ pub struct Schedule {
     pub block_k: usize,
     /// Waves per workgroup for the staged forms. 0 means 4.
     pub waves: u32,
+    /// matrix: waves across M, rest across N. 0 picks the split with fewest fragments per
+    /// wave edge.
+    pub wave_rows: u32,
+    /// Matrix form: stages per operand, 1 or 2. 0 means 1, since double buffering is slower on
+    /// gfx1200 (sync copy).
+    pub stages: u32,
 }
 
 impl Schedule {
@@ -44,6 +50,8 @@ impl Schedule {
             block_n: 0,
             block_k: 0,
             waves: 1,
+            wave_rows: 0,
+            stages: 0,
         }
     }
 }
@@ -57,6 +65,8 @@ impl Default for Schedule {
             block_n: 0,
             block_k: 0,
             waves: 4,
+            wave_rows: 0,
+            stages: 0,
         }
     }
 }
@@ -154,7 +164,7 @@ pub(crate) fn resolve(
         schedule.waves as usize
     };
     if schedule.matrix != Matrix::Scalar {
-        match mma_plan(kernel, &parts, target, waves, &mut notes) {
+        match mma_plan(kernel, &parts, target, schedule, &mut notes) {
             Ok(plan) => return (plan, notes),
             Err(why) => notes.push(format!("mma: {why}")),
         }
@@ -206,6 +216,9 @@ fn staged_plan(
         waves: 1,
         wave_size: wave,
         native_shared: false,
+        wave_rows: 1,
+        wave_cols: 1,
+        stages: 1,
     })
 }
 
@@ -213,7 +226,7 @@ fn mma_plan(
     kernel: &TileKernel,
     parts: &Parts,
     target: &Target,
-    waves: usize,
+    schedule: &Schedule,
     notes: &mut Vec<String>,
 ) -> Result<Plan, String> {
     let acc = kernel.values[parts.dot_out.0].dtype;
@@ -238,20 +251,34 @@ fn mma_plan(
             return Err(format!("{what} {v} is not a multiple of 16"));
         }
     }
-    let frags = (bm / 16) * (bn / 16);
-    let waves = if frags % waves == 0 {
-        waves
-    } else {
-        notes.push(format!(
-            "{waves} waves do not divide {frags} fragments; using 1 wave"
-        ));
-        1
-    };
     let wave = target.wave_size as usize;
-    let need = (bm * bk + bk * bn + bm * bn) * 4;
-    let lds = target.lds_bytes as usize;
-    if need > lds {
-        return Err(format!("tile needs {need} bytes of LDS, target has {lds}"));
+    let want_waves = if schedule.waves == 0 {
+        4
+    } else {
+        schedule.waves as usize
+    };
+    let (waves, nwr, nwc) = wave_grid(bm / 16, bn / 16, want_waves, schedule.wave_rows, notes);
+    let native = target.backend != BackendPreference::Vulkan;
+    let operand_bytes = |d: DType| match d {
+        DType::I8 => 1,
+        DType::F16 if native => 2,
+        _ => 4,
+    };
+    let stage_bytes =
+        (bm * bk * operand_bytes(parts.a_dtype) + bk * bn * operand_bytes(parts.b_dtype)) as u32;
+    let slice_bytes = (bm * nwc * 16 * 4) as u32;
+    let lds = target.lds_bytes;
+    let fits = |stages: u32| stages * stage_bytes + slice_bytes <= lds;
+    let stages = match schedule.stages {
+        0 | 1 => 1,
+        2 => 2,
+        n => return Err(format!("{n} stages are not supported")),
+    };
+    if !fits(stages) {
+        return Err(format!(
+            "{stages} stage(s) need {} bytes of LDS, target has {lds}",
+            stages * stage_bytes + slice_bytes
+        ));
     }
     if waves * wave > 1024 {
         return Err(format!("{waves} waves of {wave} lanes exceed 1024 threads"));
@@ -261,6 +288,43 @@ fn mma_plan(
         workgroup: waves * wave,
         waves,
         wave_size: wave,
-        native_shared: target.backend != BackendPreference::Vulkan,
+        native_shared: native,
+        wave_rows: nwr,
+        wave_cols: nwc,
+        stages: stages as usize,
     })
+}
+
+/// Splits `waves` into `rows x cols` so each wave's fragment block fits. The wanted row split is
+/// used if it fits, else the one with the smallest perimeter. No split: one wave.
+fn wave_grid(
+    fm: usize,
+    fnn: usize,
+    waves: usize,
+    want_rows: u32,
+    notes: &mut Vec<String>,
+) -> (usize, usize, usize) {
+    if want_rows != 0 {
+        let r = want_rows as usize;
+        if fits_for(waves, r, fm, fnn) {
+            return (waves, r, waves / r);
+        }
+        notes.push(format!(
+            "wave rows {r} do not split {waves} waves over {fm}x{fnn} fragments; choosing the split"
+        ));
+    }
+    let best = (1..=waves)
+        .filter(|&r| fits_for(waves, r, fm, fnn))
+        .min_by_key(|&r| fm / r + fnn / (waves / r));
+    if let Some(r) = best {
+        return (waves, r, waves / r);
+    }
+    notes.push(format!(
+        "{waves} waves do not split {fm}x{fnn} fragments; using 1 wave"
+    ));
+    (1, 1, 1)
+}
+
+fn fits_for(waves: usize, rows: usize, fm: usize, fnn: usize) -> bool {
+    waves.is_multiple_of(rows) && fm.is_multiple_of(rows) && fnn.is_multiple_of(waves / rows)
 }

@@ -149,6 +149,7 @@ fn backend<T>(name: &'static str, r: Result<T, Diagnostic>) -> Result<T, TileErr
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::env;
     use std::time::Instant;
 
     use zengpu_hal::{
@@ -299,7 +300,7 @@ mod tests {
         assert_eq!(mma.schedule_name(), "mma");
         assert!(mma.notes().is_empty());
         assert_eq!(mma.workgroup(), [128, 1, 1]);
-        assert!(mma.zsl().contains("frag_load_a(sa,"));
+        assert!(mma.zsl().contains("frag_load_a(sa"));
         assert!(mma.zsl().contains("frag_store(sc,"));
         assert!(mma.spirv().is_err());
         assert!(mma.hip().is_ok());
@@ -413,10 +414,9 @@ mod tests {
         },
     ];
 
-    /// Scheduled cases with edges in M, N and K.
-    ///
-    /// 64-wide tiles run four waves. The last two cases cannot use the matrix unit.
-    const SCHEDULED: [Case; 5] = [
+    /// Scheduled cases: edges in M, N, K. 64-wide tiles run four waves. i8 uses the matrix unit
+    /// where the target has it.
+    const SCHEDULED: [Case; 8] = [
         Case {
             input: DType::F16,
             out: DType::F16,
@@ -461,6 +461,33 @@ mod tests {
             k: 64,
             tile: [16, 16],
             bk: 16,
+        },
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 256,
+            n: 256,
+            k: 256,
+            tile: [128, 128],
+            bk: 32,
+        },
+        Case {
+            input: DType::I8,
+            out: DType::I32,
+            m: 256,
+            n: 256,
+            k: 256,
+            tile: [128, 128],
+            bk: 32,
+        },
+        Case {
+            input: DType::F16,
+            out: DType::F16,
+            m: 200,
+            n: 136,
+            k: 72,
+            tile: [128, 128],
+            bk: 32,
         },
     ];
 
@@ -705,14 +732,14 @@ mod tests {
         }
     }
 
-    /// Benchmarks each shape and schedule with one warmup, then three timed dispatches.
+    /// Benchmarks each schedule with one warmup, then three timed dispatches.
     ///
     /// Run with `cargo test -p zengpu-tile bench_f16_gemm_hip -- --ignored --nocapture`.
     #[test]
     #[ignore]
     fn bench_f16_gemm_hip() {
         let Some(dev) = hip_device() else { return };
-        let target = Target::hip_gfx12();
+        let target = caps_target(&*dev, BackendPreference::Hip);
         let shapes = [
             (128, 5120, 5120),
             (128, 17408, 5120),
@@ -720,28 +747,23 @@ mod tests {
             (2048, 2048, 2048),
             (4096, 4096, 4096),
         ];
-        let variants = [
-            ("O0", Schedule::o0()),
-            (
-                "scalar-tiled",
-                Schedule {
-                    matrix: Matrix::Scalar,
-                    ..Schedule::default()
-                },
-            ),
-            (
-                "mma",
-                Schedule {
-                    matrix: Matrix::Mma,
-                    ..Schedule::default()
-                },
-            ),
-        ];
+        let scalar = Schedule {
+            matrix: Matrix::Scalar,
+            ..Schedule::default()
+        };
+        let mma = |waves: u32, stages: u32| Schedule {
+            matrix: Matrix::Mma,
+            waves,
+            stages,
+            ..Schedule::default()
+        };
+        let tiles = [[64, 64], [128, 64], [128, 128]];
+        let bks = [16, 32, 64];
+        let waves = [4, 8];
         println!("| M | N | K | schedule | ms | TFLOPS |");
         println!("|---|---|---|---|---|---|");
         for (m, n, k) in shapes {
-            let skip_o0 = m.max(n).max(k) > 2048;
-            let kernel = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+            let flops = 2.0 * m as f64 * n as f64 * k as f64;
             let f16_bytes = |len: usize| -> Vec<u8> {
                 (0..len)
                     .flat_map(|i| f16_bits(((i * 7 + 3) % 9) as f32 - 4.0).to_le_bytes())
@@ -765,11 +787,9 @@ mod tests {
                 dev.write_buffer(h, 0, bytes).unwrap();
                 handles.push(h);
             }
-            for (name, sched) in variants {
-                if skip_o0 && sched == Schedule::o0() {
-                    continue;
-                }
-                let compiled = compile_with(&kernel, &sched, &target).unwrap();
+            let mut rows: Vec<(String, f64, String)> = Vec::new();
+            let mut run = |label: String, kernel: &TileKernel, sched: &Schedule| {
+                let compiled = compile_with(kernel, sched, &target).unwrap();
                 let program = compiled.load(&*dev).unwrap();
                 program.dispatch(&*dev, &handles).unwrap();
                 let iters = 3;
@@ -778,16 +798,40 @@ mod tests {
                     program.dispatch(&*dev, &handles).unwrap();
                 }
                 let ms = t0.elapsed().as_secs_f64() * 1e3 / f64::from(iters);
-                let flops = 2.0 * m as f64 * n as f64 * k as f64;
-                let tflops = flops / (ms * 1e-3) / 1e12;
                 println!(
-                    "| {m} | {n} | {k} | {name} ({}) | {ms:.3} | {tflops:.2} |",
-                    compiled.schedule_name()
+                    "| {m} | {n} | {k} | {label} ({}) | {ms:.3} | {:.2} |",
+                    compiled.schedule_name(),
+                    flops / (ms * 1e-3) / 1e12
                 );
+                let zsl = compiled.zsl().to_string();
                 program.destroy(&*dev);
+                rows.push((label, ms, zsl));
+            };
+            let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+            if m.max(n).max(k) <= 2048 {
+                run("O0".into(), &base, &Schedule::o0());
+            }
+            run("scalar-tiled 64x64x16".into(), &base, &scalar);
+            for tile in tiles {
+                for bk in bks {
+                    let kernel = gemm(DType::F16, DType::F16, m, n, k, tile, bk, true).unwrap();
+                    for w in waves {
+                        let label = format!("mma {}x{} bk{bk} w{w}", tile[0], tile[1]);
+                        run(label, &kernel, &mma(w, 0));
+                    }
+                }
             }
             for h in handles {
                 dev.destroy_buffer(h);
+            }
+            let best = rows
+                .iter()
+                .filter(|r| r.0.starts_with("mma"))
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            println!("best {m}x{n}x{k}: {} at {:.3} ms", best.0, best.1);
+            if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
+                println!("{}", best.2);
             }
         }
     }
