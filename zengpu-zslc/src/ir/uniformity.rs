@@ -184,10 +184,11 @@ fn check_stmt(
             }
             Ok(())
         }
-        IrStmt::For { lo, hi, body, .. } => {
+        IrStmt::For { var, lo, hi, body } => {
             reject_if_divergent(lo, divergent)?;
             reject_if_divergent(hi, divergent)?;
             let bounds_uniform = expr_is_uniform(lo, locals) && expr_is_uniform(hi, locals);
+            locals.insert(var.clone(), !divergent && bounds_uniform);
             check_stmts(body, locals, divergent || !bounds_uniform)
         }
         IrStmt::Eval(expr) => reject_if_divergent(expr, divergent),
@@ -451,6 +452,65 @@ mod tests {
         "#,
         )
         .expect_err("global-id loop bound is divergent");
+        assert!(err.contains("uniform"));
+    }
+
+    #[test]
+    fn barrier_in_loop_with_uniform_bounds_guard_is_accepted() {
+        check(
+            r#"
+            push P { n: u32, m: u32 }
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
+                for k in 0..push.n {
+                    if k < push.m {
+                        barrier()
+                    }
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect("loop variable under uniform bounds is uniform");
+    }
+
+    #[test]
+    fn barrier_under_loop_variable_guard_with_divergent_bound_is_rejected() {
+        let err = check(
+            r#"
+            push P { m: u32 }
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
+                for k in 0..id.x {
+                    if k < push.m {
+                        barrier()
+                    }
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect_err("global-id loop bound is divergent");
+        assert!(err.contains("uniform"));
+    }
+
+    #[test]
+    fn loop_inside_local_id_guard_stays_divergent() {
+        let err = check(
+            r#"
+            push P { n: u32 }
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, push: P, id: global_id) {
+                if local_id().x < 5u32 {
+                    for k in 0..push.n {
+                        barrier()
+                    }
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect_err("loop inside a divergent if is divergent");
         assert!(err.contains("uniform"));
     }
 }
