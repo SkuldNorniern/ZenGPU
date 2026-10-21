@@ -205,6 +205,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    use zengpu_cuda::CudaInstance;
     use zengpu_hal::{
         AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage, DeviceRequest,
         GpuDevice, GpuInstance, MemoryUsage,
@@ -403,6 +404,12 @@ mod tests {
         gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap()
     }
 
+    fn cuda_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = CudaInstance::new();
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        adapter.open(DeviceRequest::default()).ok()
+    }
+
     fn hip_device() -> Option<Box<dyn GpuDevice>> {
         let inst = HipInstance::new().ok()?;
         let adapter = inst.request_adapter(AdapterRequest::default())?;
@@ -563,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn gemm_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
+        for case in CASES {
+            run_case(&*dev, &target, case, &Schedule::o0()).unwrap();
+        }
+    }
+
+    #[test]
     fn gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Vulkan);
@@ -588,6 +604,13 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_gemm_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
+        check_scheduled(&*dev, &target);
+    }
+
+    #[test]
     fn scheduled_gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Vulkan);
@@ -605,6 +628,13 @@ mod tests {
     fn split_k_on_hip() {
         let Some(dev) = hip_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Hip);
+        check_split(&*dev, &target);
+    }
+
+    #[test]
+    fn split_k_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
         check_split(&*dev, &target);
     }
 
