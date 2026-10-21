@@ -3856,8 +3856,10 @@ mod tests {
         let words = |b| -> Vec<u32> {
             dev.read_buffer(b, 0, size)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let (got_i, got_iu, got_u) = (words(outs[0]), words(outs[1]), words(outs[2]));
@@ -4194,8 +4196,10 @@ mod tests {
         let words = |b| -> Vec<u32> {
             dev.read_buffer(b, 0, size)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let got: Vec<Vec<u32>> = outs.iter().map(|b| words(*b)).collect();
@@ -4428,8 +4432,10 @@ mod tests {
         let read = |b: zengpu_hal::BufferHandle, len: u64| dev.read_buffer(b, 0, len).unwrap();
         let words = |b: zengpu_hal::BufferHandle| -> Vec<u32> {
             read(b, 1024)
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let ou = words(outs[0]);
@@ -4546,8 +4552,10 @@ mod tests {
         let got: Vec<f32> = dev
             .read_buffer(out, 0, 1024)
             .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         for m in 0..16 {
             for n in 0..16 {
@@ -4642,8 +4650,10 @@ mod tests {
         let read = |b: zengpu_hal::BufferHandle, count: usize| -> Vec<u32> {
             dev.read_buffer(b, 0, (count * 4) as u64)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let got = read(out, 20);
@@ -4718,11 +4728,7 @@ mod tests {
             |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|&x| f16_bits(x).to_le_bytes()).collect() };
         let f32_bytes = |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
         let i32_bytes = |v: &[i32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
-        let packed: Vec<u8> = ba8
-            .chunks_exact(4)
-            .chain(bb8.chunks_exact(4))
-            .flat_map(|c| c.iter().map(|&b| b as u8).collect::<Vec<u8>>())
-            .collect();
+        let packed: Vec<u8> = ba8.iter().chain(&bb8).map(|&b| b as u8).collect();
         let (pa, pb) = packed.split_at(256);
         let make = |size: u64, usage: BufferUsage, data: &[u8]| {
             let buf = dev
@@ -4773,15 +4779,19 @@ mod tests {
         let floats = |b| -> Vec<f32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let ints = |b| -> Vec<i32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let (got_f, got_i, got_z) = (floats(out), ints(oi), floats(zout));
@@ -4945,20 +4955,26 @@ mod tests {
         let read = |b| dev.read_buffer(b, 0, 1024).unwrap();
         let floats = |b| -> Vec<f32> {
             read(b)
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let ints = |b| -> Vec<i32> {
             read(b)
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let uints = |b| -> Vec<u32> {
             read(b)
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let (got_h, got_q, got_u) = (floats(oh), ints(oq), uints(ou));
@@ -5099,15 +5115,19 @@ mod tests {
         let floats = |b| -> Vec<f32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let ints = |b| -> Vec<i32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let (got_f, got_i) = (floats(out), ints(oi));
@@ -5235,15 +5255,19 @@ mod tests {
         let floats = |b| -> Vec<f32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let ints = |b| -> Vec<i32> {
             dev.read_buffer(b, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect()
         };
         let (got_f, got_i) = (floats(out), ints(oi));
@@ -5390,14 +5414,18 @@ mod tests {
         let bytes = |b| dev.read_buffer(b, 0, size).unwrap();
         let floats_of = |b| -> Vec<f32> {
             bytes(b)
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect()
         };
         let words_of = |b| -> Vec<u32> {
             bytes(b)
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect()
         };
         let got_lo = floats_of(outs[0]);
@@ -5556,8 +5584,10 @@ mod tests {
         let got: Vec<f32> = dev
             .read_buffer(out, 0, 1024)
             .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         for m in 0..16 {
             for n in 0..16 {
@@ -5660,8 +5690,10 @@ mod tests {
         let got: Vec<f32> = dev
             .read_buffer(out, 0, 1024)
             .unwrap()
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         for (h, (&g, &v)) in got.iter().zip(&vals).enumerate() {
             assert_eq!(g, v, "half {h}");
