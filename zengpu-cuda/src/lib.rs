@@ -14,7 +14,7 @@ use std::io::Write;
 use std::mem::{take, zeroed};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, yield_now};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, process, ptr, slice};
@@ -94,17 +94,55 @@ fn nvrtc_attempts((major, minor): (u32, u32)) -> [(Option<String>, bool); 3] {
     ]
 }
 
+/// Toolkit include folders holding `cuda_fp16.h`, which NVRTC before 12.8 does not carry built in:
+/// `CUDA_PATH`, `CUDA_HOME` and `CUDA_ROOT` first, then the usual install places.
+fn cuda_include_paths() -> &'static [String] {
+    static PATHS: OnceLock<Vec<String>> = OnceLock::new();
+    PATHS.get_or_init(|| {
+        let mut roots: Vec<PathBuf> = ["CUDA_PATH", "CUDA_HOME", "CUDA_ROOT"]
+            .into_iter()
+            .filter_map(env::var_os)
+            .map(PathBuf::from)
+            .collect();
+        if cfg!(windows) {
+            let toolkits = Path::new(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA");
+            let mut found: Vec<PathBuf> = fs::read_dir(toolkits)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .collect();
+            found.sort();
+            roots.extend(found.into_iter().rev());
+        } else {
+            roots.push(PathBuf::from("/usr/local/cuda"));
+            roots.push(PathBuf::from("/usr"));
+        }
+        let mut paths: Vec<String> = Vec::new();
+        for include in roots.into_iter().map(|root| root.join("include")) {
+            let shown = include.display().to_string();
+            if include.join("cuda_fp16.h").is_file() && !paths.contains(&shown) {
+                paths.push(shown);
+            }
+        }
+        paths
+    })
+}
+
 /// Compile CUDA C++ for the device arch, trying [`nvrtc_attempts`] in order. An older NVRTC that
-/// predates the GPU still gives a runnable module.
+/// predates the GPU still gives a runnable module. A failure reports the first attempt, the one
+/// aimed at this device.
 fn nvrtc_compile(src: &[u8], sm: (u32, u32)) -> Result<ModuleImage> {
-    let mut last_error = None;
+    let mut first_error = None;
     for (arch, want_cubin) in nvrtc_attempts(sm) {
         match nvrtc_build(src, arch.as_deref(), want_cubin) {
             Ok(image) => return Ok(image),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
         }
     }
-    Err(last_error.expect("nvrtc attempted at least one build"))
+    Err(first_error.expect("nvrtc attempted at least one build"))
 }
 
 fn nvrtc_build(src: &[u8], arch: Option<&str>, want_cubin: bool) -> Result<ModuleImage> {
@@ -127,7 +165,16 @@ fn nvrtc_build(src: &[u8], arch: Option<&str>, want_cubin: bool) -> Result<Modul
         return Err(GpuError::Backend(format!("nvrtcCreateProgram failed: {r}")));
     }
 
-    let opts: Vec<CString> = arch.map(|a| CString::new(a).unwrap()).into_iter().collect();
+    let opts: Vec<CString> = arch
+        .map(str::to_owned)
+        .into_iter()
+        .chain(
+            cuda_include_paths()
+                .iter()
+                .map(|p| format!("--include-path={p}")),
+        )
+        .filter_map(|o| CString::new(o).ok())
+        .collect();
     let opt_ptrs: Vec<*const c_char> = opts.iter().map(|o| o.as_ptr()).collect();
     let r = unsafe { nvrtcCompileProgram(prog, opt_ptrs.len() as i32, opt_ptrs.as_ptr()) };
     if r != NVRTC_SUCCESS {
@@ -240,6 +287,9 @@ fn cache_key(src: &[u8], sm: (u32, u32), nvrtc: (i32, i32), driver: i32) -> u64 
     for (arch, cubin) in nvrtc_attempts(sm) {
         hash.field(arch.unwrap_or_default().as_bytes());
         hash.field(&[u8::from(cubin)]);
+    }
+    for include in cuda_include_paths() {
+        hash.field(include.as_bytes());
     }
     hash.field(format!("nvrtc {}.{}", nvrtc.0, nvrtc.1).as_bytes());
     hash.field(format!("driver {driver}").as_bytes());
