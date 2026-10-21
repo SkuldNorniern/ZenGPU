@@ -262,7 +262,7 @@ mod phase_z_tests {
         }
         assert!(msl_source.contains("device ushort* src"));
         assert!(msl_source.contains("device ushort* out"));
-        assert!(msl_source.contains("f32_to_bf16(bf16_to_f32(src[gid.x]))"));
+        assert!(msl_source.contains("f32_to_bf16(bf16_to_f32(src[__zsl_gid.x]))"));
         assert!(msl_source.contains("inline ushort f32_to_bf16"));
         assert!(msl_source.contains("inline float bf16_to_f32"));
         let words = spirv::lower_compute(&module).expect("lower copy_bf16 to SPIR-V");
@@ -371,7 +371,7 @@ int main() {{
         assert!(cuda_source.contains("const __half* __restrict__ src"));
         assert!(cuda_source.contains("__float2half(__half2float(src[zsl_gx]))"));
         assert!(msl_source.contains("device half* src"));
-        assert!(msl_source.contains("half(float(src[gid.x]))"));
+        assert!(msl_source.contains("half(float(src[__zsl_gid.x]))"));
         let words = spirv::lower_compute(&module).expect("lower copy_f16 to SPIR-V");
         let opcodes: Vec<u32> = spirv_opcodes(&words);
         assert!(opcodes.contains(&240) && opcodes.contains(&241));
@@ -628,12 +628,12 @@ int main() {{
         assert!(cuda_source.contains("((unsigned int)warpSize)"));
         assert!(cuda_source.contains("(threadIdx.x / warpSize)"));
         assert!(cuda_source.contains("(threadIdx.x % warpSize)"));
-        assert!(msl_source.contains("uint simd_size [[threads_per_simdgroup]]"));
-        assert!(msl_source.contains("uint simd_group [[simdgroup_index_in_threadgroup]]"));
-        assert!(msl_source.contains("uint simd_lane [[thread_index_in_simdgroup]]"));
-        assert!(msl_source.contains("out_size[gid.x] = simd_size"));
-        assert!(msl_source.contains("out_id[gid.x] = simd_group"));
-        assert!(msl_source.contains("out_lane[gid.x] = simd_lane"));
+        assert!(msl_source.contains("uint __zsl_simd_size [[threads_per_simdgroup]]"));
+        assert!(msl_source.contains("uint __zsl_simd_group [[simdgroup_index_in_threadgroup]]"));
+        assert!(msl_source.contains("uint __zsl_simd_lane [[thread_index_in_simdgroup]]"));
+        assert!(msl_source.contains("out_size[__zsl_gid.x] = __zsl_simd_size"));
+        assert!(msl_source.contains("out_id[__zsl_gid.x] = __zsl_simd_group"));
+        assert!(msl_source.contains("out_lane[__zsl_gid.x] = __zsl_simd_lane"));
         spirv::lower_compute(&module).expect("lower query to SPIR-V");
     }
 
@@ -756,8 +756,8 @@ int main() {{
         assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 256u, "));
         assert!(cuda_source.contains("__syncthreads()"));
         assert!(msl_source.contains("threadgroup float __zsl_wg_reduce_f32[256]"));
-        assert!(msl_source.contains("zsl_wg_reduce<1>(__zsl_wg_reduce_f32, lid.x, 256u, "));
-        assert!(msl_source.contains("zsl_wg_reduce<2>(__zsl_wg_reduce_f32, lid.x, 256u, "));
+        assert!(msl_source.contains("zsl_wg_reduce<1>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, "));
+        assert!(msl_source.contains("zsl_wg_reduce<2>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, "));
         assert!(!msl_source.contains("({"));
         assert!(msl_source.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
         spirv::lower_compute(&module).expect("lower workgroup reduce to SPIR-V");
@@ -1880,7 +1880,7 @@ int main() {{
             .source;
         assert!(hip_source.contains("fmaf(a[zsl_gx], b[zsl_gx], c[zsl_gx])"));
         assert!(cuda_source.contains("fmaf(a[zsl_gx], b[zsl_gx], c[zsl_gx])"));
-        assert!(msl_source.contains("fma(a[gid.x], b[gid.x], c[gid.x])"));
+        assert!(msl_source.contains("fma(a[__zsl_gid.x], b[__zsl_gid.x], c[__zsl_gid.x])"));
         spirv::lower_compute(&module).expect("lower fma3 to SPIR-V");
     }
 

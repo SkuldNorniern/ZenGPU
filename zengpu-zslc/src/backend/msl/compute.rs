@@ -1,4 +1,3 @@
-
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -251,14 +250,14 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
             textures.len() + i
         );
     }
-    s.push_str("    uint3 gid [[thread_position_in_grid]],\n");
-    s.push_str("    uint3 lid [[thread_position_in_threadgroup]],\n");
-    s.push_str("    uint3 group [[threadgroup_position_in_grid]]");
+    s.push_str("    uint3 __zsl_gid [[thread_position_in_grid]],\n");
+    s.push_str("    uint3 __zsl_lid [[thread_position_in_threadgroup]],\n");
+    s.push_str("    uint3 __zsl_group [[threadgroup_position_in_grid]]");
     let uses_subgroup_query = stmts_use_subgroup_query(&e.body);
     if uses_subgroup_query {
-        s.push_str(",\n    uint simd_size [[threads_per_simdgroup]],\n");
-        s.push_str("    uint simd_group [[simdgroup_index_in_threadgroup]],\n");
-        s.push_str("    uint simd_lane [[thread_index_in_simdgroup]]\n) {\n");
+        s.push_str(",\n    uint __zsl_simd_size [[threads_per_simdgroup]],\n");
+        s.push_str("    uint __zsl_simd_group [[simdgroup_index_in_threadgroup]],\n");
+        s.push_str("    uint __zsl_simd_lane [[thread_index_in_simdgroup]]\n) {\n");
     } else {
         s.push_str("\n) {\n");
     }
@@ -573,9 +572,9 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 _ => inner,
             }
         }
-        IrExpr::GlobalId(c) => format!("gid.{}", component(*c)),
-        IrExpr::LocalId(c) => format!("lid.{}", component(*c)),
-        IrExpr::GroupId(c) => format!("group.{}", component(*c)),
+        IrExpr::GlobalId(c) => format!("__zsl_gid.{}", component(*c)),
+        IrExpr::LocalId(c) => format!("__zsl_lid.{}", component(*c)),
+        IrExpr::GroupId(c) => format!("__zsl_group.{}", component(*c)),
         IrExpr::Builtin { func, args } => {
             let mut a = Vec::with_capacity(args.len());
             for arg in args {
@@ -676,13 +675,13 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         _ => unreachable!(),
                     };
                     format!(
-                        "zsl_wg_reduce<{op}>(__zsl_wg_reduce_f32, lid.x, {}u, {})",
+                        "zsl_wg_reduce<{op}>(__zsl_wg_reduce_f32, __zsl_lid.x, {}u, {})",
                         ctx.block_size, a[0]
                     )
                 }
-                BuiltinFn::SubgroupSize => "simd_size".to_string(),
-                BuiltinFn::SubgroupId => "simd_group".to_string(),
-                BuiltinFn::SubgroupLocalId => "simd_lane".to_string(),
+                BuiltinFn::SubgroupSize => "__zsl_simd_size".to_string(),
+                BuiltinFn::SubgroupId => "__zsl_simd_group".to_string(),
+                BuiltinFn::SubgroupLocalId => "__zsl_simd_lane".to_string(),
                 BuiltinFn::Dot | BuiltinFn::Extend => {
                     return Err(Diagnostic::new(
                         DiagnosticCode::Internal,
@@ -1254,8 +1253,28 @@ mod tests {
         assert!(m.source.contains("device float* x [[buffer(0)]]"));
         assert!(m.source.contains("device float* y [[buffer(1)]]"));
         assert!(m.source.contains("constant Push& pc [[buffer(2)]]"));
-        assert!(m.source.contains("uint3 gid [[thread_position_in_grid]]"));
+        assert!(
+            m.source
+                .contains("uint3 __zsl_gid [[thread_position_in_grid]]")
+        );
         assert!(m.source.contains("y[i] = (y[i] + (pc.alpha * x[i]))"));
+    }
+
+    /// Kernel names that match the stage inputs must not shadow them.
+    #[test]
+    fn user_names_do_not_shadow_stage_inputs() {
+        let m = msl(r#"
+            @workgroup_size(64)
+            kernel shadow(out: device mut buffer<u32>, id: global_id) {
+                let gid = id.x
+                let lid = local_id().x
+                let group = gid / 64u
+                let simd_lane = subgroup_local_id()
+                out[gid] = lid + group + simd_lane
+            }
+        "#);
+        assert!(m.source.contains("uint lid = __zsl_lid.x"), "{}", m.source);
+        let _ = metal_compiles(&m.source);
     }
 
     #[test]
