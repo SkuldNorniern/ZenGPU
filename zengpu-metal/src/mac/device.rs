@@ -753,6 +753,10 @@ struct ResolvedDispatch {
 
 impl ResolvedDispatch {
     fn encode(&self, enc: &ComputeCommandEncoderRef) {
+        // Metal rejects an empty grid; it runs nothing anyway.
+        if self.grid.contains(&0) {
+            return;
+        }
         enc.set_compute_pipeline_state(&self.state);
         for (i, b) in self.buffers.iter().enumerate() {
             enc.set_buffer(i as u64, Some(b), 0);
