@@ -138,8 +138,7 @@ impl RenderCommands for MetalCommandList {
         }
     }
 
-    fn write_timestamp(&mut self, _pool: QueryPoolHandle, _index: u32) {
-    }
+    fn write_timestamp(&mut self, _pool: QueryPoolHandle, _index: u32) {}
 
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         self.end_encoder();
