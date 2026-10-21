@@ -4211,8 +4211,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                 device
                     .read_buffer(b.buffer, 0, b.size_bytes())
                     .unwrap()
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let (got_i, got_iu, got_u) = (read(&outs[0]), read(&outs[1]), read(&outs[2]));
@@ -4546,8 +4548,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                 device
                     .read_buffer(b.buffer, 0, b.size_bytes())
                     .unwrap()
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let got: Vec<Vec<u32>> = outs.iter().map(read).collect();
@@ -4755,21 +4759,27 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let read = |x: &DeviceArray| device.read_buffer(x.buffer, 0, x.size_bytes()).unwrap();
             let floats = |bytes: Vec<u8>| -> Vec<f32> {
                 bytes
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             };
             let ints = |bytes: Vec<u8>| -> Vec<i32> {
                 bytes
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
                     .collect()
             };
             let (got_out, got_oi) = (floats(read(&bufs[9])), ints(read(&bufs[10])));
             let (got_rh, got_rq) = (floats(read(&bufs[11])), ints(read(&bufs[12])));
             let got_ru: Vec<u32> = read(&bufs[13])
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             for m in 0..16 {
                 for n in 0..16 {
@@ -4885,8 +4895,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let got_i: Vec<i32> = device
                 .read_buffer(oi.buffer, 0, 1024)
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             for m in 0..16 {
                 for n in 0..16 {
@@ -4994,20 +5006,26 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let read = |b: &DeviceArray, len: u64| device.read_buffer(b.buffer, 0, len).unwrap();
             let got_u32 = |b: &DeviceArray| -> Vec<u32> {
                 read(b, 1024)
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let got_i32 = |b: &DeviceArray| -> Vec<i32> {
                 read(b, 1024)
-                    .chunks_exact(4)
-                    .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_le_bytes(*c))
                     .collect()
             };
             let got_f32 = |b: &DeviceArray| -> Vec<f32> {
                 read(b, 1024)
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             };
             let (ou, oi, of) = (got_u32(&outs[0]), got_i32(&outs[1]), got_f32(&outs[2]));
@@ -5092,7 +5110,9 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let bb8: Vec<i8> = (0..256).map(|i| ((i * 11 + 7) % 16) as i8 - 8).collect();
             let ci: Vec<i32> = (0..256i32).map(|i| i % 13 - 6).collect();
             let words = |v: &[i8]| -> Vec<u8> {
-                v.chunks_exact(4)
+                v.as_chunks::<4>()
+                    .0
+                    .iter()
                     .flat_map(|c| {
                         u32::from_le_bytes([c[0] as u8, c[1] as u8, c[2] as u8, c[3] as u8])
                             .to_le_bytes()
@@ -5134,8 +5154,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let got_i: Vec<i32> = device
                 .read_buffer(oi.buffer, 0, oi.size_bytes())
                 .unwrap()
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             for m in 0..16 {
                 for n in 0..16 {
@@ -5166,12 +5188,11 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
+        /// Fragment element access is portable: SPIR-V lowers it too.
         #[test]
-        fn zsl_frag_get_is_hip_only() {
-            assert!(FRAG_GET_ZSL.spv.is_err(), "frag_get has no SPIR-V lowering");
-            let err = FRAG_GET_ZSL.spirv_desc().unwrap_err().to_string();
-            assert!(err.contains("no spirv artifact"), "{err}");
-            assert!(FRAG_GET_ZSL.msl.is_err(), "frag_get has no MSL lowering");
+        fn zsl_frag_get_lowers_off_hip() {
+            assert!(FRAG_GET_ZSL.spv.is_ok(), "{:?}", FRAG_GET_ZSL.spv);
+            FRAG_GET_ZSL.spirv_desc().unwrap();
         }
 
         #[test]
@@ -5227,8 +5248,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                 device
                     .read_buffer(arr.buffer, 0, arr.size_bytes())
                     .unwrap()
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let (got_r, got_c) = (read_u32(&pr), read_u32(&pc));
@@ -5340,8 +5363,10 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                 device
                     .read_buffer(b.buffer, 0, (count * 4) as u64)
                     .unwrap()
-                    .chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let got = read(&out, 20);
@@ -5481,13 +5506,17 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             let read =
                 |arr: &DeviceArray| device.read_buffer(arr.buffer, 0, arr.size_bytes()).unwrap();
             let as_f32 = |b: Vec<u8>| -> Vec<f32> {
-                b.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect()
             };
             let as_u32 = |b: Vec<u8>| -> Vec<u32> {
-                b.chunks_exact(4)
-                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                b.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| u32::from_le_bytes(*c))
                     .collect()
             };
             let (got_lo, got_hi) = (as_f32(read(&lo)), as_f32(read(&hi)));
@@ -5864,7 +5893,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                 *seed
             };
             let mut w = vec![0u8; rows * cols / 256 * 144];
-            for blk in w.chunks_exact_mut(144) {
+            for blk in w.as_chunks_mut::<144>().0 {
                 let d = 0x1C00u16 | (next() as u16 & 0x3F);
                 let dmin = 0x1C00u16 | (next() as u16 & 0x3F);
                 blk[0..2].copy_from_slice(&d.to_le_bytes());
@@ -5984,14 +6013,11 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
                     .filter(|(a, b)| a != b)
                     .count();
                 let scale_gap = zq_bytes[cols..]
-                    .chunks_exact(4)
-                    .zip(s_q_bytes[cols..].chunks_exact(4))
-                    .map(|(a, b)| {
-                        ulp_gap(
-                            f32::from_le_bytes(a.try_into().unwrap()),
-                            f32::from_le_bytes(b.try_into().unwrap()),
-                        )
-                    })
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(s_q_bytes[cols..].as_chunks::<4>().0)
+                    .map(|(a, b)| ulp_gap(f32::from_le_bytes(*a), f32::from_le_bytes(*b)))
                     .max()
                     .unwrap_or(0);
                 println!(
