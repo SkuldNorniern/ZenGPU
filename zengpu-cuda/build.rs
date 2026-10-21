@@ -17,6 +17,7 @@ fn main() {
     if !cfg!(windows) {
         library_paths.extend([
             PathBuf::from("/usr/local/cuda/lib64"),
+            PathBuf::from("/usr/lib/wsl/lib"),
             PathBuf::from("/usr/local/cuda-11.3/lib64"),
             PathBuf::from("/usr/lib/x86_64-linux-gnu"),
             PathBuf::from("/usr/lib64"),
