@@ -160,11 +160,23 @@ mod tests {
                 [1, 1, 1],
             )
         };
+        assert!(bind(1, &[Scalar::F32(1.0)]).is_ok());
         assert!(bind(30, &[Scalar::F32(1.0)]).is_ok());
         assert!(bind(31, &[]).is_ok());
         assert!(bind(31, &[Scalar::F32(1.0)]).is_err());
         assert!(bind(32, &[]).is_err());
         assert!(bind(1, &[Scalar::F32(0.0); 1025]).is_err());
+        // An empty grid runs nothing.
+        for grid in [[0, 1, 1], [1, 0, 1], [1, 1, 0]] {
+            let b = Bindings {
+                buffers: &[y.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[Scalar::F32(5.0)],
+            };
+            dev.dispatch(p, b, grid).unwrap();
+        }
+        assert_eq!(read_f32(&*dev, y, 1), vec![1.0]);
     }
 
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
