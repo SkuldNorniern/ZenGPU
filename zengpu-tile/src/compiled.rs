@@ -1,4 +1,3 @@
-
 use zengpu_hal::{
     BackendPreference, Bindings, BufferHandle, ComputePipelineDesc, ComputePipelineHints,
     DispatchOp, GpuDevice, PipelineHandle, PipelineStats, ShaderDesc, ShaderHandle,
@@ -114,6 +113,13 @@ impl CompiledTile {
                 (
                     gpu(device.create_shader(ShaderDesc::spirv(&bytes)))?,
                     "main",
+                )
+            }
+            BackendPreference::Metal => {
+                let src = self.msl()?;
+                (
+                    gpu(device.create_shader(ShaderDesc::msl(&src.text)))?,
+                    src.entry,
                 )
             }
             other => {

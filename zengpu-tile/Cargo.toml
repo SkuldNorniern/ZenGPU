@@ -20,4 +20,5 @@ zengpu-zslc.workspace = true
 
 [dev-dependencies]
 zengpu-hip.workspace = true
+zengpu-metal.workspace = true
 zengpu-vulkan.workspace = true

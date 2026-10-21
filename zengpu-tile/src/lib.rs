@@ -210,6 +210,7 @@ mod tests {
         GpuDevice, GpuInstance, MemoryUsage,
     };
     use zengpu_hip::HipInstance;
+    use zengpu_metal::MetalInstance;
     use zengpu_vulkan::VulkanInstance;
 
     use super::*;
@@ -414,6 +415,12 @@ mod tests {
         adapter.open(DeviceRequest::default()).ok()
     }
 
+    fn metal_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = MetalInstance::new();
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        adapter.open(DeviceRequest::default()).ok()
+    }
+
     fn caps_target(dev: &dyn GpuDevice, backend: BackendPreference) -> Target {
         Target::from_caps(backend, &dev.compute_caps())
     }
@@ -565,6 +572,15 @@ mod tests {
     }
 
     #[test]
+    fn gemm_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Metal);
+        for case in CASES {
+            run_case(&*dev, &target, case, &Schedule::o0()).unwrap();
+        }
+    }
+
+    #[test]
     fn scheduled_gemm_on_hip() {
         let Some(dev) = hip_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Hip);
@@ -579,6 +595,13 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_gemm_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Metal);
+        check_scheduled(&*dev, &target);
+    }
+
+    #[test]
     fn split_k_on_hip() {
         let Some(dev) = hip_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Hip);
@@ -589,6 +612,13 @@ mod tests {
     fn split_k_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Vulkan);
+        check_split(&*dev, &target);
+    }
+
+    #[test]
+    fn split_k_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Metal);
         check_split(&*dev, &target);
     }
 
@@ -1014,6 +1044,8 @@ mod tests {
         waves: u32,
         rows: u32,
         split: u32,
+        /// Stages per operand; 0 is the schedule default.
+        stages: u32,
         /// `@waves_per_eu(1, 2)`: trade occupancy for fewer spills.
         wpe: bool,
     }
@@ -1027,6 +1059,9 @@ mod tests {
             if self.split > 1 {
                 s += &format!(" k{}", self.split);
             }
+            if self.stages > 1 {
+                s += &format!(" s{}", self.stages);
+            }
             if self.wpe {
                 s += " wpe";
             }
@@ -1038,7 +1073,7 @@ mod tests {
                 matrix: Matrix::Mma,
                 waves: self.waves,
                 wave_rows: self.rows,
-                stages: 0,
+                stages: self.stages,
                 split_k: self.split,
                 waves_per_eu: self.wpe.then_some((1, 2)),
                 ..Schedule::default()
@@ -1074,6 +1109,7 @@ mod tests {
                         waves,
                         rows,
                         split: 1,
+                        stages: 0,
                         wpe: false,
                     });
                 }
@@ -1093,8 +1129,32 @@ mod tests {
                     waves,
                     rows,
                     split: 1,
+                    stages: 0,
                     wpe: false,
                 });
+            }
+        }
+        grid
+    }
+
+    /// Metal grid: simdgroup matrices, k steps 16 and 32, the same wave splits as HIP.
+    fn metal_grid() -> Vec<MmaCfg> {
+        let mut grid = Vec::new();
+        for tile in [[32, 32], [64, 32], [64, 64], [128, 64]] {
+            for bk in [16, 32] {
+                for (waves, rows) in [(1, 0), (2, 0), (4, 0), (4, 2)] {
+                    for stages in [1, 2] {
+                        grid.push(MmaCfg {
+                            tile,
+                            bk,
+                            waves,
+                            rows,
+                            split: 1,
+                            stages,
+                            wpe: false,
+                        });
+                    }
+                }
             }
         }
         grid
@@ -1287,7 +1347,8 @@ mod tests {
     fn bench_f16_gemm() {
         let hip = hip_device();
         let vulkan = vulkan_device();
-        if hip.is_none() && vulkan.is_none() {
+        let metal = metal_device();
+        if hip.is_none() && vulkan.is_none() && metal.is_none() {
             return;
         }
         let naive = env::var_os("ZENGPU_TILE_BENCH_NAIVE").is_some();
@@ -1447,6 +1508,52 @@ mod tests {
                     println!("best vulkan search: {} at {:.3} ms", best.label, best.ms);
                     summary.push(format!(
                         "| {m} x {n} x {k} | vulkan {} | {:.3} | single run | {:.2} |",
+                        best.label,
+                        best.ms,
+                        flops / (best.ms * 1e-3) / 1e12
+                    ));
+                }
+                for h in handles {
+                    dev.destroy_buffer(h);
+                }
+            }
+            if let Some(dev) = &metal {
+                let dev: &dyn GpuDevice = &**dev;
+                let target = caps_target(dev, BackendPreference::Metal);
+                let handles = shape_buffers(dev, shape);
+                let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+                let scalar = Schedule {
+                    matrix: Matrix::Scalar,
+                    ..Schedule::default()
+                };
+                measure(
+                    dev,
+                    &target,
+                    "metal",
+                    shape,
+                    "scalar-tiled 64x64x16",
+                    &base,
+                    &scalar,
+                    &handles,
+                    naive,
+                );
+                let rows = search(
+                    dev,
+                    &target,
+                    "metal",
+                    shape,
+                    &metal_grid(),
+                    &[2, 4],
+                    &handles,
+                    naive,
+                );
+                if let Some(best) = pick_best(&rows) {
+                    println!("best metal search: {} at {:.3} ms", best.label, best.ms);
+                    if env::var_os("ZENGPU_TILE_BENCH_ZSL").is_some() {
+                        println!("{}", best.compiled.zsl());
+                    }
+                    summary.push(format!(
+                        "| {m} x {n} x {k} | metal {} | {:.3} | single run | {:.2} |",
                         best.label,
                         best.ms,
                         flops / (best.ms * 1e-3) / 1e12

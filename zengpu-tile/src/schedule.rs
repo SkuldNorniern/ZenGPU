@@ -138,7 +138,7 @@ impl Target {
         }
     }
 
-    /// No matrix unit. Used by text-only backends (CUDA, Metal) and `compile`.
+    /// No matrix unit. Used by text-only backends (CUDA) and `compile`.
     pub const fn scalar_only(backend: BackendPreference) -> Self {
         Target {
             backend,
