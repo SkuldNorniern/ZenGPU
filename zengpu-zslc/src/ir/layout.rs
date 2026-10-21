@@ -19,12 +19,16 @@ pub struct LayoutInfo {
 pub enum LayoutKind {
     /// A `device buffer<elem>` param. The member is a `u32` slot index, and
     /// `elem` is informational.
-    BufferIndex { elem: TypeId },
+    BufferIndex {
+        elem: TypeId,
+    },
     /// Slot in the sampled-texture table, as a `u32`.
     TextureIndex,
     /// Slot in the storage-image table, as a `u32`.
     ImageIndex,
-    Scalar { ty: TypeId },
+    Scalar {
+        ty: TypeId,
+    },
 }
 
 /// Members come in this order: buffer slots, texture slots, image slots, then scalars.
