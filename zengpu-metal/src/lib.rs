@@ -254,6 +254,92 @@ mod tests {
         assert_eq!(read_f32(&*dev, buf, 2), vec![1.0, 2.0]);
     }
 
+    /// `round_even`, `fast_exp` and the integer forms of `abs`/`min`/`max`/`clamp` compile and
+    /// match the host.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn integer_and_rounding_builtins_match_the_host() {
+        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const OPS: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel ops(xs: device buffer<i32>, fs: device buffer<f32>, o: device mut buffer<u32>, id: global_id) {
+                let i = id.x
+                if i < 8 {
+                    let x = xs[i]
+                    let u = bitcast_u32(x)
+                    let k = i * 8
+                    o[k] = bitcast_u32(abs(x))
+                    o[k + 1] = bitcast_u32(min(x, -3))
+                    o[k + 2] = bitcast_u32(max(x, 2))
+                    o[k + 3] = bitcast_u32(clamp(x, -5, 5))
+                    o[k + 4] = min(u, 7u)
+                    o[k + 5] = max(u, 7u)
+                    o[k + 6] = bitcast_u32(round_even(fs[i]))
+                    o[k + 7] = bitcast_u32(fast_exp(fs[i]))
+                }
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let xs: [i32; 8] = [0, 1, -1, 9, -9, i32::MAX, i32::MIN + 1, 4];
+        let fs: [f32; 8] = [0.5, 1.5, 2.5, -0.5, -1.5, 3.4, 0.0, 1.0];
+        let mk = |bytes: &[u8]| {
+            let h = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(h, 0, bytes).unwrap();
+            h
+        };
+        let bx = mk(&xs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        let bf = mk(&fs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        let bo = mk(&[0u8; 8 * 8 * 4]);
+        let sh = dev.create_shader(ShaderDesc::msl(OPS.msl.unwrap())).unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[bx.index(), bf.index(), bo.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let out: Vec<u32> = dev
+            .read_buffer(bo, 0, 8 * 8 * 4)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        for (i, (&x, &f)) in xs.iter().zip(&fs).enumerate() {
+            let u = x as u32;
+            let got = &out[i * 8..i * 8 + 8];
+            assert_eq!(got[0] as i32, x.abs(), "abs({x})");
+            assert_eq!(got[1] as i32, x.min(-3), "min({x})");
+            assert_eq!(got[2] as i32, x.max(2), "max({x})");
+            assert_eq!(got[3] as i32, x.clamp(-5, 5), "clamp({x})");
+            assert_eq!(got[4], u.min(7), "min({u}u)");
+            assert_eq!(got[5], u.max(7), "max({u}u)");
+            assert_eq!(f32::from_bits(got[6]), f.round_ties_even(), "round_even({f})");
+            let e = f32::from_bits(got[7]);
+            assert!((e - f.exp()).abs() <= 1e-3 * f.exp(), "fast_exp({f}) = {e}");
+        }
+    }
+
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
     #[cfg(target_os = "macos")]
