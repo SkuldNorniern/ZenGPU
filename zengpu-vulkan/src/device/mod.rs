@@ -1,4 +1,3 @@
-
 use std::{
     any::Any,
     collections::HashMap,
@@ -793,12 +792,14 @@ impl VulkanDevice {
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
         let mut supported_pipe_exec =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
+        let mut supported_memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         supported_subgroup_size.p_next = &mut supported_coop as *mut _ as *mut c_void;
         supported_coop.p_next = &mut supported_storage16 as *mut _ as *mut c_void;
         supported_storage16.p_next = &mut supported_storage8 as *mut _ as *mut c_void;
         supported_storage8.p_next = &mut supported_f16i8 as *mut _ as *mut c_void;
         supported_f16i8.p_next = &mut supported_wg_explicit as *mut _ as *mut c_void;
         supported_wg_explicit.p_next = &mut supported_pipe_exec as *mut _ as *mut c_void;
+        supported_pipe_exec.p_next = &mut supported_memory_model as *mut _ as *mut c_void;
         let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
             p_next: &mut supported_desc_idx as *mut _ as *mut c_void,
             ..Default::default()
@@ -954,9 +955,17 @@ impl VulkanDevice {
             && supported_storage8.storage_buffer8_bit_access == vk::TRUE
             && supported_f16i8.shader_float16 == vk::TRUE
             && supported_f16i8.shader_int8 == vk::TRUE;
+        // Cooperative matrix modules use the Vulkan memory model.
         let coop_supported = supports_extension(khr::cooperative_matrix::NAME)
             && supported_coop.cooperative_matrix == vk::TRUE
+            && supported_memory_model.vulkan_memory_model == vk::TRUE
             && f16i8_supported;
+        let mut memory_model_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures {
+            vulkan_memory_model: vk::TRUE,
+            vulkan_memory_model_device_scope: supported_memory_model
+                .vulkan_memory_model_device_scope,
+            ..Default::default()
+        };
         let mut coop_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
             cooperative_matrix: vk::TRUE,
             ..Default::default()
@@ -1009,7 +1018,8 @@ impl VulkanDevice {
         if coop_supported {
             extensions.push(khr::cooperative_matrix::NAME.as_ptr());
             coop_feat.p_next = features2.p_next;
-            features2.p_next = &mut coop_feat as *mut _ as *mut c_void;
+            memory_model_feat.p_next = &mut coop_feat as *mut _ as *mut c_void;
+            features2.p_next = &mut memory_model_feat as *mut _ as *mut c_void;
         }
 
         let device_create_info = vk::DeviceCreateInfo {
