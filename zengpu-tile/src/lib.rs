@@ -788,12 +788,29 @@ mod tests {
     #[test]
     fn k_loop_past_the_tensor_on_metal() {
         let Some(dev) = metal_device() else { return };
-        let target = caps_target(&*dev, BackendPreference::Metal);
-        let (m, n, kc, extent) = (70, 50, 40, 64);
-        let mut b = TileKernel::builder("short_k", [64, 64]);
+        short_operands(&*dev, (70, 70), 50, 40, 64);
+    }
+
+    /// The output has more rows than A: A's missing rows read as zero.
+    #[test]
+    fn output_past_the_operand_rows_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        short_operands(&*dev, (64, 128), 50, 64, 64);
+    }
+
+    /// `C[out_m, n] = A[m, kc] * B[n, kc]^T` over a k loop of `extent`, checked on the host.
+    fn short_operands(
+        dev: &dyn GpuDevice,
+        (m, out_m): (usize, usize),
+        n: usize,
+        kc: usize,
+        extent: usize,
+    ) {
+        let target = caps_target(dev, dev.backend());
+        let mut b = TileKernel::builder("short", [64, 64]);
         let a = b.input("a", DType::F16, [m, kc]);
         let w = b.input("b", DType::F16, [n, kc]);
-        let c = b.output("c", DType::F32, [m, n]);
+        let c = b.output("c", DType::F32, [out_m, n]);
         let mut acc = b.zeros(DType::F32, [64, 64]);
         b.loop_k(extent, 16, |kb| {
             let at = kb.load(Block::new(a, Affine::grid_m(), Affine::k(), [64, 16]));
@@ -823,7 +840,7 @@ mod tests {
         let (ha, hb) = (f16_buf(&av), f16_buf(&bv));
         let hc = dev
             .create_buffer(BufferDesc {
-                size: (m * n * 4) as u64,
+                size: (out_m * n * 4) as u64,
                 usage: BufferUsage::STORAGE | BufferUsage::READBACK,
                 memory: MemoryUsage::GpuOnly,
             })
@@ -836,20 +853,24 @@ mod tests {
         if target.has_mma_f16 {
             assert_eq!(compiled.schedule_name(), "mma", "{:?}", compiled.notes());
         }
-        let program = compiled.load(&*dev).unwrap();
-        program.dispatch(&*dev, &[ha, hb, hc]).unwrap();
-        program.destroy(&*dev);
+        let program = compiled.load(dev).unwrap();
+        program.dispatch(dev, &[ha, hb, hc]).unwrap();
+        program.destroy(dev);
         let got: Vec<f32> = dev
-            .read_buffer(hc, 0, (m * n * 4) as u64)
+            .read_buffer(hc, 0, (out_m * n * 4) as u64)
             .unwrap()
             .as_chunks::<4>()
             .0
             .iter()
             .map(|c| f32::from_le_bytes(*c))
             .collect();
-        for i in 0..m {
+        for i in 0..out_m {
             for j in 0..n {
-                let want: f32 = (0..kc).map(|k| av[i * kc + k] * bv[j * kc + k]).sum();
+                let want: f32 = if i < m {
+                    (0..kc).map(|k| av[i * kc + k] * bv[j * kc + k]).sum()
+                } else {
+                    0.0
+                };
                 assert_eq!(got[i * n + j], want, "({i}, {j})");
             }
         }
