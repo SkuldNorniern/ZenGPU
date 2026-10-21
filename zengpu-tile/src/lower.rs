@@ -44,8 +44,8 @@ pub(crate) struct Plan {
     /// `Mma` only: `@waves_per_eu(min, max)` for the compiler, or none.
     pub waves_per_eu: Option<(u32, u32)>,
     /// `Mma` only: the k loop runs full k blocks unmasked, with rows clamped to the tensor (rows
-    /// past it only feed outputs the store drops), then one masked tail block. No branch in the
-    /// hot loop. One stage, no split.
+    /// past it only feed outputs the store drops), then masked tail blocks. No branch in the hot
+    /// loop. One stage, no split.
     pub clamp_rows: bool,
     /// `Mma` only: elements added to each staged row of A and B, against bank conflicts.
     pub pad: usize,
@@ -570,11 +570,14 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         let _ = writeln!(src, "}}");
     };
 
-    if plan.clamp_rows {
+    // Clamped rows repeat the operand's last row, so they must only feed outputs the store
+    // drops: A has to cover every output row and B every output column.
+    let rows = |b: Block| kernel.tensors[b.tensor.0].shape[0];
+    let clamp_ok = plan.clamp_rows && rows(parts.a) >= out_m && rows(parts.b) >= out_n;
+    if clamp_ok {
         // Blocks whose columns are inside both tensors; the rest go through the masked copy.
         let cols = |b: Block| kernel.tensors[b.tensor.0].shape[1];
         let full = parts.extent.min(cols(parts.a)).min(cols(parts.b)) / bk;
-        let full = full.min(ksteps);
         if full > 0 {
             let _ = writeln!(src, "for kt in 0..{full} {{");
             stage(&mut g, &mut src, &bufs[0], "kt", true);
@@ -909,9 +912,16 @@ impl<'a> Gen<'a> {
         let bc = format!("({} * {cols})", affine(block.cols, &self.kt));
         let exact = total % workgroup == 0;
         let (ty, zero) = (scalar(decl.dtype), zero(decl.dtype));
+        // Clamp unless every workgroup's block ends inside the tensor.
+        let a = block.rows;
+        let [gm, gn] = self.kernel.grid();
+        let last = |g: usize| g.saturating_sub(1) as i64;
+        let reach = (a.c0 >= 0 && a.c_m >= 0 && a.c_n >= 0 && a.c_k == 0)
+            .then(|| (a.c0 + a.c_m * last(gm) + a.c_n * last(gn) + 1) as usize * rows);
+        let needs_clamp = clamp && reach.is_none_or(|end| end > tr);
         // Global row of block row `r`.
         let grow = |r: &str| {
-            if clamp && !tr.is_multiple_of(rows) {
+            if needs_clamp {
                 format!("min({br} + {r}, {})", tr - 1)
             } else {
                 format!("({br} + {r})")
