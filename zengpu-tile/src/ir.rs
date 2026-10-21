@@ -137,13 +137,20 @@ pub enum Op {
     /// Values of dtype f16 stay f32 until stored.
     Cast(Tile, DType),
     /// `acc + a * b^T`: `a` is `[BM, BK]`, `b` is `[BN, BK]`, `acc` is `[BM, BN]`.
-    Dot { a: Tile, b: Tile, acc: Tile },
+    Dot {
+        a: Tile,
+        b: Tile,
+        acc: Tile,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stmt {
     Def(Tile, Op),
-    Store { block: Block, value: Tile },
+    Store {
+        block: Block,
+        value: Tile,
+    },
     Loop {
         extent: usize,
         step: usize,
