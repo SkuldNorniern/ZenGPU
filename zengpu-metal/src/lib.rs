@@ -120,6 +120,53 @@ mod tests {
         assert_eq!(out, expect);
     }
 
+    /// Metal has 31 buffer slots and the push block takes the one after the buffers: binding
+    /// past that is an error, not an out-of-range `setBuffer`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn too_many_bindings_is_an_error() {
+        use zengpu_hal::{Bindings, ComputePipelineDesc};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL: ZslShader = zsl!(
+            push P { v: f32 }
+            @workgroup_size(1)
+            kernel fill(y: device mut buffer<f32>, p: P) {
+                y[0] = p.v
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let y = make_f32(&*dev, &[0.0], true);
+        let sh = dev
+            .create_shader(ShaderDesc::msl(FILL.msl.unwrap()))
+            .unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        let bind = |n: usize, scalars: &[Scalar]| {
+            let slots = vec![y.index(); n];
+            dev.dispatch(
+                p,
+                Bindings {
+                    buffers: &slots,
+                    textures: &[],
+                    images: &[],
+                    scalars,
+                },
+                [1, 1, 1],
+            )
+        };
+        assert!(bind(30, &[Scalar::F32(1.0)]).is_ok());
+        assert!(bind(31, &[]).is_ok());
+        assert!(bind(31, &[Scalar::F32(1.0)]).is_err());
+        assert!(bind(32, &[]).is_err());
+        assert!(bind(1, &[Scalar::F32(0.0); 1025]).is_err());
+    }
+
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
     #[cfg(target_os = "macos")]

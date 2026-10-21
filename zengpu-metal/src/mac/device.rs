@@ -582,6 +582,33 @@ impl MetalDevice {
                 state.max_total_threads_per_threadgroup()
             )));
         }
+        let b = &op.bindings;
+        let buffer_slots = b.buffers.len() + usize::from(!b.scalars.is_empty());
+        let texture_slots = b.textures.len() + b.images.len();
+        if buffer_slots > MAX_BUFFER_SLOTS
+            || b.textures.len() > MAX_SAMPLER_SLOTS
+            || texture_slots > MAX_TEXTURE_SLOTS
+        {
+            return Err(GpuError::Dispatch(format!(
+                "metal: {} buffers{}, {} sampled textures and {} images exceed the argument \
+                 table ({MAX_BUFFER_SLOTS} buffer, {MAX_SAMPLER_SLOTS} sampler and \
+                 {MAX_TEXTURE_SLOTS} texture slots)",
+                b.buffers.len(),
+                if b.scalars.is_empty() {
+                    ""
+                } else {
+                    " plus push data"
+                },
+                b.textures.len(),
+                b.images.len(),
+            )));
+        }
+        if b.scalars.len() * 4 > MAX_PUSH_BYTES {
+            return Err(GpuError::Dispatch(format!(
+                "metal: {} scalars exceed the {MAX_PUSH_BYTES}-byte push block",
+                b.scalars.len()
+            )));
+        }
         let buffers: Vec<Buffer> = {
             let table = lock(&self.inner.buffers)?;
             op.bindings
@@ -706,6 +733,13 @@ impl MetalDevice {
         Ok(cmd)
     }
 }
+
+/// Compute argument table sizes on every Metal GPU family ZenGPU runs on.
+const MAX_BUFFER_SLOTS: usize = 31;
+const MAX_SAMPLER_SLOTS: usize = 16;
+const MAX_TEXTURE_SLOTS: usize = 128;
+/// `setBytes` limit.
+const MAX_PUSH_BYTES: usize = 4096;
 
 struct ResolvedDispatch {
     state: ComputePipelineState,
