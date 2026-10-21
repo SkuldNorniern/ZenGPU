@@ -254,8 +254,8 @@ mod tests {
         assert_eq!(read_f32(&*dev, buf, 2), vec![1.0, 2.0]);
     }
 
-    /// `round_even`, `fast_exp` and the integer forms of `abs`/`min`/`max`/`clamp` compile and
-    /// match the host.
+    /// `round_even`, `fast_exp`, the integer forms of `abs`/`min`/`max`/`clamp`, i32 arithmetic
+    /// with u32 literals, and integer shuffles match the host.
     #[test]
     #[cfg(target_os = "macos")]
     fn integer_and_rounding_builtins_match_the_host() {
@@ -266,10 +266,12 @@ mod tests {
             @workgroup_size(64)
             kernel ops(xs: device buffer<i32>, fs: device buffer<f32>, o: device mut buffer<u32>, id: global_id) {
                 let i = id.x
+                // Odd and above 2^24: an f32 round trip would change it.
+                let lane3 = subgroup_shuffle(i * 2u + 16777217u, 3u)
                 if i < 8 {
                     let x = xs[i]
                     let u = bitcast_u32(x)
-                    let k = i * 8
+                    let k = i * 11
                     o[k] = bitcast_u32(abs(x))
                     o[k + 1] = bitcast_u32(min(x, -3))
                     o[k + 2] = bitcast_u32(max(x, 2))
@@ -278,6 +280,9 @@ mod tests {
                     o[k + 5] = max(u, 7u)
                     o[k + 6] = bitcast_u32(round_even(fs[i]))
                     o[k + 7] = bitcast_u32(fast_exp(fs[i]))
+                    o[k + 8] = select(x - 5 < 0, 1u, 0u)
+                    o[k + 9] = bitcast_u32((x - 5) / 2)
+                    o[k + 10] = lane3
                 }
             }
         );
@@ -297,8 +302,10 @@ mod tests {
         };
         let bx = mk(&xs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
         let bf = mk(&fs.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
-        let bo = mk(&[0u8; 8 * 8 * 4]);
-        let sh = dev.create_shader(ShaderDesc::msl(OPS.msl.unwrap())).unwrap();
+        let bo = mk(&[0u8; 8 * 11 * 4]);
+        let sh = dev
+            .create_shader(ShaderDesc::msl(OPS.msl.unwrap()))
+            .unwrap();
         let p = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader: sh,
@@ -318,7 +325,7 @@ mod tests {
         )
         .unwrap();
         let out: Vec<u32> = dev
-            .read_buffer(bo, 0, 8 * 8 * 4)
+            .read_buffer(bo, 0, 8 * 11 * 4)
             .unwrap()
             .as_chunks::<4>()
             .0
@@ -327,16 +334,26 @@ mod tests {
             .collect();
         for (i, (&x, &f)) in xs.iter().zip(&fs).enumerate() {
             let u = x as u32;
-            let got = &out[i * 8..i * 8 + 8];
+            let got = &out[i * 11..i * 11 + 11];
             assert_eq!(got[0] as i32, x.abs(), "abs({x})");
             assert_eq!(got[1] as i32, x.min(-3), "min({x})");
             assert_eq!(got[2] as i32, x.max(2), "max({x})");
             assert_eq!(got[3] as i32, x.clamp(-5, 5), "clamp({x})");
             assert_eq!(got[4], u.min(7), "min({u}u)");
             assert_eq!(got[5], u.max(7), "max({u}u)");
-            assert_eq!(f32::from_bits(got[6]), f.round_ties_even(), "round_even({f})");
+            assert_eq!(
+                f32::from_bits(got[6]),
+                f.round_ties_even(),
+                "round_even({f})"
+            );
             let e = f32::from_bits(got[7]);
             assert!((e - f.exp()).abs() <= 1e-3 * f.exp(), "fast_exp({f}) = {e}");
+            // i32 with a bare literal stays signed. Overflow is undefined, so not checked.
+            if let Some(d) = x.checked_sub(5) {
+                assert_eq!(got[8], u32::from(d < 0), "{x} - 5 < 0");
+                assert_eq!(got[9] as i32, d / 2, "({x} - 5) / 2");
+            }
+            assert_eq!(got[10], 16777223, "u32 shuffle");
         }
     }
 
