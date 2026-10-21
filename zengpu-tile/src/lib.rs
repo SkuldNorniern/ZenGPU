@@ -682,8 +682,10 @@ mod tests {
                 ..Schedule::default()
             };
             let (shape, notes) = run_case(dev, target, case, &sched).unwrap();
-            assert_eq!(shape, "mma", "{notes:?}");
-            assert!(notes.is_empty(), "{notes:?}");
+            if target.has_mma_f16 {
+                assert_eq!(shape, "mma", "{notes:?}");
+                assert!(notes.is_empty(), "{notes:?}");
+            }
         }
     }
 
@@ -700,10 +702,11 @@ mod tests {
             vector_loads: false,
             ..mma
         };
+        let double = Schedule { stages: 2, ..mma };
         for case in SCHEDULED {
-            for sched in [Schedule::o0(), staged, mma, scalar_loads] {
+            for sched in [Schedule::o0(), staged, mma, scalar_loads, double] {
                 let (shape, notes) = run_case(dev, target, case, &sched).unwrap();
-                if sched == mma && case.input == DType::F16 {
+                if sched == mma && case.input == DType::F16 && target.has_mma_f16 {
                     assert_eq!(shape, "mma", "{}x{}x{}", case.m, case.n, case.k);
                     assert!(notes.is_empty(), "{notes:?}");
                 }
@@ -779,6 +782,80 @@ mod tests {
         // 72 = 2 full blocks of 32 plus a masked tail.
         assert!(zsl.contains("for kt in 0..2 {"), "{zsl}");
         assert!(c.msl().is_ok());
+    }
+
+    /// The k loop runs past the operands' columns: those reads are zero on every path.
+    #[test]
+    fn k_loop_past_the_tensor_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Metal);
+        let (m, n, kc, extent) = (70, 50, 40, 64);
+        let mut b = TileKernel::builder("short_k", [64, 64]);
+        let a = b.input("a", DType::F16, [m, kc]);
+        let w = b.input("b", DType::F16, [n, kc]);
+        let c = b.output("c", DType::F32, [m, n]);
+        let mut acc = b.zeros(DType::F32, [64, 64]);
+        b.loop_k(extent, 16, |kb| {
+            let at = kb.load(Block::new(a, Affine::grid_m(), Affine::k(), [64, 16]));
+            let bt = kb.load(Block::new(w, Affine::grid_n(), Affine::k(), [64, 16]));
+            acc = kb.dot(at, bt, acc);
+        });
+        b.store(
+            Block::new(c, Affine::grid_m(), Affine::grid_n(), [64, 64]),
+            acc,
+        );
+        let kernel = b.build().unwrap();
+
+        let av: Vec<f32> = (0..m * kc).map(|i| ((i * 7) % 9) as f32 - 4.0).collect();
+        let bv: Vec<f32> = (0..n * kc).map(|i| ((i * 5) % 7) as f32 - 3.0).collect();
+        let f16_buf = |v: &[f32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| f16_bits(*x).to_le_bytes()).collect();
+            let h = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                    memory: MemoryUsage::GpuOnly,
+                })
+                .unwrap();
+            dev.write_buffer(h, 0, &bytes).unwrap();
+            h
+        };
+        let (ha, hb) = (f16_buf(&av), f16_buf(&bv));
+        let hc = dev
+            .create_buffer(BufferDesc {
+                size: (m * n * 4) as u64,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let sched = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let compiled = compile_with(&kernel, &sched, &target).unwrap();
+        if target.has_mma_f16 {
+            assert_eq!(compiled.schedule_name(), "mma", "{:?}", compiled.notes());
+        }
+        let program = compiled.load(&*dev).unwrap();
+        program.dispatch(&*dev, &[ha, hb, hc]).unwrap();
+        program.destroy(&*dev);
+        let got: Vec<f32> = dev
+            .read_buffer(hc, 0, (m * n * 4) as u64)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        for i in 0..m {
+            for j in 0..n {
+                let want: f32 = (0..kc).map(|k| av[i * kc + k] * bv[j * kc + k]).sum();
+                assert_eq!(got[i * n + j], want, "({i}, {j})");
+            }
+        }
+        for h in [ha, hb, hc] {
+            dev.destroy_buffer(h);
+        }
     }
 
     /// Exact binary16 bits for small integers, quarters and zero.
