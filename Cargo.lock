@@ -1845,6 +1845,7 @@ version = "0.0.1"
 dependencies = [
  "zengpu-hal",
  "zengpu-hip",
+ "zengpu-metal",
  "zengpu-spirv",
 ]
 
@@ -1935,6 +1936,7 @@ version = "0.0.1"
 dependencies = [
  "zengpu-hal",
  "zengpu-hip",
+ "zengpu-metal",
  "zengpu-vulkan",
  "zengpu-zslc",
 ]
