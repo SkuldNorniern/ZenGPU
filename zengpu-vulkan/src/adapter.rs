@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ash::ext::pci_bus_info;
 use ash::vk;
 use zengpu_hal::{
     AdapterInfo, DeviceLimits, DeviceRequest, Features, GpuAdapter, GpuDevice, HalCapabilities,
@@ -66,6 +67,51 @@ impl VulkanAdapter {
                 .get_physical_device_properties2(self.physical, &mut props)
         };
         id.device_uuid
+    }
+
+    /// PCI address as `domain:bus:device.function` in lowercase hex, e.g. `0000:0b:00.0`, the
+    /// same text `hipDeviceGetPCIBusId` gives. `None` without `VK_EXT_pci_bus_info`.
+    pub fn pci_bus_id(&self) -> Option<String> {
+        let instance = &self.shared.instance;
+        let extensions =
+            unsafe { instance.enumerate_device_extension_properties(self.physical) }.ok()?;
+        let supported = extensions.iter().any(|e| {
+            e.extension_name_as_c_str()
+                .is_ok_and(|n| n == pci_bus_info::NAME)
+        });
+        if !supported {
+            return None;
+        }
+        let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+        unsafe { instance.get_physical_device_properties2(self.physical, &mut props) };
+        Some(format!(
+            "{:04x}:{:02x}:{:02x}.{:x}",
+            pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function
+        ))
+    }
+
+    /// Driver name and version text, e.g. `("radv", "Mesa 25.2.8")`. `None` before Vulkan 1.2.
+    pub fn driver(&self) -> Option<(String, String)> {
+        let instance = &self.shared.instance;
+        let base = unsafe { instance.get_physical_device_properties(self.physical) };
+        if base.api_version < vk::API_VERSION_1_2 {
+            return None;
+        }
+        let mut driver = vk::PhysicalDeviceDriverProperties::default();
+        let mut props = vk::PhysicalDeviceProperties2::default().push_next(&mut driver);
+        unsafe { instance.get_physical_device_properties2(self.physical, &mut props) };
+        let name = driver
+            .driver_name_as_c_str()
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        let info = driver
+            .driver_info_as_c_str()
+            .ok()?
+            .to_string_lossy()
+            .into_owned();
+        Some((name, info))
     }
 
     /// Opens a headless graphics device with no swapchain extension. For windowed rendering,
