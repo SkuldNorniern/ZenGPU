@@ -1158,7 +1158,9 @@ mod half_buffer_tests {
         let halves = |i: usize| -> Vec<u16> {
             vk.read_buffer(bufs[i], 0, half_bytes)
                 .unwrap()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect()
         };
