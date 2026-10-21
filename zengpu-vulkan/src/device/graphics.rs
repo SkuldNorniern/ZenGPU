@@ -14,12 +14,18 @@ impl VulkanDevice {
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: resolve shaders");
         let (vert_module, frag_module) = {
             let shaders = self.shaders.lock().unwrap();
-            let vert = shaders.get(desc.vertex_shader).map(|s| s.0).ok_or_else(|| {
-                GpuError::PipelineCreation("stale vertex shader handle".to_string())
-            })?;
-            let frag = shaders.get(desc.fragment_shader).map(|s| s.0).ok_or_else(|| {
-                GpuError::PipelineCreation("stale fragment shader handle".to_string())
-            })?;
+            let vert = shaders
+                .get(desc.vertex_shader)
+                .map(|s| s.0)
+                .ok_or_else(|| {
+                    GpuError::PipelineCreation("stale vertex shader handle".to_string())
+                })?;
+            let frag = shaders
+                .get(desc.fragment_shader)
+                .map(|s| s.0)
+                .ok_or_else(|| {
+                    GpuError::PipelineCreation("stale fragment shader handle".to_string())
+                })?;
             (vert, frag)
         };
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: build stages");
