@@ -1097,6 +1097,34 @@ int main() {{
         spirv::lower_compute(&module).expect("lower view_mma to SPIR-V");
     }
 
+    /// An f32 view reuses f16 staging memory for an f32 accumulator store.
+    const VIEW_F32: &str = r#"
+        @workgroup_size(32)
+        kernel view_f32(a: device buffer<f16>, out: device mut buffer<f32>) {
+            shared sa: array<f16, 512>
+            view sc: array<f32> = sa
+            let lane = local_id().x
+            let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+            let fb: frag<f16, 16, 16, b> = frag_load_b_t(a, 0, 16)
+            let d: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())
+            frag_store(sc, 0, 16, d)
+            barrier()
+            out[lane] = sc[lane]
+        }
+    "#;
+
+    #[test]
+    fn f32_views_lower_on_all_compute_backends() {
+        let module = parse_compute(VIEW_F32).expect("parse view_f32");
+        let hip_source = hip::lower_compute(&module).expect("HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        assert!(hip_source.contains("float* sc = reinterpret_cast<float*>(sa);"));
+        assert!(cuda_source.contains("float* sc = reinterpret_cast<float*>(sa);"));
+        assert!(msl_source.contains("threadgroup float* sc = (threadgroup float*)sa;"));
+        spirv::lower_compute(&module).expect("lower view_f32 to SPIR-V");
+    }
+
     const FRAG_MMA: &str = r#"
         @workgroup_size(32)
         kernel frag_mma(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
