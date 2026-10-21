@@ -450,6 +450,9 @@ mod tests {
             }
         );
         let Some(dev) = open_metal() else { return };
+        if !dev.compute_caps().mma.iter().any(|m| m.m == 16) {
+            return;
+        }
         // Extremes, so 300 rounds pass 2^24.
         let a: Vec<i8> = (0..256)
             .map(|i| {
