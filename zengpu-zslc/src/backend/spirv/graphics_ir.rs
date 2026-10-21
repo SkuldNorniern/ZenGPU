@@ -24,6 +24,9 @@ mod glsl_op {
     pub const F_MIN: u32 = 37;
     pub const F_MAX: u32 = 40;
     pub const F_CLAMP: u32 = 43;
+    pub const U_MIN: u32 = 38;
+    pub const U_MAX: u32 = 41;
+    pub const U_CLAMP: u32 = 44;
     pub const F_MIX: u32 = 46;
     pub const STEP: u32 = 48;
     pub const SMOOTH_STEP: u32 = 49;
@@ -391,6 +394,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut t_ptr_func_vec2 = Id(0);
     let mut t_ptr_func_vec3 = Id(0);
     let mut t_ptr_func_vec4 = Id(0);
+    let mut t_ptr_func_mat4 = Id(0);
     let mut locals: HashMap<String, LocalVar> = HashMap::new();
     let mut arrays: HashMap<String, ArrayInfo> = HashMap::new();
     for (name, tid) in &e.locals {
@@ -433,8 +437,10 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             (t_vec3, &mut t_ptr_func_vec3)
         } else if gty == vec4_id {
             (t_vec4, &mut t_ptr_func_vec4)
+        } else if gty == mat4_id {
+            (t_mat4, &mut t_ptr_func_mat4)
         } else {
-            return Err("Mat4 local variables are not supported".into());
+            return Err("unsupported local variable type".into());
         };
         if *slot == Id(0) {
             *slot = spv.type_pointer(sc::FUNCTION, elem_ty);
@@ -1084,9 +1090,19 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
+            if a.ty == ctx.u32_id && b.ty == ctx.u32_id && func != BuiltinFn::Pow {
+                let op = if func == BuiltinFn::Min {
+                    glsl_op::U_MIN
+                } else {
+                    glsl_op::U_MAX
+                };
+                let (t, glsl) = (ctx.t_u32, ctx.glsl_ext);
+                let id = ctx.spv.op_ext_inst(t, glsl, op, &[a.id, b.id]);
+                return Ok(GVal { id, ty: a.ty });
+            }
             let (a, b) = widen_pair(ctx, a, b)?;
             if !(a.ty == ctx.f32_id || is_vec(ctx, a.ty)) {
-                return Err(format!("{name}() requires f32/f32xN args"));
+                return Err(format!("{name}() requires u32 or f32/f32xN args"));
             }
             let opcode = match func {
                 BuiltinFn::Min => glsl_op::F_MIN,
@@ -1103,8 +1119,20 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
                 return Err("clamp(x, lo, hi) takes 3 args".into());
             }
             let x = lower_expr(ctx, &args[0])?;
+            if x.ty == ctx.u32_id {
+                let lo = lower_expr(ctx, &args[1])?;
+                let hi = lower_expr(ctx, &args[2])?;
+                if lo.ty != ctx.u32_id || hi.ty != ctx.u32_id {
+                    return Err("clamp() of a u32 needs u32 bounds".into());
+                }
+                let (t, glsl) = (ctx.t_u32, ctx.glsl_ext);
+                let id = ctx
+                    .spv
+                    .op_ext_inst(t, glsl, glsl_op::U_CLAMP, &[x.id, lo.id, hi.id]);
+                return Ok(GVal { id, ty: x.ty });
+            }
             if !(x.ty == ctx.f32_id || is_vec(ctx, x.ty)) {
-                return Err("clamp() requires f32/f32xN args".into());
+                return Err("clamp() requires u32 or f32/f32xN args".into());
             }
             let lo = lower_expr(ctx, &args[1])?;
             let lo = broadcast(ctx, lo, x.ty)?;

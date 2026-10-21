@@ -458,16 +458,24 @@ impl<'a> Parser<'a> {
                 ));
             }
             let f32_id = self.types.f32_id();
-            if buffer.elem != f32_id {
-                return self.err("atomic_add currently requires buffer<f32>");
+            let u32_id = self.types.u32_id();
+            let i32_id = self.types.i32_id();
+            if ![f32_id, u32_id, i32_id].contains(&buffer.elem) {
+                return self.err("atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>");
             }
             let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
-            let u32_id = self.types.u32_id();
             if index_ty != u32_id && index_ty != f32_id {
                 return self.err("atomic_add index must be a u32- or f32-typed expression");
             }
-            if type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types) != f32_id {
-                return self.err("atomic_add value must be an f32-typed expression");
+            // f32 buffers add f32 values; integer buffers add either integer type, converted.
+            let value_ty = type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types);
+            let fits = if buffer.elem == f32_id {
+                value_ty == f32_id
+            } else {
+                value_ty == u32_id || value_ty == i32_id
+            };
+            if !fits {
+                return self.err("atomic_add value must match the buffer: f32 for buffer<f32>, an integer otherwise");
             }
             return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
         }

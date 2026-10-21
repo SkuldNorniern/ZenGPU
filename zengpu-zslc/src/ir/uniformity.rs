@@ -64,6 +64,11 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
                     | BuiltinFn::WorkgroupReduceMax
                     | BuiltinFn::Mma
                     | BuiltinFn::FragZeroAcc
+                    // Element access syncs the subgroup on backends with opaque layouts.
+                    | BuiltinFn::FragRow
+                    | BuiltinFn::FragCol
+                    | BuiltinFn::FragGet
+                    | BuiltinFn::FragSet
             ) || args.iter().any(expr_contains_subgroup_collective)
         }
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {

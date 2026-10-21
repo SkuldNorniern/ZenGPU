@@ -42,6 +42,7 @@ pub(crate) mod op {
     pub const RETURN: u32 = 253;
     pub const CONTROL_BARRIER: u32 = 224;
     pub const ATOMIC_FADD_EXT: u32 = 6035;
+    pub const ATOMIC_I_ADD: u32 = 234;
     pub const ATOMIC_AND: u32 = 240;
     pub const ATOMIC_OR: u32 = 241;
     pub const IADD: u32 = 128;
@@ -113,6 +114,7 @@ pub(crate) mod op {
     pub const FORD_EQUAL: u32 = 180;
     pub const FORD_NOT_EQUAL: u32 = 182;
     pub const SHIFT_RIGHT_LOGICAL: u32 = 194;
+    pub const SHIFT_RIGHT_ARITHMETIC: u32 = 195;
     pub const SHIFT_LEFT_LOGICAL: u32 = 196;
     pub const BITWISE_OR: u32 = 197;
     pub const BITWISE_XOR: u32 = 198;
@@ -178,6 +180,8 @@ pub(crate) mod cap {
     pub const STORAGE_BUFFER_16BIT_ACCESS: u32 = 4433;
     pub const STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
     pub const COOPERATIVE_MATRIX_KHR: u32 = 6022;
+    pub const VULKAN_MEMORY_MODEL: u32 = 5345;
+    pub const VULKAN_MEMORY_MODEL_DEVICE_SCOPE: u32 = 5346;
     pub const GROUP_NON_UNIFORM: u32 = 61;
     pub const GROUP_NON_UNIFORM_VOTE: u32 = 62;
     pub const GROUP_NON_UNIFORM_ARITHMETIC: u32 = 63;
@@ -227,6 +231,8 @@ pub struct SpvBuilder {
     type_constant_cache: HashMap<(u32, u32), Id>,
     scalar_type_cache: HashMap<(u32, u32, bool), Id>,
     capabilities_seen: Vec<u32>,
+    /// The module has device-scope atomics.
+    atomics: bool,
 }
 
 #[allow(dead_code)]
@@ -248,6 +254,7 @@ impl SpvBuilder {
             capabilities_seen: Vec::new(),
             constant_cache: HashMap::new(),
             type_constant_cache: HashMap::new(),
+            atomics: false,
         }
     }
 
@@ -291,7 +298,7 @@ impl SpvBuilder {
             op::CAPABILITY,
             &[cap::ATOMIC_FLOAT32_ADD_EXT],
         );
-        let name = encode_string("SPV_EXT_shader_atomic_float");
+        let name = encode_string("SPV_EXT_shader_atomic_float_add");
         emit_raw(&mut self.extensions, op::EXTENSION, &name);
     }
 
@@ -636,6 +643,7 @@ impl SpvBuilder {
         semantics: Id,
         value: Id,
     ) -> Id {
+        self.atomics = true;
         let id = self.fresh_id();
         emit(
             &mut self.functions,
@@ -654,6 +662,7 @@ impl SpvBuilder {
         semantics: Id,
         value: Id,
     ) -> Id {
+        self.atomics = true;
         let id = self.fresh_id();
         emit(
             &mut self.functions,
@@ -1354,6 +1363,17 @@ impl SpvBuilder {
         id
     }
 
+    /// Sign-fills, for `i32`.
+    pub fn op_shift_right_arithmetic(&mut self, ty: Id, a: Id, b: Id) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::SHIFT_RIGHT_ARITHMETIC,
+            &[ty.0, id.0, a.0, b.0],
+        );
+        id
+    }
+
     pub fn op_bitfield_sextract(&mut self, ty: Id, base: Id, offset: Id, count: Id) -> Id {
         let id = self.fresh_id();
         emit(
@@ -1522,14 +1542,22 @@ impl SpvBuilder {
         id
     }
 
-    pub fn finish(self) -> Vec<u32> {
+    pub fn finish(mut self) -> Vec<u32> {
+        // Cooperative matrices need the Vulkan memory model (an extension before SPIR-V 1.5).
+        if self
+            .capabilities_seen
+            .contains(&cap::COOPERATIVE_MATRIX_KHR)
+        {
+            self.capability(cap::VULKAN_MEMORY_MODEL);
+            if self.atomics {
+                self.capability(cap::VULKAN_MEMORY_MODEL_DEVICE_SCOPE);
+            }
+            self.extension("SPV_KHR_vulkan_memory_model");
+            self.memory_model.clear();
+            emit(&mut self.memory_model, op::MEMORY_MODEL, &[0, 3]);
+        }
         let bound = self.next_id;
-        let mut out = vec![
-            0x07230203,
-            0x00010300,
-            0x7A656E67,
-            bound, 0,
-        ];
+        let mut out = vec![0x07230203, 0x00010300, 0x7A656E67, bound, 0];
         out.extend_from_slice(&self.capabilities);
         out.extend_from_slice(&self.extensions);
         out.extend_from_slice(&self.imports);
