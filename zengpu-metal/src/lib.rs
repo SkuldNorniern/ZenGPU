@@ -179,6 +179,81 @@ mod tests {
         assert_eq!(read_f32(&*dev, y, 1), vec![1.0]);
     }
 
+    /// Resources Metal cannot create are errors. Metal itself aborts the process on them.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn impossible_resources_are_errors() {
+        use zengpu_hal::{
+            BufferUsage, Format, GpuError, MemoryUsage, TexDim, TextureDesc, TextureUsage,
+        };
+        let Some(dev) = open_metal() else { return };
+        let huge = dev.create_buffer(BufferDesc {
+            size: 1 << 42,
+            usage: BufferUsage::STORAGE,
+            memory: MemoryUsage::GpuOnly,
+        });
+        assert!(matches!(huge, Err(GpuError::OutOfMemory(_))), "{huge:?}");
+
+        let base = TextureDesc {
+            width: 16,
+            height: 16,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::SAMPLED,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        };
+        let bad = [
+            TextureDesc {
+                width: 1 << 16,
+                ..base
+            },
+            TextureDesc {
+                mip_levels: 6,
+                ..base
+            },
+            TextureDesc {
+                dimension: TexDim::D3,
+                depth: 4096,
+                ..base
+            },
+            TextureDesc {
+                array_layers: 4096,
+                ..base
+            },
+            TextureDesc {
+                samples: 3,
+                usage: TextureUsage::RENDER_TARGET,
+                ..base
+            },
+            TextureDesc {
+                samples: 4,
+                array_layers: 2,
+                usage: TextureUsage::RENDER_TARGET,
+                ..base
+            },
+            TextureDesc {
+                dimension: TexDim::Cube,
+                height: 8,
+                array_layers: 6,
+                ..base
+            },
+        ];
+        for desc in bad {
+            assert!(dev.create_texture(desc).is_err(), "{desc:?}");
+        }
+        let full_chain = dev.create_texture(TextureDesc {
+            mip_levels: 5,
+            ..base
+        });
+        assert!(full_chain.is_ok(), "{full_chain:?}");
+        // The device still works.
+        let buf = make_f32(&*dev, &[1.0, 2.0], true);
+        assert_eq!(read_f32(&*dev, buf, 2), vec![1.0, 2.0]);
+    }
+
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
     #[cfg(target_os = "macos")]
