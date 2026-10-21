@@ -755,6 +755,32 @@ mod tests {
         assert!(!vk.zsl().contains("@waves_per_eu"));
     }
 
+    /// Metal: full k blocks run without a masked path, rows are padded at bk 32, and the
+    /// epilogue reuses A's staging memory instead of its own shared array.
+    #[test]
+    fn metal_mma_plan_has_no_branch_or_extra_shared() {
+        let kernel = gemm(DType::F16, DType::F16, 200, 136, 72, [64, 64], 32, true).unwrap();
+        let metal = Target {
+            backend: BackendPreference::Metal,
+            lds_bytes: 32768,
+            ..Target::hip_gfx12()
+        };
+        let sched = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let c = compile_with(&kernel, &sched, &metal).unwrap();
+        assert_eq!(c.schedule_name(), "mma", "{:?}", c.notes());
+        let zsl = c.zsl();
+        assert!(zsl.contains("view sc: array<f32> = sa"), "{zsl}");
+        assert!(!zsl.contains("shared sc"), "{zsl}");
+        assert!(zsl.contains("shared sa: array<f16, 2560>"), "{zsl}");
+        assert!(zsl.contains("min("), "{zsl}");
+        // 72 = 2 full blocks of 32 plus a masked tail.
+        assert!(zsl.contains("for kt in 0..2 {"), "{zsl}");
+        assert!(c.msl().is_ok());
+    }
+
     /// Exact binary16 bits for small integers, quarters and zero.
     fn f16_bits(x: f32) -> u16 {
         if x == 0.0 {
@@ -1140,9 +1166,9 @@ mod tests {
     /// Metal grid: simdgroup matrices, k steps 16 and 32, the same wave splits as HIP.
     fn metal_grid() -> Vec<MmaCfg> {
         let mut grid = Vec::new();
-        for tile in [[32, 32], [64, 32], [64, 64], [128, 64]] {
+        for tile in [[32, 32], [64, 32], [64, 64], [128, 64], [128, 128]] {
             for bk in [16, 32] {
-                for (waves, rows) in [(1, 0), (2, 0), (4, 0), (4, 2)] {
+                for (waves, rows) in [(1, 0), (2, 0), (4, 0), (4, 2), (8, 0)] {
                     for stages in [1, 2] {
                         grid.push(MmaCfg {
                             tile,
