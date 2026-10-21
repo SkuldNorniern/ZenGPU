@@ -237,6 +237,9 @@ fn staged_plan(
         vector_loads: false,
         split_k: 1,
         waves_per_eu: None,
+        clamp_rows: false,
+        pad: 0,
+        alias_epilogue: false,
     })
 }
 
@@ -293,18 +296,38 @@ fn mma_plan(
     };
     let stage_bytes =
         (bm * bk * operand_bytes(parts.a_dtype) + bk * bn * operand_bytes(parts.b_dtype)) as u32;
-    let slice_bytes = (bm * nwc * 16 * 4) as u32;
     let lds = target.lds_bytes;
-    let fits = |stages: u32| stages * stage_bytes + slice_bytes <= lds;
+    // Metal: measured on M1, a branch-free k loop, padded rows at bk >= 32 and an epilogue in A's
+    // staging memory are faster. Not yet measured elsewhere.
+    let metal = target.backend == BackendPreference::Metal;
+    let alias = metal && split_k == 1;
+    let f16 = parts.a_dtype == DType::F16 && parts.b_dtype == DType::F16;
+    let need = |stages: u32, pad: usize| -> u32 {
+        let pad_bytes = ((bm + bn) * pad * 2) as u32;
+        if alias {
+            // The epilogue slice lives in A's (first) staging array, grown if it is smaller.
+            let a_bytes = (bm * (bk + pad) * operand_bytes(parts.a_dtype)) as u32;
+            let slice = (nwr * 16 * nwc * 16 * 4) as u32;
+            stages * (stage_bytes + pad_bytes) + slice.saturating_sub(a_bytes)
+        } else {
+            stages * (stage_bytes + pad_bytes) + (bm * nwc * 16 * 4) as u32
+        }
+    };
     let stages = match schedule.stages {
         0 | 1 => 1,
         2 => 2,
         n => return Err(format!("{n} stages are not supported")),
     };
-    if !fits(stages) {
+    // Padding is dropped when it does not fit.
+    let pad = if metal && bk >= 32 && f16 && need(stages, 8) <= lds {
+        8
+    } else {
+        0
+    };
+    if need(stages, pad) > lds {
         return Err(format!(
             "{stages} stage(s) need {} bytes of LDS, target has {lds}",
-            stages * stage_bytes + slice_bytes
+            need(stages, pad)
         ));
     }
     if waves * wave > 1024 {
@@ -322,6 +345,9 @@ fn mma_plan(
         vector_loads: schedule.vector_loads,
         split_k,
         waves_per_eu: schedule.waves_per_eu,
+        clamp_rows: metal && split_k == 1 && stages == 1,
+        pad,
+        alias_epilogue: alias,
     })
 }
 

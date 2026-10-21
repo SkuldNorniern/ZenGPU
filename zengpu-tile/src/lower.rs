@@ -43,6 +43,15 @@ pub(crate) struct Plan {
     pub split_k: usize,
     /// `Mma` only: `@waves_per_eu(min, max)` for the compiler, or none.
     pub waves_per_eu: Option<(u32, u32)>,
+    /// `Mma` only: the k loop runs full k blocks unmasked, with rows clamped to the tensor (rows
+    /// past it only feed outputs the store drops), then one masked tail block. No branch in the
+    /// hot loop. One stage, no split.
+    pub clamp_rows: bool,
+    /// `Mma` only: elements added to each staged row of A and B, against bank conflicts.
+    pub pad: usize,
+    /// `Mma` only: the epilogue reuses A's staging memory, one fragment at a time, so the
+    /// workgroup needs no extra shared memory. Unsplit only.
+    pub alias_epilogue: bool,
 }
 
 impl Plan {
@@ -62,6 +71,9 @@ impl Plan {
             vector_loads: false,
             split_k: 1,
             waves_per_eu: None,
+            clamp_rows: false,
+            pad: 0,
+            alias_epilogue: false,
         }
     }
 }
@@ -222,6 +234,14 @@ fn row_arg(shape0: usize, r: &str) -> String {
     }
 }
 
+fn dtype_bytes(dtype: DType) -> usize {
+    match dtype {
+        DType::I8 => 1,
+        DType::F16 => 2,
+        DType::F32 | DType::I32 | DType::U32 => 4,
+    }
+}
+
 /// Elements of `dtype` in one 16-byte vector.
 fn vec_lanes(dtype: DType) -> usize {
     match dtype {
@@ -357,8 +377,26 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
     }
 
     let _ = writeln!(src, "for kt in 0..{ksteps} {{");
-    g.stage(&mut src, "sa", parts.a, [bm, bk], StageForm::Rows, wg);
-    g.stage(&mut src, "sb", parts.b, [bn, bk], StageForm::Rows, wg);
+    g.stage(
+        &mut src,
+        "sa",
+        parts.a,
+        [bm, bk],
+        bk,
+        StageForm::Rows,
+        wg,
+        false,
+    );
+    g.stage(
+        &mut src,
+        "sb",
+        parts.b,
+        [bn, bk],
+        bk,
+        StageForm::Rows,
+        wg,
+        false,
+    );
     let _ = writeln!(src, "barrier()");
     for p in 0..per_thread {
         let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
@@ -423,8 +461,10 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         buffer_elem(parts.b_dtype),
         buffer_elem(acc),
     );
+    let alias = plan.alias_epilogue && split == 1;
     let scw = nwc * 16;
-    let slice = bm * scw;
+    // Aliased: one fragment per wave per pass, `nwr * 16` rows. Else a fragment column per pass.
+    let slice = if alias { nwr * 16 * scw } else { bm * scw };
     let per_slice = slice.div_ceil(wg);
     let double = plan.stages == 2;
     let bufs: Vec<(String, String)> = if double {
@@ -444,9 +484,17 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         plan.vector_loads && vector_stage(kernel, parts.a, parts.step),
         plan.vector_loads && vector_stage(kernel, parts.b, parts.step),
     );
+    // Staged row stride. Padding applies to the native row-major layout only.
+    let ldk = bk + plan.pad;
+    // Aliased: A's staging array also holds the f32 epilogue slice.
+    let sa_len = if alias {
+        (bm * ldk).max(slice * 4 / dtype_bytes(ea))
+    } else {
+        bm * ldk
+    };
     for (sa, sb) in &bufs {
-        let _ = writeln!(src, "shared {sa}: array<{}, {}>", buffer_elem(ea), bm * bk);
-        let _ = writeln!(src, "shared {sb}: array<{}, {}>", buffer_elem(eb), bk * bn);
+        let _ = writeln!(src, "shared {sa}: array<{}, {}>", buffer_elem(ea), sa_len);
+        let _ = writeln!(src, "shared {sb}: array<{}, {}>", buffer_elem(eb), bn * ldk);
         if view_a {
             let _ = writeln!(src, "view {sa}v: array<u32x4> = {sa}");
         }
@@ -454,7 +502,11 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
             let _ = writeln!(src, "view {sb}v: array<u32x4> = {sb}");
         }
     }
-    let _ = writeln!(src, "shared sc: array<{fc}, {slice}>");
+    if alias {
+        let _ = writeln!(src, "view sc: array<{fc}> = {}", bufs[0].0);
+    } else {
+        let _ = writeln!(src, "shared sc: array<{fc}, {slice}>");
+    }
     let _ = writeln!(src, "let lid = local_id().x");
     let _ = writeln!(src, "let wv = lid / {wave}");
     let _ = writeln!(src, "let wr = wv / {nwc}");
@@ -475,34 +527,35 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
             x.to_string()
         }
     };
-    let stage = |g: &mut Gen, src: &mut String, (sa, sb): &(String, String), kt: &str| {
-        g.kt = kidx(kt);
-        let form = if plan.vector_loads {
-            StageForm::Vector
-        } else {
-            StageForm::Rows
+    let stage =
+        |g: &mut Gen, src: &mut String, (sa, sb): &(String, String), kt: &str, clamp: bool| {
+            g.kt = kidx(kt);
+            let form = if plan.vector_loads {
+                StageForm::Vector
+            } else {
+                StageForm::Rows
+            };
+            g.stage(src, sa, parts.a, [bm, bk], ldk, form, wg, clamp);
+            let form_b = match (native, plan.vector_loads) {
+                (false, _) => StageForm::Transposed,
+                (true, true) => StageForm::Vector,
+                (true, false) => StageForm::Rows,
+            };
+            g.stage(src, sb, parts.b, [bn, bk], ldk, form_b, wg, clamp);
         };
-        g.stage(src, sa, parts.a, [bm, bk], form, wg);
-        let form_b = match (native, plan.vector_loads) {
-            (false, _) => StageForm::Transposed,
-            (true, true) => StageForm::Vector,
-            (true, false) => StageForm::Rows,
-        };
-        g.stage(src, sb, parts.b, [bn, bk], form_b, wg);
-    };
     let compute = |src: &mut String, (sa, sb): &(String, String)| {
         let _ = writeln!(src, "for kq in 0..{} {{", bk / 16);
         for i in 0..wm {
             let _ = writeln!(
                 src,
-                "let fa{i}: frag<{fa}, 16, 16, a> = frag_load_a({sa}, (wr * {wm} + {i}) * {} + kq * 16, {bk})",
-                16 * bk
+                "let fa{i}: frag<{fa}, 16, 16, a> = frag_load_a({sa}, (wr * {wm} + {i}) * {} + kq * 16, {ldk})",
+                16 * ldk
             );
         }
         for j in 0..wn {
             let col = format!("(wc * {wn} + {j}) * 16");
             let load = if native {
-                format!("frag_load_b_t({sb}, {col} * {bk} + kq * 16, {bk})")
+                format!("frag_load_b_t({sb}, {col} * {ldk} + kq * 16, {ldk})")
             } else {
                 format!("frag_load_b({sb}, kq * {} + {col}, {bn})", 16 * bn)
             };
@@ -516,24 +569,40 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         let _ = writeln!(src, "}}");
     };
 
-    if !double {
+    if plan.clamp_rows {
+        let full = parts.extent / bk;
+        if full > 0 {
+            let _ = writeln!(src, "for kt in 0..{full} {{");
+            stage(&mut g, &mut src, &bufs[0], "kt", true);
+            let _ = writeln!(src, "barrier()");
+            compute(&mut src, &bufs[0]);
+            let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "}}");
+        }
+        if full < ksteps {
+            stage(&mut g, &mut src, &bufs[0], &full.to_string(), false);
+            let _ = writeln!(src, "barrier()");
+            compute(&mut src, &bufs[0]);
+            let _ = writeln!(src, "barrier()");
+        }
+    } else if !double {
         let _ = writeln!(src, "for kt in 0..{ksplit} {{");
-        stage(&mut g, &mut src, &bufs[0], "kt");
+        stage(&mut g, &mut src, &bufs[0], "kt", false);
         let _ = writeln!(src, "barrier()");
         compute(&mut src, &bufs[0]);
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "}}");
     } else {
         let pairs = ksplit / 2;
-        stage(&mut g, &mut src, &bufs[0], "0");
+        stage(&mut g, &mut src, &bufs[0], "0", false);
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "for kp in 0..{pairs} {{");
         let _ = writeln!(src, "let kn: u32 = kp * 2 + 1");
         let _ = writeln!(src, "let kn2: u32 = kp * 2 + 2");
-        stage(&mut g, &mut src, &bufs[1], "kn");
+        stage(&mut g, &mut src, &bufs[1], "kn", false);
         compute(&mut src, &bufs[0]);
         let _ = writeln!(src, "barrier()");
-        stage(&mut g, &mut src, &bufs[0], "kn2");
+        stage(&mut g, &mut src, &bufs[0], "kn2", false);
         compute(&mut src, &bufs[1]);
         let _ = writeln!(src, "barrier()");
         let _ = writeln!(src, "}}");
@@ -543,6 +612,34 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     }
 
     let loop_at = parts.loop_at;
+    if alias {
+        for j in 0..wn {
+            for i in 0..wm {
+                let _ = writeln!(
+                    src,
+                    "frag_store(sc, wr * {} + wc * 16, {scw}, c{i}_{j})",
+                    16 * scw
+                );
+                let _ = writeln!(src, "barrier()");
+                let _ = writeln!(src, "for it in 0..{per_slice} {{");
+                let _ = writeln!(src, "let e = lid + it * {wg}");
+                let _ = writeln!(src, "if e < {slice} {{");
+                let _ = writeln!(src, "let sr = e / {scw}");
+                let _ = writeln!(src, "let ts = e % {scw}");
+                let _ = writeln!(src, "let tr = ((sr / 16) * {wm} + {i}) * 16 + sr % 16");
+                let _ = writeln!(src, "let tc = ((ts / 16) * {wn} + {j}) * 16 + ts % 16");
+                g.values[parts.dot_out.0] = Some("sc[e]".to_string());
+                for stmt in &kernel.body[loop_at + 1..] {
+                    g.stmt(&mut src, stmt)?;
+                }
+                let _ = writeln!(src, "}}");
+                let _ = writeln!(src, "}}");
+                let _ = writeln!(src, "barrier()");
+            }
+        }
+        let _ = writeln!(src, "}}");
+        return Ok(src);
+    }
     for j in 0..wn {
         for i in 0..wm {
             let _ = writeln!(
@@ -773,16 +870,20 @@ impl<'a> Gen<'a> {
     }
 
     /// Copies the `[rows, cols]` block into shared `dst`, with the whole workgroup cooperating.
-    /// `form` is the element layout ([`StageForm`]). Full blocks are copied unmasked, partial
-    /// blocks masked.
+    /// `form` is the element layout ([`StageForm`]); row-major forms put row `r` at `r * ld`.
+    /// Full blocks are copied unmasked, partial blocks masked. `clamp`: the block's columns are
+    /// known to be in range; rows past the tensor read its last row, with no masked path.
+    #[allow(clippy::too_many_arguments)]
     fn stage(
         &mut self,
         out: &mut String,
         dst: &str,
         block: Block,
         [rows, cols]: [usize; 2],
+        ld: usize,
         form: StageForm,
         workgroup: usize,
+        clamp: bool,
     ) {
         let total = rows * cols;
         let per = total.div_ceil(workgroup);
@@ -790,7 +891,7 @@ impl<'a> Gen<'a> {
         let index = if transposed {
             format!("c * {rows} + r")
         } else {
-            format!("r * {cols} + c")
+            format!("r * {ld} + c")
         };
         let decl = &self.kernel.tensors[block.tensor.0];
         let (tr, tc) = (decl.shape[0], decl.shape[1]);
@@ -798,7 +899,17 @@ impl<'a> Gen<'a> {
         let bc = format!("({} * {cols})", affine(block.cols, &self.kt));
         let exact = total % workgroup == 0;
         let (ty, zero) = (scalar(decl.dtype), zero(decl.dtype));
-        let _ = writeln!(out, "if {br} + {rows} <= {tr} && {bc} + {cols} <= {tc} {{");
+        // Global row of block row `r`.
+        let grow = |r: &str| {
+            if clamp && !tr.is_multiple_of(rows) {
+                format!("min({br} + {r}, {})", tr - 1)
+            } else {
+                format!("({br} + {r})")
+            }
+        };
+        if !clamp {
+            let _ = writeln!(out, "if {br} + {rows} <= {tr} && {bc} + {cols} <= {tc} {{");
+        }
         if form == StageForm::Vector && vector_stage(self.kernel, block, cols) {
             let lanes = vec_lanes(decl.dtype);
             let cpr = cols / lanes;
@@ -816,10 +927,15 @@ impl<'a> Gen<'a> {
             let _ = writeln!(out, "let c8 = e % {cpr}");
             let _ = writeln!(
                 out,
-                "let vec16: u32x4 = {alias}[({br} + r) * {} + {acol} * {cpr} + c8]",
+                "let vec16: u32x4 = {alias}[{} * {} + {acol} * {cpr} + c8]",
+                grow("r"),
                 tc / lanes
             );
-            let _ = writeln!(out, "{dst}v[e] = vec16");
+            if ld == cols {
+                let _ = writeln!(out, "{dst}v[e] = vec16");
+            } else {
+                let _ = writeln!(out, "{dst}v[r * {} + c8] = vec16", ld / lanes);
+            }
             if !exact_v {
                 let _ = writeln!(out, "}}");
             }
@@ -834,12 +950,20 @@ impl<'a> Gen<'a> {
             let _ = writeln!(out, "let c = e % {cols}");
             let v = self.name("ld");
             let _ = writeln!(out, "let {v}: {ty} = {zero}");
-            let _ = writeln!(out, "{v} = b_{}[({br} + r) * {tc} + {bc} + c]", decl.name);
+            let _ = writeln!(
+                out,
+                "{v} = b_{}[{} * {tc} + {bc} + c]",
+                decl.name,
+                grow("r")
+            );
             let _ = writeln!(out, "{dst}[{index}] = {v}");
             if !exact {
                 let _ = writeln!(out, "}}");
             }
             let _ = writeln!(out, "}}");
+        }
+        if clamp {
+            return;
         }
         let _ = writeln!(out, "}} else {{");
         let _ = writeln!(out, "for it in 0..{per} {{");
