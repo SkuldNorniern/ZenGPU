@@ -373,6 +373,8 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 | BuiltinFn::FragGet
                 | BuiltinFn::FragSet => return Err(super::compute::frag_unsupported(func.name())),
                 BuiltinFn::F32 => format!("float({})", a[0]),
+                BuiltinFn::RoundEven => format!("rint({})", a[0]),
+                BuiltinFn::FastExp => format!("fast::exp({})", a[0]),
                 _ => format!("{}({})", func.name(), a.join(", ")),
             }
         }

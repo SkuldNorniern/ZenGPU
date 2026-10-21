@@ -352,6 +352,11 @@ struct Ctx<'a> {
     frag_used: Cell<bool>,
 }
 
+fn is_i32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
+    let ty = expr_type_id(ctx, expr);
+    ty == ctx.types.borrow_mut().i32_id()
+}
+
 fn expr_type_id(ctx: &Ctx<'_>, expr: &IrExpr) -> TypeId {
     let mut types = ctx.types.borrow_mut();
     type_of_compute_expr(expr, &ctx.type_ctx, &mut types)
@@ -421,8 +426,7 @@ fn is_mixed_sign_checked_op(op: IrBinOp) -> bool {
 fn builtin_requires_f32(func: BuiltinFn) -> bool {
     matches!(
         func,
-        BuiltinFn::Abs
-            | BuiltinFn::Sign
+        BuiltinFn::Sign
             | BuiltinFn::Exp
             | BuiltinFn::FastExp
             | BuiltinFn::RoundEven
@@ -439,10 +443,7 @@ fn builtin_requires_f32(func: BuiltinFn) -> bool {
             | BuiltinFn::IsNan
             | BuiltinFn::IsInf
             | BuiltinFn::IsFinite
-            | BuiltinFn::Min
-            | BuiltinFn::Max
             | BuiltinFn::Pow
-            | BuiltinFn::Clamp
             | BuiltinFn::Mix
             | BuiltinFn::MulAddF32
     )
@@ -784,6 +785,24 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         DiagnosticCode::Internal,
                         "step and smoothstep are graphics-only",
                     ));
+                }
+                BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp
+                    if !expr_is_f32(ctx, e) =>
+                {
+                    // Integer forms. Operands convert to the call's type, as in arithmetic.
+                    let cty = if is_i32(ctx, e) {
+                        "int"
+                    } else {
+                        "unsigned int"
+                    };
+                    let c: Vec<String> = args_s.iter().map(|a| format!("(({cty})({a}))")).collect();
+                    match func {
+                        BuiltinFn::Abs if cty == "int" => format!("abs({})", c[0]),
+                        BuiltinFn::Abs => c[0].clone(),
+                        BuiltinFn::Min => format!("min({}, {})", c[0], c[1]),
+                        BuiltinFn::Max => format!("max({}, {})", c[0], c[1]),
+                        _ => format!("min(max({}, {}), {})", c[0], c[1], c[2]),
+                    }
                 }
                 BuiltinFn::Abs => format!("fabsf({})", args_s[0]),
                 BuiltinFn::Sign => format!("(({0} > 0.0f) - ({0} < 0.0f))", args_s[0]),
