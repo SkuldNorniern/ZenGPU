@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let inst = {
         let b = Instance::builder();
+        #[cfg(feature = "vulkan")]
         let b = b.try_vulkan().unwrap_or_else(|b| b);
         #[cfg(feature = "cuda")]
         let b = b.cuda();
