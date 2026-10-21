@@ -357,6 +357,250 @@ mod tests {
         }
     }
 
+    /// `frag_row`/`frag_col` name the element `frag_get` reads and `frag_set` writes, and the
+    /// lanes cover all 256 elements once.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fragment_elements_follow_their_mapping() {
+        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FRAG: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel frag_map(src: device buffer<f32>, out: device mut buffer<f32>, bad: device mut buffer<u32>) {
+                let c: frag<f32, 16, 16, acc> = frag_load_acc(src, 0, 16)
+                let miss = frag_len(c) - 8u
+                for i in 0..8 {
+                    let at = frag_row(c, i) * 16u + frag_col(c, i)
+                    if frag_get(c, i) != f32(at) {
+                        miss = miss + 1u
+                    }
+                    c = frag_set(c, i, f32(at) * 2.0)
+                }
+                bad[subgroup_local_id()] = miss
+                frag_store(out, 0, 16, c)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        if !dev.compute_caps().mma.iter().any(|m| m.m == 16) {
+            return;
+        }
+        let src: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let bs = make_f32(&*dev, &src, false);
+        let bo = make_f32(&*dev, &[0.0; 256], true);
+        let bb = dev
+            .create_buffer(BufferDesc {
+                size: 32 * 4,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let sh = dev
+            .create_shader(ShaderDesc::msl(FRAG.msl.unwrap()))
+            .unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[bs.index(), bo.index(), bb.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let bad = dev.read_buffer(bb, 0, 32 * 4).unwrap();
+        assert!(
+            bad.iter().all(|&b| b == 0),
+            "lanes with misplaced elements: {bad:?}"
+        );
+        let out = read_f32(&*dev, bo, 256);
+        let want: Vec<f32> = (0..256).map(|i| 2.0 * i as f32).collect();
+        assert_eq!(out, want);
+    }
+
+    /// i8 x i8 -> i32 `mma` is exact, past the 2^24 where f32 would round.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn integer_mma_is_exact() {
+        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const IMMA: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel imma(a: device buffer<u32>, b: device buffer<u32>, c: device buffer<i32>, out: device mut buffer<i32>, big: device mut buffer<i32>) {
+                let fa: frag<i8, 16, 16, a> = frag_load_a(a, 0, 16)
+                let fb: frag<i8, 16, 16, b> = frag_load_b(b, 0, 16)
+                let fbt: frag<i8, 16, 16, b> = frag_load_b_t(b, 0, 16)
+                let acc: frag<i32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                acc = mma(fa, fb, acc)
+                frag_store(out, 0, 16, acc)
+                let sum: frag<i32, 16, 16, acc> = frag_zero_acc()
+                for r in 0..300 {
+                    sum = mma(fa, fbt, sum)
+                }
+                frag_store(big, 0, 16, sum)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        // Extremes, so 300 rounds pass 2^24.
+        let a: Vec<i8> = (0..256)
+            .map(|i| {
+                if i % 3 == 0 {
+                    -128
+                } else {
+                    127 - (i % 7) as i8
+                }
+            })
+            .collect();
+        let b: Vec<i8> = (0..256)
+            .map(|i| {
+                if i % 5 == 0 {
+                    127
+                } else {
+                    -128 + (i % 11) as i8
+                }
+            })
+            .collect();
+        let c: Vec<i32> = (0..256).map(|i| i * 1000 - 77).collect();
+        let mk = |bytes: Vec<u8>| {
+            let h = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(h, 0, &bytes).unwrap();
+            h
+        };
+        let ba = mk(a.iter().map(|&v| v as u8).collect());
+        let bb = mk(b.iter().map(|&v| v as u8).collect());
+        let bc = mk(c.iter().flat_map(|v| v.to_le_bytes()).collect());
+        let bo = mk(vec![0; 1024]);
+        let bg = mk(vec![0; 1024]);
+        let sh = dev
+            .create_shader(ShaderDesc::msl(IMMA.msl.unwrap()))
+            .unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[ba.index(), bb.index(), bc.index(), bo.index(), bg.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let read = |h| -> Vec<i32> {
+            dev.read_buffer(h, 0, 1024)
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|q| i32::from_le_bytes(*q))
+                .collect()
+        };
+        let (out, big) = (read(bo), read(bg));
+        let at = |m: &[i8], r: usize, k: usize| i32::from(m[r * 16 + k]);
+        for r in 0..16 {
+            for col in 0..16 {
+                let dot: i32 = (0..16).map(|k| at(&a, r, k) * at(&b, k, col)).sum();
+                assert_eq!(
+                    out[r * 16 + col],
+                    dot + c[r * 16 + col],
+                    "A*B+C at ({r}, {col})"
+                );
+                let dot_t: i32 = (0..16).map(|k| at(&a, r, k) * at(&b, col, k)).sum();
+                assert_eq!(
+                    big[r * 16 + col],
+                    300 * dot_t,
+                    "300 * A*B^T at ({r}, {col})"
+                );
+            }
+        }
+        assert!(big.iter().any(|v| v.unsigned_abs() > 1 << 24));
+    }
+
+    /// f16 fragments load from f32 shared arrays, plain and transposed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn half_fragments_load_from_f32_shared() {
+        use zengpu_hal::{Bindings, ComputePipelineDesc};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const STAGED: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel staged(src: device buffer<f32>, out: device mut buffer<f32>, out_t: device mut buffer<f32>, id: global_id) {
+                shared s: array<f32, 256>
+                for k in 0..8 {
+                    s[id.x * 8u + k] = src[id.x * 8u + k]
+                }
+                barrier()
+                let fa: frag<f16, 16, 16, a> = frag_load_a(s, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b(s, 0, 16)
+                let fbt: frag<f16, 16, 16, b> = frag_load_b_t(s, 0, 16)
+                let c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())
+                frag_store(out, 0, 16, c)
+                let ct: frag<f32, 16, 16, acc> = mma(fa, fbt, frag_zero_acc())
+                frag_store(out_t, 0, 16, ct)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        if !dev.compute_caps().mma.iter().any(|m| m.m == 16) {
+            return;
+        }
+        let m: Vec<f32> = (0..256).map(|i| ((i * 7) % 13) as f32 - 6.0).collect();
+        let bs = make_f32(&*dev, &m, false);
+        let bo = make_f32(&*dev, &[0.0; 256], true);
+        let bt = make_f32(&*dev, &[0.0; 256], true);
+        let sh = dev
+            .create_shader(ShaderDesc::msl(STAGED.msl.unwrap()))
+            .unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[bs.index(), bo.index(), bt.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let (out, out_t) = (read_f32(&*dev, bo, 256), read_f32(&*dev, bt, 256));
+        for r in 0..16 {
+            for c in 0..16 {
+                let ab: f32 = (0..16).map(|k| m[r * 16 + k] * m[k * 16 + c]).sum();
+                let abt: f32 = (0..16).map(|k| m[r * 16 + k] * m[c * 16 + k]).sum();
+                assert_eq!(out[r * 16 + c], ab, "A*B at ({r}, {c})");
+                assert_eq!(out_t[r * 16 + c], abt, "A*B^T at ({r}, {c})");
+            }
+        }
+    }
+
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
     #[cfg(target_os = "macos")]
