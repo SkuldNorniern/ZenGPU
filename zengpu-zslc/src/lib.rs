@@ -926,6 +926,30 @@ int main() {{
         }
     }
 
+    /// Shuffles and broadcasts keep the value's type; i32 arithmetic with a u32 literal stays
+    /// signed on MSL (C++ would make it unsigned).
+    #[test]
+    fn integer_shuffles_and_mixed_sign_arithmetic() {
+        let source = r#"
+            @workgroup_size(32)
+            kernel mixed(src: device buffer<i32>, out: device mut buffer<u32>, id: global_id) {
+                let x = src[id.x]
+                let v = subgroup_shuffle(bitcast_u32(x), 1u)
+                out[id.x] = v + select(x - 1 < 0, 1u, 0u)
+            }
+        "#;
+        let module = parse_compute(source).expect("parse");
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        assert!(
+            msl_source.contains("uint v = simd_shuffle("),
+            "{msl_source}"
+        );
+        assert!(msl_source.contains("(x - int(1u))"), "{msl_source}");
+        spirv::lower_compute(&module).expect("SPIR-V");
+        hip::lower_compute(&module).expect("HIP");
+        cuda::lower_compute(&module).expect("CUDA");
+    }
+
     /// `abs`, `min`, `max` and `clamp` take their operands' type. Mixed operands convert as in
     /// arithmetic: f32 if any is f32, else i32 if any is i32.
     #[test]

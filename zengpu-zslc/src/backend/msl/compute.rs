@@ -775,12 +775,31 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             }
         }
         IrExpr::Binary { op, lhs, rhs } => {
-            format!(
-                "({} {} {})",
-                emit_expr(ctx, lhs)?,
-                binop(*op)?,
-                emit_expr(ctx, rhs)?
-            )
+            let mut l = emit_expr(ctx, lhs)?;
+            let mut r = emit_expr(ctx, rhs)?;
+            // C++ makes `int op uint` unsigned. ZSL makes it i32, as SPIR-V does.
+            if !matches!(
+                op,
+                IrBinOp::BitAnd
+                    | IrBinOp::BitOr
+                    | IrBinOp::BitXor
+                    | IrBinOp::Shl
+                    | IrBinOp::Shr
+                    | IrBinOp::And
+                    | IrBinOp::Or
+            ) {
+                let (lt, rt) = (expr_type(ctx, lhs), expr_type(ctx, rhs));
+                let (i32_id, u32_id) = {
+                    let mut types = ctx.types.borrow_mut();
+                    (types.i32_id(), types.u32_id())
+                };
+                if lt == i32_id && rt == u32_id {
+                    r = format!("int({r})");
+                } else if lt == u32_id && rt == i32_id {
+                    l = format!("int({l})");
+                }
+            }
+            format!("({l} {} {r})", binop(*op)?)
         }
         IrExpr::FieldAccess { base, component: c } => {
             format!("{}.{}", emit_expr(ctx, base)?, component(*c))
