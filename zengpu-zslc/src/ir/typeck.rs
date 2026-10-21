@@ -253,7 +253,12 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::SubgroupReduceAnd
             | BuiltinFn::SubgroupReduceOr
             | BuiltinFn::SubgroupScanInclusiveAdd
-            | BuiltinFn::SubgroupScanExclusiveAdd => args
+            | BuiltinFn::SubgroupScanExclusiveAdd
+            | BuiltinFn::SubgroupBroadcast
+            | BuiltinFn::SubgroupShuffle
+            | BuiltinFn::SubgroupShuffleXor
+            | BuiltinFn::SubgroupShuffleUp
+            | BuiltinFn::SubgroupShuffleDown => args
                 .first()
                 .map(|a| type_of_compute_expr(a, ctx, arena))
                 .unwrap_or(f32_id),

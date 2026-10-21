@@ -1763,19 +1763,23 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let value = lower_expr(ctx, &args[0])?;
             let lane = lower_expr(ctx, &args[1])?;
-            if value.ty != ctx.f32_id {
-                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            if ![ctx.f32_id, ctx.i32_id, ctx.u32_id].contains(&value.ty) {
+                return Err(format!(
+                    "ZSL: {}() requires an f32, i32 or u32 value",
+                    func.name()
+                ));
             }
+            let t = ctx.spv_ty(value.ty);
             let lane = coerce(ctx, lane, ctx.u32_id);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
             let id = if matches!(func, BuiltinFn::SubgroupBroadcast) {
                 ctx.spv
-                    .op_group_non_uniform_broadcast(ctx.t_f32, scope, value.id, lane)
+                    .op_group_non_uniform_broadcast(t, scope, value.id, lane)
             } else {
                 ctx.spv
-                    .op_group_non_uniform_shuffle(ctx.t_f32, scope, value.id, lane)
+                    .op_group_non_uniform_shuffle(t, scope, value.id, lane)
             };
-            Ok(Val { id, ty: ctx.f32_id })
+            Ok(Val { id, ty: value.ty })
         }
 
         BuiltinFn::SubgroupShuffleXor => {
@@ -1784,15 +1788,19 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let value = lower_expr(ctx, &args[0])?;
             let mask = lower_expr(ctx, &args[1])?;
-            if value.ty != ctx.f32_id {
-                return Err("ZSL: subgroup_shuffle_xor() requires an f32 value".to_string());
+            if ![ctx.f32_id, ctx.i32_id, ctx.u32_id].contains(&value.ty) {
+                return Err(format!(
+                    "ZSL: {}() requires an f32, i32 or u32 value",
+                    func.name()
+                ));
             }
+            let t = ctx.spv_ty(value.ty);
             let mask = coerce(ctx, mask, ctx.u32_id);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
             let id = ctx
                 .spv
-                .op_group_non_uniform_shuffle_xor(ctx.t_f32, scope, value.id, mask);
-            Ok(Val { id, ty: ctx.f32_id })
+                .op_group_non_uniform_shuffle_xor(t, scope, value.id, mask);
+            Ok(Val { id, ty: value.ty })
         }
 
         BuiltinFn::Dot4I8 | BuiltinFn::Dot4U8 | BuiltinFn::Dot4IU8 => {
@@ -2068,19 +2076,23 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             }
             let value = lower_expr(ctx, &args[0])?;
             let delta = lower_expr(ctx, &args[1])?;
-            if value.ty != ctx.f32_id {
-                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            if ![ctx.f32_id, ctx.i32_id, ctx.u32_id].contains(&value.ty) {
+                return Err(format!(
+                    "ZSL: {}() requires an f32, i32 or u32 value",
+                    func.name()
+                ));
             }
+            let t = ctx.spv_ty(value.ty);
             let delta = coerce(ctx, delta, ctx.u32_id);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 3);
             let id = if matches!(func, BuiltinFn::SubgroupShuffleUp) {
                 ctx.spv
-                    .op_group_non_uniform_shuffle_up(ctx.t_f32, scope, value.id, delta)
+                    .op_group_non_uniform_shuffle_up(t, scope, value.id, delta)
             } else {
                 ctx.spv
-                    .op_group_non_uniform_shuffle_down(ctx.t_f32, scope, value.id, delta)
+                    .op_group_non_uniform_shuffle_down(t, scope, value.id, delta)
             };
-            Ok(Val { id, ty: ctx.f32_id })
+            Ok(Val { id, ty: value.ty })
         }
 
         BuiltinFn::SubgroupReduceAdd
