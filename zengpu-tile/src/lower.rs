@@ -492,8 +492,9 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     } else {
         bm * ldk
     };
-    for (sa, sb) in &bufs {
-        let _ = writeln!(src, "shared {sa}: array<{}, {}>", buffer_elem(ea), sa_len);
+    for (n, (sa, sb)) in bufs.iter().enumerate() {
+        let len = if n == 0 { sa_len } else { bm * ldk };
+        let _ = writeln!(src, "shared {sa}: array<{}, {len}>", buffer_elem(ea));
         let _ = writeln!(src, "shared {sb}: array<{}, {}>", buffer_elem(eb), bn * ldk);
         if view_a {
             let _ = writeln!(src, "view {sa}v: array<u32x4> = {sa}");
@@ -570,7 +571,10 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
     };
 
     if plan.clamp_rows {
-        let full = parts.extent / bk;
+        // Blocks whose columns are inside both tensors; the rest go through the masked copy.
+        let cols = |b: Block| kernel.tensors[b.tensor.0].shape[1];
+        let full = parts.extent.min(cols(parts.a)).min(cols(parts.b)) / bk;
+        let full = full.min(ksteps);
         if full > 0 {
             let _ = writeln!(src, "for kt in 0..{full} {{");
             stage(&mut g, &mut src, &bufs[0], "kt", true);
@@ -580,10 +584,12 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
             let _ = writeln!(src, "}}");
         }
         if full < ksteps {
-            stage(&mut g, &mut src, &bufs[0], &full.to_string(), false);
+            let _ = writeln!(src, "for kr in 0..{} {{", ksteps - full);
+            stage(&mut g, &mut src, &bufs[0], &format!("({full} + kr)"), false);
             let _ = writeln!(src, "barrier()");
             compute(&mut src, &bufs[0]);
             let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "}}");
         }
     } else if !double {
         let _ = writeln!(src, "for kt in 0..{ksplit} {{");
@@ -608,6 +614,10 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         let _ = writeln!(src, "}}");
         if ksplit % 2 == 1 {
             compute(&mut src, &bufs[0]);
+            if alias {
+                // The epilogue overwrites the buffer just read.
+                let _ = writeln!(src, "barrier()");
+            }
         }
     }
 
