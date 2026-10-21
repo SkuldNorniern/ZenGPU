@@ -179,6 +179,7 @@ entry_points! {
     fn hipGetDeviceCount(count: *mut i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceGetName(name: *mut c_char, len: i32, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceTotalMem(bytes: *mut usize, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
+    fn hipDeviceGetPCIBusId(bus_id: *mut c_char, len: i32, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipDeviceComputeCapability(major: *mut i32, minor: *mut i32, device: i32) -> HipError = HIP_ERROR_NOT_SUPPORTED;
     fn hipGetErrorName(code: HipError) -> *const c_char = null();

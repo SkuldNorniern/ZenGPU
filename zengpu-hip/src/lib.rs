@@ -240,6 +240,8 @@ pub struct HipDeviceInfo {
     /// Bare gfx target, e.g. "gfx1200". Empty: hipRTC picks the target.
     pub gfx_target: String,
     pub gfx_family: GfxFamily,
+    /// PCI address from `hipDeviceGetPCIBusId`, e.g. `0000:0b:00.0`. Empty when unknown.
+    pub pci_bus_id: String,
     pub total_mem: usize,
     pub cu_count: u32,
     pub clock_mhz: u32,
@@ -292,6 +294,16 @@ impl HipDeviceInfo {
         let name = unsafe { CStr::from_ptr(name_buf.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+
+        let mut bus_buf = [0 as c_char; 64];
+        let pci_bus_id =
+            if unsafe { hipDeviceGetPCIBusId(bus_buf.as_mut_ptr(), 64, ordinal) } == HIP_SUCCESS {
+                unsafe { CStr::from_ptr(bus_buf.as_ptr()) }
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+            } else {
+                String::new()
+            };
 
         let mut total_mem: usize = 0;
         if unsafe { hipDeviceTotalMem(&mut total_mem, ordinal) } != HIP_SUCCESS {
@@ -350,6 +362,7 @@ impl HipDeviceInfo {
             name,
             gfx_target,
             gfx_family: family,
+            pci_bus_id,
             total_mem,
             cu_count: positive_attribute(HIP_ATTR_MULTIPROCESSOR_COUNT, ordinal).unwrap_or(0),
             clock_mhz: positive_attribute(HIP_ATTR_CLOCK_RATE, ordinal).unwrap_or(0) / 1000,
@@ -3073,6 +3086,7 @@ extern "C" __global__ void classify(const float* in, unsigned int* out) {
                 name: String::new(),
                 gfx_target: "gfx1030".into(),
                 gfx_family: family,
+                pci_bus_id: String::new(),
                 total_mem: 0,
                 cu_count,
                 clock_mhz: 0,
