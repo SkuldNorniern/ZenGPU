@@ -19,6 +19,7 @@ zengpu-hal.workspace = true
 zengpu-zslc.workspace = true
 
 [dev-dependencies]
+zengpu-cuda.workspace = true
 zengpu-hip.workspace = true
 zengpu-metal.workspace = true
 zengpu-vulkan.workspace = true

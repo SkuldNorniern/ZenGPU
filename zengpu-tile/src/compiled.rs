@@ -122,6 +122,13 @@ impl CompiledTile {
                     src.entry,
                 )
             }
+            BackendPreference::Cuda => {
+                let src = self.cuda()?;
+                (
+                    gpu(device.create_shader(ShaderDesc::cuda_src(&src.text)))?,
+                    src.entry,
+                )
+            }
             other => {
                 return Err(TileError::Unsupported(format!(
                     "backend {other:?} has no tile runner"

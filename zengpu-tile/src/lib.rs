@@ -205,6 +205,7 @@ mod tests {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
+    use zengpu_cuda::CudaInstance;
     use zengpu_hal::{
         AdapterRequest, BackendPreference, BufferDesc, BufferHandle, BufferUsage, DeviceRequest,
         GpuDevice, GpuInstance, MemoryUsage,
@@ -403,6 +404,12 @@ mod tests {
         gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap()
     }
 
+    fn cuda_device() -> Option<Box<dyn GpuDevice>> {
+        let inst = CudaInstance::new();
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        adapter.open(DeviceRequest::default()).ok()
+    }
+
     fn hip_device() -> Option<Box<dyn GpuDevice>> {
         let inst = HipInstance::new().ok()?;
         let adapter = inst.request_adapter(AdapterRequest::default())?;
@@ -563,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn gemm_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
+        for case in CASES {
+            run_case(&*dev, &target, case, &Schedule::o0()).unwrap();
+        }
+    }
+
+    #[test]
     fn gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Vulkan);
@@ -588,6 +604,13 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_gemm_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
+        check_scheduled(&*dev, &target);
+    }
+
+    #[test]
     fn scheduled_gemm_on_vulkan() {
         let Some(dev) = vulkan_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Vulkan);
@@ -605,6 +628,13 @@ mod tests {
     fn split_k_on_hip() {
         let Some(dev) = hip_device() else { return };
         let target = caps_target(&*dev, BackendPreference::Hip);
+        check_split(&*dev, &target);
+    }
+
+    #[test]
+    fn split_k_on_cuda() {
+        let Some(dev) = cuda_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Cuda);
         check_split(&*dev, &target);
     }
 
@@ -1463,16 +1493,20 @@ mod tests {
     /// Benchmarks f16 GEMM schedules per shape and prints the results.
     ///
     /// Run with `cargo test --release -p zengpu-tile bench_f16_gemm -- --ignored --nocapture`. Each
-    /// shape runs HIP O0 (to 2048), scalar-staged and an mma search. Vulkan gets a smaller mma
-    /// search. `SPILL` marks spilling configs. The fastest measured config wins. The best HIP
-    /// config is re-run 3x for spread.
+    /// shape runs HIP O0 (to 2048), scalar-staged and an mma search. CUDA gets the HIP search,
+    /// Vulkan a smaller one. `SPILL` marks spilling configs. The fastest measured config wins. The
+    /// best HIP config is re-run 3x for spread. `ZENGPU_TILE_BENCH_BACKEND` (`hip`, `cuda`,
+    /// `vulkan`, `metal`) runs one backend only.
     #[test]
     #[ignore]
     fn bench_f16_gemm() {
-        let hip = hip_device();
-        let vulkan = vulkan_device();
-        let metal = metal_device();
-        if hip.is_none() && vulkan.is_none() && metal.is_none() {
+        let only_backend = env::var("ZENGPU_TILE_BENCH_BACKEND").ok();
+        let wanted = |name: &str| only_backend.as_deref().is_none_or(|b| b == name);
+        let hip = hip_device().filter(|_| wanted("hip"));
+        let cuda = cuda_device().filter(|_| wanted("cuda"));
+        let vulkan = vulkan_device().filter(|_| wanted("vulkan"));
+        let metal = metal_device().filter(|_| wanted("metal"));
+        if hip.is_none() && cuda.is_none() && vulkan.is_none() && metal.is_none() {
             return;
         }
         let naive = env::var_os("ZENGPU_TILE_BENCH_NAIVE").is_some();
@@ -1607,6 +1641,50 @@ mod tests {
                         med.min,
                         med.max,
                         flops / (med.median * 1e-3) / 1e12
+                    ));
+                }
+                for h in handles {
+                    dev.destroy_buffer(h);
+                }
+            }
+
+            if let Some(dev) = &cuda {
+                let dev: &dyn GpuDevice = &**dev;
+                let target = caps_target(dev, BackendPreference::Cuda);
+                let handles = shape_buffers(dev, shape);
+                let base = gemm(DType::F16, DType::F16, m, n, k, [64, 64], 16, true).unwrap();
+                let scalar = Schedule {
+                    matrix: Matrix::Scalar,
+                    ..Schedule::default()
+                };
+                measure(
+                    dev,
+                    &target,
+                    "cuda",
+                    shape,
+                    "scalar-tiled 64x64x16",
+                    &base,
+                    &scalar,
+                    &handles,
+                    naive,
+                );
+                let rows = search(
+                    dev,
+                    &target,
+                    "cuda",
+                    shape,
+                    &hip_grid(),
+                    &[2, 4, 8],
+                    &handles,
+                    naive,
+                );
+                if let Some(best) = pick_best(&rows) {
+                    println!("best cuda search: {} at {:.3} ms", best.label, best.ms);
+                    summary.push(format!(
+                        "| {m} x {n} x {k} | cuda {} | {:.3} | single run | {:.2} |",
+                        best.label,
+                        best.ms,
+                        flops / (best.ms * 1e-3) / 1e12
                     ));
                 }
                 for h in handles {
