@@ -9,9 +9,13 @@ pub enum Trailing {
     /// Every trailing operand is an id-ref.
     AllIds,
     /// Trailing operands are all ids starting at `from` (earlier ones literal).
-    IdsFrom { from: usize },
+    IdsFrom {
+        from: usize,
+    },
     /// A fixed set of trailing operand positions are ids; the rest are literals.
-    IdsAt { idx: &'static [usize] },
+    IdsAt {
+        idx: &'static [usize],
+    },
     /// `OpEntryPoint`: [exec-model lit, fn id, name string…, interface ids…].
     EntryPoint,
     ExtInstImport,
