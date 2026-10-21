@@ -359,7 +359,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `view name: array<T> = base` reinterprets `base`'s bytes as `T` (u32, u32x2, u32x4). Length
+    /// `view name: array<T> = base` reinterprets `base`'s bytes as `T` (u32, u32x2, u32x4, f32, f16). Length
     /// is base bytes / sizeof(T), which must divide evenly.
     pub(super) fn parse_view(&mut self, ctx: &mut Ctx) -> Result<(), ParseError> {
         let name = self.ident()?;
@@ -389,7 +389,15 @@ impl<'a> Parser<'a> {
         let view_bytes = match u32_vec_lanes(&self.types, elem) {
             Some(lanes) => 4 * u32::from(lanes),
             None if elem == self.types.u32_id() => 4,
-            None => return self.err("views are array<u32>, array<u32x2> or array<u32x4>"),
+            None => match storage_elem(&self.types, elem) {
+                Some(StorageElem::F32) => 4,
+                Some(StorageElem::F16) => 2,
+                _ => {
+                    return self.err(
+                        "views are array<u32>, array<u32x2>, array<u32x4>, array<f32> or array<f16>",
+                    );
+                }
+            },
         };
         let total = u64::from(base_len) * u64::from(base_bytes);
         if total % u64::from(view_bytes) != 0 {
