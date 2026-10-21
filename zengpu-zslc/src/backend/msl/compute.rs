@@ -374,6 +374,9 @@ fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str
     }
 }
 
+/// Longest constant-trip loop that is fully unrolled.
+const UNROLL_MAX: u32 = 8;
+
 fn indent(s: &mut String, depth: usize) {
     for _ in 0..depth {
         s.push_str("    ");
@@ -515,6 +518,14 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             s.push('\n');
         }
         IrStmt::For { var, lo, hi, body } => {
+            // Short constant loops unroll fully: Metal's compiler otherwise keeps them as loops,
+            // which costs simdgroup-matrix code its register allocation.
+            if let (IrExpr::LitU32(lo), IrExpr::LitU32(hi)) = (lo, hi)
+                && hi.saturating_sub(*lo) <= UNROLL_MAX
+            {
+                indent(s, depth);
+                s.push_str("_Pragma(\"clang loop unroll(full)\")\n");
+            }
             indent(s, depth);
             let _ = writeln!(
                 s,
