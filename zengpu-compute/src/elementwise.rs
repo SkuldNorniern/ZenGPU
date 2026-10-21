@@ -170,11 +170,18 @@ mod tests {
 
     use zengpu_hal::{AdapterRequest, DeviceRequest, GpuInstance};
     use zengpu_hip::HipInstance;
+    use zengpu_metal::MetalInstance;
 
     use super::*;
 
     fn hip_device() -> Option<Arc<dyn GpuDevice>> {
         let inst = HipInstance::new().ok()?;
+        let adapter = inst.request_adapter(AdapterRequest::default())?;
+        Some(Arc::from(adapter.open(DeviceRequest::default()).ok()?))
+    }
+
+    fn metal_device() -> Option<Arc<dyn GpuDevice>> {
+        let inst = MetalInstance::new();
         let adapter = inst.request_adapter(AdapterRequest::default())?;
         Some(Arc::from(adapter.open(DeviceRequest::default()).ok()?))
     }
@@ -189,6 +196,16 @@ mod tests {
     #[test]
     fn hip_add_then_relu_matches_cpu() {
         let Some(device) = hip_device() else { return };
+        add_then_relu_matches_cpu(device);
+    }
+
+    #[test]
+    fn metal_add_then_relu_matches_cpu() {
+        let Some(device) = metal_device() else { return };
+        add_then_relu_matches_cpu(device);
+    }
+
+    fn add_then_relu_matches_cpu(device: Arc<dyn GpuDevice>) {
         let pool = BufferPool::new(device.clone());
         let kernels = ElementwiseKernels::new(&*device).unwrap();
 
@@ -200,7 +217,9 @@ mod tests {
 
         let sum = kernels.add(&*device, &pool, &da, &db).unwrap();
         let relu = kernels.relu(&*device, &pool, &sum).unwrap();
-        let raw = device.read_buffer(relu.buffer, 0, relu.size_bytes()).unwrap();
+        let raw = device
+            .read_buffer(relu.buffer, 0, relu.size_bytes())
+            .unwrap();
         let got: Vec<f32> = raw
             .as_chunks::<4>()
             .0
