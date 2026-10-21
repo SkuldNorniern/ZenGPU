@@ -108,7 +108,6 @@ required-features = ["vulkan"]
 
 [[example]]
 name = "heavy_compute"
-required-features = ["hip"]
 
 [[example]]
 name = "cube"

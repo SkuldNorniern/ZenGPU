@@ -65,6 +65,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let b = b.try_vulkan().unwrap_or_else(|b| b);
         #[cfg(feature = "cuda")]
         let b = b.cuda();
+        #[cfg(feature = "metal")]
+        let b = b.metal();
+        #[cfg(feature = "hip")]
         let b = b.try_hip().unwrap_or_else(|b| b);
         b.build()
     };
