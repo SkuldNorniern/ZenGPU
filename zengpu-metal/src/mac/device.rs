@@ -412,6 +412,59 @@ impl MetalDevice {
             .ok_or_else(|| GpuError::Backend("metal: invalid texture handle".into()))
     }
 
+    /// Metal aborts the process on a descriptor it cannot create, so limits are checked first.
+    fn check_texture(&self, desc: &TextureDesc) -> Result<()> {
+        let unsupported = |what: String| Err(GpuError::Unsupported(format!("metal: {what}")));
+        let (w, h) = (desc.width, desc.height);
+        let depth = if desc.dimension == TexDim::D3 {
+            desc.depth.max(1)
+        } else {
+            1
+        };
+        let layers = desc.array_layers.max(1);
+        let samples = desc.samples.max(1);
+        let max_extent = if desc.dimension == TexDim::D3 {
+            MAX_TEXTURE_3D
+        } else {
+            MAX_TEXTURE_2D
+        };
+        if w.max(h).max(depth) > max_extent {
+            return unsupported(format!(
+                "{w}x{h}x{depth} texture exceeds {max_extent} per side"
+            ));
+        }
+        if desc.dimension == TexDim::D2 && layers > MAX_TEXTURE_LAYERS {
+            return unsupported(format!("{layers} array layers exceed {MAX_TEXTURE_LAYERS}"));
+        }
+        if desc.dimension == TexDim::Cube && (w != h || layers != 6) {
+            return unsupported(format!(
+                "a cube texture needs square faces and 6 layers, got {w}x{h} with {layers}"
+            ));
+        }
+        let max_mips = 32 - w.max(h).max(depth).leading_zeros();
+        if desc.mip_levels > max_mips {
+            return unsupported(format!(
+                "{} mip levels on a {w}x{h}x{depth} texture; at most {max_mips}",
+                desc.mip_levels
+            ));
+        }
+        if samples > 1 {
+            if !self
+                .inner
+                .device
+                .supports_texture_sample_count(u64::from(samples))
+            {
+                return unsupported(format!("{samples} samples per texel"));
+            }
+            if desc.dimension != TexDim::D2 || layers > 1 || desc.mip_levels > 1 {
+                return unsupported(
+                    "multisampled textures are single-layer 2D with one mip level".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Fails while async work uses the buffer. Its contents belong to the GPU until done.
     fn ensure_not_busy(&self, index: u32, op: &str) -> Result<()> {
         let mut in_flight = lock(&self.inner.in_flight)?;
@@ -734,6 +787,11 @@ impl MetalDevice {
     }
 }
 
+/// Texture size limits on every Metal GPU family ZenGPU runs on (Apple3+ and Mac2).
+const MAX_TEXTURE_2D: u32 = 16384;
+const MAX_TEXTURE_3D: u32 = 2048;
+const MAX_TEXTURE_LAYERS: u32 = 2048;
+
 /// Compute argument table sizes on every Metal GPU family ZenGPU runs on.
 const MAX_BUFFER_SLOTS: usize = 31;
 const MAX_SAMPLER_SLOTS: usize = 16;
@@ -890,10 +948,15 @@ impl GpuDevice for MetalDevice {
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
-        let buf = self
-            .inner
-            .device
-            .new_buffer(desc.size.max(1), MTLResourceOptions::StorageModeShared);
+        let device = &self.inner.device;
+        if desc.size > device.max_buffer_length() {
+            return Err(GpuError::OutOfMemory(desc.memory));
+        }
+        let buf = device.new_buffer(desc.size.max(1), MTLResourceOptions::StorageModeShared);
+        // A failed allocation is nil, and messaging nil returns 0.
+        if buf.length() == 0 {
+            return Err(GpuError::OutOfMemory(desc.memory));
+        }
         Ok(lock(&self.inner.buffers)?.insert(MetalBuffer {
             buf,
             size: desc.size,
@@ -1004,6 +1067,7 @@ impl GpuDevice for MetalDevice {
         if desc.width == 0 || desc.height == 0 {
             return Err(GpuError::Backend("metal: zero-sized texture".into()));
         }
+        self.check_texture(&desc)?;
         let td = TextureDescriptor::new();
         let layers = desc.array_layers.max(1);
         let (ty, depth, array) = match desc.dimension {
