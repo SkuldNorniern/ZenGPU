@@ -659,19 +659,25 @@ int main() {{
     }
 
     #[test]
-    fn subgroup_ballot_is_spirv_only_for_now() {
+    fn subgroup_ballot_lowers_on_every_backend() {
         let module = parse_compute(SUBGROUP_BALLOT).expect("parse ballot");
         assert!(
-            hip::lower_compute(&module).is_err(),
-            "HIP ballot must reject"
+            hip::lower_compute(&module)
+                .expect("HIP")
+                .source
+                .contains("zsl_ballot(")
         );
         assert!(
-            cuda::lower_compute(&module).is_err(),
-            "CUDA ballot must reject"
+            cuda::lower_compute(&module)
+                .expect("CUDA")
+                .source
+                .contains("zsl_ballot(")
         );
         assert!(
-            msl::lower_compute(&module).is_err(),
-            "MSL ballot must reject"
+            msl::lower_compute(&module)
+                .expect("MSL")
+                .source
+                .contains("zsl_ballot(")
         );
         spirv::lower_compute(&module).expect("lower ballot to SPIR-V");
     }
@@ -751,13 +757,17 @@ int main() {{
         assert!(hip_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
         assert!(hip_source.contains("fminf(__zsl_v, __zsl_o)"));
         assert!(hip_source.contains("fmaxf(__zsl_v, __zsl_o)"));
-        assert!(hip_source.contains("__zsl_wg_reduce_f32[0]"));
+        assert!(hip_source.contains("__zsl_s[0]"));
         assert!(cuda_source.contains("__shared__ float __zsl_wg_reduce_f32[256]"));
         assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 256u, "));
         assert!(cuda_source.contains("__syncthreads()"));
         assert!(msl_source.contains("threadgroup float __zsl_wg_reduce_f32[256]"));
-        assert!(msl_source.contains("zsl_wg_reduce<1>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, "));
-        assert!(msl_source.contains("zsl_wg_reduce<2>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, "));
+        assert!(
+            msl_source.contains("zsl_wg_reduce<1, float>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, ")
+        );
+        assert!(
+            msl_source.contains("zsl_wg_reduce<2, float>(__zsl_wg_reduce_f32, __zsl_lid.x, 256u, ")
+        );
         assert!(!msl_source.contains("({"));
         assert!(msl_source.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"));
         spirv::lower_compute(&module).expect("lower workgroup reduce to SPIR-V");
@@ -882,7 +892,7 @@ int main() {{
         let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
         assert!(hip_source.contains("auto __zsl_v = (v + o);"));
         assert!(hip_source.contains("auto __zsl_v = off;"));
-        assert!(hip_source.contains("__zsl_wg_reduce_f32[threadIdx.x] = v;"));
+        assert!(hip_source.contains("__zsl_s[threadIdx.x] = (float)(v);"));
         assert!(cuda_source.contains("zsl_sg_xor_reduce((v + o), ZslAddOp())"));
         assert!(cuda_source.contains("zsl_sg_scan_incl_add(off)"));
         assert!(cuda_source.contains("zsl_wg_reduce(__zsl_wg_reduce_f32, 64u, v, ZslAddOp())"));
@@ -1217,10 +1227,12 @@ int main() {{
         assert!(hip_source.contains("zsl_mma_i8("));
         cuda::lower_compute(&module).expect("lower frag i8 to CUDA");
         spirv::lower_compute(&module).expect("lower frag i8 to SPIR-V");
-        let Err(err) = msl::lower_compute(&module) else {
-            panic!("MSL has no integer simdgroup matrix");
-        };
-        assert!(format!("{err:?}").contains("integer element type"));
+        // MSL: i8 operands as half tiles, the i32 accumulator element-wise.
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower frag i8 to MSL")
+            .source;
+        assert!(msl_source.contains("int2 "), "{msl_source}");
+        assert!(msl_source.contains("+= int2("), "{msl_source}");
     }
 
     const OCCUPANCY_KERNEL: &str = r#"
@@ -1402,10 +1414,13 @@ int main() {{
             .source;
         assert!(cuda_source.contains("zsl_stage_tile(zsl_stage["));
         assert!(cuda_source.contains("nvcuda::wmma::load_matrix_sync(fa"));
-        let Err(err) = msl::lower_compute(&module) else {
-            panic!("MSL stages no a/b tiles from shared arrays");
-        };
-        assert!(format!("{err:?}").contains("shared"));
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower shared frag to MSL")
+            .source;
+        assert!(
+            msl_source.contains("thread_elements()[0] = half("),
+            "{msl_source}"
+        );
         let words = spirv::lower_compute(&module).expect("lower shared frag to SPIR-V");
         let ops = spirv_opcodes(&words);
         assert!(ops.contains(&4457) && ops.contains(&224) && ops.contains(&115));
@@ -1488,7 +1503,7 @@ int main() {{
     }
 
     #[test]
-    fn frag_element_queries_are_rejected_off_hip() {
+    fn frag_element_queries_lower_on_every_backend() {
         const ROW: &str = r#"
             @workgroup_size(32)
             kernel frag_row_probe(out: device mut buffer<u32>, id: global_id) {
@@ -1498,18 +1513,14 @@ int main() {{
         "#;
         let module = parse_compute(ROW).expect("parse frag_row probe");
         assert!(hip::lower_compute(&module).is_ok());
-        let Err(err) = cuda::lower_compute(&module) else {
-            panic!("CUDA has no frag_row lowering");
-        };
-        assert!(format!("{err:?}").contains("frag_row"));
-        let Err(err) = spirv::lower_compute(&module) else {
-            panic!("SPIR-V has no frag_row lowering");
-        };
-        assert!(format!("{err:?}").contains("frag_row"));
-        let Err(err) = msl::lower_compute(&module) else {
-            panic!("MSL has no frag_row lowering");
-        };
-        assert!(format!("{err:?}").contains("frag_row"));
+        let cuda_source = cuda::lower_compute(&module).expect("CUDA").source;
+        assert!(cuda_source.contains("zsl_frag_pos("), "{cuda_source}");
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        assert!(
+            msl_source.contains("zsl_frag_row(__zsl_simd_lane"),
+            "{msl_source}"
+        );
+        spirv::lower_compute(&module).expect("SPIR-V");
     }
 
     const PACKED: &str = r#"
@@ -2099,7 +2110,7 @@ int main() {{
                     .flat_map(|word| word.to_le_bytes())
                     .take_while(|byte| *byte != 0)
                     .collect();
-                atomic_extension |= bytes == b"SPV_EXT_shader_atomic_float";
+                atomic_extension |= bytes == b"SPV_EXT_shader_atomic_float_add";
             }
             at += wc;
         }
@@ -2110,7 +2121,7 @@ int main() {{
         );
         assert!(
             atomic_extension,
-            "missing SPV_EXT_shader_atomic_float extension"
+            "missing SPV_EXT_shader_atomic_float_add extension"
         );
     }
 
@@ -2592,5 +2603,109 @@ int main() {{
             "NVRTC rejected:\n{}",
             failures.join("\n")
         );
+    }
+}
+
+/// Every compute and graphics feature lowers on every backend, and the SPIR-V validates.
+#[cfg(all(test, feature = "test-all-backends"))]
+mod portability_tests {
+    use crate::backend::spirv::graphics_ir::tests::validate;
+    use crate::backend::{cuda, hip, msl, spirv};
+    use crate::frontend::parser::{Shader, parse_zsl};
+
+    fn kernel(params: &str, body: &str) -> String {
+        format!(
+            "@workgroup_size(64)\nkernel probe({params}o: device mut buffer<u32>, of: device mut buffer<f32>, ai: device mut buffer<i32>, id: global_id) {{\nlet i = id.x\nlet u = i * 3u\nlet x = bitcast_i32(u) - 7\nlet f = f32(u) * 0.5\n{body}\n}}\n"
+        )
+    }
+
+    const COMPUTE: &[(&str, &str, &str)] = &[
+        ("i32 bitwise", "", "o[i] = bitcast_u32((x & 3) | (x ^ 5))"),
+        (
+            "i32 shifts",
+            "",
+            "o[i] = bitcast_u32((x >> 2u) + (x << 1u))",
+        ),
+        ("integer sign", "", "o[i] = bitcast_u32(sign(x)) + sign(u)"),
+        (
+            "integer min/max/clamp/abs",
+            "",
+            "o[i] = bitcast_u32(clamp(abs(x), -5, 5) + min(x, 3)) + max(u, 7u)",
+        ),
+        (
+            "i32 reduce and/or",
+            "",
+            "o[i] = bitcast_u32(subgroup_reduce_and(x) | subgroup_reduce_or(x))",
+        ),
+        (
+            "integer workgroup reduce",
+            "",
+            "o[i] = workgroup_reduce_add(u) + bitcast_u32(workgroup_reduce_min(x)) + workgroup_reduce_max(u)",
+        ),
+        (
+            "integer shuffles",
+            "",
+            "o[i] = subgroup_shuffle(u, 1u) + subgroup_broadcast(u, 0u) + bitcast_u32(subgroup_shuffle_xor(x, 1u))",
+        ),
+        (
+            "ballot",
+            "",
+            "let m = subgroup_ballot(u > 3u)\no[i] = m.x + m.y + m.z + m.w + subgroup_ballot(x < 0).x",
+        ),
+        (
+            "integer atomics",
+            "",
+            "atomic_add(o, 0u, u)\natomic_add(ai, 1u, x)\natomic_add(of, 2u, f)",
+        ),
+        (
+            "frag element access",
+            "",
+            "let c: frag<f32, 16, 16, acc> = frag_zero_acc()\nc = frag_set(c, 0u, f)\nof[i] = frag_get(c, 1u) + f32(frag_row(c, 1u) + frag_col(c, 1u) + frag_len(c))\nfrag_store(of, 0u, 16u, c)",
+        ),
+        (
+            "i8 frag element access",
+            "",
+            "shared s: array<i8, 256>\nlet fa: frag<i8, 16, 16, a> = frag_load_a(s, 0u, 16u)\nfa = frag_set(fa, 0u, x)\no[i] = bitcast_u32(frag_get(fa, 1u))",
+        ),
+        (
+            "i8 mma",
+            "",
+            "shared s: array<i8, 256>\nlet fa: frag<i8, 16, 16, a> = frag_load_a(s, 0u, 16u)\nlet fb: frag<i8, 16, 16, b> = frag_load_b_t(s, 0u, 16u)\nlet c: frag<i32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(ai, 0u, 16u, c)",
+        ),
+        (
+            "f16 frags from f32 shared",
+            "",
+            "shared s: array<f32, 256>\nlet fa: frag<f16, 16, 16, a> = frag_load_a(s, 0u, 16u)\nlet fb: frag<f16, 16, 16, b> = frag_load_b_t(s, 0u, 16u)\nlet c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(of, 0u, 16u, c)",
+        ),
+    ];
+
+    #[test]
+    fn compute_features_lower_everywhere_and_validate() {
+        for (name, params, body) in COMPUTE {
+            let src = kernel(params, body);
+            let Ok(Shader::Compute(m)) = parse_zsl(&src) else {
+                panic!("{name}: does not parse\n{src}");
+            };
+            let words =
+                spirv::lower_compute(&m).unwrap_or_else(|e| panic!("{name}: SPIR-V: {e:?}"));
+            validate(&words);
+            msl::lower_compute(&m).unwrap_or_else(|e| panic!("{name}: MSL: {e:?}"));
+            hip::lower_compute(&m).unwrap_or_else(|e| panic!("{name}: HIP: {e:?}"));
+            cuda::lower_compute(&m).unwrap_or_else(|e| panic!("{name}: CUDA: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn graphics_features_lower_everywhere_and_validate() {
+        for src in [
+            "push P { mvp: mat4x4<f32> }\nvertex vs(@location(0) pos: f32x3, p: P) -> f32x4 {\nlet m = p.mvp\nm * pos.extend(1.0)\n}",
+            "push P { n: u32 }\nvertex vs(vi: vertex_index, p: P) -> f32x4 {\nf32x4(f32(min(vi, p.n)), f32(max(vi, 2u)), f32(clamp(vi, 1u, 3u)), 1.0)\n}",
+        ] {
+            let Ok(Shader::Graphics(m)) = parse_zsl(src) else {
+                panic!("does not parse\n{src}");
+            };
+            validate(&spirv::lower_graphics(&m).unwrap_or_else(|e| panic!("SPIR-V: {e:?}\n{src}")));
+            msl::lower_graphics(&m).unwrap_or_else(|e| panic!("MSL: {e:?}\n{src}"));
+        }
     }
 }

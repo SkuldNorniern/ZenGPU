@@ -203,7 +203,21 @@ impl<'a> Parser<'a> {
                     if let Some(load) = self.parse_frag_load(ctx, &name)? {
                         return Ok(load);
                     }
-                    return self.parse_call(ctx, &name);
+                    let call = self.parse_call(ctx, &name)?;
+                    // `.x`..`.w` on a vector result, as `subgroup_ballot(p).x`.
+                    if matches!(self.peek(), Some(Tok::Dot)) {
+                        let ty = type_of_compute_expr(&call, &ctx.type_ctx(), &mut self.types);
+                        if let Some(lanes) = u32_vec_lanes(&self.types, ty) {
+                            self.pos += 1;
+                            let field = self.ident()?;
+                            let component = self.vector_component(&field, lanes)?;
+                            return Ok(IrExpr::FieldAccess {
+                                base: Box::new(call),
+                                component,
+                            });
+                        }
+                    }
+                    return Ok(call);
                 }
                 if self.eat(&Tok::Dot) {
                     let field = self.ident()?;

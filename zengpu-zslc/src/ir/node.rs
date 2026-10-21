@@ -11,8 +11,14 @@ pub enum IrExpr {
     LitF32(f32),
     Local(String),
     ScalarParam(String),
-    BufferLoad { buf: String, index: Box<IrExpr> },
-    SharedLoad { name: String, index: Box<IrExpr> },
+    BufferLoad {
+        buf: String,
+        index: Box<IrExpr>,
+    },
+    SharedLoad {
+        name: String,
+        index: Box<IrExpr>,
+    },
     /// Component 0, 1 or 2. Compute only.
     GlobalId(u32),
     LocalId(u32),
@@ -25,14 +31,26 @@ pub enum IrExpr {
         component: u32,
     },
     /// Mip 0 size along `axis` (0 is width, 1 is height). Compute only.
-    TexSize { tex: String, axis: u32 },
+    TexSize {
+        tex: String,
+        axis: u32,
+    },
     Input(String),
-    FieldAccess { base: Box<IrExpr>, component: u32 },
+    FieldAccess {
+        base: Box<IrExpr>,
+        component: u32,
+    },
     /// Picks `lanes.len()` (2-4) components from `base`. Graphics only.
-    Swizzle { base: Box<IrExpr>, lanes: Vec<u32> },
+    Swizzle {
+        base: Box<IrExpr>,
+        lanes: Vec<u32>,
+    },
     /// Values of the same type, bound by a `let`. Graphics only.
     ArrayLit(Vec<IrExpr>),
-    Index { array: String, index: Box<IrExpr> },
+    Index {
+        array: String,
+        index: Box<IrExpr>,
+    },
     /// An `f32x4` sampled from the texture in slot `index`. Graphics only.
     Sample {
         index: Box<IrExpr>,
@@ -55,7 +73,10 @@ pub enum IrExpr {
         /// `frag_load_b_t`: B is N x K row-major, (k, n) at `offset + n * ld + k`.
         trans: bool,
     },
-    Builtin { func: BuiltinFn, args: Vec<IrExpr> },
+    Builtin {
+        func: BuiltinFn,
+        args: Vec<IrExpr>,
+    },
     Neg(Box<IrExpr>),
     Binary {
         op: IrBinOp,
@@ -67,8 +88,14 @@ pub enum IrExpr {
 #[derive(Debug)]
 pub enum IrStmt {
     /// `name` is pre-declared in `Entry::locals`.
-    Let { name: String, init: IrExpr },
-    AssignLocal { name: String, value: IrExpr },
+    Let {
+        name: String,
+        init: IrExpr,
+    },
+    AssignLocal {
+        name: String,
+        value: IrExpr,
+    },
     AssignBuffer {
         buf: String,
         index: IrExpr,
@@ -81,7 +108,10 @@ pub enum IrStmt {
         value: IrExpr,
     },
     /// Six values: x, y, r, g, b and a. Compute only.
-    ImageStore { image: String, args: Vec<IrExpr> },
+    ImageStore {
+        image: String,
+        args: Vec<IrExpr>,
+    },
     AssignShared {
         name: String,
         index: IrExpr,
@@ -402,7 +432,14 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
         IrExpr::Builtin { func, args } => {
             matches!(
                 func,
-                BuiltinFn::SubgroupId | BuiltinFn::SubgroupLocalId | BuiltinFn::SubgroupSize
+                BuiltinFn::SubgroupId
+                    | BuiltinFn::SubgroupLocalId
+                    | BuiltinFn::SubgroupSize
+                    // Element mappings depend on the lane.
+                    | BuiltinFn::FragRow
+                    | BuiltinFn::FragCol
+                    | BuiltinFn::FragGet
+                    | BuiltinFn::FragSet
             ) || args.iter().any(expr_uses_subgroup_query)
         }
         IrExpr::BufferLoad { index, .. } | IrExpr::SharedLoad { index, .. } => {

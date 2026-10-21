@@ -137,7 +137,6 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
     let i32_id = arena.i32_id();
     let f32_id = arena.f32_id();
     let bool_id = arena.bool_id();
-    let bitset128_id = arena.bitset128_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
         IrExpr::LitF32(_) => f32_id,
@@ -226,7 +225,11 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             BuiltinFn::F16Lo | BuiltinFn::F16Hi | BuiltinFn::BitcastF32 => f32_id,
             BuiltinFn::BitcastI32 | BuiltinFn::SByte => i32_id,
             // Typed like their operands: f32 if any is f32, else i32 if any is i32, else u32.
-            BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp => {
+            BuiltinFn::Abs
+            | BuiltinFn::Sign
+            | BuiltinFn::Min
+            | BuiltinFn::Max
+            | BuiltinFn::Clamp => {
                 let tys: Vec<TypeId> = args
                     .iter()
                     .map(|a| type_of_compute_expr(a, ctx, arena))
@@ -246,7 +249,8 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::IsFinite
             | BuiltinFn::SubgroupAny
             | BuiltinFn::SubgroupAll => bool_id,
-            BuiltinFn::SubgroupBallot => bitset128_id,
+            // Lane n is bit n % 32 of component n / 32. Lanes past subgroup_size() are 0.
+            BuiltinFn::SubgroupBallot => arena.u32_vec_id(4),
             BuiltinFn::SubgroupReduceAdd
             | BuiltinFn::SubgroupReduceMin
             | BuiltinFn::SubgroupReduceMax
@@ -258,7 +262,10 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::SubgroupShuffle
             | BuiltinFn::SubgroupShuffleXor
             | BuiltinFn::SubgroupShuffleUp
-            | BuiltinFn::SubgroupShuffleDown => args
+            | BuiltinFn::SubgroupShuffleDown
+            | BuiltinFn::WorkgroupReduceAdd
+            | BuiltinFn::WorkgroupReduceMin
+            | BuiltinFn::WorkgroupReduceMax => args
                 .first()
                 .map(|a| type_of_compute_expr(a, ctx, arena))
                 .unwrap_or(f32_id),
@@ -274,6 +281,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | IrBinOp::Ne
             | IrBinOp::And
             | IrBinOp::Or => bool_id,
+            IrBinOp::Shl | IrBinOp::Shr => type_of_compute_expr(lhs, ctx, arena),
             _ => {
                 let l = type_of_compute_expr(lhs, ctx, arena);
                 let r = type_of_compute_expr(rhs, ctx, arena);

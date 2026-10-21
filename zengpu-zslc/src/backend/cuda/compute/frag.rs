@@ -1,7 +1,8 @@
 //! CUDA lowering of `frag<…>` onto `nvcuda::wmma` (16x16x16, compute_70+).
 //!
-//! Element mapping is opaque, so only load / mma / store lower. `frag_len`, `frag_row`, `frag_col`,
-//! `frag_get` and `frag_set` are compile errors.
+//! wmma's element mapping is opaque. `frag_row`/`frag_col` find an element by loading a fragment
+//! of the same type from a tile of row (or column) indices; `frag_get` reads `x[i]`; `frag_set`
+//! goes through a per-warp tile so copies of an element held by several lanes stay equal.
 
 use std::fmt::Write;
 
@@ -14,6 +15,60 @@ use crate::ir::types::{FloatFormat, FragUse, IntWidth, Type, TypeId};
 
 pub(super) const FRAG_PRELUDE: &str = r#"#include <cuda_fp16.h>
 #include <mma.h>
+template <typename F> struct zsl_frag_col_major { static const bool value = false; };
+template <typename U, int M, int N, int K, typename T>
+struct zsl_frag_col_major<nvcuda::wmma::fragment<U, M, N, K, T, nvcuda::wmma::col_major> > {
+    static const bool value = true;
+};
+template <typename U, int M, int N, int K, typename T, typename L>
+__device__ __forceinline__ void zsl_frag_fill(nvcuda::wmma::fragment<U, M, N, K, T, L>& f, const T* p) {
+    nvcuda::wmma::load_matrix_sync(f, p, 16);
+}
+template <int M, int N, int K, typename T>
+__device__ __forceinline__ void zsl_frag_fill(nvcuda::wmma::fragment<nvcuda::wmma::accumulator, M, N, K, T, void>& f, const T* p) {
+    nvcuda::wmma::load_matrix_sync(f, p, 16, nvcuda::wmma::mem_row_major);
+}
+// `d` gets each element's row (or column): it is loaded from a tile of indices. `mem` is the
+// warp's first 1 KiB of scratch.
+template <typename U, int M, int N, int K, typename T, typename L>
+__device__ __forceinline__ void zsl_frag_index(nvcuda::wmma::fragment<U, M, N, K, T, L>& d, bool row, unsigned char* mem, unsigned int lane) {
+    T* tile = reinterpret_cast<T*>(mem);
+    const bool col_major = zsl_frag_col_major<nvcuda::wmma::fragment<U, M, N, K, T, L> >::value;
+    __syncwarp();
+    for (unsigned int e = lane; e < 256u; e += 32u) {
+        unsigned int r = col_major ? (e & 15u) : (e >> 4);
+        unsigned int c = col_major ? (e >> 4) : (e & 15u);
+        tile[e] = (T)(float)(row ? r : c);
+    }
+    __syncwarp();
+    zsl_frag_fill(d, tile);
+    __syncwarp();
+}
+template <typename U, int M, int N, int K, typename T, typename L>
+__device__ __forceinline__ unsigned int zsl_frag_pos(const nvcuda::wmma::fragment<U, M, N, K, T, L>&, unsigned int i, bool row, unsigned char* mem, unsigned int lane) {
+    nvcuda::wmma::fragment<U, M, N, K, T, L> d;
+    zsl_frag_index(d, row, mem, lane);
+    return (unsigned int)(float)d.x[i];
+}
+// Every lane writes its elements to the warp's tile, the caller's element changes, and every lane
+// reloads, so duplicated elements stay equal. `mem` is the warp's 2 KiB of scratch.
+template <typename U, int M, int N, int K, typename T, typename L, typename V>
+__device__ __forceinline__ void zsl_frag_set(nvcuda::wmma::fragment<U, M, N, K, T, L>& f, unsigned int i, V v, unsigned char* mem, unsigned int lane) {
+    nvcuda::wmma::fragment<U, M, N, K, T, L> dr, dc;
+    zsl_frag_index(dr, true, mem, lane);
+    zsl_frag_index(dc, false, mem, lane);
+    T* tile = reinterpret_cast<T*>(mem + 1024);
+    for (int k = 0; k < f.num_elements; ++k) {
+        tile[(unsigned int)(float)dr.x[k] * 16u + (unsigned int)(float)dc.x[k]] = f.x[k];
+    }
+    __syncwarp();
+    tile[(unsigned int)(float)dr.x[i] * 16u + (unsigned int)(float)dc.x[i]] = (T)v;
+    __syncwarp();
+    for (int k = 0; k < f.num_elements; ++k) {
+        f.x[k] = tile[(unsigned int)(float)dr.x[k] * 16u + (unsigned int)(float)dc.x[k]];
+    }
+    __syncwarp();
+}
 // wmma cannot convert on load, so `zsl_load` reads the staged `__half` tile.
 __device__ __forceinline__ void zsl_stage_tile(__half* dst, const float* src, unsigned int off, unsigned int ld, unsigned int lane) {
     for (unsigned int i = 0; i < 8u; ++i) {
@@ -99,10 +154,58 @@ pub(super) fn is_frag_statement(e: &IrExpr) -> bool {
         e,
         IrExpr::FragLoad { .. }
             | IrExpr::Builtin {
-                func: BuiltinFn::FragZeroAcc | BuiltinFn::Mma,
+                func: BuiltinFn::FragZeroAcc | BuiltinFn::Mma | BuiltinFn::FragSet,
                 ..
             }
     )
+}
+
+/// Kernel-scope scratch for the element builtins: 2 KiB per warp, and this thread's lane.
+pub(super) fn element_prologue(local_size: [u32; 3], block_size: u32) -> String {
+    let warps = block_size.div_ceil(32);
+    let [lx, ly, _] = local_size;
+    format!(
+        "    __shared__ __align__(16) unsigned char zsl_frag_mem[{warps}][2048];\n\
+         \x20   const unsigned int zsl_frag_lin = threadIdx.x + {lx}u * (threadIdx.y + {ly}u * threadIdx.z);\n\
+         \x20   unsigned char* zsl_frag_scratch = zsl_frag_mem[zsl_frag_lin >> 5];\n\
+         \x20   const unsigned int zsl_frag_lane = zsl_frag_lin & 31u;\n"
+    )
+}
+
+/// `frag_len`, `frag_row`, `frag_col` and `frag_get` as expressions.
+pub(super) fn element_expr(
+    ctx: &Ctx<'_>,
+    func: BuiltinFn,
+    args: &[IrExpr],
+) -> Result<String, Diagnostic> {
+    let IrExpr::Local(f) = &args[0] else {
+        return Err(unsupported(format!(
+            "{}: the first argument must be a frag local",
+            func.name()
+        )));
+    };
+    ctx.frag_elements.set(true);
+    if func == BuiltinFn::FragLen {
+        return Ok(format!("((unsigned int){f}.num_elements)"));
+    }
+    let i = emit_expr(ctx, &args[1])?;
+    Ok(match func {
+        BuiltinFn::FragRow | BuiltinFn::FragCol => format!(
+            "zsl_frag_pos({f}, {i}, {}, zsl_frag_scratch, zsl_frag_lane)",
+            func == BuiltinFn::FragRow
+        ),
+        _ if frag_is_int(ctx, f) => format!("((int)({f}.x[{i}]))"),
+        _ => format!("((float)({f}.x[{i}]))"),
+    })
+}
+
+fn frag_is_int(ctx: &Ctx<'_>, local: &str) -> bool {
+    let types = ctx.types.borrow();
+    ctx.type_ctx
+        .locals
+        .get(local)
+        .and_then(|t| frag_parts(&types, *t))
+        .is_some_and(|(e, _)| matches!(types.get(e), Type::Int { .. }))
 }
 
 fn load_args(
@@ -241,13 +344,7 @@ pub(super) fn let_stmt(
             let off = emit_expr(ctx, offset)?;
             let ldv = emit_expr(ctx, ld)?;
             if *trans {
-                if !matches!(src, FragSrc::Buffer(_) | FragSrc::Shared(_))
-                    || matches!(src, FragSrc::Shared(t) if is_shared_f32(ctx, t))
-                {
-                    return Err(unsupported(
-                        "frag_load_b_t from an f32 shared array is not lowered on CUDA",
-                    ));
-                }
+                // A col_major fragment reads the (staged or direct) row-major block transposed.
                 out = format!("{} {name};", ty.replace("row_major>", "col_major>"));
             }
             let _ = write!(out, " {}", load_stmt(ctx, name, usage, src, &off, &ldv)?);
@@ -280,6 +377,27 @@ pub(super) fn assign_stmt(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<S
 
 fn mma_or_zero(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<String, Diagnostic> {
     match value {
+        IrExpr::Builtin {
+            func: BuiltinFn::FragSet,
+            args,
+        } => {
+            let IrExpr::Local(src) = &args[0] else {
+                return Err(unsupported(
+                    "frag_set: the first argument must be a frag local",
+                ));
+            };
+            ctx.frag_elements.set(true);
+            let copy = if src == name {
+                String::new()
+            } else {
+                format!("{name} = {src}; ")
+            };
+            let i = emit_expr(ctx, &args[1])?;
+            let x = emit_expr(ctx, &args[2])?;
+            Ok(format!(
+                "{copy}zsl_frag_set({name}, {i}, {x}, zsl_frag_scratch, zsl_frag_lane);"
+            ))
+        }
         IrExpr::Builtin {
             func: BuiltinFn::FragZeroAcc,
             ..

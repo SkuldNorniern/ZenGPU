@@ -306,7 +306,11 @@ mod tests {
             }
         "#;
         let e = parse_compute(bad_value).unwrap_err();
-        assert!(e.msg.contains("value must be an f32"), "got: {}", e.msg);
+        assert!(
+            e.msg.contains("value must match the buffer"),
+            "got: {}",
+            e.msg
+        );
     }
 
     #[test]
@@ -522,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_operators_reject_non_u32_operands() {
+    fn bitwise_operators_reject_float_operands() {
         let src = r#"
             @workgroup_size(1)
             kernel k(dst: device mut buffer<f32>, id: global_id) {
@@ -532,7 +536,7 @@ mod tests {
         "#;
         let module = parse_compute(src).expect("parse");
         let err = lower_compute(&module).unwrap_err();
-        assert!(err.message.contains("u32 operands"), "got: {err}");
+        assert!(err.message.contains("u32 or i32 operands"), "got: {err}");
     }
 
     #[test]

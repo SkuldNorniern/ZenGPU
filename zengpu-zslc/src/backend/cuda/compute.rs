@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -124,7 +124,11 @@ pub fn lower_compute(module: &Module) -> Result<CudaShader, Diagnostic> {
     }
 
     s.push_str(
-        "__device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
+        "// Lane n is bit n % 32 of component n / 32.\n\
+         __device__ __forceinline__ uint4 zsl_ballot(bool p) {\n\
+         \x20   return make_uint4(__ballot_sync(0xffffffffu, p), 0u, 0u, 0u);\n\
+         }\n\
+         __device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
          \x20   return __dp4a(a, b, acc);\n\
          }\n\
          __device__ __forceinline__ unsigned int zsl_dot4_u8(unsigned int a, unsigned int b, unsigned int acc) {\n\
@@ -241,7 +245,8 @@ template <typename T> __device__ __forceinline__ T zsl_sg_scan_excl_add(T v) {
     if ((threadIdx.x % warpSize) == 0) excl = T(0);
     return excl;
 }
-template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scratch, unsigned int n, float v, Op op) {
+template <typename T, typename Op> __device__ __forceinline__ T zsl_wg_reduce(float *scratch_f, unsigned int n, T v, Op op) {
+    T *scratch = reinterpret_cast<T *>(scratch_f);
     __syncthreads();
     scratch[threadIdx.x] = v;
     __syncthreads();
@@ -347,9 +352,14 @@ template <typename Op> __device__ __forceinline__ float zsl_wg_reduce(float *scr
         types: RefCell::new(module.types.clone()),
         block_size,
         local_size,
+        frag_elements: Cell::new(false),
     };
+    let body_start = s.len();
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
+    }
+    if ctx.frag_elements.get() {
+        s.insert_str(body_start, &frag::element_prologue(local_size, block_size));
     }
 
     s.push_str("}\n");
@@ -375,6 +385,8 @@ struct Ctx<'a> {
     block_size: u32,
     /// Workgroup dimensions, to linearize `threadIdx` for fragment staging.
     local_size: [u32; 3],
+    /// A fragment element builtin was emitted: the kernel needs their scratch.
+    frag_elements: Cell<bool>,
 }
 
 fn is_i32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
@@ -451,8 +463,7 @@ fn is_mixed_sign_checked_op(op: IrBinOp) -> bool {
 fn builtin_requires_f32(func: BuiltinFn) -> bool {
     matches!(
         func,
-        BuiltinFn::Sign
-            | BuiltinFn::Exp
+        BuiltinFn::Exp
             | BuiltinFn::FastExp
             | BuiltinFn::RoundEven
             | BuiltinFn::Tanh
@@ -602,9 +613,18 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
+            // The value converts to the buffer's element type, which picks the overload.
+            let cty = {
+                let mut types = ctx.types.borrow_mut();
+                match ctx.type_ctx.buffers.get(buf.as_str()) {
+                    Some(&t) if t == types.u32_id() => "unsigned int",
+                    Some(&t) if t == types.i32_id() => "int",
+                    _ => "float",
+                }
+            };
             let _ = writeln!(
                 s,
-                "atomicAdd(&{}[(unsigned int)({})], {});",
+                "atomicAdd(&{}[(unsigned int)({})], ({cty})({}));",
                 buf,
                 emit_expr(ctx, index)?,
                 emit_expr(ctx, value)?
@@ -757,14 +777,11 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
             func: func @ (BuiltinFn::FragZeroAcc | BuiltinFn::Mma),
             ..
         } => return Err(frag::expr_error(func.name())),
-        IrExpr::Builtin { func, .. } if is_frag_builtin(*func) => {
-            return Err(Diagnostic::new(
-                DiagnosticCode::Unsupported,
-                format!(
-                    "CUDA backend: {} has no lowering (wmma fragment element mapping is opaque)",
-                    func.name()
-                ),
-            ));
+        IrExpr::Builtin { func, args } if is_frag_builtin(*func) => {
+            if *func == BuiltinFn::FragSet {
+                return Err(frag::expr_error("frag_set"));
+            }
+            frag::element_expr(ctx, *func, args)?
         }
         IrExpr::Builtin { func, args } => {
             let mut args_s = Vec::with_capacity(args.len());
@@ -800,7 +817,11 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         "step and smoothstep are graphics-only",
                     ));
                 }
-                BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp
+                BuiltinFn::Abs
+                | BuiltinFn::Sign
+                | BuiltinFn::Min
+                | BuiltinFn::Max
+                | BuiltinFn::Clamp
                     if !expr_is_f32(ctx, e) =>
                 {
                     // Integer forms. Operands convert to the call's type, as in arithmetic.
@@ -813,6 +834,10 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     match func {
                         BuiltinFn::Abs if cty == "int" => format!("abs({})", c[0]),
                         BuiltinFn::Abs => c[0].clone(),
+                        BuiltinFn::Sign if cty == "int" => {
+                            format!("(({0} > 0) - ({0} < 0))", c[0])
+                        }
+                        BuiltinFn::Sign => format!("((unsigned int)({} != 0u))", c[0]),
                         BuiltinFn::Min => format!("min({}, {})", c[0], c[1]),
                         BuiltinFn::Max => format!("max({}, {})", c[0], c[1]),
                         _ => format!("min(max({}, {}), {})", c[0], c[1], c[2]),
@@ -918,13 +943,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::SubgroupAll => {
                     format!("((bool)__all_sync(0xffffffffu, (int)({})))", args_s[0])
                 }
-                BuiltinFn::SubgroupBallot => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::Unsupported,
-                        "CUDA backend: subgroup_ballot() is not yet supported \
-                         (needs a 128-bit-capable value representation)",
-                    ));
-                }
+                BuiltinFn::SubgroupBallot => format!("zsl_ballot({})", args_s[0]),
                 BuiltinFn::SubgroupBroadcast | BuiltinFn::SubgroupShuffle => {
                     format!(
                         "__shfl_sync(0xffffffffu, {}, (int)({}))",

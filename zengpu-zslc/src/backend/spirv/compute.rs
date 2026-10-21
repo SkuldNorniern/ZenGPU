@@ -7,6 +7,7 @@
 mod glsl_op {
     pub const F_ABS: u32 = 4;
     pub const S_ABS: u32 = 5;
+    pub const S_SIGN: u32 = 7;
     pub const U_MIN: u32 = 38;
     pub const S_MIN: u32 = 39;
     pub const U_MAX: u32 = 41;
@@ -70,7 +71,14 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 
     spv.capability_shader();
     spv.capability_runtime_descriptor_array();
-    if has_atomic_add(&entry.body) {
+    let mut atomic_bufs = Vec::new();
+    collect_atomic_bufs(&entry.body, &mut atomic_bufs);
+    let f32_elem = module.types.clone().f32_id();
+    let float_atomics = entry.params.iter().any(|p| {
+        atomic_bufs.contains(&p.name.as_str())
+            && matches!(p.kind, ParamKind::Buffer { elem, .. } if elem == f32_elem)
+    });
+    if float_atomics {
         spv.enable_atomic_float32_add_ext();
     }
     let uses_subgroup_query = stmts_use_subgroup_query(&entry.body);
@@ -113,7 +121,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let i32_id = types.i32_id();
     let f32_id = types.f32_id();
     let bool_id = types.bool_id();
-    let bitset128_id = types.bitset128_id();
+    let u32x4_id = types.u32_vec_id(4);
 
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
@@ -509,7 +517,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             (&mut ptr_func_i32, t_i32)
         } else if sty == f32_id {
             (&mut ptr_func_f32, t_f32)
-        } else if sty == bitset128_id || u32_vec_lanes(&types, sty) == Some(4) {
+        } else if sty == u32x4_id || u32_vec_lanes(&types, sty) == Some(4) {
             (&mut ptr_func_uvec4, t_uvec4)
         } else if u32_vec_lanes(&types, sty) == Some(2) {
             (&mut ptr_func_uvec2, t_uvec2)
@@ -554,7 +562,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         i32_id,
         f32_id,
         bool_id,
-        bitset128_id,
+        u32x4_id,
         t_bool,
         t_u32,
         t_i32,
@@ -682,7 +690,7 @@ struct LowerCtx<'a> {
     i32_id: TypeId,
     f32_id: TypeId,
     bool_id: TypeId,
-    bitset128_id: TypeId,
+    u32x4_id: TypeId,
     t_bool: Id,
     t_u32: Id,
     t_i32: Id,
@@ -732,7 +740,7 @@ impl LowerCtx<'_> {
             self.t_i32
         } else if tid == self.f32_id {
             self.t_f32
-        } else if tid == self.bitset128_id {
+        } else if tid == self.u32x4_id {
             self.t_uvec4
         } else {
             match u32_vec_lanes(&self.types, tid) {
@@ -751,15 +759,20 @@ fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), String> {
     Ok(())
 }
 
-fn has_atomic_add(stmts: &[IrStmt]) -> bool {
-    stmts.iter().any(|stmt| match stmt {
-        IrStmt::AtomicAdd { .. } => true,
-        IrStmt::If { then, else_, .. } => {
-            has_atomic_add(then) || else_.as_deref().is_some_and(has_atomic_add)
+fn collect_atomic_bufs<'a>(stmts: &'a [IrStmt], out: &mut Vec<&'a str>) {
+    for s in stmts {
+        match s {
+            IrStmt::AtomicAdd { buf, .. } => out.push(buf),
+            IrStmt::If { then, else_, .. } => {
+                collect_atomic_bufs(then, out);
+                if let Some(e) = else_ {
+                    collect_atomic_bufs(e, out);
+                }
+            }
+            IrStmt::For { body, .. } => collect_atomic_bufs(body, out),
+            _ => {}
         }
-        IrStmt::For { body, .. } => has_atomic_add(body),
-        _ => false,
-    })
+    }
 }
 
 #[allow(clippy::expect_used)]
@@ -862,15 +875,16 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
         }
 
         IrStmt::AtomicAdd { buf, index, value } => {
-            let buf_pc_index = ctx
+            let info = *ctx
                 .buf_params
                 .get(buf)
-                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?
-                .pc_index;
+                .ok_or_else(|| format!("ZSL: `{buf}` is not a buffer param"))?;
+            let buf_pc_index = info.pc_index;
+            let elem = info.elem;
             let table = *ctx
                 .ssbo_tables
-                .get(&ctx.f32_id)
-                .expect("atomic_add requires an f32 SSBO table");
+                .get(&info.table)
+                .ok_or_else(|| format!("ZSL: `{buf}` has no SSBO table"))?;
             let pc_var = ctx
                 .pc_var
                 .ok_or_else(|| "ZSL: no push constant block".to_string())?;
@@ -887,11 +901,17 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
                 &[buf_idx, ctx.const_0_u32, idx_id],
             );
             let rhs = lower_expr(ctx, value)?;
-            let rhs_id = coerce(ctx, rhs, ctx.f32_id);
+            let rhs_id = coerce(ctx, rhs, elem);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
-            ctx.spv
-                .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
+            if elem == ctx.f32_id {
+                ctx.spv
+                    .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
+            } else {
+                let t = ctx.spv_ty(elem);
+                ctx.spv
+                    .op_atomic_int(op::ATOMIC_I_ADD, t, ptr_elem, scope, semantics, rhs_id);
+            }
             Ok(())
         }
 
@@ -1436,19 +1456,32 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
             })
         }
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            if lhs.ty != ctx.u32_id || rhs.ty != ctx.u32_id {
-                return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` currently require u32 operands".into());
+            let ints = [ctx.u32_id, ctx.i32_id];
+            if !ints.contains(&lhs.ty) || !ints.contains(&rhs.ty) {
+                return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` require u32 or i32 operands".into());
             }
-            let ty = ctx.spv_ty(ctx.u32_id);
+            if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
+                // A shift keeps its left operand's type; `>>` sign-fills an i32.
+                let ty_id = lhs.ty;
+                let amount = coerce(ctx, rhs, ty_id);
+                let ty = ctx.spv_ty(ty_id);
+                let id = match op {
+                    IrBinOp::Shl => ctx.spv.op_shift_left_logical(ty, lhs.id, amount),
+                    _ if ty_id == ctx.i32_id => {
+                        ctx.spv.op_shift_right_arithmetic(ty, lhs.id, amount)
+                    }
+                    _ => ctx.spv.op_shift_right_logical(ty, lhs.id, amount),
+                };
+                return Ok(Val { id, ty: ty_id });
+            }
+            let (lhs, rhs) = unify(ctx, lhs, rhs);
+            let ty = ctx.spv_ty(lhs.ty);
             let id = match op {
                 IrBinOp::BitAnd => ctx.spv.op_bitwise_and(ty, lhs.id, rhs.id),
                 IrBinOp::BitOr => ctx.spv.op_bitwise_or(ty, lhs.id, rhs.id),
-                IrBinOp::BitXor => ctx.spv.op_bitwise_xor(ty, lhs.id, rhs.id),
-                IrBinOp::Shl => ctx.spv.op_shift_left_logical(ty, lhs.id, rhs.id),
-                IrBinOp::Shr => ctx.spv.op_shift_right_logical(ty, lhs.id, rhs.id),
-                _ => unreachable!(),
+                _ => ctx.spv.op_bitwise_xor(ty, lhs.id, rhs.id),
             };
-            Ok(Val { id, ty: ctx.u32_id })
+            Ok(Val { id, ty: lhs.ty })
         }
     }
 }
@@ -1466,9 +1499,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
         | BuiltinFn::FragRow
         | BuiltinFn::FragCol
         | BuiltinFn::FragGet
-        | BuiltinFn::FragSet => Err(format!(
-            "SPIR-V backend: {name}() is not lowered: the cooperative matrix element mapping is opaque"
-        )),
+        | BuiltinFn::FragSet => ctx.lower_frag_element(func, args),
         BuiltinFn::I32 => {
             if args.len() != 1 {
                 return Err("ZSL: i32() takes 1 arg".into());
@@ -1531,27 +1562,38 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 ty: ctx.bool_id,
             })
         }
-        BuiltinFn::Abs => {
+        BuiltinFn::Abs | BuiltinFn::Sign => {
             if args.len() != 1 {
                 return Err(format!("ZSL: {name}() takes 1 arg"));
             }
             let v = lower_expr(ctx, &args[0])?;
             let glsl = ctx.glsl_ext;
+            let abs = func == BuiltinFn::Abs;
             let id = if v.ty == ctx.f32_id {
                 let t = ctx.t_f32;
-                ctx.spv.op_ext_inst(t, glsl, glsl_op::F_ABS, &[v.id])
+                let op = if abs { glsl_op::F_ABS } else { glsl_op::F_SIGN };
+                ctx.spv.op_ext_inst(t, glsl, op, &[v.id])
             } else if v.ty == ctx.i32_id {
                 let t = ctx.t_i32;
-                ctx.spv.op_ext_inst(t, glsl, glsl_op::S_ABS, &[v.id])
+                let op = if abs { glsl_op::S_ABS } else { glsl_op::S_SIGN };
+                ctx.spv.op_ext_inst(t, glsl, op, &[v.id])
             } else if v.ty == ctx.u32_id {
-                v.id
+                if abs {
+                    v.id
+                } else {
+                    // 1 for nonzero, else 0.
+                    let zero = ctx.spv.constant_u32(ctx.t_u32, 0);
+                    let one = ctx.spv.constant_u32(ctx.t_u32, 1);
+                    let (t_bool, t_u32) = (ctx.t_bool, ctx.t_u32);
+                    let nz = ctx.spv.op_inot_equal(t_bool, v.id, zero);
+                    ctx.spv.op_select(t_u32, nz, one, zero)
+                }
             } else {
                 return Err(format!("ZSL: {name}() requires f32, i32 or u32"));
             };
             Ok(Val { id, ty: v.ty })
         }
-        BuiltinFn::Sign
-        | BuiltinFn::Exp
+        BuiltinFn::Exp
         | BuiltinFn::FastExp
         | BuiltinFn::RoundEven
         | BuiltinFn::Tanh
@@ -1572,7 +1614,6 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
-                BuiltinFn::Sign => glsl_op::F_SIGN,
                 BuiltinFn::Exp | BuiltinFn::FastExp => glsl_op::EXP,
                 BuiltinFn::RoundEven => glsl_op::ROUND_EVEN,
                 BuiltinFn::Tanh => glsl_op::TANH,
@@ -1753,7 +1794,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 .op_group_non_uniform_ballot(ctx.t_uvec4, scope, pred.id);
             Ok(Val {
                 id,
-                ty: ctx.bitset128_id,
+                ty: ctx.u32x4_id,
             })
         }
 
@@ -2139,9 +2180,16 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err(format!("ZSL: {}(value) takes 1 arg", func.name()));
             }
             let value = lower_expr(ctx, &args[0])?;
-            if value.ty != ctx.f32_id {
-                return Err(format!("ZSL: {}() requires an f32 value", func.name()));
+            let ty = value.ty;
+            if ![ctx.f32_id, ctx.i32_id, ctx.u32_id].contains(&ty) {
+                return Err(format!(
+                    "ZSL: {}() requires an f32, i32 or u32 value",
+                    func.name()
+                ));
             }
+            // The f32 scratch holds integers as their bits.
+            let t_val = ctx.spv_ty(ty);
+            let is_float = ty == ctx.f32_id;
             let var = ctx
                 .workgroup_reduce_var
                 .expect("stmts_use_workgroup_reduce should have detected this call");
@@ -2158,7 +2206,12 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
 
             let chain = reduce_chain(ctx, lid_x);
             let ptr = ctx.spv.op_access_chain(ctx.t_ptr_wg_f32, var, &chain);
-            ctx.spv.op_store(ptr, value.id);
+            let stored = if is_float {
+                value.id
+            } else {
+                ctx.spv.op_bitcast(ctx.t_f32, value.id)
+            };
+            ctx.spv.op_store(ptr, stored);
 
             ctx.spv
                 .op_control_barrier(barrier_scope, barrier_scope, barrier_semantics);
@@ -2179,21 +2232,40 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 let ptr_hi = ctx
                     .spv
                     .op_access_chain(ctx.t_ptr_wg_f32, var, &reduce_chain(ctx, lid_plus_s));
-                let v_lo = ctx.spv.op_load(ctx.t_f32, ptr_lo);
-                let v_hi = ctx.spv.op_load(ctx.t_f32, ptr_hi);
+                let raw_lo = ctx.spv.op_load(ctx.t_f32, ptr_lo);
+                let raw_hi = ctx.spv.op_load(ctx.t_f32, ptr_hi);
+                let (v_lo, v_hi) = if is_float {
+                    (raw_lo, raw_hi)
+                } else {
+                    (
+                        ctx.spv.op_bitcast(t_val, raw_lo),
+                        ctx.spv.op_bitcast(t_val, raw_hi),
+                    )
+                };
+                let glsl = ctx.glsl_ext;
+                let signed = ty == ctx.i32_id;
                 let combined = match func {
-                    BuiltinFn::WorkgroupReduceAdd => ctx.spv.op_fadd(ctx.t_f32, v_lo, v_hi),
-                    BuiltinFn::WorkgroupReduceMin => {
-                        let glsl = ctx.glsl_ext;
-                        ctx.spv
-                            .op_ext_inst(ctx.t_f32, glsl, glsl_op::F_MIN, &[v_lo, v_hi])
+                    BuiltinFn::WorkgroupReduceAdd if is_float => {
+                        ctx.spv.op_fadd(t_val, v_lo, v_hi)
                     }
-                    BuiltinFn::WorkgroupReduceMax => {
-                        let glsl = ctx.glsl_ext;
-                        ctx.spv
-                            .op_ext_inst(ctx.t_f32, glsl, glsl_op::F_MAX, &[v_lo, v_hi])
+                    BuiltinFn::WorkgroupReduceAdd => ctx.spv.op_iadd(t_val, v_lo, v_hi),
+                    _ => {
+                        let min = func == BuiltinFn::WorkgroupReduceMin;
+                        let opcode = match (is_float, signed, min) {
+                            (true, _, true) => glsl_op::F_MIN,
+                            (true, _, false) => glsl_op::F_MAX,
+                            (false, true, true) => glsl_op::S_MIN,
+                            (false, true, false) => glsl_op::S_MAX,
+                            (false, false, true) => glsl_op::U_MIN,
+                            (false, false, false) => glsl_op::U_MAX,
+                        };
+                        ctx.spv.op_ext_inst(t_val, glsl, opcode, &[v_lo, v_hi])
                     }
-                    _ => unreachable!(),
+                };
+                let combined = if is_float {
+                    combined
+                } else {
+                    ctx.spv.op_bitcast(ctx.t_f32, combined)
                 };
                 ctx.spv.op_store(ptr_lo, combined);
                 ctx.spv.op_branch(merge_label);
@@ -2209,11 +2281,13 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let ptr_zero = ctx
                 .spv
                 .op_access_chain(ctx.t_ptr_wg_f32, var, &reduce_chain(ctx, zero_const));
-            let result = ctx.spv.op_load(ctx.t_f32, ptr_zero);
-            Ok(Val {
-                id: result,
-                ty: ctx.f32_id,
-            })
+            let raw = ctx.spv.op_load(ctx.t_f32, ptr_zero);
+            let result = if is_float {
+                raw
+            } else {
+                ctx.spv.op_bitcast(t_val, raw)
+            };
+            Ok(Val { id: result, ty })
         }
     }
 }
@@ -2254,17 +2328,17 @@ fn reduce_opcode(func: BuiltinFn, ty: TypeId, ctx: &LowerCtx<'_>) -> Result<u32,
             }
         }
         BuiltinFn::SubgroupReduceAnd => {
-            if ty == ctx.u32_id {
+            if ty == ctx.u32_id || ty == ctx.i32_id {
                 Ok(op::GROUP_NON_UNIFORM_BITWISE_AND)
             } else {
-                Err("ZSL: subgroup_reduce_and requires u32".to_string())
+                Err("ZSL: subgroup_reduce_and requires u32 or i32".to_string())
             }
         }
         BuiltinFn::SubgroupReduceOr => {
-            if ty == ctx.u32_id {
+            if ty == ctx.u32_id || ty == ctx.i32_id {
                 Ok(op::GROUP_NON_UNIFORM_BITWISE_OR)
             } else {
-                Err("ZSL: subgroup_reduce_or requires u32".to_string())
+                Err("ZSL: subgroup_reduce_or requires u32 or i32".to_string())
             }
         }
         _ => unreachable!(),

@@ -104,14 +104,15 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
     let mut s = String::new();
     s.push_str("#include <metal_stdlib>\nusing namespace metal;\n\n");
     s.push_str(
-        "template <int OP> inline float zsl_wg_reduce(threadgroup float* scratch, uint lid, uint n, float x) {\n\
+        "template <int OP, typename T> inline T zsl_wg_reduce(threadgroup float* scratch_f, uint lid, uint n, T x) {\n\
+         \x20   threadgroup T* scratch = (threadgroup T*)scratch_f;\n\
          \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
          \x20   scratch[lid] = x;\n\
          \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n\
          \x20   for (uint s = n / 2; s > 0; s /= 2) {\n\
          \x20       if (lid < s) {\n\
-         \x20           float o = scratch[lid + s];\n\
-         \x20           float v = scratch[lid];\n\
+         \x20           T o = scratch[lid + s];\n\
+         \x20           T v = scratch[lid];\n\
          \x20           scratch[lid] = OP == 0 ? v + o : OP == 1 ? min(v, o) : max(v, o);\n\
          \x20       }\n\
          \x20       threadgroup_barrier(mem_flags::mem_threadgroup);\n\
@@ -120,7 +121,23 @@ pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
          }\n",
     );
     s.push_str(
-        "inline float zsl_f16_lo(uint x) { return float(as_type<half>(ushort(x & 0xffffu))); }\n\
+        "// A 16x16 fragment is four 8x8 simdgroup matrices (row-major tiles). Each lane holds\n\
+         // two adjacent elements of each tile; element i of a lane is in tile i / 2.\n\
+         inline uint zsl_frag_row(uint lane, uint i) {\n\
+         \x20   return (i / 4u) * 8u + ((lane / 4u) & 4u) + (lane / 2u) % 4u;\n\
+         }\n\
+         inline uint zsl_frag_col(uint lane, uint i) {\n\
+         \x20   return ((i / 2u) % 2u) * 8u + ((lane / 4u) & 2u) * 2u + (lane % 2u) * 2u + i % 2u;\n\
+         }\n\
+         template <typename T> inline float zsl_frag_get(thread simdgroup_matrix<T, 8, 8> (&f)[4], uint i) {\n\
+         \x20   return float(f[i / 2u].thread_elements()[i % 2u]);\n\
+         }\n\
+         // Lane n is bit n % 32 of component n / 32.\n\
+         inline uint4 zsl_ballot(bool p) {\n\
+         \x20   ulong v = static_cast<ulong>(static_cast<simd_vote::vote_t>(simd_ballot(p)));\n\
+         \x20   return uint4(uint(v), uint(v >> 32), 0u, 0u);\n\
+         }\n\
+         inline float zsl_f16_lo(uint x) { return float(as_type<half>(ushort(x & 0xffffu))); }\n\
          inline float zsl_f16_hi(uint x) { return float(as_type<half>(ushort(x >> 16))); }\n\
          inline uint zsl_pack_f16x2(float lo, float hi) {\n\
          \x20   return uint(as_type<ushort>(half(lo))) | (uint(as_type<ushort>(half(hi))) << 16);\n\
@@ -229,7 +246,11 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
     let mut slot = 0u32;
     for (b, buffer_elem) in &buffers {
         let elem = if atomic_buffers.contains(b) {
-            "atomic_float"
+            match msl_buffer_elem(module.types.get(*buffer_elem))? {
+                "uint" => "atomic_uint",
+                "int" => "atomic_int",
+                _ => "atomic_float",
+            }
         } else {
             msl_buffer_elem(module.types.get(*buffer_elem))?
         };
@@ -253,7 +274,8 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
     s.push_str("    uint3 __zsl_gid [[thread_position_in_grid]],\n");
     s.push_str("    uint3 __zsl_lid [[thread_position_in_threadgroup]],\n");
     s.push_str("    uint3 __zsl_group [[threadgroup_position_in_grid]]");
-    let uses_subgroup_query = stmts_use_subgroup_query(&e.body);
+    // Fragments loaded or stored element-wise index by lane.
+    let uses_subgroup_query = stmts_use_subgroup_query(&e.body) || !frags.is_empty();
     if uses_subgroup_query {
         s.push_str(",\n    uint __zsl_simd_size [[threads_per_simdgroup]],\n");
         s.push_str("    uint __zsl_simd_group [[simdgroup_index_in_threadgroup]],\n");
@@ -336,8 +358,37 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
 #[derive(Clone, Copy)]
 struct FragTiles {
     usage: FragUse,
-    /// The tile element: `half` for a/b, `float` for an accumulator.
+    /// `half` (f16 a/b) and `float` (f32 accumulator) are `simdgroup_matrix` tiles. `char` (i8
+    /// a/b) is held as `half` tiles, exact for every i8. `int` (i32 accumulator) is `int2` per
+    /// tile in the lane layout of `zsl_frag_row`/`zsl_frag_col`, since simdgroup matrices have no
+    /// integer type.
     elem: &'static str,
+}
+
+impl FragTiles {
+    /// Elements are moved one at a time through the lane layout, not `simdgroup_load`/`store`.
+    fn by_element(self) -> bool {
+        matches!(self.elem, "char" | "int")
+    }
+
+    /// Scalar type of one element in storage.
+    fn storage(self) -> &'static str {
+        match self.elem {
+            "char" | "half" => "half",
+            other => other,
+        }
+    }
+
+    fn declaration(self, name: &str) -> String {
+        if self.elem == "int" {
+            format!("int2 {name}[{TILES}];")
+        } else {
+            format!(
+                "simdgroup_matrix<{}, 8, 8> {name}[{TILES}];",
+                self.storage()
+            )
+        }
+    }
 }
 
 const TILES: usize = 4;
@@ -404,10 +455,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::Let { name, init } => {
             if let Some(frag) = ctx.frags.get(name.as_str()).copied() {
-                let mut lines = vec![format!(
-                    "simdgroup_matrix<{}, 8, 8> {name}[{TILES}];",
-                    frag.elem
-                )];
+                let mut lines = vec![frag.declaration(name)];
                 lines.extend(frag_fill_lines(ctx, name, frag, init)?);
                 emit_lines(s, depth, &lines);
             } else {
@@ -444,9 +492,15 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
+            // The value converts to the buffer's element type.
+            let cty = ctx
+                .type_ctx
+                .buffers
+                .get(buf.as_str())
+                .map_or("float", |&t| scalar_c_type(ctx, t));
             let _ = writeln!(
                 s,
-                "atomic_fetch_add_explicit(&{}[uint({})], {}, memory_order_relaxed);",
+                "atomic_fetch_add_explicit(&{}[uint({})], {cty}({}), memory_order_relaxed);",
                 buf,
                 emit_expr(ctx, index)?,
                 emit_expr(ctx, value)?
@@ -593,6 +647,13 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             }
             match func {
                 // Overloads need one operand type: convert to the call's type.
+                BuiltinFn::Sign if scalar_c_type(ctx, expr_type(ctx, expr)) != "float" => {
+                    if scalar_c_type(ctx, expr_type(ctx, expr)) == "int" {
+                        format!("(int({0} > 0) - int({0} < 0))", a[0])
+                    } else {
+                        format!("uint({} != 0u)", a[0])
+                    }
+                }
                 BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp => {
                     let ty = expr_type(ctx, expr);
                     let cty = scalar_c_type(ctx, ty);
@@ -616,14 +677,22 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         "a fragment op must be the whole initializer of a `let` or an assignment",
                     ));
                 }
-                BuiltinFn::FragLen
-                | BuiltinFn::FragRow
-                | BuiltinFn::FragCol
-                | BuiltinFn::FragGet
-                | BuiltinFn::FragSet => {
+                // 256 elements over a 32-lane simdgroup.
+                BuiltinFn::FragLen => "8u".to_string(),
+                BuiltinFn::FragRow => format!("zsl_frag_row(__zsl_simd_lane, {})", a[1]),
+                BuiltinFn::FragCol => format!("zsl_frag_col(__zsl_simd_lane, {})", a[1]),
+                BuiltinFn::FragGet => {
+                    let f = frag_local(ctx, &args[0], "frag_get")?;
+                    match ctx.frags.get(f).map(|t| t.elem) {
+                        Some("int") => format!("{}[({}) / 2u][({}) % 2u]", a[0], a[1], a[1]),
+                        Some("char") => format!("int(zsl_frag_get({}, {}))", a[0], a[1]),
+                        _ => format!("zsl_frag_get({}, {})", a[0], a[1]),
+                    }
+                }
+                BuiltinFn::FragSet => {
                     return Err(frag_rejected(
-                        func.name(),
-                        "simdgroup_matrix elements have no per-lane fragment mapping; use HIP",
+                        "frag_set",
+                        "a fragment op must be the whole initializer of a `let` or an assignment",
                     ));
                 }
                 BuiltinFn::F32 => format!("float({})", a[0]),
@@ -670,13 +739,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::SByte => format!("zsl_sbyte({}, {})", a[0], a[1]),
                 BuiltinFn::SubgroupAny => format!("simd_any({})", a[0]),
                 BuiltinFn::SubgroupAll => format!("simd_all({})", a[0]),
-                BuiltinFn::SubgroupBallot => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::Unsupported,
-                        "MSL backend: subgroup_ballot() is not yet supported \
-                         (needs a 128-bit-capable value representation)",
-                    ));
-                }
+                BuiltinFn::SubgroupBallot => format!("zsl_ballot({})", a[0]),
                 BuiltinFn::SubgroupBroadcast => format!("simd_broadcast({}, {})", a[0], a[1]),
                 BuiltinFn::SubgroupShuffle => format!("simd_shuffle({}, {})", a[0], a[1]),
                 BuiltinFn::SubgroupShuffleXor => format!("simd_shuffle_xor({}, {})", a[0], a[1]),
@@ -704,8 +767,9 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         BuiltinFn::WorkgroupReduceMax => 2,
                         _ => unreachable!(),
                     };
+                    let cty = scalar_c_type(ctx, expr_type(ctx, expr));
                     format!(
-                        "zsl_wg_reduce<{op}>(__zsl_wg_reduce_f32, __zsl_lid.x, {}u, {})",
+                        "zsl_wg_reduce<{op}, {cty}>(__zsl_wg_reduce_f32, __zsl_lid.x, {}u, {cty}({}))",
                         ctx.block_size, a[0]
                     )
                 }
@@ -889,6 +953,17 @@ pub(super) fn frag_unsupported(what: &str) -> Diagnostic {
     )
 }
 
+/// The fragment local `e` names, for the element builtins.
+fn frag_local<'e>(ctx: &Ctx<'_>, e: &'e IrExpr, what: &str) -> Result<&'e str, Diagnostic> {
+    match e {
+        IrExpr::Local(n) if ctx.frags.contains_key(n.as_str()) => Ok(n),
+        _ => Err(frag_rejected(
+            what,
+            "the first argument must be a fragment local",
+        )),
+    }
+}
+
 fn frag_rejected(what: &str, why: &str) -> Diagnostic {
     Diagnostic::new(
         DiagnosticCode::Unsupported,
@@ -896,7 +971,7 @@ fn frag_rejected(what: &str, why: &str) -> Diagnostic {
     )
 }
 
-/// MSL `simdgroup_matrix` is only `half` or `float`: packed i8 and i32 fragments are rejected.
+/// f16 and i8 a/b fragments, f32 and i32 accumulators.
 fn frag_tiles(types: &TypeArena, ty: TypeId) -> Result<FragTiles, Diagnostic> {
     let (elem, usage) =
         frag_parts(types, ty).ok_or_else(|| frag_rejected("fragment", "not a fragment type"))?;
@@ -918,25 +993,15 @@ fn frag_tiles(types: &TypeArena, ty: TypeId) -> Result<FragTiles, Diagnostic> {
                 width: IntWidth::W8,
                 ..
             },
-            _,
-        ) => {
-            return Err(frag_rejected(
-                "packed i8 fragment",
-                "simdgroup_matrix has no integer element type",
-            ));
-        }
+            FragUse::A | FragUse::B,
+        ) => "char",
         (
             Type::Int {
                 width: IntWidth::W32,
                 ..
             },
-            _,
-        ) => {
-            return Err(frag_rejected(
-                "i32 fragment",
-                "simdgroup_matrix has no integer element type",
-            ));
-        }
+            FragUse::Acc,
+        ) => "int",
         _ => {
             return Err(frag_rejected(
                 "fragment",
@@ -967,6 +1032,15 @@ fn frag_fill_lines(
         } => {
             let off = emit_expr(ctx, offset)?;
             let ld = emit_expr(ctx, ld)?;
+            // f32 sources convert per element: simdgroup_load cannot narrow.
+            let f32_source = frag.elem == "half"
+                && match src {
+                    FragSrc::Buffer(n) => ctx.buffer_elems.get(n.as_str()) == Some(&"float"),
+                    FragSrc::Shared(n) => ctx.shared_elems.get(n.as_str()) == Some(&"float"),
+                };
+            if frag.by_element() || f32_source {
+                return frag_load_elements(ctx, name, frag, src, &off, &ld, *trans);
+            }
             if *trans && frag.elem != "half" {
                 return Err(frag_rejected(
                     "frag_load_b_t",
@@ -1021,8 +1095,35 @@ fn frag_fill_lines(
             func: BuiltinFn::FragZeroAcc,
             ..
         } => Ok((0..TILES)
-            .map(|t| format!("{name}[{t}] = simdgroup_matrix<{}, 8, 8>(0);", frag.elem))
+            .map(|t| {
+                if frag.elem == "int" {
+                    format!("{name}[{t}] = int2(0);")
+                } else {
+                    format!(
+                        "{name}[{t}] = simdgroup_matrix<{}, 8, 8>(0);",
+                        frag.storage()
+                    )
+                }
+            })
             .collect()),
+        IrExpr::Builtin {
+            func: BuiltinFn::FragSet,
+            args,
+        } => {
+            frag_local(ctx, &args[0], "frag_set")?;
+            // Copies the source fragment unless it is `name` itself.
+            let mut lines = frag_fill_lines(ctx, name, frag, &args[0])?;
+            let i = emit_expr(ctx, &args[1])?;
+            let x = emit_expr(ctx, &args[2])?;
+            let slot = if frag.elem == "int" {
+                format!("{name}[({i}) / 2u][({i}) % 2u]")
+            } else {
+                format!("{name}[({i}) / 2u].thread_elements()[({i}) % 2u]")
+            };
+            lines.push(format!("{slot} = {}({x});", frag.storage()));
+            Ok(lines)
+        }
+        IrExpr::Local(src) if src == name => Ok(Vec::new()),
         IrExpr::Local(src) => {
             let src_frag = ctx.frags.get(src.as_str()).copied().ok_or_else(|| {
                 frag_rejected(
@@ -1047,6 +1148,56 @@ fn frag_fill_lines(
     }
 }
 
+/// i8 and i32 fragments, and f16 fragments from f32 arrays, one element at a time through the
+/// lane layout. `frag_load_b_t` reads element `(r, c)` at `c * ld + r`.
+fn frag_load_elements(
+    ctx: &Ctx<'_>,
+    name: &str,
+    frag: FragTiles,
+    src: &FragSrc,
+    off: &str,
+    ld: &str,
+    trans: bool,
+) -> Result<Vec<String>, Diagnostic> {
+    let (name_src, elem) = match src {
+        FragSrc::Buffer(n) => (n, ctx.buffer_elems.get(n.as_str()).copied()),
+        FragSrc::Shared(n) => (n, ctx.shared_elems.get(n.as_str()).copied()),
+    };
+    let base = match (frag.elem, src, elem) {
+        (e, _, Some(b)) if e == b => name_src.clone(),
+        ("half", _, Some("float")) => name_src.clone(),
+        // Packed i8 in a 32-bit buffer: the offset counts bytes.
+        ("char", FragSrc::Buffer(_), Some("uint" | "int")) => {
+            format!("((device const char*){name_src})")
+        }
+        _ => {
+            return Err(frag_rejected(
+                &format!("frag load from `{name_src}`"),
+                "i8 fragments load i8 arrays or packed 32-bit buffers, and i32 accumulators load i32 arrays",
+            ));
+        }
+    };
+    Ok((0..TILES * 2)
+        .map(|i| {
+            let (r, c) = (
+                format!("zsl_frag_row(__zsl_simd_lane, {i}u)"),
+                format!("zsl_frag_col(__zsl_simd_lane, {i}u)"),
+            );
+            let at = if trans {
+                format!("({off}) + {c} * ({ld}) + {r}")
+            } else {
+                format!("({off}) + {r} * ({ld}) + {c}")
+            };
+            let (t, j) = (i / 2, i % 2);
+            if frag.elem == "int" {
+                format!("{name}[{t}][{j}] = {base}[{at}];")
+            } else {
+                format!("{name}[{t}].thread_elements()[{j}] = half({base}[{at}]);")
+            }
+        })
+        .collect())
+}
+
 /// `mma` as eight `simdgroup_multiply_accumulate` calls. `c` seeds `d`.
 fn mma_lines(
     ctx: &Ctx<'_>,
@@ -1069,10 +1220,12 @@ fn mma_lines(
         .copied()
         .filter(|f| f.usage == FragUse::B)
         .ok_or_else(|| frag_rejected("mma", "the second operand must be a b fragment"))?;
-    if frag.usage != FragUse::Acc || a_frag.elem != "half" || b_frag.elem != "half" {
+    let int_mma = a_frag.elem == "char" && b_frag.elem == "char" && frag.elem == "int";
+    let float_mma = a_frag.elem == "half" && b_frag.elem == "half" && frag.elem == "float";
+    if frag.usage != FragUse::Acc || !(int_mma || float_mma) {
         return Err(frag_rejected(
             "mma",
-            "mma takes f16 a and b and yields an f32 accumulator",
+            "mma takes f16 a and b into an f32 accumulator, or i8 a and b into an i32 one",
         ));
     }
     let mut lines = match c {
@@ -1081,10 +1234,10 @@ fn mma_lines(
                 ctx.frags.get(cn.as_str()).copied().ok_or_else(|| {
                     frag_rejected("mma", "the accumulator must be a fragment local")
                 })?;
-            if c_frag.usage != FragUse::Acc || c_frag.elem != "float" {
+            if c_frag.usage != FragUse::Acc || c_frag.elem != frag.elem {
                 return Err(frag_rejected(
                     "mma",
-                    "the accumulator must be an f32 acc fragment",
+                    "the accumulator must have the result's type",
                 ));
             }
             (0..TILES)
@@ -1095,7 +1248,13 @@ fn mma_lines(
             func: BuiltinFn::FragZeroAcc,
             ..
         } => (0..TILES)
-            .map(|t| format!("{name}[{t}] = simdgroup_matrix<float, 8, 8>(0);"))
+            .map(|t| {
+                if int_mma {
+                    format!("{name}[{t}] = int2(0);")
+                } else {
+                    format!("{name}[{t}] = simdgroup_matrix<float, 8, 8>(0);")
+                }
+            })
             .collect(),
         _ => {
             return Err(frag_rejected(
@@ -1104,6 +1263,25 @@ fn mma_lines(
             ));
         }
     };
+    if int_mma {
+        // Each 8x8x16 partial sum is at most 16 * 128 * 128, exact in f32, then added as i32.
+        for i in 0..2 {
+            for j in 0..2 {
+                lines.push(format!(
+                    "{{ simdgroup_matrix<float, 8, 8> p = simdgroup_matrix<float, 8, 8>(0); \
+                     simdgroup_multiply_accumulate(p, {a}[{}], {b}[{}], p); \
+                     simdgroup_multiply_accumulate(p, {a}[{}], {b}[{}], p); \
+                     {name}[{}] += int2(int(p.thread_elements()[0]), int(p.thread_elements()[1])); }}",
+                    2 * i,
+                    j,
+                    2 * i + 1,
+                    2 + j,
+                    2 * i + j,
+                ));
+            }
+        }
+        return Ok(lines);
+    }
     for i in 0..2 {
         for j in 0..2 {
             for k in 0..2 {
@@ -1133,18 +1311,35 @@ fn frag_store_lines(
             "the value must be a fragment local",
         ));
     };
-    let is_f32_acc = ctx
+    let acc_frag = ctx
         .frags
         .get(acc.as_str())
-        .is_some_and(|f| f.usage == FragUse::Acc && f.elem == "float");
-    if !is_f32_acc {
-        return Err(frag_rejected(
-            "frag_store",
-            "only f32 accumulators can be stored",
-        ));
-    }
+        .copied()
+        .filter(|f| f.usage == FragUse::Acc)
+        .ok_or_else(|| frag_rejected("frag_store", "only accumulators can be stored"))?;
     let off = emit_expr(ctx, offset)?;
     let ld = emit_expr(ctx, ld)?;
+    if acc_frag.elem == "int" {
+        let (dst, elem) = match src {
+            FragSrc::Buffer(n) => (n, ctx.buffer_elems.get(n.as_str()).copied()),
+            FragSrc::Shared(n) => (n, ctx.shared_elems.get(n.as_str()).copied()),
+        };
+        if elem != Some("int") {
+            return Err(frag_rejected(
+                &format!("frag_store to `{dst}`"),
+                "i32 accumulators are stored to i32 buffers or shared arrays",
+            ));
+        }
+        return Ok((0..TILES * 2)
+            .map(|i| {
+                format!(
+                    "{dst}[({off}) + zsl_frag_row(__zsl_simd_lane, {i}u) * ({ld}) + zsl_frag_col(__zsl_simd_lane, {i}u)] = {acc}[{}][{}];",
+                    i / 2,
+                    i % 2
+                )
+            })
+            .collect());
+    }
     let base = match src {
         FragSrc::Buffer(buf) => {
             if ctx.buffer_elems.get(buf.as_str()).copied() != Some("float") {

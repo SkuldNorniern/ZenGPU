@@ -1,9 +1,12 @@
 //! `frag<…>` onto `VK_KHR_cooperative_matrix`: subgroup scope, 16x16x16, MatrixA /
 //! MatrixB / MatrixAccumulator.
 //!
-//! Element-to-lane mapping is opaque, so only load / mma / store lower. Loads read a 16- or
-//! 8-bit view of the `buffer<u32>` binding. Packed i8 fragments address bytes, f16 fragments
-//! address halves.
+//! Loads read a 16- or 8-bit view of the `buffer<u32>` binding. Packed i8 fragments address
+//! bytes, f16 fragments address halves.
+//!
+//! The element-to-lane mapping is opaque, so `frag_get`/`frag_set` go through a per-subgroup
+//! 16x16 scratch tile with a fixed mapping: element `i` of lane `l` is row-major element
+//! `l * 8 + i`, which `frag_row`/`frag_col` report.
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,11 +39,14 @@ pub(super) struct Coop {
     vec_views: HashMap<u8, (Id, Id)>,
     /// Workgroup f16 staging array for `frag_load_a|b`: the variable and its pointer type.
     stage: Option<(Id, Id)>,
+    /// Workgroup scratch tiles for element access, keyed by component type.
+    scratch: HashMap<Id, (Id, Id)>,
 }
 
 /// Subgroup size pinned to match `zengpu-vulkan`, with one 16x16 tile per subgroup.
 const SUBGROUP_LANES: u32 = 32;
 const TILE_ELEMS: u32 = 16 * 16;
+const ELEMS_PER_LANE: u32 = TILE_ELEMS / SUBGROUP_LANES;
 const SEMANTICS_WG_ACQ_REL: u32 = 0x108;
 
 impl Coop {
@@ -132,6 +138,26 @@ impl Coop {
         let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
         let t_ptr_elem = spv.type_pointer(sc::WORKGROUP, t_f16);
         self.stage = Some((var, t_ptr_elem));
+        (var, t_ptr_elem)
+    }
+
+    /// One 16x16 tile of `component` per subgroup.
+    fn scratch(
+        &mut self,
+        spv: &mut SpvBuilder,
+        t_u32: Id,
+        component: Id,
+        subgroups: u32,
+    ) -> (Id, Id) {
+        if let Some(&s) = self.scratch.get(&component) {
+            return s;
+        }
+        let len = spv.constant_u32(t_u32, subgroups * TILE_ELEMS);
+        let array_ty = spv.type_array(component, len);
+        let ptr_ty = spv.type_pointer_global(sc::WORKGROUP, array_ty);
+        let var = spv.global_variable(ptr_ty, sc::WORKGROUP);
+        let t_ptr_elem = spv.type_pointer(sc::WORKGROUP, component);
+        self.scratch.insert(component, (var, t_ptr_elem));
         (var, t_ptr_elem)
     }
 
@@ -275,17 +301,6 @@ impl LowerCtx<'_> {
     ) -> Result<Val, String> {
         let (_, usage) =
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
-        if trans
-            && let FragSrc::Shared(name) = src
-            && self
-                .shared
-                .get(name)
-                .is_some_and(|sv| self.is_f32_shared(sv))
-        {
-            return Err(format!(
-                "ZSL: SPIR-V frag_load_b_t from f32 shared `{name}` is not lowered (stage it as f16 first)"
-            ));
-        }
         if let FragSrc::Shared(name) = src
             && usage != FragUse::Acc
             && self
@@ -293,7 +308,7 @@ impl LowerCtx<'_> {
                 .get(name)
                 .is_some_and(|sv| self.is_f32_shared(sv))
         {
-            return self.lower_shared_frag_ab(name, ty, offset, ld);
+            return self.lower_shared_frag_ab(name, ty, offset, ld, trans);
         }
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let ptr = self.frag_elem_ptr(src, ty, off)?;
@@ -307,18 +322,20 @@ impl LowerCtx<'_> {
         Ok(Val { id, ty })
     }
 
-    /// Loads from f32 shared via `frag_load_a|b(shared, offset, ld)`.
+    /// Loads from f32 shared via `frag_load_a|b|b_t(shared, offset, ld)`.
     ///
     /// Cooperative loads cannot convert, so each lane writes its share as f16 into its subgroup's
     /// slice of a workgroup f16 array, then the subgroup loads it. Element `e = lane + 32 * i` is
     /// `(2 * i + lane / 16, lane % 16)`: lane `l` reads
-    /// `off + (l / 16) * ld + l % 16 + 2 * i * ld`.
+    /// `off + (l / 16) * ld + l % 16 + 2 * i * ld`, or transposed
+    /// `off + (l % 16) * ld + l / 16 + 2 * i`.
     fn lower_shared_frag_ab(
         &mut self,
         name: &str,
         ty: TypeId,
         offset: &IrExpr,
         ld: &IrExpr,
+        trans: bool,
     ) -> Result<Val, String> {
         let sv = *self
             .shared
@@ -333,8 +350,7 @@ impl LowerCtx<'_> {
         let tile_zero = self.spv.constant_u32(self.t_u32, 0);
         let (off, stride) = self.frag_offset_and_stride(offset, ld)?;
         let coop_ty = self.frag_spv_ty(ty)?;
-        let [sx, sy, sz] = self.local_size;
-        let subgroups = (sx * sy * sz).div_ceil(SUBGROUP_LANES);
+        let subgroups = self.subgroups();
         let (stage, t_ptr_f16) = self.coop.stage(self.spv, self.t_u32, subgroups);
         let t_f16 = self.coop.t_f16(self.spv);
         let t_u32 = self.t_u32;
@@ -342,32 +358,23 @@ impl LowerCtx<'_> {
         let scope = self.spv.constant_u32(t_u32, SCOPE_SUBGROUP);
         let semantics = self.spv.constant_u32(t_u32, SEMANTICS_WG_ACQ_REL);
 
-        let lid3 = self.spv.op_load(self.t_uvec3, self.lid_var);
-        let x = self.spv.op_composite_extract(t_u32, lid3, &[0]);
-        let y = self.spv.op_composite_extract(t_u32, lid3, &[1]);
-        let z = self.spv.op_composite_extract(t_u32, lid3, &[2]);
-        let sy_c = self.spv.constant_u32(t_u32, sy);
-        let sx_c = self.spv.constant_u32(t_u32, sx);
-        let zs = self.spv.op_imul(t_u32, z, sy_c);
-        let ys = self.spv.op_iadd(t_u32, y, zs);
-        let ys_sx = self.spv.op_imul(t_u32, ys, sx_c);
-        let lin = self.spv.op_iadd(t_u32, x, ys_sx);
-        let c31 = self.spv.constant_u32(t_u32, SUBGROUP_LANES - 1);
-        let lane = self.spv.op_bitwise_and(t_u32, lin, c31);
-        let c5 = self.spv.constant_u32(t_u32, 5);
-        let sub = self.spv.op_shift_right_logical(t_u32, lin, c5);
-        let c8 = self.spv.constant_u32(t_u32, 8);
-        let slice = self.spv.op_shift_left_logical(t_u32, sub, c8);
+        let (lane, slice) = self.frag_lane_and_slice();
 
         let c4 = self.spv.constant_u32(t_u32, 4);
         let row_hi = self.spv.op_shift_right_logical(t_u32, lane, c4);
         let c15 = self.spv.constant_u32(t_u32, 15);
         let col = self.spv.op_bitwise_and(t_u32, lane, c15);
-        let row_off = self.spv.op_imul(t_u32, row_hi, stride);
-        let base = self.spv.op_iadd(t_u32, off, row_off);
-        let mut src_idx = self.spv.op_iadd(t_u32, base, col);
+        // The source index steps by two rows: 2 * ld, or 2 when transposed.
+        let (outer, inner) = if trans { (col, row_hi) } else { (row_hi, col) };
+        let outer_off = self.spv.op_imul(t_u32, outer, stride);
+        let base = self.spv.op_iadd(t_u32, off, outer_off);
+        let mut src_idx = self.spv.op_iadd(t_u32, base, inner);
         let c1 = self.spv.constant_u32(t_u32, 1);
-        let step = self.spv.op_shift_left_logical(t_u32, stride, c1);
+        let step = if trans {
+            self.spv.constant_u32(t_u32, 2)
+        } else {
+            self.spv.op_shift_left_logical(t_u32, stride, c1)
+        };
         let stage_lane = self.spv.op_iadd(t_u32, slice, lane);
 
         self.spv.op_control_barrier(scope, scope, semantics);
@@ -400,6 +407,124 @@ impl LowerCtx<'_> {
             .op_cooperative_matrix_load(coop_ty, tile_ptr, layout, row_stride);
         self.spv.op_control_barrier(scope, scope, semantics);
         Ok(Val { id, ty })
+    }
+
+    fn subgroups(&self) -> u32 {
+        let [sx, sy, sz] = self.local_size;
+        (sx * sy * sz).div_ceil(SUBGROUP_LANES)
+    }
+
+    /// This lane's index in its subgroup, and the first element of its subgroup's 16x16 slice.
+    fn frag_lane_and_slice(&mut self) -> (Id, Id) {
+        let t_u32 = self.t_u32;
+        let [sx, sy, _] = self.local_size;
+        let lid3 = self.spv.op_load(self.t_uvec3, self.lid_var);
+        let x = self.spv.op_composite_extract(t_u32, lid3, &[0]);
+        let y = self.spv.op_composite_extract(t_u32, lid3, &[1]);
+        let z = self.spv.op_composite_extract(t_u32, lid3, &[2]);
+        let sy_c = self.spv.constant_u32(t_u32, sy);
+        let sx_c = self.spv.constant_u32(t_u32, sx);
+        let zs = self.spv.op_imul(t_u32, z, sy_c);
+        let ys = self.spv.op_iadd(t_u32, y, zs);
+        let ys_sx = self.spv.op_imul(t_u32, ys, sx_c);
+        let lin = self.spv.op_iadd(t_u32, x, ys_sx);
+        let c31 = self.spv.constant_u32(t_u32, SUBGROUP_LANES - 1);
+        let lane = self.spv.op_bitwise_and(t_u32, lin, c31);
+        let c5 = self.spv.constant_u32(t_u32, 5);
+        let sub = self.spv.op_shift_right_logical(t_u32, lin, c5);
+        let c8 = self.spv.constant_u32(t_u32, 8);
+        let slice = self.spv.op_shift_left_logical(t_u32, sub, c8);
+        (lane, slice)
+    }
+
+    /// Row-major element `lane * 8 + i` of the 16x16 tile.
+    fn frag_elem_index(&mut self, lane: Id, i: Id) -> Id {
+        let t_u32 = self.t_u32;
+        let c8 = self.spv.constant_u32(t_u32, ELEMS_PER_LANE);
+        let base = self.spv.op_imul(t_u32, lane, c8);
+        self.spv.op_iadd(t_u32, base, i)
+    }
+
+    /// `frag_len`, `frag_row`, `frag_col`, `frag_get` and `frag_set` over the fixed mapping.
+    pub(super) fn lower_frag_element(
+        &mut self,
+        func: BuiltinFn,
+        args: &[IrExpr],
+    ) -> Result<Val, String> {
+        let t_u32 = self.t_u32;
+        let u32_id = self.u32_id;
+        if func == BuiltinFn::FragLen {
+            let id = self.spv.constant_u32(t_u32, ELEMS_PER_LANE);
+            return Ok(Val { id, ty: u32_id });
+        }
+        let frag = super::lower_expr(self, &args[0])?;
+        let (elem, _) = frag_parts(&self.types, frag.ty)
+            .ok_or_else(|| format!("ZSL: {}() takes a fragment", func.name()))?;
+        let i = super::lower_expr(self, &args[1])?;
+        let i = coerce(self, i, u32_id);
+        let (lane, slice) = self.frag_lane_and_slice();
+        let elem_idx = self.frag_elem_index(lane, i);
+        if matches!(func, BuiltinFn::FragRow | BuiltinFn::FragCol) {
+            let c4 = self.spv.constant_u32(t_u32, 4);
+            let c15 = self.spv.constant_u32(t_u32, 15);
+            let id = if func == BuiltinFn::FragRow {
+                self.spv.op_shift_right_logical(t_u32, elem_idx, c4)
+            } else {
+                self.spv.op_bitwise_and(t_u32, elem_idx, c15)
+            };
+            return Ok(Val { id, ty: u32_id });
+        }
+        // Component type in the matrix, the value type ZSL sees, and whether it is a float.
+        let (component, value_ty, float) = match self.types.get(elem).clone() {
+            Type::Float {
+                format: FloatFormat::F16,
+            } => (self.coop.t_f16(self.spv), self.f32_id, true),
+            Type::Float { .. } => (self.t_f32, self.f32_id, true),
+            Type::Int {
+                width: IntWidth::W8,
+                ..
+            } => (self.coop.t_i8(self.spv), self.i32_id, false),
+            _ => (self.t_i32, self.i32_id, false),
+        };
+        let subgroups = self.subgroups();
+        let (scratch, t_ptr) = self.coop.scratch(self.spv, t_u32, component, subgroups);
+        let scope = self.spv.constant_u32(t_u32, SCOPE_SUBGROUP);
+        let semantics = self.spv.constant_u32(t_u32, SEMANTICS_WG_ACQ_REL);
+        let layout = self.spv.constant_u32(t_u32, ROW_MAJOR);
+        let stride = self.spv.constant_u32(t_u32, 16);
+        let tile = self.spv.op_access_chain(t_ptr, scratch, &[slice]);
+        let at = self.spv.op_iadd(t_u32, slice, elem_idx);
+        let elem_ptr = self.spv.op_access_chain(t_ptr, scratch, &[at]);
+        // Earlier readers of the slice finish before it is overwritten.
+        self.spv.op_control_barrier(scope, scope, semantics);
+        self.spv
+            .op_cooperative_matrix_store(tile, frag.id, layout, stride);
+        self.spv.op_control_barrier(scope, scope, semantics);
+        let narrow = component != self.t_f32 && component != self.t_i32;
+        if func == BuiltinFn::FragGet {
+            let raw = self.spv.op_load(component, elem_ptr);
+            let t_value = self.spv_ty(value_ty);
+            let id = match (narrow, float) {
+                (false, _) => raw,
+                (true, true) => self.spv.op_convert_f_to_f(t_value, raw),
+                (true, false) => self.spv.op_sconvert(t_value, raw),
+            };
+            return Ok(Val { id, ty: value_ty });
+        }
+        let x = super::lower_expr(self, &args[2])?;
+        let x = coerce(self, x, value_ty);
+        let x = match (narrow, float) {
+            (false, _) => x,
+            (true, true) => self.spv.op_convert_f_to_f(component, x),
+            (true, false) => self.spv.op_sconvert(component, x),
+        };
+        self.spv.op_store(elem_ptr, x);
+        self.spv.op_control_barrier(scope, scope, semantics);
+        let coop_ty = self.frag_spv_ty(frag.ty)?;
+        let id = self
+            .spv
+            .op_cooperative_matrix_load(coop_ty, tile, layout, stride);
+        Ok(Val { id, ty: frag.ty })
     }
 
     pub(super) fn lower_frag_store(

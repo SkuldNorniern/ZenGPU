@@ -131,7 +131,12 @@ pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
     }
 
     s.push_str(
-        "__device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
+        "// Lane n is bit n % 32 of component n / 32.\n\
+         __device__ __forceinline__ uint4 zsl_ballot(bool p) {\n\
+         \x20   unsigned long long v = __ballot(p);\n\
+         \x20   return make_uint4((unsigned int)v, (unsigned int)(v >> 32), 0u, 0u);\n\
+         }\n\
+         __device__ __forceinline__ int zsl_dot4_i8(int a, int b, int acc) {\n\
          #if defined(__GFX11__) || defined(__GFX12__)\n\
          \x20   return __builtin_amdgcn_sudot4(true, a, true, b, acc, false);\n\
          #else\n\
@@ -426,8 +431,7 @@ fn is_mixed_sign_checked_op(op: IrBinOp) -> bool {
 fn builtin_requires_f32(func: BuiltinFn) -> bool {
     matches!(
         func,
-        BuiltinFn::Sign
-            | BuiltinFn::Exp
+        BuiltinFn::Exp
             | BuiltinFn::FastExp
             | BuiltinFn::RoundEven
             | BuiltinFn::Tanh
@@ -592,9 +596,18 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
         }
         IrStmt::AtomicAdd { buf, index, value } => {
             indent(s, depth);
+            // The value converts to the buffer's element type, which picks the overload.
+            let cty = {
+                let mut types = ctx.types.borrow_mut();
+                match ctx.type_ctx.buffers.get(buf.as_str()) {
+                    Some(&t) if t == types.u32_id() => "unsigned int",
+                    Some(&t) if t == types.i32_id() => "int",
+                    _ => "float",
+                }
+            };
             let _ = writeln!(
                 s,
-                "atomicAdd(&{}[(unsigned int)({})], {});",
+                "atomicAdd(&{}[(unsigned int)({})], ({cty})({}));",
                 buf,
                 emit_expr(ctx, index)?,
                 emit_expr(ctx, value)?
@@ -786,7 +799,11 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                         "step and smoothstep are graphics-only",
                     ));
                 }
-                BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp
+                BuiltinFn::Abs
+                | BuiltinFn::Sign
+                | BuiltinFn::Min
+                | BuiltinFn::Max
+                | BuiltinFn::Clamp
                     if !expr_is_f32(ctx, e) =>
                 {
                     // Integer forms. Operands convert to the call's type, as in arithmetic.
@@ -799,6 +816,10 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                     match func {
                         BuiltinFn::Abs if cty == "int" => format!("abs({})", c[0]),
                         BuiltinFn::Abs => c[0].clone(),
+                        BuiltinFn::Sign if cty == "int" => {
+                            format!("(({0} > 0) - ({0} < 0))", c[0])
+                        }
+                        BuiltinFn::Sign => format!("((unsigned int)({} != 0u))", c[0]),
                         BuiltinFn::Min => format!("min({}, {})", c[0], c[1]),
                         BuiltinFn::Max => format!("max({}, {})", c[0], c[1]),
                         _ => format!("min(max({}, {}), {})", c[0], c[1], c[2]),
@@ -904,13 +925,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::SubgroupAll => {
                     format!("((bool)__all((int)({})))", args_s[0])
                 }
-                BuiltinFn::SubgroupBallot => {
-                    return Err(Diagnostic::new(
-                        DiagnosticCode::Unsupported,
-                        "HIP backend: subgroup_ballot() is not yet supported \
-                         (needs a 128-bit-capable value representation)",
-                    ));
-                }
+                BuiltinFn::SubgroupBallot => format!("zsl_ballot({})", args_s[0]),
                 BuiltinFn::SubgroupBroadcast | BuiltinFn::SubgroupShuffle => {
                     format!("__shfl({}, (int)({}))", args_s[0], args_s[1])
                 }
@@ -965,22 +980,33 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::WorkgroupReduceAdd
                 | BuiltinFn::WorkgroupReduceMin
                 | BuiltinFn::WorkgroupReduceMax => {
-                    let combine = match func {
-                        BuiltinFn::WorkgroupReduceAdd => "__zsl_v + __zsl_o",
-                        BuiltinFn::WorkgroupReduceMin => "fminf(__zsl_v, __zsl_o)",
-                        BuiltinFn::WorkgroupReduceMax => "fmaxf(__zsl_v, __zsl_o)",
+                    // The float scratch holds any 32-bit operand type.
+                    let float = expr_is_f32(ctx, &args[0]);
+                    let cty = if float {
+                        "float"
+                    } else if is_i32(ctx, &args[0]) {
+                        "int"
+                    } else {
+                        "unsigned int"
+                    };
+                    let combine = match (func, float) {
+                        (BuiltinFn::WorkgroupReduceAdd, _) => "__zsl_v + __zsl_o",
+                        (BuiltinFn::WorkgroupReduceMin, true) => "fminf(__zsl_v, __zsl_o)",
+                        (BuiltinFn::WorkgroupReduceMax, true) => "fmaxf(__zsl_v, __zsl_o)",
+                        (BuiltinFn::WorkgroupReduceMin, false) => "min(__zsl_v, __zsl_o)",
+                        (BuiltinFn::WorkgroupReduceMax, false) => "max(__zsl_v, __zsl_o)",
                         _ => unreachable!(),
                     };
                     let mut steps = String::new();
                     let mut s = ctx.block_size / 2;
                     while s > 0 {
                         steps.push_str(&format!(
-                            "if (threadIdx.x < {s}u) {{ auto __zsl_o = __zsl_wg_reduce_f32[threadIdx.x + {s}u]; auto __zsl_v = __zsl_wg_reduce_f32[threadIdx.x]; __zsl_wg_reduce_f32[threadIdx.x] = {combine}; }} __syncthreads(); "
+                            "if (threadIdx.x < {s}u) {{ auto __zsl_o = __zsl_s[threadIdx.x + {s}u]; auto __zsl_v = __zsl_s[threadIdx.x]; __zsl_s[threadIdx.x] = {combine}; }} __syncthreads(); "
                         ));
                         s /= 2;
                     }
                     format!(
-                        "({{ __syncthreads(); __zsl_wg_reduce_f32[threadIdx.x] = {}; __syncthreads(); {steps} __zsl_wg_reduce_f32[0]; }})",
+                        "({{ {cty} *__zsl_s = reinterpret_cast<{cty} *>(__zsl_wg_reduce_f32); __syncthreads(); __zsl_s[threadIdx.x] = ({cty})({}); __syncthreads(); {steps} __zsl_s[0]; }})",
                         args_s[0]
                     )
                 }
