@@ -33,7 +33,11 @@ pub enum SupportLevel {
     Native,
     /// Has no native form, but is emulated exactly (same bits, rounding and sync) via `strategy`,
     /// for example 'packed u16 + F32 convert'.
-    Emulated { strategy: &'static str },
+    Emulated {
+        strategy: &'static str,
+    },
     /// Reason shown in diagnostics.
-    Unsupported { reason: String },
+    Unsupported {
+        reason: String,
+    },
 }
