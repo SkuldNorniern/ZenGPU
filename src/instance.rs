@@ -1,4 +1,4 @@
-use zengpu_hal::{AdapterRequest, GpuInstance};
+use zengpu_hal::{AdapterRequest, BackendPreference, GpuInstance};
 
 use crate::adapter::Adapter;
 
@@ -36,14 +36,14 @@ impl Instance {
             .collect()
     }
 
-    /// Best adapter matching `req` across all backends, or `None`.
+    /// Best adapter matching `req` across all backends, or `None`. A backend other than
+    /// [`BackendPreference::Auto`] only matches adapters of that backend.
     pub fn request_adapter(&self, req: AdapterRequest) -> Option<Adapter> {
-        for backend in &self.backends {
-            if let Some(inner) = backend.request_adapter(req) {
-                return Some(Adapter { inner });
-            }
-        }
-        None
+        self.backends
+            .iter()
+            .filter_map(|b| b.request_adapter(req))
+            .find(|a| req.backend == BackendPreference::Auto || a.info().backend == req.backend)
+            .map(|inner| Adapter { inner })
     }
 }
 
@@ -194,6 +194,36 @@ impl InstanceBuilder {
     pub fn build(self) -> Instance {
         Instance {
             backends: self.backends,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use zengpu_hal::{AdapterRequest, BackendPreference};
+
+    use super::Instance;
+
+    /// A named backend never falls back to another registered backend.
+    #[test]
+    fn named_backend_only_matches_its_own_adapters() {
+        let inst = Instance::builder().metal().build();
+        let want = |backend| AdapterRequest {
+            backend,
+            ..AdapterRequest::default()
+        };
+        assert!(
+            inst.request_adapter(want(BackendPreference::Vulkan))
+                .is_none()
+        );
+        assert!(
+            inst.request_adapter(want(BackendPreference::Cuda))
+                .is_none()
+        );
+        if let Some(a) = inst.request_adapter(want(BackendPreference::Auto)) {
+            assert_eq!(a.info().backend, BackendPreference::Metal);
+            let named = inst.request_adapter(want(BackendPreference::Metal));
+            assert!(named.is_some());
         }
     }
 }
