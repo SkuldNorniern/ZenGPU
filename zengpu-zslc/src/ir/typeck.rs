@@ -225,6 +225,22 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
             | BuiltinFn::Byte => u32_id,
             BuiltinFn::F16Lo | BuiltinFn::F16Hi | BuiltinFn::BitcastF32 => f32_id,
             BuiltinFn::BitcastI32 | BuiltinFn::SByte => i32_id,
+            // Typed like their operands: f32 if any is f32, else i32 if any is i32, else u32.
+            BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp => {
+                let tys: Vec<TypeId> = args
+                    .iter()
+                    .map(|a| type_of_compute_expr(a, ctx, arena))
+                    .collect();
+                if tys.is_empty() || tys.contains(&f32_id) {
+                    f32_id
+                } else if tys.contains(&i32_id) {
+                    i32_id
+                } else if tys.iter().all(|&t| t == u32_id) {
+                    u32_id
+                } else {
+                    f32_id
+                }
+            }
             BuiltinFn::IsNan
             | BuiltinFn::IsInf
             | BuiltinFn::IsFinite

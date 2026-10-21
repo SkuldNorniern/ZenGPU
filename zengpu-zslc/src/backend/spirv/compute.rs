@@ -6,6 +6,13 @@
 
 mod glsl_op {
     pub const F_ABS: u32 = 4;
+    pub const S_ABS: u32 = 5;
+    pub const U_MIN: u32 = 38;
+    pub const S_MIN: u32 = 39;
+    pub const U_MAX: u32 = 41;
+    pub const S_MAX: u32 = 42;
+    pub const U_CLAMP: u32 = 44;
+    pub const S_CLAMP: u32 = 45;
     pub const F_SIGN: u32 = 6;
     pub const FLOOR: u32 = 8;
     pub const CEIL: u32 = 9;
@@ -1524,8 +1531,26 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 ty: ctx.bool_id,
             })
         }
-        BuiltinFn::Abs
-        | BuiltinFn::Sign
+        BuiltinFn::Abs => {
+            if args.len() != 1 {
+                return Err(format!("ZSL: {name}() takes 1 arg"));
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let glsl = ctx.glsl_ext;
+            let id = if v.ty == ctx.f32_id {
+                let t = ctx.t_f32;
+                ctx.spv.op_ext_inst(t, glsl, glsl_op::F_ABS, &[v.id])
+            } else if v.ty == ctx.i32_id {
+                let t = ctx.t_i32;
+                ctx.spv.op_ext_inst(t, glsl, glsl_op::S_ABS, &[v.id])
+            } else if v.ty == ctx.u32_id {
+                v.id
+            } else {
+                return Err(format!("ZSL: {name}() requires f32, i32 or u32"));
+            };
+            Ok(Val { id, ty: v.ty })
+        }
+        BuiltinFn::Sign
         | BuiltinFn::Exp
         | BuiltinFn::FastExp
         | BuiltinFn::RoundEven
@@ -1547,7 +1572,6 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 return Err(format!("ZSL: {name}() requires f32"));
             }
             let opcode = match func {
-                BuiltinFn::Abs => glsl_op::F_ABS,
                 BuiltinFn::Sign => glsl_op::F_SIGN,
                 BuiltinFn::Exp | BuiltinFn::FastExp => glsl_op::EXP,
                 BuiltinFn::RoundEven => glsl_op::ROUND_EVEN,
@@ -1568,7 +1592,29 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[v.id]);
             Ok(Val { id, ty: ctx.f32_id })
         }
-        BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
+        BuiltinFn::Min | BuiltinFn::Max => {
+            if args.len() != 2 {
+                return Err(format!("ZSL: {name}(a, b) takes 2 args"));
+            }
+            let a = lower_expr(ctx, &args[0])?;
+            let b = lower_expr(ctx, &args[1])?;
+            let (a, b) = unify(ctx, a, b);
+            let min = func == BuiltinFn::Min;
+            let opcode = if a.ty == ctx.f32_id {
+                if min { glsl_op::F_MIN } else { glsl_op::F_MAX }
+            } else if a.ty == ctx.i32_id {
+                if min { glsl_op::S_MIN } else { glsl_op::S_MAX }
+            } else if a.ty == ctx.u32_id {
+                if min { glsl_op::U_MIN } else { glsl_op::U_MAX }
+            } else {
+                return Err(format!("ZSL: {name}() requires f32, i32 or u32"));
+            };
+            let t = ctx.spv_ty(a.ty);
+            let glsl = ctx.glsl_ext;
+            let id = ctx.spv.op_ext_inst(t, glsl, opcode, &[a.id, b.id]);
+            Ok(Val { id, ty: a.ty })
+        }
+        BuiltinFn::Pow => {
             if args.len() != 2 {
                 return Err(format!("ZSL: {name}(a, b) takes 2 args"));
             }
@@ -1580,15 +1626,11 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             if b.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
-            let opcode = match func {
-                BuiltinFn::Min => glsl_op::F_MIN,
-                BuiltinFn::Max => glsl_op::F_MAX,
-                BuiltinFn::Pow => glsl_op::POW,
-                _ => unreachable!(),
-            };
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
-            let id = ctx.spv.op_ext_inst(t_f32, glsl, opcode, &[a.id, b.id]);
+            let id = ctx
+                .spv
+                .op_ext_inst(t_f32, glsl, glsl_op::POW, &[a.id, b.id]);
             Ok(Val { id, ty: ctx.f32_id })
         }
         BuiltinFn::Clamp => {
@@ -1598,15 +1640,30 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let x = lower_expr(ctx, &args[0])?;
             let lo = lower_expr(ctx, &args[1])?;
             let hi = lower_expr(ctx, &args[2])?;
-            if x.ty != ctx.f32_id || lo.ty != ctx.f32_id || hi.ty != ctx.f32_id {
-                return Err("ZSL: clamp() requires f32 args".into());
+            let ty = if [x.ty, lo.ty, hi.ty].contains(&ctx.f32_id) {
+                ctx.f32_id
+            } else if [x.ty, lo.ty, hi.ty].contains(&ctx.i32_id) {
+                ctx.i32_id
+            } else {
+                ctx.u32_id
+            };
+            let opcode = if ty == ctx.f32_id {
+                glsl_op::F_CLAMP
+            } else if ty == ctx.i32_id {
+                glsl_op::S_CLAMP
+            } else {
+                glsl_op::U_CLAMP
+            };
+            for v in [&x, &lo, &hi] {
+                if ![ctx.f32_id, ctx.i32_id, ctx.u32_id].contains(&v.ty) {
+                    return Err("ZSL: clamp() requires f32, i32 or u32 args".into());
+                }
             }
-            let t_f32 = ctx.t_f32;
+            let ids = [x, lo, hi].map(|v| coerce(ctx, v, ty));
+            let t = ctx.spv_ty(ty);
             let glsl = ctx.glsl_ext;
-            let id = ctx
-                .spv
-                .op_ext_inst(t_f32, glsl, glsl_op::F_CLAMP, &[x.id, lo.id, hi.id]);
-            Ok(Val { id, ty: ctx.f32_id })
+            let id = ctx.spv.op_ext_inst(t, glsl, opcode, &ids);
+            Ok(Val { id, ty })
         }
         BuiltinFn::Mix => {
             if args.len() != 3 {

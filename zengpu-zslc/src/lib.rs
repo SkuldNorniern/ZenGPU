@@ -926,36 +926,36 @@ int main() {{
         }
     }
 
+    /// `abs`, `min`, `max` and `clamp` take their operands' type. Mixed operands convert as in
+    /// arithmetic: f32 if any is f32, else i32 if any is i32.
     #[test]
-    fn f32_builtins_reject_integer_operands_on_hip_and_cuda() {
+    fn integer_abs_min_max_clamp_lower_on_all_backends() {
         let source = r#"
             @workgroup_size(64)
-            kernel int_abs(src: device buffer<i32>, out: device mut buffer<f32>, id: global_id) {
-                out[id.x] = abs(src[id.x])
+            kernel int_minmax(src: device buffer<i32>, u: device buffer<u32>, out: device mut buffer<i32>, uo: device mut buffer<u32>, id: global_id) {
+                let x = src[id.x]
+                let m = max(u[id.x], 7u)
+                out[id.x] = clamp(abs(x), -5, 5) + min(x, 3)
+                uo[id.x] = min(m, u[0])
             }
         "#;
-        let module = parse_compute(source).expect("parse integer abs kernel");
-        let expected = "abs() requires f32";
-        assert!(
-            hip::lower_compute(&module)
-                .err()
-                .expect("HIP must reject")
-                .message
-                .contains(expected)
-        );
-        assert!(
-            cuda::lower_compute(&module)
-                .err()
-                .expect("CUDA must reject")
-                .message
-                .contains(expected)
-        );
-        assert!(
-            spirv::lower_compute(&module)
-                .expect_err("SPIR-V must reject")
-                .message
-                .contains(expected)
-        );
+        let module = parse_compute(source).expect("parse integer min/max kernel");
+        for c_like in [
+            hip::lower_compute(&module).expect("HIP").source,
+            cuda::lower_compute(&module).expect("CUDA").source,
+        ] {
+            assert!(c_like.contains("abs(((int)("), "{c_like}");
+            assert!(c_like.contains("unsigned int m = max("), "{c_like}");
+            let body: String = c_like
+                .lines()
+                .filter(|l| l.contains("out[") || l.contains(" m = "))
+                .collect();
+            assert!(!body.contains("fminf") && !body.contains("fabsf"), "{body}");
+        }
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        assert!(msl_source.contains("uint m = max("), "{msl_source}");
+        assert!(msl_source.contains("clamp(abs(x), int("), "{msl_source}");
+        spirv::lower_compute(&module).expect("SPIR-V");
     }
 
     #[test]

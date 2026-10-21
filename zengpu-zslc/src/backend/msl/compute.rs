@@ -592,6 +592,23 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 a.push(emit_expr(ctx, arg)?);
             }
             match func {
+                // Overloads need one operand type: convert to the call's type.
+                BuiltinFn::Abs | BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Clamp => {
+                    let ty = expr_type(ctx, expr);
+                    let cty = scalar_c_type(ctx, ty);
+                    let conv: Vec<String> = args
+                        .iter()
+                        .zip(&a)
+                        .map(|(arg, s)| {
+                            if expr_type(ctx, arg) == ty {
+                                s.clone()
+                            } else {
+                                format!("{cty}({s})")
+                            }
+                        })
+                        .collect();
+                    format!("{}({})", func.name(), conv.join(", "))
+                }
                 BuiltinFn::U32 => format!("uint({})", a[0]),
                 BuiltinFn::FragZeroAcc | BuiltinFn::Mma => {
                     return Err(frag_rejected(
@@ -640,6 +657,8 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                         format!("int({})", a[0])
                     }
                 }
+                BuiltinFn::RoundEven => format!("rint({})", a[0]),
+                BuiltinFn::FastExp => format!("fast::exp({})", a[0]),
                 BuiltinFn::BytePerm => format!("zsl_byte_perm({}, {}, {})", a[0], a[1], a[2]),
                 BuiltinFn::F16Lo => format!("zsl_f16_lo({})", a[0]),
                 BuiltinFn::F16Hi => format!("zsl_f16_hi({})", a[0]),
@@ -799,6 +818,18 @@ fn component(c: u32) -> &'static str {
         1 => "y",
         2 => "z",
         _ => "w",
+    }
+}
+
+/// MSL name of a scalar `f32`, `i32` or `u32` type.
+fn scalar_c_type(ctx: &Ctx<'_>, ty: TypeId) -> &'static str {
+    let mut types = ctx.types.borrow_mut();
+    if ty == types.i32_id() {
+        "int"
+    } else if ty == types.u32_id() {
+        "uint"
+    } else {
+        "float"
     }
 }
 
