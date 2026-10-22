@@ -46,7 +46,7 @@ impl GpuDevice for VulkanDevice {
             .unwrap_or((default_subgroup, default_subgroup));
         let mut mma = Vec::new();
         let (lo, hi) = subgroup_sizes;
-        if inner.coop_matrix && (lo..=hi).contains(&32) {
+        if inner.coop_matrix && inner.compute_full_subgroups && (lo..=hi).contains(&32) {
             let coop = khr::cooperative_matrix::Instance::new(&inner.shared.entry, instance);
             let shapes =
                 unsafe { coop.get_physical_device_cooperative_matrix_properties(physical) }
@@ -54,6 +54,7 @@ impl GpuDevice for VulkanDevice {
             for p in shapes {
                 if p.scope != vk::ScopeKHR::SUBGROUP
                     || (p.m_size, p.n_size, p.k_size) != (16, 16, 16)
+                    || p.saturating_accumulation != vk::FALSE
                 {
                     continue;
                 }
@@ -868,6 +869,23 @@ impl GpuDevice for VulkanDevice {
             zengpu_spv::disassemble(words)
         );
 
+        let coop = uses_cooperative_matrix(words);
+        if coop {
+            if !self.inner.coop_matrix {
+                return Err(GpuError::Unsupported(
+                    "cooperative matrices are unavailable".into(),
+                ));
+            }
+            let loader = khr::cooperative_matrix::Instance::new(
+                &self.inner.shared.entry,
+                &self.inner.shared.instance,
+            );
+            let supported = unsafe {
+                loader.get_physical_device_cooperative_matrix_properties(self.inner.physical)
+            }
+            .map_err(|e| GpuError::Backend(format!("cooperative matrix properties: {e}")))?;
+            cooperative::validate(words, &supported)?;
+        }
         let module = unsafe {
             self.inner
                 .device
@@ -881,7 +899,6 @@ impl GpuDevice for VulkanDevice {
                 )
                 .map_err(|e| GpuError::ShaderCompile(format!("vkCreateShaderModule: {e}")))?
         };
-        let coop = uses_cooperative_matrix(words);
         Ok(self.shaders.lock().unwrap().insert((module, coop)))
     }
 
@@ -910,6 +927,27 @@ impl GpuDevice for VulkanDevice {
                 .ok_or_else(|| GpuError::PipelineCreation("stale shader handle".to_string()))?
         };
 
+        let entry = CString::new(desc.entry)
+            .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
+        let wanted = hints.subgroup_size.or(coop.then_some(32));
+        let required_size = wanted.filter(|&size| {
+            size.is_power_of_two()
+                && self
+                    .inner
+                    .compute_subgroup_sizes
+                    .is_some_and(|(min, max)| (min..=max).contains(&size))
+        });
+        if coop && (!self.inner.compute_full_subgroups || required_size != Some(32)) {
+            return Err(GpuError::Unsupported(
+                "cooperative matrices require full 32-lane compute subgroups".into(),
+            ));
+        }
+        if coop && !desc.block[0].is_multiple_of(32) {
+            return Err(GpuError::PipelineCreation(
+                "cooperative matrix workgroup X size must be a multiple of 32".into(),
+            ));
+        }
+
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             offset: 0,
@@ -931,22 +969,17 @@ impl GpuDevice for VulkanDevice {
                 .map_err(|e| GpuError::PipelineCreation(format!("vkCreatePipelineLayout: {e}")))?
         };
 
-        let entry = CString::new(desc.entry)
-            .map_err(|e| GpuError::PipelineCreation(format!("entry name nul: {e}")))?;
-        let wanted = hints.subgroup_size.or(coop.then_some(32));
         let capture = hints.capture_stats && self.inner.pipeline_executable_info;
-        let required_size = wanted.filter(|&size| {
-            size.is_power_of_two()
-                && self
-                    .inner
-                    .compute_subgroup_sizes
-                    .is_some_and(|(min, max)| (min..=max).contains(&size))
-        });
         let mut required = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfoEXT {
             required_subgroup_size: required_size.unwrap_or(0),
             ..Default::default()
         };
         let stage = vk::PipelineShaderStageCreateInfo {
+            flags: if coop {
+                vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS
+            } else {
+                vk::PipelineShaderStageCreateFlags::empty()
+            },
             p_next: if required_size.is_some() {
                 &mut required as *mut _ as *const c_void
             } else {
