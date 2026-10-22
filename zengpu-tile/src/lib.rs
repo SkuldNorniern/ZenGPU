@@ -945,25 +945,25 @@ mod tests {
         assert_eq!(suggest(&hip, DType::F16, 1, 1, 1), defaults([16, 16]));
     }
 
-    /// i8 on Metal: 64x64, bk 16, four waves, matrix form.
+    /// i8 on Metal: 32x32, bk 16, one wave, matrix form.
     #[test]
     fn suggestions_use_the_i8_matrix_unit() {
         let s = suggest(&metal_target(), DType::I8, 2048, 2048, 2048);
         assert_eq!(
             s,
             Suggestion {
-                tile: [64, 64],
+                tile: [32, 32],
                 bk: 16,
                 schedule: Schedule {
                     matrix: Matrix::Mma,
-                    waves: 4,
+                    waves: 1,
                     wave_rows: 0,
                     ..Schedule::default()
                 },
             }
         );
         let small = suggest(&metal_target(), DType::I8, 8, 40, 20);
-        assert_eq!(small.tile, [16, 48]);
+        assert_eq!(small.tile, [16, 32]);
     }
 
     /// f32 on Metal: 64x64, bk 32, four waves, matrix form; a 32 KiB budget still fits it.
