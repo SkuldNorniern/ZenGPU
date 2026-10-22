@@ -202,7 +202,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::env;
-    use std::process::Command;
+    use std::fs::{remove_file, write};
+    use std::process::{Command, id};
     use std::time::{Duration, Instant};
 
     use zengpu_cuda::CudaInstance;
@@ -745,6 +746,44 @@ mod tests {
                     assert_eq!(shape, want, "{notes:?}");
                 }
             }
+        }
+    }
+
+    /// The Vulkan matrix form (views, 16-byte loads, cooperative matrices) is valid SPIR-V.
+    /// Skipped without `spirv-val`.
+    #[test]
+    fn vulkan_mma_spirv_validates() {
+        let vulkan = Target {
+            backend: BackendPreference::Vulkan,
+            ..Target::hip_gfx12()
+        };
+        let sched = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        for (input, out) in [(DType::F16, DType::F16), (DType::I8, DType::I32)] {
+            let kernel = gemm(input, out, 256, 256, 256, [64, 64], 32, false).unwrap();
+            let compiled = compile_with(&kernel, &sched, &vulkan).unwrap();
+            assert_eq!(compiled.schedule_name(), "mma", "{:?}", compiled.notes());
+            let bytes: Vec<u8> = compiled
+                .spirv()
+                .unwrap()
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect();
+            let path = env::temp_dir().join(format!("zengpu_tile_{}_{input}.spv", id()));
+            write(&path, bytes).unwrap();
+            let run = Command::new("spirv-val")
+                .args(["--target-env", "vulkan1.2"])
+                .arg(&path)
+                .output();
+            let _ = remove_file(&path);
+            let Ok(run) = run else { return };
+            assert!(
+                run.status.success(),
+                "{input}: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
         }
     }
 
