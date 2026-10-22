@@ -604,6 +604,92 @@ mod tests {
         }
     }
 
+    /// f32 fragments load from f32 buffers and shared arrays, and `mma` multiplies them in f32.
+    /// The inputs are not f16-representable, so an f16 product would miss the tolerance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn f32_fragments_multiply_in_f32() {
+        use zengpu_hal::{Bindings, ComputePipelineDesc, DType};
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const F32_MMA: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel f32_mma(src: device buffer<f32>, out: device mut buffer<f32>, out_t: device mut buffer<f32>, id: global_id) {
+                shared s: array<f32, 256>
+                for k in 0..8 {
+                    s[id.x * 8u + k] = src[id.x * 8u + k]
+                }
+                barrier()
+                let fa: frag<f32, 16, 16, a> = frag_load_a(s, 0, 16)
+                let fb: frag<f32, 16, 16, b> = frag_load_b(s, 0, 16)
+                let fbt: frag<f32, 16, 16, b> = frag_load_b_t(src, 0, 16)
+                let c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())
+                frag_store(out, 0, 16, c)
+                let ct: frag<f32, 16, 16, acc> = mma(fa, fbt, frag_zero_acc())
+                frag_store(out_t, 0, 16, ct)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        if !dev
+            .compute_caps()
+            .mma
+            .iter()
+            .any(|s| s.m == 16 && s.a == DType::F32)
+        {
+            return;
+        }
+        let m: Vec<f32> = (0..256)
+            .map(|i| (((i * 7) % 13) as f32 - 6.0) * 0.123_456_7)
+            .collect();
+        let bs = make_f32(&*dev, &m, false);
+        let bo = make_f32(&*dev, &[0.0; 256], true);
+        let bt = make_f32(&*dev, &[0.0; 256], true);
+        let sh = dev
+            .create_shader(ShaderDesc::msl(F32_MMA.msl.unwrap()))
+            .unwrap();
+        let p = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader: sh,
+                entry: "zsl_main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            p,
+            Bindings {
+                buffers: &[bs.index(), bo.index(), bt.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[],
+            },
+            [1, 1, 1],
+        )
+        .unwrap();
+        let (out, out_t) = (read_f32(&*dev, bo, 256), read_f32(&*dev, bt, 256));
+        for r in 0..16 {
+            for c in 0..16 {
+                let ab: f64 = (0..16)
+                    .map(|k| f64::from(m[r * 16 + k]) * f64::from(m[k * 16 + c]))
+                    .sum();
+                let abt: f64 = (0..16)
+                    .map(|k| f64::from(m[r * 16 + k]) * f64::from(m[c * 16 + k]))
+                    .sum();
+                let tol = 1e-5 * ab.abs().max(1.0);
+                assert!(
+                    (f64::from(out[r * 16 + c]) - ab).abs() <= tol,
+                    "A*B at ({r}, {c}): {} vs {ab}",
+                    out[r * 16 + c]
+                );
+                let tol_t = 1e-5 * abt.abs().max(1.0);
+                assert!(
+                    (f64::from(out_t[r * 16 + c]) - abt).abs() <= tol_t,
+                    "A*B^T at ({r}, {c}): {} vs {abt}",
+                    out_t[r * 16 + c]
+                );
+            }
+        }
+    }
+
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
     #[cfg(target_os = "macos")]
