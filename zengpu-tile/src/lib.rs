@@ -29,10 +29,12 @@ mod compiled;
 mod ir;
 mod lower;
 mod schedule;
+mod tuning;
 
 pub use compiled::{BackendSource, CompiledTile, TileBinding, TileProgram};
 pub use ir::{Affine, Block, DType, KernelBuilder, Op, Stmt, Tensor, Tile, TileKernel};
 pub use schedule::{Matrix, Schedule, Target};
+pub use tuning::{Suggestion, suggest};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TileError {
@@ -853,6 +855,176 @@ mod tests {
         assert!(c.msl().is_ok());
     }
 
+    /// M1 as `Target::from_caps` reports it: f16 matrix unit, no i8 one.
+    fn metal_target() -> Target {
+        Target {
+            backend: BackendPreference::Metal,
+            wave_size: 32,
+            lds_bytes: 32768,
+            has_mma_f16: true,
+            has_mma_i8: false,
+        }
+    }
+
+    /// The measured picks on M1: wide grids take 128x64, the rest 64x64 with two wave rows.
+    #[test]
+    fn suggestions_follow_the_metal_table() {
+        let metal = metal_target();
+        let f16 = |m, n, k| suggest(&metal, DType::F16, m, n, k);
+        let wide = Suggestion {
+            tile: [128, 64],
+            bk: 32,
+            schedule: Schedule {
+                matrix: Matrix::Mma,
+                waves: 4,
+                wave_rows: 0,
+                ..Schedule::default()
+            },
+        };
+        assert_eq!(f16(2048, 2048, 2048), wide);
+        assert_eq!(f16(512, 5120, 5120), wide);
+        assert_eq!(f16(512, 17408, 5120), wide);
+        assert_eq!(f16(128, 17408, 5120), wide);
+        let narrow = f16(128, 5120, 5120);
+        assert_eq!(narrow.tile, [64, 64]);
+        assert_eq!(narrow.bk, 32);
+        assert_eq!(narrow.schedule.wave_rows, 2);
+    }
+
+    /// Off Metal, for dtypes without a matrix unit (i8 on M1), and for shapes smaller than the
+    /// tile: the crate defaults, clamped to the shape.
+    #[test]
+    fn suggestions_are_defaults_elsewhere() {
+        let defaults = |tile| Suggestion {
+            tile,
+            bk: 16,
+            schedule: Schedule::default(),
+        };
+        let hip = Target::hip_gfx12();
+        assert_eq!(
+            suggest(&hip, DType::F16, 2048, 2048, 2048),
+            defaults([64, 64])
+        );
+        assert_eq!(
+            suggest(&metal_target(), DType::F32, 2048, 2048, 2048),
+            defaults([64, 64])
+        );
+        assert_eq!(
+            suggest(&metal_target(), DType::I8, 2048, 2048, 2048),
+            defaults([64, 64])
+        );
+        assert_eq!(suggest(&hip, DType::F16, 8, 40, 20), defaults([16, 48]));
+        assert_eq!(suggest(&hip, DType::F16, 1, 1, 1), defaults([16, 16]));
+    }
+
+    /// i8 with a matrix unit (synthetic target: M1 has none): 64x64, bk 16, four waves, matrix
+    /// form. Checked on the suggestion only, since the i8 matrix ZSL is not exercised here.
+    #[test]
+    fn suggestions_use_the_i8_matrix_unit() {
+        let target = Target {
+            has_mma_i8: true,
+            ..metal_target()
+        };
+        let s = suggest(&target, DType::I8, 2048, 2048, 2048);
+        assert_eq!(
+            s,
+            Suggestion {
+                tile: [64, 64],
+                bk: 16,
+                schedule: Schedule {
+                    matrix: Matrix::Mma,
+                    waves: 4,
+                    wave_rows: 0,
+                    ..Schedule::default()
+                },
+            }
+        );
+        let small = suggest(&target, DType::I8, 8, 40, 20);
+        assert_eq!(small.tile, [16, 48]);
+    }
+
+    /// LDS is the limit: with 8 KiB the wide tile does not fit, and the 64x64 tile does.
+    #[test]
+    fn suggestions_respect_lds() {
+        let small = Target {
+            lds_bytes: 8192,
+            ..metal_target()
+        };
+        let s = suggest(&small, DType::F16, 2048, 2048, 2048);
+        assert_eq!((s.tile, s.bk, s.schedule.waves), ([64, 64], 32, 4));
+        assert_eq!(s.schedule.wave_rows, 2);
+        let tiny = Target {
+            lds_bytes: 4096,
+            ..metal_target()
+        };
+        let s = suggest(&tiny, DType::F16, 2048, 2048, 2048);
+        assert_eq!(s.schedule.matrix, Matrix::Mma);
+        assert_eq!(s.tile, [64, 32]);
+    }
+
+    /// Suggested configs compile to the matrix form with no notes, for benchmark and odd shapes,
+    /// without a device.
+    #[test]
+    fn suggestions_compile_to_the_matrix_form() {
+        let metal = metal_target();
+        let shapes = [
+            (1, 1, 1),
+            (8, 200, 17),
+            (16, 16, 16),
+            (33, 47, 65),
+            (100, 70, 37),
+            (260, 130, 72),
+            (128, 5120, 5120),
+            (128, 17408, 5120),
+            (512, 17408, 5120),
+            (2048, 2048, 2048),
+            (4096, 4096, 4096),
+        ];
+        for (m, n, k) in shapes {
+            let s = suggest(&metal, DType::F16, m, n, k);
+            let kernel = gemm(DType::F16, DType::F16, m, n, k, s.tile, s.bk, true).unwrap();
+            let c = compile_with(&kernel, &s.schedule, &metal)
+                .unwrap_or_else(|e| panic!("{m}x{n}x{k} {s:?}: {e}"));
+            assert_eq!(c.schedule_name(), "mma", "{m}x{n}x{k} {s:?}");
+            assert!(c.notes().is_empty(), "{m}x{n}x{k} {:?}", c.notes());
+        }
+    }
+
+    /// Suggested tiles on Metal are correct on odd edges: partial tiles in M and N and a masked
+    /// k tail.
+    #[test]
+    fn suggested_gemm_on_metal() {
+        let Some(dev) = metal_device() else { return };
+        let target = caps_target(&*dev, BackendPreference::Metal);
+        for (m, n, k) in [(100, 70, 37), (260, 130, 72), (200, 136, 72), (1, 17, 40)] {
+            let s = suggest(&target, DType::F16, m, n, k);
+            let case = Case {
+                input: DType::F16,
+                out: DType::F16,
+                m,
+                n,
+                k,
+                tile: s.tile,
+                bk: s.bk,
+            };
+            let (shape, notes) = run_case(&*dev, &target, case, &s.schedule).unwrap();
+            assert_eq!(shape, "mma", "{m}x{n}x{k} {notes:?}");
+            assert!(notes.is_empty(), "{m}x{n}x{k} {notes:?}");
+
+            let s = suggest(&target, DType::I8, m, n, k);
+            let case = Case {
+                input: DType::I8,
+                out: DType::I32,
+                m,
+                n,
+                k,
+                tile: s.tile,
+                bk: s.bk,
+            };
+            run_case(&*dev, &target, case, &s.schedule).unwrap();
+        }
+    }
+
     /// The k loop runs past the operands' columns: those reads are zero on every path.
     #[test]
     fn k_loop_past_the_tensor_on_metal() {
@@ -1572,6 +1744,7 @@ mod tests {
                 (d[0], d[1], d[2])
             });
         let mut summary: Vec<String> = Vec::new();
+        let mut suggest_rows: Vec<String> = Vec::new();
         for shape in shapes {
             if only.is_some_and(|o| o != shape) {
                 continue;
@@ -1751,6 +1924,50 @@ mod tests {
                         best.ms,
                         flops / (best.ms * 1e-3) / 1e12
                     ));
+                    if let Some(bc) = best.cfg {
+                        let s = suggest(&target, DType::F16, m, n, k);
+                        let sugg = MmaCfg {
+                            tile: s.tile,
+                            bk: s.bk,
+                            waves: s.schedule.waves,
+                            rows: s.schedule.wave_rows,
+                            split: 1,
+                            stages: 0,
+                            wpe: false,
+                        };
+                        // Three timed runs each, median of those, so one noisy run does not
+                        // decide the comparison.
+                        let median_of = |cfg: MmaCfg| -> f64 {
+                            let runs: Vec<f64> = (0..3)
+                                .filter_map(|_| {
+                                    measure(
+                                        dev,
+                                        &target,
+                                        "metal",
+                                        shape,
+                                        &cfg.label(),
+                                        &cfg.kernel(shape),
+                                        &cfg.schedule(),
+                                        &handles,
+                                        naive,
+                                    )
+                                })
+                                .map(|r| r.ms)
+                                .collect();
+                            if runs.is_empty() {
+                                f64::NAN
+                            } else {
+                                timing(runs).median
+                            }
+                        };
+                        let (best_ms, sugg_ms) = (median_of(bc), median_of(sugg));
+                        suggest_rows.push(format!(
+                            "| {m} x {n} x {k} | {} | {sugg_ms:.3} | {} | {best_ms:.3} | {:+.1}% |",
+                            sugg.label(),
+                            bc.label(),
+                            (sugg_ms / best_ms - 1.0) * 100.0
+                        ));
+                    }
                 }
                 for h in handles {
                     dev.destroy_buffer(h);
@@ -1760,6 +1977,12 @@ mod tests {
         println!("\n| M x N x K | best config | median ms | rerun range ms / note | TFLOPS |");
         println!("|---|---|---|---|---|");
         for line in summary {
+            println!("{line}");
+        }
+        println!("\n`suggest` on Metal f16 against the search's best (3-run medians, ms):");
+        println!("| M x N x K | suggested | ms | best | ms | suggested vs best |");
+        println!("|---|---|---|---|---|---|");
+        for line in suggest_rows {
             println!("{line}");
         }
     }
