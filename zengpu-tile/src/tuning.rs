@@ -36,7 +36,7 @@ struct Candidate {
 /// wave rows. The later candidates are smaller tiles for limited LDS. Smaller k, and any shape
 /// outside the bench, is an extrapolation.
 ///
-/// Metal i8 with an i8 matrix unit uses 64x64, bk 16, four waves (best measured for 2048^3).
+/// Metal i8 with an i8 matrix unit uses 32x32, bk 16, one wave (best measured for 2048^3).
 /// Metal f32 with an f32 matrix unit uses 64x64, bk 32, four waves, or 64x32 when LDS is short.
 /// Everything else gets the crate defaults: a 64x64 tile, bk 16 and `Schedule::default()`.
 /// That includes i8 where the target has no i8 matrix unit.
@@ -66,8 +66,9 @@ fn candidates(target: &Target, input: DType, m: usize, n: usize, k: usize) -> Ve
         rows,
     };
     if input == DType::I8 && target.has_mma_i8 {
-        // Measured on M1 with an i8 matrix unit: 64x64 with four waves beat larger tiles.
-        return vec![cand([64, 64], 16, 4, 0)];
+        // Measured on M1 at 2048^3: 32x32 with one wave (11.0 ms) beat 64x32 (11.7) and 64x64
+        // (12.2); i8 fragments load element-wise, so smaller tiles win.
+        return vec![cand([32, 32], 16, 1, 0)];
     }
     if input == DType::F32 && target.has_mma_f32 {
         // Measured on M1 at 2048^3: 64x64 bk 32 with four waves, then 64x32 with two.
