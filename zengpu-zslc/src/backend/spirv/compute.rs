@@ -2099,7 +2099,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = if func == BuiltinFn::Byte {
                 ctx.spv.op_bitfield_uextract(t_u32, word, offset, c8)
             } else {
+                // SPIR-V wants the base in the result's type.
                 let t_i32 = ctx.t_i32;
+                let word = ctx.spv.op_bitcast(t_i32, word);
                 ctx.spv.op_bitfield_sextract(t_i32, word, offset, c8)
             };
             Ok(Val {
@@ -2494,6 +2496,7 @@ fn load_byte(ctx: &mut LowerCtx<'_>, signed: bool, table: SsboTable, buf_idx: Id
     let word = ctx.spv.op_load(t_u32, ptr);
     let count = ctx.spv.constant_u32(t_u32, 8);
     if signed {
+        let word = ctx.spv.op_bitcast(t_i32, word);
         ctx.spv.op_bitfield_sextract(t_i32, word, shift, count)
     } else {
         ctx.spv.op_bitfield_uextract(t_u32, word, shift, count)
@@ -2572,6 +2575,7 @@ fn dot4_lane(ctx: &mut LowerCtx<'_>, word: Id, signed: bool, lane: u32, want: Id
     let count = ctx.spv.constant_u32(ctx.t_u32, 8);
     let base_ty = if signed { ctx.t_i32 } else { ctx.t_u32 };
     let field = if signed {
+        let word = ctx.spv.op_bitcast(base_ty, word);
         ctx.spv.op_bitfield_sextract(base_ty, word, offset, count)
     } else {
         ctx.spv.op_bitfield_uextract(base_ty, word, offset, count)
