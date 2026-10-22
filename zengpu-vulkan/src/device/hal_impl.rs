@@ -464,6 +464,12 @@ impl GpuDevice for VulkanDevice {
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
         self.collect_garbage();
+        let depth_stencil = desc.format.is_depth_stencil();
+        if desc.usage.contains(TextureUsage::DEPTH_STENCIL) && !depth_stencil {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "DEPTH_STENCIL usage requires a depth/stencil format".into(),
+            )));
+        }
         let mip_levels = desc.mip_levels.max(1);
         let array_layers = desc.array_layers.max(1);
         let depth = if desc.dimension == TexDim::D3 {
@@ -512,7 +518,11 @@ impl GpuDevice for VulkanDevice {
             usage |= vk::ImageUsageFlags::STORAGE;
         }
         if desc.usage.contains(TextureUsage::RENDER_TARGET) {
-            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            usage |= if depth_stencil {
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            } else {
+                vk::ImageUsageFlags::COLOR_ATTACHMENT
+            };
         }
         if desc.usage.contains(TextureUsage::DEPTH_STENCIL) {
             usage |= vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT;
@@ -606,7 +616,17 @@ impl GpuDevice for VulkanDevice {
                     view_type,
                     format,
                     subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        aspect_mask: if depth_stencil {
+                            if desc.format == Format::Depth24PlusStencil8
+                                && !desc.usage.contains(TextureUsage::SAMPLED)
+                            {
+                                vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+                            } else {
+                                vk::ImageAspectFlags::DEPTH
+                            }
+                        } else {
+                            vk::ImageAspectFlags::COLOR
+                        },
                         base_mip_level: 0,
                         level_count: mip_levels,
                         base_array_layer: 0,
