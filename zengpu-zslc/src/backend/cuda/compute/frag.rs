@@ -76,6 +76,53 @@ __device__ __forceinline__ void zsl_stage_tile(__half* dst, const float* src, un
         dst[e] = __float2half(src[off + (e >> 4) * ld + (e & 15u)]);
     }
 }
+// f32 a and b: wmma has no exact f32 product (tf32 is not f32), so they hold 8 floats per lane in
+// the fixed layout below. Lane l holds A[l%16][8*(l/16)+i] (kA), B at [8*(l/16)+i][l%16].
+template <bool kA> struct zsl_f32_ab { float x[8]; static const int num_elements = 8; };
+typedef zsl_f32_ab<true> zsl_f32_a;
+typedef zsl_f32_ab<false> zsl_f32_b;
+template <bool kA> __device__ __forceinline__ unsigned int zsl_f32_row(unsigned int lane, unsigned int i) {
+    return kA ? (lane & 15u) : (8u * (lane >> 4) + i);
+}
+template <bool kA> __device__ __forceinline__ unsigned int zsl_f32_col(unsigned int lane, unsigned int i) {
+    return kA ? (8u * (lane >> 4) + i) : (lane & 15u);
+}
+// `off`, `ld` in elements. `T`: B from N x K row-major, element (k, n) at n * ld + k.
+template <bool kA, bool T>
+__device__ __forceinline__ zsl_f32_ab<kA> zsl_load_f32_ab(const float* p, unsigned int off, unsigned int ld, unsigned int lane) {
+    zsl_f32_ab<kA> v;
+    for (unsigned int i = 0; i < 8u; ++i) {
+        unsigned int r = zsl_f32_row<kA>(lane, i);
+        unsigned int c = zsl_f32_col<kA>(lane, i);
+        if (T) { unsigned int t = r; r = c; c = t; }
+        v.x[i] = p[off + r * ld + c];
+    }
+    return v;
+}
+// The products are staged in the warp's 2 KiB scratch (`mem`): a at [row][k], b at [k][col]. Each
+// lane takes its acc elements as f32 FMA chains over k, so the result is exact f32.
+template <typename U, int M, int N, int K, typename T, typename L>
+__device__ __forceinline__ void zsl_mma_f32(nvcuda::wmma::fragment<U, M, N, K, T, L>& d, const zsl_f32_ab<true>& a, const zsl_f32_ab<false>& b, const nvcuda::wmma::fragment<U, M, N, K, T, L>& c, unsigned char* mem, unsigned int lane) {
+    // d's element positions come from the wmma mapping, read before the scratch is reused.
+    nvcuda::wmma::fragment<U, M, N, K, T, L> dr, dc;
+    zsl_frag_index(dr, true, mem, lane);
+    zsl_frag_index(dc, false, mem, lane);
+    float* sa = reinterpret_cast<float*>(mem);
+    float* sb = sa + 256;
+    for (unsigned int i = 0; i < 8u; ++i) {
+        sa[zsl_f32_row<true>(lane, i) * 16u + zsl_f32_col<true>(lane, i)] = a.x[i];
+        sb[zsl_f32_row<false>(lane, i) * 16u + zsl_f32_col<false>(lane, i)] = b.x[i];
+    }
+    __syncwarp();
+    for (int k = 0; k < d.num_elements; ++k) {
+        unsigned int r = (unsigned int)(float)dr.x[k];
+        unsigned int col = (unsigned int)(float)dc.x[k];
+        float acc = (float)c.x[k];
+        for (unsigned int kk = 0; kk < 16u; ++kk) acc = fmaf(sa[r * 16u + kk], sb[kk * 16u + col], acc);
+        d.x[k] = (T)acc;
+    }
+    __syncwarp();
+}
 "#;
 
 const LAYOUT_ROW: &str = "nvcuda::wmma::mem_row_major";
@@ -100,6 +147,18 @@ pub(super) fn cuda_frag_type(types: &TypeArena, ty: TypeId) -> Option<&'static s
         ) => {
             "nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, __half, nvcuda::wmma::row_major>"
         }
+        (
+            Type::Float {
+                format: FloatFormat::F32,
+            },
+            FragUse::A,
+        ) => "zsl_f32_a",
+        (
+            Type::Float {
+                format: FloatFormat::F32,
+            },
+            FragUse::B,
+        ) => "zsl_f32_b",
         (
             Type::Int {
                 width: IntWidth::W8,
@@ -189,7 +248,17 @@ pub(super) fn element_expr(
         return Ok(format!("((unsigned int){f}.num_elements)"));
     }
     let i = emit_expr(ctx, &args[1])?;
+    let f32_ab = f32_ab_usage(ctx, f);
     Ok(match func {
+        BuiltinFn::FragRow | BuiltinFn::FragCol if f32_ab.is_some() => {
+            let k_a = f32_ab == Some(FragUse::A);
+            let axis = if func == BuiltinFn::FragRow {
+                "row"
+            } else {
+                "col"
+            };
+            format!("zsl_f32_{axis}<{k_a}>(zsl_frag_lane, {i})")
+        }
         BuiltinFn::FragRow | BuiltinFn::FragCol => format!(
             "zsl_frag_pos({f}, {i}, {}, zsl_frag_scratch, zsl_frag_lane)",
             func == BuiltinFn::FragRow
@@ -197,6 +266,20 @@ pub(super) fn element_expr(
         _ if frag_is_int(ctx, f) => format!("((int)({f}.x[{i}]))"),
         _ => format!("((float)({f}.x[{i}]))"),
     })
+}
+
+/// The usage of a fragment local that is an f32 a or b, which has the fixed lane layout.
+fn f32_ab_usage(ctx: &Ctx<'_>, local: &str) -> Option<FragUse> {
+    let types = ctx.types.borrow();
+    let (elem, usage) = ctx
+        .type_ctx
+        .locals
+        .get(local)
+        .and_then(|t| frag_parts(&types, *t))?;
+    let f32 = Type::Float {
+        format: FloatFormat::F32,
+    };
+    (types.get(elem) == &f32 && usage != FragUse::Acc).then_some(usage)
 }
 
 fn frag_is_int(ctx: &Ctx<'_>, local: &str) -> bool {
@@ -305,7 +388,18 @@ fn load_stmt(
     src: &FragSrc,
     off: &str,
     ldv: &str,
+    trans: bool,
 ) -> Result<String, Diagnostic> {
+    if f32_ab_usage(ctx, name).is_some() {
+        ctx.frag_elements.set(true);
+        let src_name = match src {
+            FragSrc::Buffer(n) | FragSrc::Shared(n) => n,
+        };
+        let k_a = usage == FragUse::A;
+        return Ok(format!(
+            "{name} = zsl_load_f32_ab<{k_a}, {trans}>((const float*){src_name}, {off}, {ldv}, zsl_frag_lane);"
+        ));
+    }
     if let FragSrc::Shared(tile) = src
         && matches!(usage, FragUse::A | FragUse::B)
         && is_shared_f32(ctx, tile)
@@ -347,7 +441,11 @@ pub(super) fn let_stmt(
                 // A col_major fragment reads the (staged or direct) row-major block transposed.
                 out = format!("{} {name};", ty.replace("row_major>", "col_major>"));
             }
-            let _ = write!(out, " {}", load_stmt(ctx, name, usage, src, &off, &ldv)?);
+            let _ = write!(
+                out,
+                " {}",
+                load_stmt(ctx, name, usage, src, &off, &ldv, *trans)?
+            );
         }
         _ => out.push_str(&mma_or_zero(ctx, name, init)?),
     }
@@ -369,7 +467,7 @@ pub(super) fn assign_stmt(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<S
             let usage = usage_from(ctx, *fty)?;
             let off = emit_expr(ctx, offset)?;
             let ldv = emit_expr(ctx, ld)?;
-            load_stmt(ctx, name, usage, src, &off, &ldv)
+            load_stmt(ctx, name, usage, src, &off, &ldv, false)
         }
         _ => mma_or_zero(ctx, name, value),
     }
@@ -394,6 +492,10 @@ fn mma_or_zero(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<String, Diag
             };
             let i = emit_expr(ctx, &args[1])?;
             let x = emit_expr(ctx, &args[2])?;
+            if f32_ab_usage(ctx, name).is_some() {
+                // Each element is held by one lane, so the lane's own element is the write.
+                return Ok(format!("{copy}{name}.x[{i}] = (float)({x});"));
+            }
             Ok(format!(
                 "{copy}zsl_frag_set({name}, {i}, {x}, zsl_frag_scratch, zsl_frag_lane);"
             ))
@@ -415,6 +517,21 @@ fn mma_or_zero(ctx: &Ctx<'_>, name: &str, value: &IrExpr) -> Result<String, Diag
                     ..
                 }
             );
+            let f32_ab = matches!(&args[0], IrExpr::Local(an) if f32_ab_usage(ctx, an).is_some());
+            if f32_ab {
+                ctx.frag_elements.set(true);
+                let (zero, c) = if zero_acc {
+                    (
+                        format!("nvcuda::wmma::fill_fragment({name}, 0); "),
+                        name.to_string(),
+                    )
+                } else {
+                    (String::new(), emit_expr(ctx, &args[2])?)
+                };
+                return Ok(format!(
+                    "{zero}zsl_mma_f32({name}, {a}, {b}, {c}, zsl_frag_scratch, zsl_frag_lane);"
+                ));
+            }
             if zero_acc {
                 Ok(format!(
                     "nvcuda::wmma::fill_fragment({name}, 0); nvcuda::wmma::mma_sync({name}, {a}, {b}, {name});"

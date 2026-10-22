@@ -62,6 +62,39 @@ __device__ __forceinline__ zsl_f8 zsl_load_f8(const float* b, unsigned int off, 
     for (unsigned int i = 0; i < 8; ++i) v[i] = b[zsl_frag_at<false>(lane, i, off, ld)];
     return v;
 }
+template <bool kA, bool T = false>
+__device__ __forceinline__ zsl_f8 zsl_load_f8_ab(const float* b, unsigned int off, unsigned int ld, unsigned int lane) {
+    zsl_f8 v;
+    for (unsigned int i = 0; i < 8; ++i) v[i] = b[zsl_frag_at<kA, T>(lane, i, off, ld)];
+    return v;
+}
+__device__ __forceinline__ void zsl_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+// f32 a and b: WMMA has no exact f32 product, so the wave stages a and b (256 floats each) in its
+// 512 floats of LDS, and each lane takes its 8 outputs as an f32 FMA chain over k. Lane l holds
+// the acc element at row 8 * (l / 16) + i, column l % 16.
+__device__ __forceinline__ zsl_f8 zsl_mma_f32(zsl_f8 a, zsl_f8 b, zsl_f8 c, float* mem, unsigned int lane) {
+    float* sa = mem;
+    float* sb = mem + 256;
+    for (unsigned int i = 0; i < 8; ++i) {
+        sa[(lane & 15u) * 16u + 8u * (lane >> 4) + i] = a[i];
+        sb[(8u * (lane >> 4) + i) * 16u + (lane & 15u)] = b[i];
+    }
+    zsl_wave_sync();
+    zsl_f8 d;
+    for (unsigned int i = 0; i < 8; ++i) {
+        unsigned int row = 8u * (lane >> 4) + i;
+        unsigned int col = lane & 15u;
+        float acc = c[i];
+        for (unsigned int k = 0; k < 16; ++k) acc = __builtin_fmaf(sa[row * 16u + k], sb[k * 16u + col], acc);
+        d[i] = acc;
+    }
+    zsl_wave_sync();
+    return d;
+}
 __device__ __forceinline__ zsl_i8v zsl_load_i8v(const int* b, unsigned int off, unsigned int ld, unsigned int lane) {
     zsl_i8v v;
     for (unsigned int i = 0; i < 8; ++i) v[i] = b[zsl_frag_at<false>(lane, i, off, ld)];
@@ -113,6 +146,12 @@ pub(super) fn hip_frag_type(types: &TypeArena, ty: TypeId) -> Option<&'static st
             },
             FragUse::A | FragUse::B,
         ) => "zsl_h8",
+        (
+            Type::Float {
+                format: FloatFormat::F32,
+            },
+            FragUse::A | FragUse::B,
+        ) => "zsl_f8",
         (
             Type::Int {
                 width: IntWidth::W8,
@@ -170,6 +209,12 @@ fn f16_type() -> Type {
     }
 }
 
+fn f32_type() -> Type {
+    Type::Float {
+        format: FloatFormat::F32,
+    }
+}
+
 fn i32_type() -> Type {
     Type::Int {
         width: IntWidth::W32,
@@ -209,7 +254,7 @@ pub(super) fn load_expr(
     trans: bool,
 ) -> Result<String, Diagnostic> {
     ctx.frag_used.set(true);
-    let (_, usage) = frag_shape(ctx, ty)?;
+    let (frag_elem, usage) = frag_shape(ctx, ty)?;
     let name = src_name(src);
     let elem = source_elem(ctx, src)?;
     let off = super::emit_expr(ctx, offset)?;
@@ -228,6 +273,9 @@ pub(super) fn load_expr(
         signedness: Signedness::Signed,
     };
     Ok(match usage {
+        FragUse::A | FragUse::B if kind_is(ctx, frag_elem, &f32) && kind_is(ctx, elem, &f32) => {
+            format!("zsl_load_f8_ab<{k_a}, {t}>({name}, {args}")
+        }
         FragUse::A | FragUse::B if shared && kind_is(ctx, elem, &f32) => {
             format!("zsl_load_h8f<{k_a}, {t}>({name}, {args}")
         }
@@ -287,6 +335,16 @@ pub(super) fn store_stmt(
     Ok(out)
 }
 
+/// Kernel-scope scratch for the f32 `mma`: 512 floats per wave, and this thread's wave slot.
+pub(super) fn mma_prologue(local_size: [u32; 3], block_size: u32) -> String {
+    let warps = block_size.div_ceil(32);
+    let [lx, ly, _] = local_size;
+    format!(
+        "    __shared__ float zsl_mma_mem[{warps}][512];\n\
+         \x20   float* zsl_mma_scratch = zsl_mma_mem[(threadIdx.x + {lx}u * (threadIdx.y + {ly}u * threadIdx.z)) >> 5];\n"
+    )
+}
+
 /// `frag_zero_acc()` has no C value: `Let` and `AssignLocal` emit an empty initializer, `mma` an
 /// empty accumulator.
 pub(super) fn builtin_expr(
@@ -323,6 +381,17 @@ pub(super) fn builtin_expr(
                     args_s[2].clone()
                 };
                 format!("zsl_mma_f16({}, {}, {acc})", args_s[0], args_s[1])
+            } else if kind_is(ctx, a_elem, &f32_type()) {
+                ctx.f32_mma.set(true);
+                let acc = if zero_acc {
+                    "zsl_f8{}".to_string()
+                } else {
+                    args_s[2].clone()
+                };
+                format!(
+                    "zsl_mma_f32({}, {}, {acc}, zsl_mma_scratch, __lane_id())",
+                    args_s[0], args_s[1]
+                )
             } else if kind_is(
                 ctx,
                 a_elem,

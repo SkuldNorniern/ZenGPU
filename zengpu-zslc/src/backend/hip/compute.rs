@@ -270,6 +270,7 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
     }
 
     s.push_str(") {\n");
+    let body_start = s.len();
 
     let aligned = e.shared.iter().any(|d| d.view_of.is_some());
     for shared in &e.shared {
@@ -327,13 +328,18 @@ __device__ __forceinline__ unsigned int zsl_byte_perm(unsigned int a, unsigned i
         },
         types: RefCell::new(module.types.clone()),
         block_size,
+        local_size,
         frag_used: Cell::new(false),
+        f32_mma: Cell::new(false),
     };
     for st in &e.body {
         emit_stmt(&mut s, &ctx, st, 1)?;
     }
 
     s.push_str("}\n");
+    if ctx.f32_mma.get() {
+        s.insert_str(body_start, &frag::mma_prologue(local_size, block_size));
+    }
     if ctx.frag_used.get() {
         s.insert_str(kernel_start, frag::FRAG_PRELUDE);
     }
@@ -354,7 +360,11 @@ struct Ctx<'a> {
     type_ctx: ComputeTypeCtx,
     types: RefCell<TypeArena>,
     block_size: u32,
+    /// Workgroup dimensions, to pick each wave's f32 `mma` scratch.
+    local_size: [u32; 3],
     frag_used: Cell<bool>,
+    /// An f32 `mma` was emitted: the kernel needs its scratch.
+    f32_mma: Cell<bool>,
 }
 
 fn is_i32(ctx: &Ctx<'_>, expr: &IrExpr) -> bool {
