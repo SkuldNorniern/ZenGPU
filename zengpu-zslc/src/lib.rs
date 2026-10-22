@@ -2653,6 +2653,11 @@ mod portability_tests {
             "let m = subgroup_ballot(u > 3u)\no[i] = m.x + m.y + m.z + m.w + subgroup_ballot(x < 0).x",
         ),
         (
+            "i32 view",
+            "",
+            "shared sa: array<f16, 512>\nview si: array<i32> = sa\nsi[i % 256u] = x\nbarrier()\no[i] = bitcast_u32(si[0])",
+        ),
+        (
             "integer atomics",
             "",
             "atomic_add(o, 0u, u)\natomic_add(ai, 1u, x)\natomic_add(of, 2u, f)",
