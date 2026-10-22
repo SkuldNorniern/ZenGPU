@@ -520,6 +520,7 @@ int main() {{
         }
     "#;
 
+    #[cfg(unix)]
     const SUBGROUP_SHUFFLE_XOR: &str = r#"
         @workgroup_size(256)
         kernel shuffle_xor(out: device mut buffer<f32>, id: global_id) {
@@ -1235,6 +1236,7 @@ int main() {{
         assert!(msl_source.contains("+= int2("), "{msl_source}");
     }
 
+    #[cfg(unix)]
     const OCCUPANCY_KERNEL: &str = r#"
         @workgroup_size(256)
         @launch_bounds(512)
@@ -2462,6 +2464,7 @@ int main() {{
     }
 
     /// Loads NVRTC via `dlopen`, with no link-time dependency.
+    #[cfg(unix)]
     mod nvrtc {
         use std::ffi::{CString, c_char, c_int, c_void};
         use std::mem::transmute;
@@ -2572,6 +2575,7 @@ int main() {{
     ///
     /// Skipped unless `ZENGPU_NVRTC` (libnvrtc.so path) and `ZENGPU_CUDA_INCLUDE` (CUDA headers)
     /// are set.
+    #[cfg(unix)]
     #[test]
     fn lowered_cuda_kernels_compile_with_nvrtc() {
         let (Ok(lib), Ok(include)) = (var("ZENGPU_NVRTC"), var("ZENGPU_CUDA_INCLUDE")) else {
