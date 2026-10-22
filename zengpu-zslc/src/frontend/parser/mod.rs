@@ -16,6 +16,7 @@
 //!            | "if" expr block ("else" block)?
 //!            | "for" Ident "in" expr ".." expr block
 //!            | "barrier" "(" ")"
+//!            | "shared_barrier" "(" ")"
 //!            | "atomic_add" "(" Ident "," expr "," expr ")"
 //!            | expr ("=" expr)?
 //! ```

@@ -359,7 +359,7 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    /// `view name: array<T> = base` reinterprets `base`'s bytes as `T` (u32, u32x2, u32x4, f32, f16). Length
+    /// `view name: array<T> = base` reinterprets `base`'s bytes as `T` (u32, u32x2, u32x4, i32, f32, f16). Length
     /// is base bytes / sizeof(T), which must divide evenly.
     pub(super) fn parse_view(&mut self, ctx: &mut Ctx) -> Result<(), ParseError> {
         let name = self.ident()?;
@@ -390,11 +390,11 @@ impl<'a> Parser<'a> {
             Some(lanes) => 4 * u32::from(lanes),
             None if elem == self.types.u32_id() => 4,
             None => match storage_elem(&self.types, elem) {
-                Some(StorageElem::F32) => 4,
+                Some(StorageElem::F32 | StorageElem::I32) => 4,
                 Some(StorageElem::F16) => 2,
                 _ => {
                     return self.err(
-                        "views are array<u32>, array<u32x2>, array<u32x4>, array<f32> or array<f16>",
+                        "views are array<u32>, array<u32x2>, array<u32x4>, array<i32>, array<f32> or array<f16>",
                     );
                 }
             },
@@ -437,6 +437,11 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::LParen, "`(` after barrier")?;
             self.expect(&Tok::RParen, "`)` after barrier(")?;
             return Ok(vec![IrStmt::Barrier]);
+        }
+        if self.eat_kw("shared_barrier") {
+            self.expect(&Tok::LParen, "`(` after shared_barrier")?;
+            self.expect(&Tok::RParen, "`)` after shared_barrier(")?;
+            return Ok(vec![IrStmt::SharedBarrier]);
         }
         if self.eat_kw("frag_store") {
             return Ok(vec![self.parse_frag_store(ctx)?]);
@@ -509,6 +514,10 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr(ctx)?;
             let stmt = match lhs {
                 IrExpr::Local(name) => {
+                    let rhs = match ctx.locals.get(&name).copied() {
+                        Some(local_ty) => self.frag_load_for(ctx, rhs, local_ty),
+                        None => rhs,
+                    };
                     self.check_frag_assign(ctx, &name, &rhs)?;
                     if let Some(&local_ty) = ctx.locals.get(&name) {
                         let rhs_ty = type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types);
@@ -671,6 +680,10 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_expr(ctx)?;
+        let init = match annot {
+            Some(ty) => self.frag_load_for(ctx, init, ty),
+            None => init,
+        };
         let is_zero_acc = matches!(
             init,
             IrExpr::Builtin {

@@ -276,7 +276,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             indent(s, depth);
             s.push_str("}\n");
         }
-        IrStmt::AssignShared { .. } | IrStmt::Barrier => {
+        IrStmt::AssignShared { .. } | IrStmt::Barrier | IrStmt::SharedBarrier => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
                 "MSL graphics backend: workgroup operations are unavailable in graphics shaders",

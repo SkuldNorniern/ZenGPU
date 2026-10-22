@@ -919,6 +919,25 @@ impl GpuDevice for MetalDevice {
                 acc: DType::F32,
                 subgroup: 32,
             });
+            // ZSL runs i8 operands as half tiles and keeps the i32 sum exact.
+            mma.push(MmaShape {
+                m: 16,
+                n: 16,
+                k: 16,
+                a: DType::I8,
+                b: DType::I8,
+                acc: DType::I32,
+                subgroup: 32,
+            });
+            mma.push(MmaShape {
+                m: 16,
+                n: 16,
+                k: 16,
+                a: DType::F32,
+                b: DType::F32,
+                acc: DType::F32,
+                subgroup: 32,
+            });
         }
         ComputeCaps {
             subgroup_sizes: (32, 32),

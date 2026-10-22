@@ -95,6 +95,8 @@ pub struct Target {
     pub lds_bytes: u32,
     /// Matrix ops from f16 x f16 to f32.
     pub has_mma_f16: bool,
+    /// Matrix ops from f32 x f32 to f32.
+    pub has_mma_f32: bool,
     /// Matrix ops from i8 x i8 to i32.
     pub has_mma_i8: bool,
 }
@@ -107,12 +109,13 @@ impl Target {
             wave_size: 32,
             lds_bytes: 65536,
             has_mma_f16: true,
+            has_mma_f32: false,
             has_mma_i8: true,
         }
     }
 
     /// Subgroup 32 if the device runs it (the matrix form needs it), else the default. Shared
-    /// memory and 16x16x16 f16 and i8 shapes at that subgroup.
+    /// memory and 16x16x16 f16, f32 and i8 shapes at that subgroup.
     pub fn from_caps(backend: BackendPreference, caps: &ComputeCaps) -> Self {
         let (lo, hi) = caps.subgroup_sizes;
         let wave = if (lo..=hi).contains(&32) {
@@ -134,6 +137,7 @@ impl Target {
             wave_size: wave,
             lds_bytes: caps.shared_bytes,
             has_mma_f16: has(zengpu_hal::DType::F16, zengpu_hal::DType::F32),
+            has_mma_f32: has(zengpu_hal::DType::F32, zengpu_hal::DType::F32),
             has_mma_i8: has(zengpu_hal::DType::I8, zengpu_hal::DType::I32),
         }
     }
@@ -145,6 +149,7 @@ impl Target {
             wave_size: 32,
             lds_bytes: 32768,
             has_mma_f16: false,
+            has_mma_f32: false,
             has_mma_i8: false,
         }
     }
@@ -254,10 +259,11 @@ fn mma_plan(
     let elem = (parts.a_dtype, parts.b_dtype, acc);
     let (has, want) = match elem {
         (DType::F16, DType::F16, DType::F32) => (target.has_mma_f16, "f16"),
+        (DType::F32, DType::F32, DType::F32) => (target.has_mma_f32, "f32"),
         (DType::I8, DType::I8, DType::I32) => (target.has_mma_i8, "i8"),
         _ => {
             return Err(format!(
-                "dot is {} x {} -> {acc}; the matrix unit runs f16 x f16 -> f32 and i8 x i8 -> i32",
+                "dot is {} x {} -> {acc}; the matrix unit runs f16 x f16 -> f32, f32 x f32 -> f32 and i8 x i8 -> i32",
                 parts.a_dtype, parts.b_dtype
             ));
         }
@@ -353,7 +359,7 @@ fn mma_plan(
 
 /// Splits `waves` into `rows x cols` so each wave's fragment block fits. The wanted row split is
 /// used if it fits, else the one with the smallest perimeter. No split: one wave.
-fn wave_grid(
+pub(crate) fn wave_grid(
     fm: usize,
     fnn: usize,
     waves: usize,

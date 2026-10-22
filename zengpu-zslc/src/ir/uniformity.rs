@@ -177,7 +177,9 @@ fn check_stmt(
         IrStmt::ImageStore { args, .. } => args
             .iter()
             .try_for_each(|arg| reject_if_divergent(arg, divergent)),
-        IrStmt::Barrier => reject_if_divergent_collective("workgroup barrier", divergent),
+        IrStmt::Barrier | IrStmt::SharedBarrier => {
+            reject_if_divergent_collective("workgroup barrier", divergent)
+        }
         IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             reject_if_divergent(cond, divergent)?;
@@ -318,6 +320,35 @@ mod tests {
         ] {
             assert!(msg.contains("barrier") && msg.contains("uniform"), "{msg}");
         }
+    }
+
+    #[test]
+    fn shared_barrier_follows_barrier_uniformity() {
+        check(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, id: global_id) {
+                if group_id().x < 4u32 {
+                    shared_barrier()
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect("group-uniform guard");
+        let err = check(
+            r#"
+            @workgroup_size(64)
+            kernel k(out: device mut buffer<f32>, id: global_id) {
+                if local_id().x < 5u32 {
+                    shared_barrier()
+                }
+                out[id.x] = 1.0
+            }
+        "#,
+        )
+        .expect_err("local-id guard is divergent");
+        assert!(err.contains("uniform"));
     }
 
     #[test]
