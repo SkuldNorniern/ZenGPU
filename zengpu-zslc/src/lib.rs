@@ -2687,6 +2687,21 @@ mod portability_tests {
             "",
             "shared s: array<f32, 256>\nlet fa: frag<f16, 16, 16, a> = frag_load_a(s, 0u, 16u)\nlet fb: frag<f16, 16, 16, b> = frag_load_b_t(s, 0u, 16u)\nlet c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(of, 0u, 16u, c)",
         ),
+        (
+            "f32 frags from f32 buffers",
+            "src: device buffer<f32>, ",
+            "let fa: frag<f32, 16, 16, a> = frag_load_a(src, 0u, 16u)\nlet fb: frag<f32, 16, 16, b> = frag_load_b_t(src, 0u, 16u)\nlet c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(of, 0u, 16u, c)",
+        ),
+        (
+            "f32 frags from f32 shared",
+            "",
+            "shared s: array<f32, 256>\nlet fa: frag<f32, 16, 16, a> = frag_load_a(s, 0u, 16u)\nlet fb: frag<f32, 16, 16, b> = frag_load_b(s, 0u, 16u)\nlet c: frag<f32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(of, 0u, 16u, c)",
+        ),
+        (
+            "f32 frag element access",
+            "src: device buffer<f32>, ",
+            "let fa: frag<f32, 16, 16, a> = frag_load_a(src, 0u, 16u)\nfa = frag_set(fa, 0u, f)\no[i] = bitcast_u32(frag_get(fa, 1u)) + frag_row(fa, 1u) + frag_col(fa, 1u) + frag_len(fa)",
+        ),
     ];
 
     #[test]

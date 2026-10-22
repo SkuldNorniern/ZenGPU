@@ -509,6 +509,10 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr(ctx)?;
             let stmt = match lhs {
                 IrExpr::Local(name) => {
+                    let rhs = match ctx.locals.get(&name).copied() {
+                        Some(local_ty) => self.frag_load_for(ctx, rhs, local_ty),
+                        None => rhs,
+                    };
                     self.check_frag_assign(ctx, &name, &rhs)?;
                     if let Some(&local_ty) = ctx.locals.get(&name) {
                         let rhs_ty = type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types);
@@ -671,6 +675,10 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         let init = self.parse_expr(ctx)?;
+        let init = match annot {
+            Some(ty) => self.frag_load_for(ctx, init, ty),
+            None => init,
+        };
         let is_zero_acc = matches!(
             init,
             IrExpr::Builtin {

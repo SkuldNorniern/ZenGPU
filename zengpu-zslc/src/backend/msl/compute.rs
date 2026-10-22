@@ -358,8 +358,8 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
 #[derive(Clone, Copy)]
 struct FragTiles {
     usage: FragUse,
-    /// `half` (f16 a/b) and `float` (f32 accumulator) are `simdgroup_matrix` tiles. `char` (i8
-    /// a/b) is held as `half` tiles, exact for every i8. `int` (i32 accumulator) is `int2` per
+    /// `half` (f16 a/b) and `float` (f32 a/b and accumulator) are `simdgroup_matrix` tiles. `char`
+    /// (i8 a/b) is held as `half` tiles, exact for every i8. `int` (i32 accumulator) is `int2` per
     /// tile in the lane layout of `zsl_frag_row`/`zsl_frag_col`, since simdgroup matrices have no
     /// integer type.
     elem: &'static str,
@@ -986,7 +986,7 @@ fn frag_tiles(types: &TypeArena, ty: TypeId) -> Result<FragTiles, Diagnostic> {
             Type::Float {
                 format: FloatFormat::F32,
             },
-            FragUse::Acc,
+            FragUse::A | FragUse::B | FragUse::Acc,
         ) => "float",
         (
             Type::Int {
@@ -1005,7 +1005,7 @@ fn frag_tiles(types: &TypeArena, ty: TypeId) -> Result<FragTiles, Diagnostic> {
         _ => {
             return Err(frag_rejected(
                 "fragment",
-                "a/b fragments are f16 and accumulators are f32 on MSL",
+                "a/b fragments are f16, f32 or i8 and accumulators are f32 or i32 on MSL",
             ));
         }
     };
@@ -1041,10 +1041,10 @@ fn frag_fill_lines(
             if frag.by_element() || f32_source {
                 return frag_load_elements(ctx, name, frag, src, &off, &ld, *trans);
             }
-            if *trans && frag.elem != "half" {
+            if *trans && !matches!(frag.elem, "half" | "float") {
                 return Err(frag_rejected(
                     "frag_load_b_t",
-                    "the transposed B load takes f16 operands",
+                    "the transposed B load takes f16 or f32 operands",
                 ));
             }
             let base = match src {
@@ -1068,7 +1068,7 @@ fn frag_fill_lines(
                     if !fits {
                         return Err(frag_rejected(
                             &format!("frag load from shared `{tile}`"),
-                            "a/b load f16 shared arrays and accumulators load f32 shared arrays on MSL (f32 a/b would need an f16 stage)",
+                            "a/b load f16 or f32 shared arrays, and accumulators load f32 shared arrays",
                         ));
                     }
                     format!("({tile} + ({off}))")
@@ -1221,11 +1221,13 @@ fn mma_lines(
         .filter(|f| f.usage == FragUse::B)
         .ok_or_else(|| frag_rejected("mma", "the second operand must be a b fragment"))?;
     let int_mma = a_frag.elem == "char" && b_frag.elem == "char" && frag.elem == "int";
-    let float_mma = a_frag.elem == "half" && b_frag.elem == "half" && frag.elem == "float";
+    let float_mma = a_frag.elem == b_frag.elem
+        && matches!(a_frag.elem, "half" | "float")
+        && frag.elem == "float";
     if frag.usage != FragUse::Acc || !(int_mma || float_mma) {
         return Err(frag_rejected(
             "mma",
-            "mma takes f16 a and b into an f32 accumulator, or i8 a and b into an i32 one",
+            "mma takes f16 or f32 a and b into an f32 accumulator, or i8 a and b into an i32 one",
         ));
     }
     let mut lines = match c {

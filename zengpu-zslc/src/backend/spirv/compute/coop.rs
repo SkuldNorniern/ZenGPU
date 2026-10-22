@@ -165,23 +165,23 @@ impl Coop {
         if let Some(&v) = self.views.get(&bits) {
             return v;
         }
-        let (t_elem, stride) = if bits == 16 {
-            (self.t_f16(spv), 2)
-        } else {
-            (self.t_i8(spv), 1)
+        let (t_elem, stride) = match bits {
+            32 => (spv.type_float(32), 4),
+            16 => (self.t_f16(spv), 2),
+            _ => (self.t_i8(spv), 1),
         };
-        if bits == 16 {
-            self.require(
+        match bits {
+            32 => {}
+            16 => self.require(
                 spv,
                 cap::STORAGE_BUFFER_16BIT_ACCESS,
                 Some("SPV_KHR_16bit_storage"),
-            );
-        } else {
-            self.require(
+            ),
+            _ => self.require(
                 spv,
                 cap::STORAGE_BUFFER_8BIT_ACCESS,
                 Some("SPV_KHR_8bit_storage"),
-            );
+            ),
         }
         let view = alias_u32_table(spv, t_elem, stride);
         self.views.insert(bits, view);
@@ -256,6 +256,12 @@ impl LowerCtx<'_> {
                             .ok_or_else(|| "ZSL: buffer has no SSBO table".to_string())?;
                         (table.var, table.t_ptr_elem)
                     }
+                    (
+                        _,
+                        Type::Float {
+                            format: FloatFormat::F32,
+                        },
+                    ) => self.coop.view(self.spv, 32),
                     (_, Type::Float { .. }) => self.coop.view(self.spv, 16),
                     (_, Type::Int { .. }) => self.coop.view(self.spv, 8),
                     _ => return Err("ZSL: frag source element does not fit this use".into()),
@@ -285,8 +291,8 @@ impl LowerCtx<'_> {
         Ok((off, stride))
     }
 
-    /// Cooperative loads cannot convert f32 to f16, so f32 shared is staged first. f16 and i8
-    /// load directly.
+    /// Cooperative loads cannot convert f32 to f16, so an f16 fragment from f32 shared is staged
+    /// first. f32 a/b, f16 and i8 load directly.
     fn is_f32_shared(&self, sv: &SharedVar) -> bool {
         storage_elem(&self.types, sv.elem) == Some(StorageElem::F32)
     }
@@ -299,10 +305,17 @@ impl LowerCtx<'_> {
         ld: &IrExpr,
         trans: bool,
     ) -> Result<Val, String> {
-        let (_, usage) =
+        let (elem, usage) =
             frag_parts(&self.types, ty).ok_or_else(|| "ZSL: expected a frag type".to_string())?;
+        let narrows = !matches!(
+            self.types.get(elem),
+            Type::Float {
+                format: FloatFormat::F32,
+            }
+        );
         if let FragSrc::Shared(name) = src
             && usage != FragUse::Acc
+            && narrows
             && self
                 .shared
                 .get(name)
