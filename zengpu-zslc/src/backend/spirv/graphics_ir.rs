@@ -635,7 +635,7 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             Ok(())
         }
         IrStmt::For { .. } => Err("for-loops are not supported in vertex/fragment shaders".into()),
-        IrStmt::AssignShared { .. } | IrStmt::Barrier => {
+        IrStmt::AssignShared { .. } | IrStmt::Barrier | IrStmt::SharedBarrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }
         IrStmt::AtomicAdd { .. } => Err("atomic_add is only available in compute shaders".into()),

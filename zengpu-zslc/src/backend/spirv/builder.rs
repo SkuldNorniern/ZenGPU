@@ -233,6 +233,12 @@ pub struct SpvBuilder {
     capabilities_seen: Vec<u32>,
     /// The module has device-scope atomics.
     atomics: bool,
+    /// Module-scope variables, for SPIR-V 1.4 entry point interfaces.
+    globals: Vec<Id>,
+    /// `(component, count)` of each vector type: SPIR-V forbids declaring one twice.
+    vector_type_cache: HashMap<(u32, u32), Id>,
+    /// An extension that needs SPIR-V 1.4 was enabled.
+    needs_1_4: bool,
 }
 
 #[allow(dead_code)]
@@ -255,6 +261,9 @@ impl SpvBuilder {
             constant_cache: HashMap::new(),
             type_constant_cache: HashMap::new(),
             atomics: false,
+            globals: Vec::new(),
+            vector_type_cache: HashMap::new(),
+            needs_1_4: false,
         }
     }
 
@@ -458,12 +467,16 @@ impl SpvBuilder {
     }
 
     pub fn type_vector(&mut self, component: Id, count: u32) -> Id {
+        if let Some(&id) = self.vector_type_cache.get(&(component.0, count)) {
+            return id;
+        }
         let id = self.fresh_id();
         emit(
             &mut self.types,
             op::TYPE_VECTOR,
             &[id.0, component.0, count],
         );
+        self.vector_type_cache.insert((component.0, count), id);
         id
     }
 
@@ -592,6 +605,7 @@ impl SpvBuilder {
 
     pub fn global_variable(&mut self, ptr_ty: Id, storage_class: u32) -> Id {
         let id = self.fresh_id();
+        self.globals.push(id);
         emit(
             &mut self.constants_globals,
             op::VARIABLE,
@@ -771,6 +785,9 @@ impl SpvBuilder {
     }
 
     pub fn extension(&mut self, name: &str) {
+        if name == "SPV_KHR_workgroup_memory_explicit_layout" {
+            self.needs_1_4 = true;
+        }
         let words = encode_string(name);
         emit_raw(&mut self.extensions, op::EXTENSION, &words);
     }
@@ -1556,8 +1573,16 @@ impl SpvBuilder {
             self.memory_model.clear();
             emit(&mut self.memory_model, op::MEMORY_MODEL, &[0, 3]);
         }
+        // SPIR-V 1.4 entry points list every module-scope variable they use, not only inputs and
+        // outputs. Listing them all is valid: every global belongs to the one entry point.
+        let version = if self.needs_1_4 {
+            self.list_all_globals_in_entry_points();
+            0x00010400
+        } else {
+            0x00010300
+        };
         let bound = self.next_id;
-        let mut out = vec![0x07230203, 0x00010300, 0x7A656E67, bound, 0];
+        let mut out = vec![0x07230203, version, 0x7A656E67, bound, 0];
         out.extend_from_slice(&self.capabilities);
         out.extend_from_slice(&self.extensions);
         out.extend_from_slice(&self.imports);
@@ -1569,6 +1594,36 @@ impl SpvBuilder {
         out.extend_from_slice(&self.constants_globals);
         out.extend_from_slice(&self.functions);
         out
+    }
+}
+
+impl SpvBuilder {
+    /// Appends the module-scope variables missing from each `OpEntryPoint` interface.
+    fn list_all_globals_in_entry_points(&mut self) {
+        let mut out = Vec::with_capacity(self.entry_points.len() + self.globals.len());
+        let mut at = 0;
+        while at < self.entry_points.len() {
+            let head = self.entry_points[at];
+            let wc = (head >> 16) as usize;
+            let mut words = self.entry_points[at..at + wc].to_vec();
+            if head & 0xffff == op::ENTRY_POINT {
+                // Operands: model, function, name (zero-terminated string), then interface ids.
+                let name_words = words[3..]
+                    .iter()
+                    .position(|w| w >> 24 == 0)
+                    .map_or(0, |p| p + 1);
+                let listed: Vec<u32> = words[3 + name_words..].to_vec();
+                for g in &self.globals {
+                    if !listed.contains(&g.0) {
+                        words.push(g.0);
+                    }
+                }
+                words[0] = ((words.len() as u32) << 16) | op::ENTRY_POINT;
+            }
+            out.extend_from_slice(&words);
+            at += wc;
+        }
+        self.entry_points = out;
     }
 }
 

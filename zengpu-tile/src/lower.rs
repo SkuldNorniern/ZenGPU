@@ -354,7 +354,8 @@ fn naive_source(kernel: &TileKernel, plan: &Plan) -> Result<String, TileError> {
 }
 
 /// The k loop stages A and B to shared memory (masked, zero outside the tensor), then runs a
-/// barrier, compute, and barrier. The epilogue runs the kernel's ops per output element.
+/// barrier, compute, and barrier. The epilogue runs the kernel's ops per output element. The
+/// barriers only order shared memory, so they are `shared_barrier()`.
 fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String, TileError> {
     if plan.mode == Mode::Mma {
         return mma_source(kernel, plan, parts);
@@ -397,7 +398,7 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
         wg,
         false,
     );
-    let _ = writeln!(src, "barrier()");
+    let _ = writeln!(src, "shared_barrier()");
     for p in 0..per_thread {
         let _ = writeln!(src, "let e{p} = lid + {}", p * wg);
         let _ = writeln!(src, "if e{p} < {elems} {{");
@@ -411,7 +412,7 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
         let _ = writeln!(src, "}}");
         let _ = writeln!(src, "}}");
     }
-    let _ = writeln!(src, "barrier()");
+    let _ = writeln!(src, "shared_barrier()");
     let _ = writeln!(src, "}}");
 
     let loop_at = parts.loop_at;
@@ -432,7 +433,8 @@ fn staged_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<Stri
 
 /// Matrix lowering. Each wave owns a `WM x WN` grid of 16x16 accumulators: A fragments are reused
 /// across `WN`, B across `WM`. Two stages: compute one while loading the next. The epilogue goes
-/// through a shared `BM x (WN_waves * 16)` slice per fragment column.
+/// through a shared `BM x (WN_waves * 16)` slice per fragment column. Its barriers are
+/// `shared_barrier()`: no device-buffer ordering is needed between k blocks or epilogue slices.
 ///
 /// `split_k > 1`: grid gets a z dimension. Group `z` reduces k blocks from `z * ksplit` and writes
 /// its partial tile to `ws[(z * M + row) * N + col]`, no epilogue. [`reduce_source`] sums them.
@@ -581,45 +583,45 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         if full > 0 {
             let _ = writeln!(src, "for kt in 0..{full} {{");
             stage(&mut g, &mut src, &bufs[0], "kt", true);
-            let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "shared_barrier()");
             compute(&mut src, &bufs[0]);
-            let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "shared_barrier()");
             let _ = writeln!(src, "}}");
         }
         if full < ksteps {
             let _ = writeln!(src, "for kr in 0..{} {{", ksteps - full);
             stage(&mut g, &mut src, &bufs[0], &format!("({full} + kr)"), false);
-            let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "shared_barrier()");
             compute(&mut src, &bufs[0]);
-            let _ = writeln!(src, "barrier()");
+            let _ = writeln!(src, "shared_barrier()");
             let _ = writeln!(src, "}}");
         }
     } else if !double {
         let _ = writeln!(src, "for kt in 0..{ksplit} {{");
         stage(&mut g, &mut src, &bufs[0], "kt", false);
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         compute(&mut src, &bufs[0]);
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         let _ = writeln!(src, "}}");
     } else {
         let pairs = ksplit / 2;
         stage(&mut g, &mut src, &bufs[0], "0", false);
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         let _ = writeln!(src, "for kp in 0..{pairs} {{");
         let _ = writeln!(src, "let kn: u32 = kp * 2 + 1");
         let _ = writeln!(src, "let kn2: u32 = kp * 2 + 2");
         stage(&mut g, &mut src, &bufs[1], "kn", false);
         compute(&mut src, &bufs[0]);
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         stage(&mut g, &mut src, &bufs[0], "kn2", false);
         compute(&mut src, &bufs[1]);
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         let _ = writeln!(src, "}}");
         if ksplit % 2 == 1 {
             compute(&mut src, &bufs[0]);
             if alias {
                 // The epilogue overwrites the buffer just read.
-                let _ = writeln!(src, "barrier()");
+                let _ = writeln!(src, "shared_barrier()");
             }
         }
     }
@@ -633,7 +635,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
                     "frag_store(sc, wr * {} + wc * 16, {scw}, c{i}_{j})",
                     16 * scw
                 );
-                let _ = writeln!(src, "barrier()");
+                let _ = writeln!(src, "shared_barrier()");
                 let _ = writeln!(src, "for it in 0..{per_slice} {{");
                 let _ = writeln!(src, "let e = lid + it * {wg}");
                 let _ = writeln!(src, "if e < {slice} {{");
@@ -647,7 +649,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
                 }
                 let _ = writeln!(src, "}}");
                 let _ = writeln!(src, "}}");
-                let _ = writeln!(src, "barrier()");
+                let _ = writeln!(src, "shared_barrier()");
             }
         }
         let _ = writeln!(src, "}}");
@@ -661,7 +663,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
                 16 * scw
             );
         }
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
         let _ = writeln!(src, "for it in 0..{per_slice} {{");
         let _ = writeln!(src, "let e = lid + it * {wg}");
         let _ = writeln!(src, "if e < {slice} {{");
@@ -685,7 +687,7 @@ fn mma_source(kernel: &TileKernel, plan: &Plan, parts: &Parts) -> Result<String,
         }
         let _ = writeln!(src, "}}");
         let _ = writeln!(src, "}}");
-        let _ = writeln!(src, "barrier()");
+        let _ = writeln!(src, "shared_barrier()");
     }
     let _ = writeln!(src, "}}");
     Ok(src)

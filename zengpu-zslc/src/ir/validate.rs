@@ -156,7 +156,7 @@ fn check_stmt(
             check_expr(ld, ctx, types, bool_id)?;
             check_expr(value, ctx, types, bool_id)
         }
-        IrStmt::Barrier | IrStmt::Discard => Ok(()),
+        IrStmt::Barrier | IrStmt::SharedBarrier | IrStmt::Discard => Ok(()),
         IrStmt::If { cond, then, else_ } => {
             check_expr(cond, ctx, types, bool_id)?;
             for stmt in then {

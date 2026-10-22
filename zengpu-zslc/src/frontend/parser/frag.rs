@@ -30,7 +30,8 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `frag<T, R, C, use>`: a 16x16 tile. `a`/`b` take `f16` or `i8`, `acc` takes `f32` or `i32`.
+    /// `frag<T, R, C, use>`: a 16x16 tile. `a`/`b` take `f16`, `f32` or `i8`, `acc` takes `f32` or
+    /// `i32`.
     pub(super) fn parse_frag_type(&mut self) -> Result<TypeId, ParseError> {
         if !self.eat_kw("frag") {
             return self.err("expected `frag<…>`");
@@ -54,12 +55,13 @@ impl<'a> Parser<'a> {
         }
         let element = match (usage, elem.as_str()) {
             (FragUse::A | FragUse::B, "f16") => self.types.f16_id(),
+            (FragUse::A | FragUse::B, "f32") => self.types.f32_id(),
             (FragUse::A | FragUse::B, "i8") => self.i8_id(),
             (FragUse::Acc, "f32") => self.types.f32_id(),
             (FragUse::Acc, "i32") => self.types.i32_id(),
             _ => {
                 return self.err(format!(
-                    "frag element `{elem}` does not fit its use: a and b take f16 or i8, acc takes f32 or i32"
+                    "frag element `{elem}` does not fit its use: a and b take f16, f32 or i8, acc takes f32 or i32"
                 ));
             }
         };
@@ -104,8 +106,9 @@ impl<'a> Parser<'a> {
         Ok((offset, ld))
     }
 
-    /// Element types. For `a` and `b`: `f16` (rounded from shared `f32`) or packed `u32`/`i32` i8.
-    /// For `acc`: `f32` or `i32`.
+    /// Element types. For `a` and `b`: `f16` (rounded from shared `f32`), `f32` from an f32
+    /// buffer, or packed `u32`/`i32` i8. A shared f32 load is `f16` unless its `let` asks for
+    /// [`Self::frag_load_for`]. For `acc`: `f32` or `i32`.
     pub(super) fn parse_frag_load(
         &mut self,
         ctx: &Ctx,
@@ -127,13 +130,14 @@ impl<'a> Parser<'a> {
         let element = match (usage, buf_elem) {
             (FragUse::A | FragUse::B, e) if e == f16 => f16,
             (FragUse::A | FragUse::B, e) if e == f32 && shared => f16,
+            (FragUse::A | FragUse::B, e) if e == f32 => f32,
             (FragUse::A | FragUse::B, e) if e == i8 && shared => i8,
             (FragUse::A | FragUse::B, e) if (e == u32 || e == i32) && !shared => i8,
             (FragUse::Acc, e) if e == f32 => f32,
             (FragUse::Acc, e) if e == i32 => i32,
             _ => {
                 return self.err(format!(
-                    "{name}: source element does not fit this use (a/b: f16 buffer or shared array, i8 shared array, u32/i32 buffer for packed i8, or shared f32; acc: f32 or i32)"
+                    "{name}: source element does not fit this use (a/b: f16 buffer or shared array, f32 buffer or shared array, i8 shared array, u32/i32 buffer for packed i8, or shared f32; acc: f32 or i32)"
                 ));
             }
         };
@@ -145,6 +149,43 @@ impl<'a> Parser<'a> {
             ld: Box::new(ld),
             trans,
         }))
+    }
+
+    /// `let x: frag<f32, 16, 16, a|b> = frag_load_a|b(shared, …)`: a shared f32 load takes the
+    /// annotated element instead of rounding to f16. Other initializers are returned as they are.
+    pub(super) fn frag_load_for(&mut self, ctx: &Ctx, init: IrExpr, want: TypeId) -> IrExpr {
+        let f32 = self.types.f32_id();
+        let Some((want_elem, want_use)) = frag_parts(&self.types, want) else {
+            return init;
+        };
+        let IrExpr::FragLoad { ty, src, .. } = &init else {
+            return init;
+        };
+        let src_elem = match src {
+            FragSrc::Buffer(name) => ctx.buffers.get(name).map(|b| b.elem),
+            FragSrc::Shared(name) => ctx.shared.get(name).map(|s| s.elem),
+        };
+        let load_use = frag_parts(&self.types, *ty).map(|(_, u)| u);
+        let f32_ab = want_elem == f32 && want_use != FragUse::Acc && src_elem == Some(f32);
+        if !f32_ab || load_use != Some(want_use) {
+            return init;
+        }
+        match init {
+            IrExpr::FragLoad {
+                src,
+                offset,
+                ld,
+                trans,
+                ..
+            } => IrExpr::FragLoad {
+                ty: want,
+                src,
+                offset,
+                ld,
+                trans,
+            },
+            other => other,
+        }
     }
 
     pub(super) fn parse_frag_store(&mut self, ctx: &Ctx) -> Result<IrStmt, ParseError> {
@@ -203,12 +244,13 @@ impl<'a> Parser<'a> {
                         .err("mma(a, b, acc) takes an a fragment, a b fragment, then an acc");
                 }
                 let f16 = self.types.f16_id();
-                let want_acc = if ea == f16 && ea == eb {
-                    self.types.f32_id()
+                let f32 = self.types.f32_id();
+                let want_acc = if (ea == f16 || ea == f32) && ea == eb {
+                    f32
                 } else if ea == self.i8_id() && ea == eb {
                     self.types.i32_id()
                 } else {
-                    return self.err("mma operands must both be f16 or both be i8");
+                    return self.err("mma operands must both be f16, both be f32, or both be i8");
                 };
                 if matches!(
                     args[2],
@@ -222,7 +264,7 @@ impl<'a> Parser<'a> {
                 let (ec, uc) = frag_arg(self, &args[2])?;
                 if uc != FragUse::Acc || ec != want_acc {
                     return self.err(
-                        "mma accumulator must be acc with f32 (f16 operands) or i32 (i8 operands)",
+                        "mma accumulator must be acc with f32 (f16 or f32 operands) or i32 (i8 operands)",
                     );
                 }
                 Ok(())
