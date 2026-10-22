@@ -1270,7 +1270,11 @@ int main() {{
         assert!(msl_source.contains("fmod(") && msl_source.contains("%"));
         let words = spirv::lower_compute(&module).expect("lower % to SPIR-V");
         let ops = spirv_opcodes(&words);
-        assert!(ops.contains(&137) && ops.contains(&138) && ops.contains(&140));
+        assert!(ops.contains(&137) && ops.contains(&140));
+        assert!(
+            !ops.contains(&138),
+            "signed remainder must work without maintenance8"
+        );
     }
 
     const SELECT_KERNEL: &str = r#"
