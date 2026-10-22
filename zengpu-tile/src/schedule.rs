@@ -353,7 +353,7 @@ fn mma_plan(
 
 /// Splits `waves` into `rows x cols` so each wave's fragment block fits. The wanted row split is
 /// used if it fits, else the one with the smallest perimeter. No split: one wave.
-fn wave_grid(
+pub(crate) fn wave_grid(
     fm: usize,
     fnn: usize,
     waves: usize,
