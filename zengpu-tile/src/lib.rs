@@ -877,15 +877,15 @@ mod tests {
         assert!(c.msl().is_ok());
     }
 
-    /// M1 as `Target::from_caps` reports it: f16 matrix unit, no i8 one.
+    /// M1 as `Target::from_caps` reports it: f16, i8 and f32 matrix forms.
     fn metal_target() -> Target {
         Target {
             backend: BackendPreference::Metal,
             wave_size: 32,
             lds_bytes: 32768,
             has_mma_f16: true,
-            has_mma_i8: false,
-            has_mma_f32: false,
+            has_mma_i8: true,
+            has_mma_f32: true,
         }
     }
 
@@ -928,27 +928,27 @@ mod tests {
             suggest(&hip, DType::F16, 2048, 2048, 2048),
             defaults([64, 64])
         );
+        let scalar_metal = Target {
+            has_mma_i8: false,
+            has_mma_f32: false,
+            ..metal_target()
+        };
         assert_eq!(
-            suggest(&metal_target(), DType::F32, 2048, 2048, 2048),
+            suggest(&scalar_metal, DType::F32, 2048, 2048, 2048),
             defaults([64, 64])
         );
         assert_eq!(
-            suggest(&metal_target(), DType::I8, 2048, 2048, 2048),
+            suggest(&scalar_metal, DType::I8, 2048, 2048, 2048),
             defaults([64, 64])
         );
         assert_eq!(suggest(&hip, DType::F16, 8, 40, 20), defaults([16, 48]));
         assert_eq!(suggest(&hip, DType::F16, 1, 1, 1), defaults([16, 16]));
     }
 
-    /// i8 with a matrix unit (synthetic target: M1 has none): 64x64, bk 16, four waves, matrix
-    /// form. Checked on the suggestion only, since the i8 matrix ZSL is not exercised here.
+    /// i8 on Metal: 64x64, bk 16, four waves, matrix form.
     #[test]
     fn suggestions_use_the_i8_matrix_unit() {
-        let target = Target {
-            has_mma_i8: true,
-            ..metal_target()
-        };
-        let s = suggest(&target, DType::I8, 2048, 2048, 2048);
+        let s = suggest(&metal_target(), DType::I8, 2048, 2048, 2048);
         assert_eq!(
             s,
             Suggestion {
@@ -962,8 +962,33 @@ mod tests {
                 },
             }
         );
-        let small = suggest(&target, DType::I8, 8, 40, 20);
+        let small = suggest(&metal_target(), DType::I8, 8, 40, 20);
         assert_eq!(small.tile, [16, 48]);
+    }
+
+    /// f32 on Metal: 64x64, bk 32, four waves, matrix form; a 32 KiB budget still fits it.
+    #[test]
+    fn suggestions_use_the_f32_matrix_unit() {
+        let s = suggest(&metal_target(), DType::F32, 2048, 2048, 2048);
+        assert_eq!((s.tile, s.bk), ([64, 64], 32));
+        assert_eq!((s.schedule.matrix, s.schedule.waves), (Matrix::Mma, 4));
+        let c = compile_with(
+            &gemm(
+                DType::F32,
+                DType::F32,
+                2048,
+                2048,
+                2048,
+                s.tile,
+                s.bk,
+                false,
+            )
+            .unwrap(),
+            &s.schedule,
+            &metal_target(),
+        )
+        .unwrap();
+        assert_eq!(c.schedule_name(), "mma", "{:?}", c.notes());
     }
 
     /// LDS is the limit: with 8 KiB the wide tile does not fit, and the 64x64 tile does.
