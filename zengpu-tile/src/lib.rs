@@ -381,7 +381,7 @@ mod tests {
         };
         let got = compile_with(&f32_kernel, &mma, &target).unwrap();
         assert_eq!(got.schedule_name(), "staged");
-        assert!(got.notes()[0].starts_with("mma: dot is f32 x f32"));
+        assert!(got.notes()[0].starts_with("mma: target has no f32 matrix unit"));
 
         let i8_kernel = gemm(DType::I8, DType::I32, 48, 32, 64, [16, 16], 8, false).unwrap();
         let got = compile_with(&i8_kernel, &mma, &target).unwrap();
@@ -479,7 +479,7 @@ mod tests {
 
     /// Scheduled cases: edges in M, N, K. 64-wide tiles run four waves. i8 uses the matrix unit
     /// where the target has it.
-    const SCHEDULED: [Case; 9] = [
+    const SCHEDULED: [Case; 11] = [
         Case {
             input: DType::F16,
             out: DType::F16,
@@ -524,6 +524,24 @@ mod tests {
             k: 37,
             tile: [32, 32],
             bk: 16,
+        },
+        Case {
+            input: DType::F32,
+            out: DType::F32,
+            m: 260,
+            n: 130,
+            k: 72,
+            tile: [64, 64],
+            bk: 16,
+        },
+        Case {
+            input: DType::F32,
+            out: DType::F32,
+            m: 256,
+            n: 128,
+            k: 96,
+            tile: [64, 64],
+            bk: 32,
         },
         Case {
             input: DType::I8,
@@ -743,6 +761,10 @@ mod tests {
                     assert_eq!(shape, "mma", "{}x{}x{}", case.m, case.n, case.k);
                     assert!(notes.is_empty(), "{notes:?}");
                 }
+                if sched == mma && case.input == DType::F32 && target.has_mma_f32 {
+                    assert_eq!(shape, "mma", "{}x{}x{}", case.m, case.n, case.k);
+                    assert!(notes.is_empty(), "{notes:?}");
+                }
                 if sched == mma && case.input == DType::I8 {
                     let want = if target.has_mma_i8 { "mma" } else { "naive" };
                     assert_eq!(shape, want, "{notes:?}");
@@ -863,6 +885,7 @@ mod tests {
             lds_bytes: 32768,
             has_mma_f16: true,
             has_mma_i8: false,
+            has_mma_f32: false,
         }
     }
 
@@ -1023,6 +1046,30 @@ mod tests {
             };
             run_case(&*dev, &target, case, &s.schedule).unwrap();
         }
+    }
+
+    /// f32 x f32 -> f32 takes the matrix unit where the target has it, staging f32 natively.
+    #[test]
+    fn f32_mma_plan_stages_f32_natively() {
+        let kernel = gemm(DType::F32, DType::F32, 200, 136, 72, [64, 64], 32, false).unwrap();
+        let metal = Target {
+            backend: BackendPreference::Metal,
+            lds_bytes: 32768,
+            has_mma_f32: true,
+            ..Target::hip_gfx12()
+        };
+        let sched = Schedule {
+            matrix: Matrix::Mma,
+            ..Schedule::default()
+        };
+        let c = compile_with(&kernel, &sched, &metal).unwrap();
+        assert_eq!(c.schedule_name(), "mma", "{:?}", c.notes());
+        let zsl = c.zsl();
+        assert!(zsl.contains("shared sa: array<f32, "), "{zsl}");
+        assert!(zsl.contains("let fa0: frag<f32, 16, 16, a>"), "{zsl}");
+        assert!(zsl.contains("let fb0: frag<f32, 16, 16, b>"), "{zsl}");
+        assert!(c.msl().is_ok());
+        assert!(c.spirv().is_ok());
     }
 
     /// The k loop runs past the operands' columns: those reads are zero on every path.
