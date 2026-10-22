@@ -1068,9 +1068,21 @@ impl GpuDevice for VulkanDevice {
         if statistics.is_empty() {
             return None;
         }
+        let mut recognized = false;
         for stat in &statistics {
-            // SAFETY: the driver fills `value` in the variant named by `format`.
-            let raw = unsafe { stat.value.u64 };
+            // Statistics and their formats are driver-defined. Do not read an
+            // integer from a floating-point or boolean union member.
+            let raw = match stat.format {
+                vk::PipelineExecutableStatisticFormatKHR::UINT64 => unsafe { stat.value.u64 },
+                vk::PipelineExecutableStatisticFormatKHR::INT64 => {
+                    let signed = unsafe { stat.value.i64 };
+                    let Ok(value) = u64::try_from(signed) else {
+                        continue;
+                    };
+                    value
+                }
+                _ => continue,
+            };
             let name = unsafe { CStr::from_ptr(stat.name.as_ptr()) };
             let value = u32::try_from(raw).unwrap_or(u32::MAX);
             match name.to_bytes() {
@@ -1079,10 +1091,11 @@ impl GpuDevice for VulkanDevice {
                 b"Scratch size" => stats.scratch_bytes = value,
                 b"LDS size" => stats.lds_bytes = value,
                 b"Subgroups per SIMD" => stats.waves_per_simd = Some(value),
-                _ => {}
+                _ => continue,
             }
+            recognized = true;
         }
-        Some(stats)
+        recognized.then_some(stats)
     }
 
     fn destroy_pipeline(&self, pipeline: PipelineHandle) {
