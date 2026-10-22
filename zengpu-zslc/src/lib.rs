@@ -2653,6 +2653,11 @@ mod portability_tests {
             "let m = subgroup_ballot(u > 3u)\no[i] = m.x + m.y + m.z + m.w + subgroup_ballot(x < 0).x",
         ),
         (
+            "dot4 and bytes",
+            "",
+            "o[i] = bitcast_u32(dot4_i8(x, x, 3) + dot4_iu8(x, u, 1) + sbyte(u, 1u)) + dot4_u8(u, u, 2u) + byte(u, 2u)",
+        ),
+        (
             "i32 view",
             "",
             "shared sa: array<f16, 512>\nview si: array<i32> = sa\nsi[i % 256u] = x\nbarrier()\no[i] = bitcast_u32(si[0])",
