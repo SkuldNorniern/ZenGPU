@@ -4342,6 +4342,92 @@ mod tests {
     }
 
     #[test]
+    fn signed_remainders_keep_the_dividend_sign() {
+        use zengpu_spirv::{ZslShader, zsl};
+        const REM: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(32)
+            kernel rem(a: device buffer<i32>, b: device buffer<i32>, out: device mut buffer<i32>, p: P, id: global_id) {
+                if id.x < p.len { out[id.x] = a[id.x] % b[id.x] }
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        let mut left = Vec::new();
+        let mut right = Vec::new();
+        let mut expected = Vec::new();
+        for a in [
+            i32::MIN,
+            i32::MIN + 1,
+            -1500,
+            -7,
+            -1,
+            0,
+            1,
+            7,
+            1500,
+            i32::MAX,
+        ] {
+            for b in [i32::MIN, -1500, -7, -5, -1, 1, 5, 7, 1500, i32::MAX] {
+                if let Some(rem) = a.checked_rem(b) {
+                    left.push(a);
+                    right.push(b);
+                    expected.push(rem);
+                }
+            }
+        }
+        let upload = |values: &[i32]| {
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let buffer = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(buffer, 0, &bytes).unwrap();
+            buffer
+        };
+        let buffers = [upload(&left), upload(&right), upload(&vec![0; left.len()])];
+        let shader = dev.create_shader(REM.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [32, 1, 1],
+            })
+            .unwrap();
+        let slots = buffers.map(|b| b.index());
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(left.len() as u32)],
+                textures: &[],
+                images: &[],
+            },
+            [(left.len() as u32).div_ceil(32), 1, 1],
+        )
+        .unwrap();
+        let bytes = dev
+            .read_buffer(buffers[2], 0, (left.len() * 4) as u64)
+            .unwrap();
+        for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(
+                i32::from_le_bytes(*chunk),
+                expected[i],
+                "{} % {}",
+                left[i],
+                right[i]
+            );
+        }
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        for buffer in buffers {
+            dev.destroy_buffer(buffer);
+        }
+    }
+
+    #[test]
     fn zsl_scalar_features_run_through_vulkan() {
         use zengpu_spirv::{ZslShader, zsl};
 

@@ -338,9 +338,13 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
                 spv.capability(cap::FLOAT16);
                 spv.type_float(16)
             }
-            Some(StorageElem::I8 | StorageElem::U8) => {
+            Some(StorageElem::I8) => {
                 spv.capability(cap::INT8);
                 spv.type_int(8, true)
+            }
+            Some(StorageElem::U8) => {
+                spv.capability(cap::INT8);
+                spv.type_int(8, false)
             }
             Some(StorageElem::I32) => t_i32,
             Some(StorageElem::U32 | StorageElem::Bf16) => t_u32,
@@ -1397,7 +1401,23 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
             let id = if lhs.ty == ctx.f32_id {
                 ctx.spv.op_frem(ty, lhs.id, rhs.id)
             } else if lhs.ty == ctx.i32_id {
-                ctx.spv.op_srem(ty, lhs.id, rhs.id)
+                // Vulkan without maintenance8 leaves negative OpSRem operands
+                // undefined. Unsigned magnitudes also handle i32::MIN without
+                // overflowing a signed abs/negation.
+                let zero_i = ctx.spv.constant_u32(ctx.t_i32, 0);
+                let zero_u = ctx.spv.constant_u32(ctx.t_u32, 0);
+                let left_neg = ctx.spv.op_slt(ctx.t_bool, lhs.id, zero_i);
+                let right_neg = ctx.spv.op_slt(ctx.t_bool, rhs.id, zero_i);
+                let left = ctx.spv.op_bitcast(ctx.t_u32, lhs.id);
+                let right = ctx.spv.op_bitcast(ctx.t_u32, rhs.id);
+                let minus_left = ctx.spv.op_isub(ctx.t_u32, zero_u, left);
+                let minus_right = ctx.spv.op_isub(ctx.t_u32, zero_u, right);
+                let left = ctx.spv.op_select(ctx.t_u32, left_neg, minus_left, left);
+                let right = ctx.spv.op_select(ctx.t_u32, right_neg, minus_right, right);
+                let rem = ctx.spv.op_umod(ctx.t_u32, left, right);
+                let minus_rem = ctx.spv.op_isub(ctx.t_u32, zero_u, rem);
+                let signed = ctx.spv.op_select(ctx.t_u32, left_neg, minus_rem, rem);
+                ctx.spv.op_bitcast(ctx.t_i32, signed)
             } else if lhs.ty == ctx.u32_id {
                 ctx.spv.op_umod(ty, lhs.id, rhs.id)
             } else {
@@ -2792,6 +2812,47 @@ mod tests {
     use super::lower_compute;
     use crate::backend::spirv::graphics_ir::tests::validate;
     use crate::frontend::parser::parse_compute;
+
+    #[test]
+    fn unsigned_shared_conversions_validate() {
+        let module = parse_compute(
+            r#"
+            @workgroup_size(32)
+            kernel bytes(src: device buffer<u32>, dst: device mut buffer<u32>, id: global_id) {
+                shared values: array<u8, 32>
+                values[local_id().x] = src[id.x]
+                shared_barrier()
+                dst[id.x] = values[local_id().x]
+            }
+        "#,
+        )
+        .expect("parse unsigned shared kernel");
+        validate(&lower_compute(&module).expect("lower unsigned shared kernel"));
+    }
+
+    #[test]
+    fn signed_remainder_avoids_negative_spirv_remainder_operands() {
+        let module = parse_compute(r#"
+            @workgroup_size(32)
+            kernel rem(a: device buffer<i32>, b: device buffer<i32>, out: device mut buffer<i32>, id: global_id) {
+                out[id.x] = a[id.x] % b[id.x]
+            }
+        "#).expect("parse signed remainder");
+        let words = lower_compute(&module).expect("lower signed remainder");
+        validate(&words);
+        let mut at = 5;
+        let mut unsigned = false;
+        while at < words.len() {
+            let opcode = words[at] & 0xffff;
+            assert!(
+                !matches!(opcode, 138 | 139),
+                "negative operands must not reach SRem/SMod"
+            );
+            unsigned |= opcode == 137;
+            at += (words[at] >> 16) as usize;
+        }
+        assert!(unsigned);
+    }
 
     #[test]
     fn texture_and_image_params_lower_to_valid_spirv() {
