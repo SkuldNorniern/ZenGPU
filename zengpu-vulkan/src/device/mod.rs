@@ -25,6 +25,7 @@ use zengpu_hal::{
     WindowHandles, marker,
 };
 
+mod cooperative;
 mod dispatch;
 mod format;
 mod graphics;
@@ -432,6 +433,7 @@ pub(crate) struct VulkanDeviceInner {
     pub depth24_stencil8: vk::Format,
     /// `(min, max)` subgroup sizes a compute pipeline may require (`VK_EXT_subgroup_size_control`).
     pub compute_subgroup_sizes: Option<(u32, u32)>,
+    pub compute_full_subgroups: bool,
     pub coop_matrix: bool,
     /// `VK_KHR_pipeline_executable_properties` enabled: stats-capture pipelines report
     /// resource use.
@@ -945,6 +947,7 @@ impl VulkanDevice {
         features2.p_next = &mut desc_idx as *mut _ as *mut c_void;
         let mut subgroup_size_feat = vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT {
             subgroup_size_control: vk::TRUE,
+            compute_full_subgroups: supported_subgroup_size.compute_full_subgroups,
             ..Default::default()
         };
         if compute_subgroup_sizes.is_some() {
@@ -1081,6 +1084,8 @@ impl VulkanDevice {
             max_sampler_anisotropy,
             depth24_stencil8,
             compute_subgroup_sizes,
+            compute_full_subgroups: compute_subgroup_sizes.is_some()
+                && supported_subgroup_size.compute_full_subgroups == vk::TRUE,
             coop_matrix: coop_supported,
             pipeline_executable_info: pipe_exec_supported,
             dynamic_rendering,
@@ -1624,6 +1629,81 @@ mod tests {
         let adapter = inst.request_adapter(AdapterRequest::default())?;
         let dev = adapter.open(DeviceRequest::default()).ok()?;
         Some(TestDevice { dev, _guard: guard })
+    }
+
+    fn has_mma(dev: &dyn GpuDevice, input: zengpu_hal::DType) -> bool {
+        dev.compute_caps()
+            .mma
+            .iter()
+            .any(|s| (s.m, s.n, s.k, s.subgroup) == (16, 16, 16, 32) && s.a == input)
+    }
+
+    /// Keep exercising f16 on devices whose integer matrix unit uses a different K.
+    fn mixed_or_float_shader(
+        dev: &dyn GpuDevice,
+        mixed: &zengpu_spirv::ZslShader,
+        float: &zengpu_spirv::ZslShader,
+    ) -> (ShaderHandle, bool) {
+        let int8 = has_mma(dev, zengpu_hal::DType::I8);
+        let chosen = if int8 {
+            mixed
+        } else {
+            assert!(
+                matches!(dev.create_shader(mixed.spirv_desc().unwrap()),
+                    Err(GpuError::Unsupported(message)) if message.contains("cooperative matrix")
+                ),
+                "unsupported integer matrix shape must be rejected before driver use"
+            );
+            float
+        };
+        (
+            dev.create_shader(chosen.spirv_desc().unwrap()).unwrap(),
+            int8,
+        )
+    }
+
+    #[test]
+    fn cooperative_pipelines_reject_incompatible_subgroups() {
+        use zengpu_spirv::{ZslShader, zsl};
+        const MATRIX: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel matrix(a: device buffer<f16>, b: device buffer<f16>, out: device mut buffer<f32>) {
+                let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_zero_acc()
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        if !has_mma(&*dev, zengpu_hal::DType::F16) {
+            return;
+        }
+        let shader = dev.create_shader(MATRIX.spirv_desc().unwrap()).unwrap();
+        let desc = ComputePipelineDesc {
+            shader,
+            entry: "main",
+            block: [32, 1, 1],
+        };
+        assert!(matches!(
+            dev.create_compute_pipeline_with(
+                desc,
+                zengpu_hal::ComputePipelineHints {
+                    subgroup_size: Some(64),
+                    ..Default::default()
+                }
+            ),
+            Err(GpuError::Unsupported(_))
+        ));
+        assert!(matches!(
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                block: [16, 1, 1],
+                ..desc
+            }),
+            Err(GpuError::PipelineCreation(_))
+        ));
+        let pipeline = dev.create_compute_pipeline(desc).unwrap();
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
     }
 
     #[test]
@@ -4765,7 +4845,7 @@ mod tests {
         }
     }
 
-    /// `C = A*B + C` on one 16x16x16 tile, f16 and packed i8. Needs those configs (RADV gfx12).
+    /// `C = A*B + C` on one 16x16x16 tile. Exercise each supported input type.
     #[test]
     fn zsl_frag_mma_runs_through_vulkan() {
         use zengpu_spirv::{ZslShader, zsl};
@@ -4789,7 +4869,22 @@ mod tests {
             }
         );
 
+        const FLOAT_FRAG: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel frag_float(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, ba: device buffer<u32>, bb: device buffer<u32>, ci: device buffer<i32>, oi: device mut buffer<i32>, zout: device mut buffer<f32>) {
+                let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b(b, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+                let zero: frag<f32, 16, 16, acc> = frag_zero_acc()
+                frag_store(zout, 0, 16, mma(fa, fb, zero))
+            }
+        );
+
         let Some(dev) = try_device() else { return };
+        if !has_mma(&*dev, zengpu_hal::DType::F16) {
+            return;
+        }
         let f16_bits = |x: f32| -> u16 {
             if x == 0.0 {
                 return 0;
@@ -4839,7 +4934,7 @@ mod tests {
         let oi = make(1024, output, &[0u8; 1024]);
         let zout = make(1024, output, &[0u8; 1024]);
 
-        let shader = dev.create_shader(FRAG_ZSL.spirv_desc().unwrap()).unwrap();
+        let (shader, int8) = mixed_or_float_shader(&*dev, &FRAG_ZSL, &FLOAT_FRAG);
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -4895,7 +4990,9 @@ mod tests {
                     "f16 mma at ({m}, {n}): got {} want {s}",
                     got_f[at]
                 );
-                assert_eq!(got_i[at], si, "i8 mma at ({m}, {n})");
+                if int8 {
+                    assert_eq!(got_i[at], si, "i8 mma at ({m}, {n})");
+                }
                 let p: f32 = (0..16).map(|k| fa[m * 16 + k] * fb[k * 16 + n]).sum();
                 assert!(
                     (got_z[at] - p).abs() <= 1e-3 * p.abs().max(1.0),
@@ -5118,7 +5215,28 @@ mod tests {
             }
         );
 
+        const FLOAT_SHARED: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel float_shared(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, ba: device buffer<i32>, bb: device buffer<i32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+                shared sa: array<f16, 256>
+                shared sb: array<f16, 256>
+                let lane = local_id().x
+                for i in 0..8 {
+                    sa[lane + i * 32] = a[lane + i * 32]
+                    sb[lane + i * 32] = b[lane + i * 32]
+                }
+                shared_barrier()
+                let fa: frag<f16, 16, 16, a> = frag_load_a(sa, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b(sb, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+            }
+        );
+
         let Some(dev) = try_device() else { return };
+        if !has_mma(&*dev, zengpu_hal::DType::F16) {
+            return;
+        }
         let f16_bits = |x: f32| -> u16 {
             if x == 0.0 {
                 return 0;
@@ -5167,9 +5285,7 @@ mod tests {
         let out = make(1024, output, &[0u8; 1024]);
         let oi = make(1024, output, &[0u8; 1024]);
 
-        let shader = dev
-            .create_shader(SHARED_FRAG.spirv_desc().unwrap())
-            .unwrap();
+        let (shader, int8) = mixed_or_float_shader(&*dev, &SHARED_FRAG, &FLOAT_SHARED);
         let pipeline = dev
             .create_compute_pipeline_with(
                 ComputePipelineDesc {
@@ -5231,7 +5347,9 @@ mod tests {
                     "f16 mma from shared at ({m}, {n}): got {} want {s}",
                     got_f[at]
                 );
-                assert_eq!(got_i[at], si, "i8 mma from shared at ({m}, {n})");
+                if int8 {
+                    assert_eq!(got_i[at], si, "i8 mma from shared at ({m}, {n})");
+                }
             }
         }
         dev.destroy_pipeline(pipeline);
@@ -5241,7 +5359,7 @@ mod tests {
         }
     }
 
-    /// `frag_load_b_t` on RADV: N x K row-major f16 or packed i8 B, loaded as a ColumnMajor
+    /// `frag_load_b_t`: N x K row-major f16 or packed i8 B, loaded as a ColumnMajor
     /// cooperative load.
     #[test]
     fn zsl_frag_load_b_t_runs_through_vulkan() {
@@ -5261,7 +5379,20 @@ mod tests {
             }
         );
 
+        const FLOAT_BT: ZslShader = zsl!(
+            @workgroup_size(32)
+            kernel float_bt(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, ba: device buffer<u32>, bb: device buffer<u32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
+                let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
+                let fb: frag<f16, 16, 16, b> = frag_load_b_t(b, 0, 16)
+                let acc: frag<f32, 16, 16, acc> = frag_load_acc(c, 0, 16)
+                frag_store(out, 0, 16, mma(fa, fb, acc))
+            }
+        );
+
         let Some(dev) = try_device() else { return };
+        if !has_mma(&*dev, zengpu_hal::DType::F16) {
+            return;
+        }
         let f16_bits = |x: f32| -> u16 {
             if x == 0.0 {
                 return 0;
@@ -5309,7 +5440,7 @@ mod tests {
         let out = make(1024, output, &[0u8; 1024]);
         let oi = make(1024, output, &[0u8; 1024]);
 
-        let shader = dev.create_shader(BT_ZSL.spirv_desc().unwrap()).unwrap();
+        let (shader, int8) = mixed_or_float_shader(&*dev, &BT_ZSL, &FLOAT_BT);
         let pipeline = dev
             .create_compute_pipeline_with(
                 ComputePipelineDesc {
@@ -5371,7 +5502,9 @@ mod tests {
                     "f16 b_t at ({m}, {n}): got {} want {s}",
                     got_f[at]
                 );
-                assert_eq!(got_i[at], si, "i8 b_t at ({m}, {n})");
+                if int8 {
+                    assert_eq!(got_i[at], si, "i8 b_t at ({m}, {n})");
+                }
             }
         }
         dev.destroy_pipeline(pipeline);
@@ -5792,7 +5925,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_caps_are_reported_on_radv() {
+    fn compute_caps_match_the_device() {
         let Some(dev) = try_device() else { return };
         let caps = dev.compute_caps();
         let (lo, hi) = caps.subgroup_sizes;
@@ -5807,22 +5940,63 @@ mod tests {
             "workgroup {}",
             caps.max_workgroup
         );
+        let native = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        let loader = khr::cooperative_matrix::Instance::new(
+            &native.inner.shared.entry,
+            &native.inner.shared.instance,
+        );
+        let supported = if native.inner.coop_matrix {
+            unsafe {
+                loader.get_physical_device_cooperative_matrix_properties(native.inner.physical)
+            }
+            .unwrap()
+        } else {
+            Vec::new()
+        };
         for shape in &caps.mma {
             assert_eq!(
                 (shape.m, shape.n, shape.k, shape.subgroup),
                 (16, 16, 16, 32)
             );
+            let (a, c) = match (shape.a, shape.acc) {
+                (zengpu_hal::DType::F16, zengpu_hal::DType::F32) => {
+                    (vk::ComponentTypeKHR::FLOAT16, vk::ComponentTypeKHR::FLOAT32)
+                }
+                (zengpu_hal::DType::I8, zengpu_hal::DType::I32) => {
+                    (vk::ComponentTypeKHR::SINT8, vk::ComponentTypeKHR::SINT32)
+                }
+                other => panic!("unexpected shape types: {other:?}"),
+            };
+            assert!(
+                supported.iter().any(|p| (p.m_size, p.n_size, p.k_size)
+                    == (shape.m, shape.n, shape.k)
+                    && p.scope == vk::ScopeKHR::SUBGROUP
+                    && (p.a_type, p.b_type, p.c_type, p.result_type) == (a, a, c, c)),
+                "advertised shape missing from device properties: {shape:?}"
+            );
         }
-        assert!(
-            caps.mma
-                .iter()
-                .any(|s| s.a == zengpu_hal::DType::F16 && s.acc == zengpu_hal::DType::F32)
-        );
-        assert!(
-            caps.mma
-                .iter()
-                .any(|s| s.a == zengpu_hal::DType::I8 && s.acc == zengpu_hal::DType::I32)
-        );
+        if native.inner.compute_full_subgroups && (lo..=hi).contains(&32) {
+            for (a, c, dtype) in [
+                (
+                    vk::ComponentTypeKHR::FLOAT16,
+                    vk::ComponentTypeKHR::FLOAT32,
+                    zengpu_hal::DType::F16,
+                ),
+                (
+                    vk::ComponentTypeKHR::SINT8,
+                    vk::ComponentTypeKHR::SINT32,
+                    zengpu_hal::DType::I8,
+                ),
+            ] {
+                let available = supported.iter().any(|p| {
+                    (p.m_size, p.n_size, p.k_size) == (16, 16, 16)
+                        && p.scope == vk::ScopeKHR::SUBGROUP
+                        && p.saturating_accumulation == vk::FALSE
+                        && (p.a_type, p.b_type, p.c_type, p.result_type) == (a, a, c, c)
+                });
+                assert_eq!(caps.mma.iter().any(|s| s.a == dtype), available);
+            }
+        }
     }
 
     #[test]
