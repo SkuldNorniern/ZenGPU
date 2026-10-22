@@ -118,6 +118,8 @@ pub enum IrStmt {
         value: IrExpr,
     },
     Barrier,
+    /// Workgroup barrier that orders shared memory only, not device buffers or textures.
+    SharedBarrier,
     If {
         cond: IrExpr,
         then: Vec<IrStmt>,
@@ -413,7 +415,7 @@ fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
                 || expr_uses_subgroup_query(ld)
                 || expr_uses_subgroup_query(value)
         }
-        IrStmt::Barrier | IrStmt::Discard => false,
+        IrStmt::Barrier | IrStmt::SharedBarrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_subgroup_query(cond)
                 || stmts_use_subgroup_query(then)
@@ -502,7 +504,7 @@ fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
                 || expr_uses_workgroup_reduce(ld)
                 || expr_uses_workgroup_reduce(value)
         }
-        IrStmt::Barrier | IrStmt::Discard => false,
+        IrStmt::Barrier | IrStmt::SharedBarrier | IrStmt::Discard => false,
         IrStmt::If { cond, then, else_ } => {
             expr_uses_workgroup_reduce(cond)
                 || stmts_use_workgroup_reduce(then)
@@ -603,7 +605,9 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, boo
             ),
             expr_uses_subgroup_collectives(value),
         ),
-        IrStmt::Barrier | IrStmt::Discard => (false, false, false, false, false),
+        IrStmt::Barrier | IrStmt::SharedBarrier | IrStmt::Discard => {
+            (false, false, false, false, false)
+        }
         IrStmt::If { cond, then, else_ } => {
             let mut uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(cond),

@@ -438,6 +438,11 @@ impl<'a> Parser<'a> {
             self.expect(&Tok::RParen, "`)` after barrier(")?;
             return Ok(vec![IrStmt::Barrier]);
         }
+        if self.eat_kw("shared_barrier") {
+            self.expect(&Tok::LParen, "`(` after shared_barrier")?;
+            self.expect(&Tok::RParen, "`)` after shared_barrier(")?;
+            return Ok(vec![IrStmt::SharedBarrier]);
+        }
         if self.eat_kw("frag_store") {
             return Ok(vec![self.parse_frag_store(ctx)?]);
         }

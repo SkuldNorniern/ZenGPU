@@ -2253,6 +2253,44 @@ int main() {{
         assert_eq!(barriers, 2, "missing control barriers");
     }
 
+    /// Workgroup memory only: the barrier must not order device buffers or textures.
+    const SHARED_BARRIER: &str = r#"
+        @workgroup_size(32)
+        kernel shared_only(out: device mut buffer<f32>, id: global_id) {
+            shared s: array<f32, 32>
+            s[local_id().x] = 1.0
+            shared_barrier()
+            out[id.x] = s[local_id().x]
+        }
+    "#;
+
+    #[test]
+    fn shared_barrier_orders_only_workgroup_memory() {
+        let module = parse_compute(SHARED_BARRIER).expect("parse shared_barrier");
+        let msl_source = msl::lower_compute(&module)
+            .expect("lower shared_barrier to MSL")
+            .source;
+        assert!(msl_source.contains("threadgroup_barrier(mem_flags::mem_threadgroup);"));
+        assert!(!msl_source.contains("mem_device"));
+        let cuda_source = cuda::lower_compute(&module)
+            .expect("lower shared_barrier to CUDA")
+            .source;
+        assert!(cuda_source.contains("__syncthreads()"));
+        let words = spirv::lower_compute(&module).expect("lower shared_barrier to SPIR-V");
+        let constant = |value: u32| {
+            let mut at = 5usize;
+            let mut found = false;
+            while at < words.len() {
+                let wc = (words[at] >> 16) as usize;
+                found |= words[at] & 0xffff == 43 && wc == 4 && words[at + 3] == value;
+                at += wc;
+            }
+            found
+        };
+        assert!(constant(0x108), "shared barrier semantics missing");
+        assert!(!constant(0x148), "shared barrier orders uniform memory");
+    }
+
     #[test]
     fn tiled_gemm_hip_compiles_and_matches_reference_when_gpu_present() {
         let module = parse_compute(TILED_GEMM).expect("parse tiled GEMM");
@@ -2681,6 +2719,11 @@ mod portability_tests {
             "i8 mma",
             "",
             "shared s: array<i8, 256>\nlet fa: frag<i8, 16, 16, a> = frag_load_a(s, 0u, 16u)\nlet fb: frag<i8, 16, 16, b> = frag_load_b_t(s, 0u, 16u)\nlet c: frag<i32, 16, 16, acc> = mma(fa, fb, frag_zero_acc())\nfrag_store(ai, 0u, 16u, c)",
+        ),
+        (
+            "shared barrier",
+            "",
+            "shared s: array<f32, 64>\ns[id.x] = f\nshared_barrier()\nof[i] = s[id.x]",
         ),
         (
             "f16 frags from f32 shared",
