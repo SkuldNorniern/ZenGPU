@@ -2060,20 +2060,42 @@ mod tests {
             backing == vk::Format::D24_UNORM_S8_UINT || backing == vk::Format::D32_SFLOAT_S8_UINT,
             "{backing:?}"
         );
-        let tex = dev
-            .create_texture(zengpu_hal::TextureDesc {
+        for format in [Format::Depth24PlusStencil8, Format::Depth32Float] {
+            for usage in [
+                TextureUsage::RENDER_TARGET,
+                TextureUsage::DEPTH_STENCIL,
+                TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED,
+            ] {
+                let tex = dev
+                    .create_texture(TextureDesc {
+                        width: 64,
+                        height: 64,
+                        depth: 1,
+                        format,
+                        usage,
+                        samples: 1,
+                        dimension: TexDim::D2,
+                        mip_levels: 1,
+                        array_layers: 1,
+                    })
+                    .unwrap();
+                dev.destroy_texture(tex);
+            }
+        }
+        assert!(matches!(
+            dev.create_texture(TextureDesc {
                 width: 64,
                 height: 64,
                 depth: 1,
-                format: zengpu_hal::Format::Depth24PlusStencil8,
-                usage: zengpu_hal::TextureUsage::RENDER_TARGET,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::DEPTH_STENCIL,
                 samples: 1,
-                dimension: zengpu_hal::TexDim::D2,
+                dimension: TexDim::D2,
                 mip_levels: 1,
                 array_layers: 1,
-            })
-            .unwrap();
-        dev.destroy_texture(tex);
+            }),
+            Err(GpuError::InvalidUsage(_))
+        ));
         assert_eq!(
             crate::from_vk_format(backing),
             Some(zengpu_hal::Format::Depth24PlusStencil8)
