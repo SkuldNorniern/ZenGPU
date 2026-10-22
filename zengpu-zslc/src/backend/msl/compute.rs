@@ -541,6 +541,10 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "discard is fragment-only and never reaches a compute backend",
             ));
         }
+        IrStmt::SharedBarrier => {
+            indent(s, depth);
+            s.push_str("threadgroup_barrier(mem_flags::mem_threadgroup);\n");
+        }
         IrStmt::Barrier => {
             indent(s, depth);
             if ctx.has_images {

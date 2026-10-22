@@ -645,7 +645,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "kernels with image params are rejected before emission",
             ));
         }
-        IrStmt::Barrier => {
+        IrStmt::Barrier | IrStmt::SharedBarrier => {
             indent(s, depth);
             s.push_str("__syncthreads();\n");
         }
