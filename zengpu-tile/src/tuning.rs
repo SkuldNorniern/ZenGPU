@@ -37,6 +37,7 @@ struct Candidate {
 /// outside the bench, is an extrapolation.
 ///
 /// Metal i8 with an i8 matrix unit uses 64x64, bk 16, four waves (best measured for 2048^3).
+/// Metal f32 with an f32 matrix unit uses 64x64, bk 32, four waves, or 64x32 when LDS is short.
 /// Everything else gets the crate defaults: a 64x64 tile, bk 16 and `Schedule::default()`.
 /// That includes i8 where the target has no i8 matrix unit.
 /// Candidates that do not fit `target.lds_bytes` are skipped, so a small LDS only shrinks the
@@ -67,6 +68,10 @@ fn candidates(target: &Target, input: DType, m: usize, n: usize, k: usize) -> Ve
     if input == DType::I8 && target.has_mma_i8 {
         // Measured on M1 with an i8 matrix unit: 64x64 with four waves beat larger tiles.
         return vec![cand([64, 64], 16, 4, 0)];
+    }
+    if input == DType::F32 && target.has_mma_f32 {
+        // Measured on M1 at 2048^3: 64x64 bk 32 with four waves, then 64x32 with two.
+        return vec![cand([64, 64], 32, 4, 0), cand([64, 32], 32, 2, 0)];
     }
     if input != DType::F16 || !target.has_mma_f16 {
         return Vec::new();
@@ -103,8 +108,12 @@ fn fit(
     // Single stage, as mma_plan lays out on Metal. The epilogue slice reuses A's staging
     // memory, so only the part of it that A does not cover adds to the stage. The A tile is
     // taken without padding, which only makes the bound larger.
-    // Bytes per operand element: f16 is two, i8 is one.
-    let elem = if input == DType::I8 { 1 } else { 2 };
+    // Bytes per operand element.
+    let elem = match input {
+        DType::I8 => 1,
+        DType::F16 => 2,
+        _ => 4,
+    };
     let stage = (bm * bk + bk * bn) * elem;
     let slice = nwr * 16 * nwc * 16 * 4;
     if stage + slice.saturating_sub(bm * bk * elem) > target.lds_bytes as usize {
