@@ -166,6 +166,8 @@ impl VulkanInstance {
             }
             #[cfg(target_os = "macos")]
             ext_names.push(require(ext::metal_surface::NAME)?);
+            #[cfg(target_os = "android")]
+            ext_names.push(require(khr::android_surface::NAME)?);
         }
 
         #[cfg(target_os = "macos")]
