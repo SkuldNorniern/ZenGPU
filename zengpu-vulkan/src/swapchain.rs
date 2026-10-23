@@ -982,6 +982,30 @@ pub(crate) fn create_platform_surface(
     }
 }
 
+#[cfg(target_os = "android")]
+pub(crate) fn create_platform_surface(
+    shared: &VulkanShared,
+    handles: &zengpu_hal::WindowHandles,
+) -> Result<vk::SurfaceKHR> {
+    use zen_window_handle::WindowHandle;
+
+    let WindowHandle::AndroidNdk(android) = handles.window else {
+        return Err(GpuError::Backend(
+            "expected an ANativeWindow handle on Android".to_string(),
+        ));
+    };
+    let loader = khr::android_surface::Instance::new(&shared.entry, &shared.instance);
+    let create_info = vk::AndroidSurfaceCreateInfoKHR {
+        window: android.a_native_window.as_ptr(),
+        ..Default::default()
+    };
+    unsafe {
+        loader
+            .create_android_surface(&create_info, None)
+            .map_err(|e| GpuError::Backend(format!("vkCreateAndroidSurfaceKHR: {e}")))
+    }
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn create_platform_surface(
     shared: &VulkanShared,
@@ -1008,7 +1032,12 @@ pub(crate) fn create_platform_surface(
     }
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "android"
+)))]
 pub(crate) fn create_platform_surface(
     _shared: &VulkanShared,
     _handles: &zengpu_hal::WindowHandles,

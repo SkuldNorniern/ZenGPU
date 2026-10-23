@@ -21,6 +21,8 @@ pub enum WindowHandle {
     Xcb(XcbWindowHandle),
     /// Linux Wayland surface.
     Wayland(WaylandWindowHandle),
+    /// Android `ANativeWindow`.
+    AndroidNdk(AndroidNdkWindowHandle),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -34,6 +36,8 @@ pub enum DisplayHandle {
     Xcb(XcbDisplayHandle),
     /// Linux Wayland display.
     Wayland(WaylandDisplayHandle),
+    /// Android: no display object.
+    Android,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -57,6 +61,12 @@ pub struct XcbWindowHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WaylandWindowHandle {
     pub surface: NonNull<c_void>,
+}
+
+/// Android `ANativeWindow`; the producer holds a reference while it is in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AndroidNdkWindowHandle {
+    pub a_native_window: NonNull<c_void>,
 }
 
 /// X11 connection pointer (XCB); `None` lets the consumer open the default one.
@@ -94,6 +104,12 @@ impl XcbWindowHandle {
 impl WaylandWindowHandle {
     pub fn new(surface: NonNull<c_void>) -> Self {
         Self { surface }
+    }
+}
+
+impl AndroidNdkWindowHandle {
+    pub fn new(a_native_window: NonNull<c_void>) -> Self {
+        Self { a_native_window }
     }
 }
 
