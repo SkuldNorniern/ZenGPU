@@ -17,7 +17,7 @@ use metal::{
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
-use objc::runtime::Object;
+use objc::runtime::{BOOL, NO, Object};
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
@@ -1383,6 +1383,14 @@ impl GpuDevice for MetalDevice {
 
     fn memory_budget(&self) -> Option<MemoryBudget> {
         let device = &self.inner.device;
+        // iOS has the working set size from 16 on; before, nothing reports a budget.
+        // SAFETY: `respondsToSelector:` is on every NSObject; the device is live.
+        let known: BOOL = unsafe {
+            msg_send![device.as_ref(), respondsToSelector: sel!(recommendedMaxWorkingSetSize)]
+        };
+        if known == NO {
+            return None;
+        }
         let budget = device.recommended_max_working_set_size();
         Some(MemoryBudget {
             device_local: budget,
