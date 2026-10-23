@@ -6,7 +6,7 @@ use zengpu_hal::{
     GpuDevice, GpuInstance, HalCapabilities, PowerPreference, Result,
 };
 
-use super::device::{MetalDevice, capabilities};
+use super::device::{MetalDevice, capabilities, shared_memory};
 
 /// Apple's PCI vendor ID, reported for every Metal device.
 const APPLE_VENDOR: u32 = 0x106b;
@@ -103,7 +103,7 @@ unsafe impl Sync for MetalAdapter {}
 impl MetalAdapter {
     fn new(device: Device) -> Self {
         let device_type =
-            if device.has_unified_memory() || (is_low_power(&device) && !is_removable(&device)) {
+            if shared_memory(&device) || (is_low_power(&device) && !is_removable(&device)) {
                 DeviceType::Integrated
             } else {
                 DeviceType::Discrete
