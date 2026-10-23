@@ -81,8 +81,11 @@ impl MetalSurface {
             f64::from(config.width.max(1)),
             f64::from(config.height.max(1)),
         ));
-        self.layer
-            .set_display_sync_enabled(config.present_mode != PresentMode::Immediate);
+        // iOS always syncs to the display, and has no such setting.
+        if cfg!(target_os = "macos") {
+            self.layer
+                .set_display_sync_enabled(config.present_mode != PresentMode::Immediate);
+        }
         self.layer.set_maximum_drawable_count(3);
     }
 }
