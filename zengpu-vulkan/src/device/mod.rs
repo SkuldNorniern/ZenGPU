@@ -1,7 +1,7 @@
 use std::{
     any::Any,
     collections::HashMap,
-    ffi::{CStr, CString, c_void},
+    ffi::{CStr, CString, c_char, c_void},
     fs,
     io::ErrorKind,
     mem,
@@ -721,7 +721,7 @@ impl VulkanDevice {
         shared: Arc<VulkanShared>,
         physical: vk::PhysicalDevice,
         req: DeviceRequest,
-        extra_extensions: &[*const i8],
+        extra_extensions: &[*const c_char],
         needs_graphics: bool,
     ) -> Result<Self> {
         let pipeline_cache_path = req.pipeline_cache_path.clone();

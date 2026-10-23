@@ -1,6 +1,6 @@
 use std::{
     cmp::Reverse,
-    ffi::{CStr, c_void},
+    ffi::{CStr, c_char, c_void},
     ptr,
     sync::Arc,
 };
@@ -122,8 +122,8 @@ impl VulkanInstance {
         let want_validation =
             has_layer(b"VK_LAYER_KHRONOS_validation") && has_ext(ext::debug_utils::NAME);
 
-        let mut ext_names: Vec<*const i8> = Vec::new();
-        let mut layer_names: Vec<*const i8> = Vec::new();
+        let mut ext_names: Vec<*const c_char> = Vec::new();
+        let mut layer_names: Vec<*const c_char> = Vec::new();
 
         #[cfg(target_os = "macos")]
         let mut flags = vk::InstanceCreateFlags::empty();
@@ -137,7 +137,7 @@ impl VulkanInstance {
         }
 
         if surface_extensions {
-            let require = |name: &'static CStr| -> zengpu_hal::Result<*const i8> {
+            let require = |name: &'static CStr| -> zengpu_hal::Result<*const c_char> {
                 if !has_ext(name) {
                     return Err(GpuError::Backend(format!(
                         "required Vulkan instance extension is unavailable: {}",
