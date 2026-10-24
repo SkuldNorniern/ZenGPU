@@ -51,7 +51,10 @@ pub mod detect;
 pub mod device;
 pub mod instance;
 pub mod log;
-#[cfg(any(feature = "vulkan", all(target_os = "macos", feature = "metal")))]
+#[cfg(any(
+    feature = "vulkan",
+    all(any(target_os = "macos", target_os = "ios"), feature = "metal")
+))]
 pub mod native;
 
 pub use adapter::Adapter;

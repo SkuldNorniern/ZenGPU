@@ -1,4 +1,4 @@
-//! ZenGPU Apple Metal backend: graphics and compute on macOS.
+//! ZenGPU Apple Metal backend: graphics and compute on macOS and iOS.
 //!
 //! Shaders come from ZSL (`zsl!(..).msl`). Bindings follow ZSL's MSL: push constants at
 //! `[[buffer(16)]]`, the bindless texture table at `[[buffer(17)]]` for graphics; buffers then push
@@ -6,43 +6,43 @@
 //!
 //! Other platforms build, find no adapters, and every call fails.
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod mac;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "ios", test))]
 mod transfer;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use mac::{
     DepthTarget, MetalAdapter, MetalCommandList, MetalDevice, MetalFrame, MetalInstance,
     MetalSurface, OffscreenTarget,
 };
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 mod unsupported;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 pub use unsupported::{MetalDevice, MetalInstance};
 
 #[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     use std::mem::size_of_val;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     use std::slice::from_raw_parts;
     use zengpu_hal::GpuInstance;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     use zengpu_hal::{
         AdapterRequest, BufferDesc, BufferHandle, DeviceRequest, GpuDevice, Scalar, ShaderDesc,
     };
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn open_metal() -> Option<Box<dyn GpuDevice>> {
         let inst = MetalInstance::new();
         let adapter = inst.request_adapter(AdapterRequest::default())?;
         adapter.open(DeviceRequest::default()).ok()
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn make_f32(device: &dyn GpuDevice, data: &[f32], readback: bool) -> BufferHandle {
         use zengpu_hal::{BufferUsage, MemoryUsage};
         let usage = if readback {
@@ -61,7 +61,7 @@ mod tests {
         buf
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn read_f32(device: &dyn GpuDevice, buf: BufferHandle, n: usize) -> Vec<f32> {
         let bytes = device.read_buffer(buf, 0, (n * 4) as u64).unwrap();
         bytes
@@ -74,7 +74,7 @@ mod tests {
 
     /// Bindings for saxpy: two buffers and a push struct with `n` and `alpha`.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn metal_saxpy() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
         use zengpu_spirv::{ZslShader, zsl};
@@ -123,7 +123,7 @@ mod tests {
     /// Metal has 31 buffer slots and the push block takes the one after the buffers: binding
     /// past that is an error, not an out-of-range `setBuffer`.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn too_many_bindings_is_an_error() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
         use zengpu_spirv::{ZslShader, zsl};
@@ -181,7 +181,7 @@ mod tests {
 
     /// Resources Metal cannot create are errors. Metal itself aborts the process on them.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn impossible_resources_are_errors() {
         use zengpu_hal::{
             BufferUsage, Format, GpuError, MemoryUsage, TexDim, TextureDesc, TextureUsage,
@@ -257,7 +257,7 @@ mod tests {
     /// `round_even`, `fast_exp`, the integer forms of `abs`/`min`/`max`/`clamp`, i32 arithmetic
     /// with u32 literals, and integer shuffles match the host.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn integer_and_rounding_builtins_match_the_host() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
         use zengpu_spirv::{ZslShader, zsl};
@@ -360,7 +360,7 @@ mod tests {
     /// `frag_row`/`frag_col` name the element `frag_get` reads and `frag_set` writes, and the
     /// lanes cover all 256 elements once.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn fragment_elements_follow_their_mapping() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
         use zengpu_spirv::{ZslShader, zsl};
@@ -428,7 +428,7 @@ mod tests {
 
     /// i8 x i8 -> i32 `mma` is exact, past the 2^24 where f32 would round.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn integer_mma_is_exact() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
         use zengpu_spirv::{ZslShader, zsl};
@@ -542,7 +542,7 @@ mod tests {
 
     /// f16 fragments load from f32 shared arrays, plain and transposed.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn half_fragments_load_from_f32_shared() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
         use zengpu_spirv::{ZslShader, zsl};
@@ -607,7 +607,7 @@ mod tests {
     /// f32 fragments load from f32 buffers and shared arrays, and `mma` multiplies them in f32.
     /// The inputs are not f16-representable, so an f16 product would miss the tolerance.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn f32_fragments_multiply_in_f32() {
         use zengpu_hal::{Bindings, ComputePipelineDesc, DType};
         use zengpu_spirv::{ZslShader, zsl};
@@ -692,7 +692,7 @@ mod tests {
 
     /// `vec_add` over 4 threadgroups: the `i < n` guard covers the tail group.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn metal_vec_add_multi_threadgroup() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
         use zengpu_spirv::{ZslShader, zsl};
@@ -743,7 +743,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn enumerates_at_least_one_adapter_on_macos() {
         let inst = MetalInstance::new();
         let adapters = inst.enumerate_adapters();
@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn buffer_write_read_round_trip() {
         let inst = MetalInstance::new();
         let Some(adapter) = inst.request_adapter(AdapterRequest::default()) else {
@@ -803,14 +803,14 @@ mod tests {
         device.destroy_buffer(storage);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn bytemuck_cast(data: &[f32]) -> &[u8] {
         // SAFETY: f32 has no padding/invalid bit patterns; viewing as bytes is sound.
         unsafe { from_raw_parts(data.as_ptr() as *const u8, size_of_val(data)) }
     }
 
     /// A cube's six faces arrive in one upload, each at its own layer.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn cube_uploads_land_on_their_faces() {
         use std::time::Duration;
@@ -859,7 +859,7 @@ mod tests {
 
     /// Each dispatch reads the one before; the final copy sees them all.
     #[test]
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn batched_ops_run_in_order() {
         use std::time::Duration;
         use zengpu_hal::{

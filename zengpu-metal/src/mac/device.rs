@@ -17,7 +17,7 @@ use metal::{
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
-use objc::runtime::Object;
+use objc::runtime::{BOOL, NO, Object};
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
@@ -174,12 +174,18 @@ impl Inner {
     fn texture_storage(&self, desc: &TextureDesc) -> MTLStorageMode {
         if desc.format.is_depth_stencil() || desc.samples > 1 {
             MTLStorageMode::Private
-        } else if self.device.has_unified_memory() {
+        } else if shared_memory(&self.device) {
             MTLStorageMode::Shared
         } else {
             MTLStorageMode::Managed
         }
     }
+}
+
+/// Whether the CPU and GPU share memory, so textures can be `Shared`. Always on iOS, which has no
+/// `Managed` mode: the simulator reports no unified memory even so.
+pub(super) fn shared_memory(device: &metal::DeviceRef) -> bool {
+    cfg!(target_os = "ios") || device.has_unified_memory()
 }
 
 /// A depth buffer made by [`MetalDevice::create_depth_target`]. Its texture goes with it.
@@ -893,7 +899,7 @@ impl GpuDevice for MetalDevice {
 
     fn capabilities(&self) -> HalCapabilities {
         let mut caps = capabilities();
-        if !self.inner.device.has_unified_memory() {
+        if !shared_memory(&self.inner.device) {
             caps.features = Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING;
         }
         caps
@@ -1383,6 +1389,14 @@ impl GpuDevice for MetalDevice {
 
     fn memory_budget(&self) -> Option<MemoryBudget> {
         let device = &self.inner.device;
+        // iOS has the working set size from 16 on; before, nothing reports a budget.
+        // SAFETY: `respondsToSelector:` is on every NSObject; the device is live.
+        let known: BOOL = unsafe {
+            msg_send![device.as_ref(), respondsToSelector: sel!(recommendedMaxWorkingSetSize)]
+        };
+        if known == NO {
+            return None;
+        }
         let budget = device.recommended_max_working_set_size();
         Some(MemoryBudget {
             device_local: budget,

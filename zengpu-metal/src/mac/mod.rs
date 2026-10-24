@@ -1,4 +1,4 @@
-//! The Metal backend proper, on macOS.
+//! The Metal backend proper, on macOS and iOS.
 
 mod command;
 mod convert;
