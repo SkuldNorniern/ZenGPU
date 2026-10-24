@@ -686,8 +686,33 @@ fn create_swapchain(
     .map(|f| f.color_space)
     .unwrap_or(vk::ColorSpaceKHR::SRGB_NONLINEAR);
 
+    // Android can report a rotated display as a rotation on top of the panel's natural extent.
+    // Drawing would have to rotate to match, so ask for no transform; the compositor turns it. The
+    // extent then takes the window's own shape, which the requested size gives.
+    let pre_transform = if caps.current_transform != vk::SurfaceTransformFlagsKHR::IDENTITY
+        && caps
+            .supported_transforms
+            .contains(vk::SurfaceTransformFlagsKHR::IDENTITY)
+    {
+        vk::SurfaceTransformFlagsKHR::IDENTITY
+    } else {
+        caps.current_transform
+    };
     let extent = if caps.current_extent.width != u32::MAX {
-        caps.current_extent
+        let current = caps.current_extent;
+        let wide = |w: u32, h: u32| w > h;
+        if pre_transform != caps.current_transform
+            && width > 0
+            && height > 0
+            && wide(current.width, current.height) != wide(width, height)
+        {
+            vk::Extent2D {
+                width: current.height,
+                height: current.width,
+            }
+        } else {
+            current
+        }
     } else {
         vk::Extent2D {
             width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
@@ -712,7 +737,7 @@ fn create_swapchain(
         image_array_layers: 1,
         image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
         image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-        pre_transform: caps.current_transform,
+        pre_transform,
         composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
         present_mode,
         clipped: vk::TRUE,
