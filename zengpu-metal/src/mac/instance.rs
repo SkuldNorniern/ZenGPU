@@ -6,7 +6,7 @@ use zengpu_hal::{
     GpuDevice, GpuInstance, HalCapabilities, PowerPreference, Result,
 };
 
-use super::device::{MetalDevice, capabilities};
+use super::device::{MetalDevice, capabilities, shared_memory};
 
 /// Apple's PCI vendor ID, reported for every Metal device.
 const APPLE_VENDOR: u32 = 0x106b;
@@ -41,7 +41,7 @@ impl MetalInstance {
         Device::all().into_iter().map(MetalAdapter::new).collect()
     }
 
-    /// Returns the device macOS picks for high-performance apps.
+    /// Returns the device the system picks for high-performance apps.
     pub fn request_metal_adapter(&self) -> Option<MetalAdapter> {
         self.request_metal_adapter_with_pref(PowerPreference::HighPerformance)
     }
@@ -52,7 +52,7 @@ impl MetalInstance {
             && let Some(low) = self
                 .metal_adapters()
                 .into_iter()
-                .find(|a| a.device.is_low_power())
+                .find(|a| is_low_power(&a.device))
         {
             return Some(low);
         }
@@ -81,6 +81,15 @@ impl GpuInstance for MetalInstance {
     }
 }
 
+/// `isLowPower` and `isRemovable` are macOS only; an iOS device has one integrated GPU.
+fn is_low_power(device: &Device) -> bool {
+    cfg!(target_os = "macos") && device.is_low_power()
+}
+
+fn is_removable(device: &Device) -> bool {
+    cfg!(target_os = "macos") && device.is_removable()
+}
+
 /// One `MTLDevice`. Opening it opens that very device.
 pub struct MetalAdapter {
     device: Device,
@@ -94,7 +103,7 @@ unsafe impl Sync for MetalAdapter {}
 impl MetalAdapter {
     fn new(device: Device) -> Self {
         let device_type =
-            if device.has_unified_memory() || (device.is_low_power() && !device.is_removable()) {
+            if shared_memory(&device) || (is_low_power(&device) && !is_removable(&device)) {
                 DeviceType::Integrated
             } else {
                 DeviceType::Discrete

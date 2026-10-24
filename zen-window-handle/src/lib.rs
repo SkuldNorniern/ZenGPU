@@ -15,6 +15,8 @@ use core::ptr::NonNull;
 pub enum WindowHandle {
     /// macOS / AppKit: `NSView`.
     AppKit(AppKitWindowHandle),
+    /// iOS / UIKit: `UIView`.
+    UiKit(UiKitWindowHandle),
     /// Windows: `HWND` (+ owning `HINSTANCE`).
     Win32(Win32WindowHandle),
     /// Linux X11 window via XCB.
@@ -30,6 +32,8 @@ pub enum WindowHandle {
 pub enum DisplayHandle {
     /// macOS / AppKit: no display object.
     AppKit,
+    /// iOS / UIKit: no display object.
+    UiKit,
     /// Windows: no display object.
     Windows,
     /// Linux X11 connection via XCB.
@@ -43,6 +47,11 @@ pub enum DisplayHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AppKitWindowHandle {
     pub ns_view: NonNull<c_void>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct UiKitWindowHandle {
+    pub ui_view: NonNull<c_void>,
 }
 
 /// Windows `HWND` plus its owning `HINSTANCE` (if known).
@@ -83,6 +92,12 @@ pub struct WaylandDisplayHandle {
 impl AppKitWindowHandle {
     pub fn new(ns_view: NonNull<c_void>) -> Self {
         Self { ns_view }
+    }
+}
+
+impl UiKitWindowHandle {
+    pub fn new(ui_view: NonNull<c_void>) -> Self {
+        Self { ui_view }
     }
 }
 

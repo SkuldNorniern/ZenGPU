@@ -1,4 +1,4 @@
-//! Presenting to an AppKit view through a `CAMetalLayer`.
+//! Presenting to an AppKit or UIKit view through a `CAMetalLayer`.
 
 use std::sync::{Arc, Mutex};
 
@@ -61,11 +61,47 @@ unsafe fn metal_layer_for(view: *mut Object) -> Result<MetalLayer> {
     }
 }
 
+/// Returns the UIKit view's `CAMetalLayer`, if it is one (a view whose `layerClass` is
+/// `CAMetalLayer`), or adds one over its bounds. UIKit layers do not resize their sublayers, so
+/// the second value is the layer to follow: [`MetalSurface`] matches its bounds on each
+/// `configure`.
+///
+/// # Safety
+/// `view` must be a live `UIView`, used on the main thread.
+unsafe fn metal_layer_for_ui_view(view: *mut Object) -> Result<(MetalLayer, Option<Parent>)> {
+    let metal_class = Class::get("CAMetalLayer")
+        .ok_or_else(|| GpuError::Backend("metal: CAMetalLayer unavailable".into()))?;
+    unsafe {
+        let parent: *mut Object = msg_send![view, layer];
+        if parent.is_null() {
+            return Err(GpuError::Backend("metal: the view has no layer".into()));
+        }
+        let scale: f64 = msg_send![view, contentScaleFactor];
+        let is_metal: bool = msg_send![parent, isKindOfClass: metal_class];
+        if is_metal {
+            let layer = MetalLayerRef::from_ptr(parent.cast()).to_owned();
+            layer.set_contents_scale(scale);
+            return Ok((layer, None));
+        }
+        let layer = MetalLayer::new();
+        let bounds: CGRect = msg_send![parent, bounds];
+        let raw: *mut Object = layer.as_ref() as *const MetalLayerRef as *mut Object;
+        let _: () = msg_send![raw, setFrame: bounds];
+        layer.set_contents_scale(scale);
+        let _: () = msg_send![parent, addSublayer: raw];
+        Ok((layer, Some(Parent(parent))))
+    }
+}
+
+/// A UIKit view's own layer, which a `CAMetalLayer` added over it follows.
+struct Parent(*mut Object);
+
 /// Swapchain backed by a `CAMetalLayer`. The layer owns the drawables and throttles to frames
 /// in flight.
 pub struct MetalSurface {
     inner: Arc<Inner>,
     layer: MetalLayer,
+    parent: Option<Parent>,
     config: Mutex<SurfaceConfig>,
 }
 
@@ -75,14 +111,26 @@ unsafe impl Sync for MetalSurface {}
 
 impl MetalSurface {
     fn apply(&self, config: SurfaceConfig) {
+        if let Some(Parent(parent)) = self.parent {
+            // SAFETY: the view outlives the surface, as its handle promised; resizes come on the
+            // main thread, after UIKit laid the view out.
+            unsafe {
+                let bounds: CGRect = msg_send![parent, bounds];
+                let raw: *mut Object = self.layer.as_ref() as *const MetalLayerRef as *mut Object;
+                let _: () = msg_send![raw, setFrame: bounds];
+            }
+        }
         self.layer
             .set_pixel_format(convert::pixel_format(config.format));
         self.layer.set_drawable_size(CGSize::new(
             f64::from(config.width.max(1)),
             f64::from(config.height.max(1)),
         ));
-        self.layer
-            .set_display_sync_enabled(config.present_mode != PresentMode::Immediate);
+        // iOS always syncs to the display, and has no such setting.
+        if cfg!(target_os = "macos") {
+            self.layer
+                .set_display_sync_enabled(config.present_mode != PresentMode::Immediate);
+        }
         self.layer.set_maximum_drawable_count(3);
     }
 }
@@ -171,19 +219,29 @@ impl GraphicsDevice for MetalDevice {
         window: &WindowHandles,
         config: SurfaceConfig,
     ) -> Result<Self::Surface> {
-        let WindowHandle::AppKit(appkit) = window.window else {
-            return Err(GpuError::Backend(
-                "metal: expected an AppKit window handle".into(),
-            ));
+        // SAFETY: the handle's view is live, as its producer promises. Make surfaces on the main
+        // thread.
+        let (layer, parent) = match window.window {
+            WindowHandle::AppKit(appkit) => (
+                unsafe { metal_layer_for(appkit.ns_view.as_ptr().cast())? },
+                None,
+            ),
+            WindowHandle::UiKit(uikit) => unsafe {
+                metal_layer_for_ui_view(uikit.ui_view.as_ptr().cast())?
+            },
+            _ => {
+                return Err(GpuError::Backend(
+                    "metal: expected an AppKit or UIKit window handle".into(),
+                ));
+            }
         };
-        // SAFETY: `view` is a live `NSView`. Make surfaces on the main thread.
-        let layer = unsafe { metal_layer_for(appkit.ns_view.as_ptr().cast())? };
         layer.set_device(&self.inner.device);
         layer.set_framebuffer_only(true);
         layer.set_presents_with_transaction(false);
         let surface = MetalSurface {
             inner: Arc::clone(&self.inner),
             layer,
+            parent,
             config: Mutex::new(config),
         };
         surface.apply(config);
