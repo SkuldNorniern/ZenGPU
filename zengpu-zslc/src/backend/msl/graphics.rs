@@ -110,11 +110,12 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
     let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
     if e.textures.is_some() {
-        s.push_str("struct ZslTexture {\n    texture2d<float> tex;\n    sampler smp;\n};\n\n");
+        texture_abi(&mut s);
     }
-    let texture_arg = e.textures.as_ref().map(|_| {
-        format!("    const device ZslTexture* zsl_textures [[buffer({TEXTURE_BUFFER_INDEX})]]")
-    });
+    let texture_arg = e
+        .textures
+        .as_ref()
+        .map(|_| format!("    ZSL_TEXTURE_ARGS({TEXTURE_BUFFER_INDEX})"));
 
     if e.is_fragment {
         let single = match &e.outputs[..] {
@@ -202,6 +203,36 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         has_push,
         local_size: [1, 1, 1],
     })
+}
+
+/// Tier 1 cannot index an array of argument-buffer structs. Bind a small per-draw
+/// resource set instead, retaining the public table indices through an ID lookup.
+fn texture_abi(s: &mut String) {
+    s.push_str("#ifdef ZSL_METAL_TIER1\n");
+    s.push_str("struct ZslTextureTable {\n    array<texture2d<float>, 16> tex [[id(0)]];\n    array<sampler, 16> smp [[id(16)]];\n};\n");
+    for (suffix, lod) in [("", false), ("_lod", true)] {
+        let extra = if lod { ", float lod" } else { "" };
+        let _ = writeln!(
+            s,
+            "inline float4 zsl_sample{suffix}(constant ZslTextureTable& t, constant uint* ids, uint slot, float2 uv{extra}) {{"
+        );
+        // Constant resource indices also work on devices without resource-array indexing.
+        for i in 0..16 {
+            let level = if lod { ", level(lod)" } else { "" };
+            let _ = writeln!(
+                s,
+                "    if (ids[{i}] == slot) return t.tex[{i}].sample(t.smp[{i}], uv{level});"
+            );
+        }
+        s.push_str("    return float4(0.0);\n}\n");
+    }
+    s.push_str("#define ZSL_TEXTURE_ARGS(B) constant ZslTextureTable& zsl_textures [[buffer(B)]], constant uint* zsl_texture_ids [[buffer(18)]]\n");
+    s.push_str("#define ZSL_SAMPLE(I, UV) zsl_sample(zsl_textures, zsl_texture_ids, (I), (UV))\n");
+    s.push_str("#define ZSL_SAMPLE_LOD(I, UV, L) zsl_sample_lod(zsl_textures, zsl_texture_ids, (I), (UV), (L))\n");
+    s.push_str("#else\nstruct ZslTexture {\n    texture2d<float> tex;\n    sampler smp;\n};\n");
+    s.push_str("#define ZSL_TEXTURE_ARGS(B) const device ZslTexture* zsl_textures [[buffer(B)]]\n");
+    s.push_str("#define ZSL_SAMPLE(I, UV) zsl_textures[I].tex.sample(zsl_textures[I].smp, (UV))\n");
+    s.push_str("#define ZSL_SAMPLE_LOD(I, UV, L) zsl_textures[I].tex.sample(zsl_textures[I].smp, (UV), level(L))\n#endif\n\n");
 }
 
 struct Ctx<'a> {
@@ -334,17 +365,15 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             ));
         }
         IrExpr::Sample { index, uv, lod } => {
-            let slot = format!("zsl_textures[{}]", emit_expr(ctx, index)?);
+            let index = emit_expr(ctx, index)?;
             let uv = emit_expr(ctx, uv)?;
             match lod {
-                Some(lod) => format!(
-                    "{slot}.tex.sample({slot}.smp, {uv}, level({}))",
-                    emit_expr(ctx, lod)?
-                ),
-                None if ctx.is_fragment => format!("{slot}.tex.sample({slot}.smp, {uv})"),
-                None => format!("{slot}.tex.sample({slot}.smp, {uv}, level(0.0))"),
+                Some(lod) => format!("ZSL_SAMPLE_LOD({index}, {uv}, {})", emit_expr(ctx, lod)?),
+                None if ctx.is_fragment => format!("ZSL_SAMPLE({index}, {uv})"),
+                None => format!("ZSL_SAMPLE_LOD({index}, {uv}, 0.0)"),
             }
         }
+
         IrExpr::Swizzle { base, lanes } => {
             let picked: String = lanes.iter().map(|&l| component_char(l)).collect();
             format!("({}).{picked}", emit_expr(ctx, base)?)
@@ -578,14 +607,8 @@ mod tests {
         "#,
         );
         assert!(m.source.contains("struct ZslTexture {"));
-        assert!(
-            m.source
-                .contains("const device ZslTexture* zsl_textures [[buffer(17)]]")
-        );
-        assert!(
-            m.source
-                .contains("zsl_textures[pc.slot].tex.sample(zsl_textures[pc.slot].smp, in.uv)")
-        );
+        assert!(m.source.contains("ZSL_TEXTURE_ARGS(17)"));
+        assert!(m.source.contains("ZSL_SAMPLE(pc.slot, in.uv)"));
         let _ = metal_compiles(&m.source);
     }
 
