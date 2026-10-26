@@ -1433,6 +1433,73 @@ mod graphics_tests {
         );
     }
 
+    /// Tier 1 remaps high public IDs to the draw-local resource set.
+    #[test]
+    fn tier1_texture_indices_follow_scalars_in_the_push_block() {
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+            }
+        );
+        const TINTED_FS: ZslShader = zsl!(
+            push P { tint: f32x2, slot: u32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                tex[p.slot].sample(uv) * f32x4(p.tint.x, p.tint.y, 1.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        dev.force_tier1();
+        for _ in 0..24 {
+            let dummy = texture(&dev, Format::Rgba8Unorm, 1, 1, TextureUsage::SAMPLED);
+            // Texture handles themselves determine the table IDs.
+            let _ = dummy;
+        }
+        let src = texture(
+            &dev,
+            Format::Rgba8Unorm,
+            1,
+            1,
+            TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+        );
+        dev.upload_texture_data(src, &[255, 255, 255, 255])
+            .expect("upload");
+        let sampler = dev.create_sampler(SamplerDesc::default()).expect("sampler");
+        let slot = dev.bind_texture(src, sampler).expect("slot");
+        assert!(slot >= 16);
+        let (tex, target) = color_target(&dev, 2, 2);
+        let p = pipeline(&dev, &QUAD_VS, &TINTED_FS, &[], None, None);
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(2, 2));
+        cmd.bind(Bindings {
+            buffers: &[],
+            textures: &[slot],
+            images: &[],
+            scalars: &[Scalar::F32(1.0), Scalar::F32(0.0)],
+        });
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        assert!(
+            pixels(&dev, tex, 2, 2)
+                .iter()
+                .all(|p| *p == [255, 0, 255, 255])
+        );
+    }
+
     /// Indexed draws honour the instance range: two instances fill the target.
     #[test]
     fn indexed_draws_draw_every_instance() {

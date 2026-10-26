@@ -90,7 +90,7 @@ impl MetalDevice {
                 ));
             }
         };
-        let (vs, fs) = {
+        let (vs, fs, texture_table) = {
             let shaders = lock(&self.inner.shaders)?;
             let get = |h, what: &str| {
                 shaders
@@ -98,11 +98,14 @@ impl MetalDevice {
                     .ok_or_else(|| {
                         GpuError::PipelineCreation(format!("stale {what} shader handle"))
                     })
-                    .and_then(entry)
+                    .and_then(|shader| entry(&shader.library))
             };
             (
                 get(desc.vertex_shader, "vertex")?,
                 get(desc.fragment_shader, "fragment")?,
+                [desc.vertex_shader, desc.fragment_shader]
+                    .iter()
+                    .any(|h| shaders.get(*h).is_some_and(|s| s.texture_table)),
             )
         };
         let (primitive, class) = convert::primitive(desc.topology);
@@ -160,6 +163,7 @@ impl MetalDevice {
         });
 
         let pipeline = RenderPipeline {
+            texture_table,
             state,
             depth,
             primitive,

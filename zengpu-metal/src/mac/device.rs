@@ -49,7 +49,13 @@ pub(crate) struct MetalTarget {
     pub(crate) format: Format,
 }
 
+pub(crate) struct MetalShader {
+    pub(crate) library: Library,
+    pub(crate) texture_table: bool,
+}
+
 pub(crate) struct RenderPipeline {
+    pub(crate) texture_table: bool,
     pub(crate) state: RenderPipelineState,
     pub(crate) depth: Option<DepthStencilState>,
     pub(crate) primitive: MTLPrimitiveType,
@@ -72,7 +78,7 @@ pub(crate) struct Inner {
     pub(crate) device: Device,
     pub(crate) queue: CommandQueue,
     pub(crate) buffers: Mutex<SlotMap<marker::Buffer, MetalBuffer>>,
-    pub(crate) shaders: Mutex<SlotMap<marker::Shader, Library>>,
+    pub(crate) shaders: Mutex<SlotMap<marker::Shader, MetalShader>>,
     pub(crate) pipelines: Mutex<SlotMap<marker::Pipeline, MetalPipeline>>,
     pub(crate) textures: Mutex<SlotMap<marker::Texture, MetalTexture>>,
     pub(crate) samplers: Mutex<SlotMap<marker::Sampler, SamplerState>>,
@@ -290,6 +296,12 @@ pub struct MetalDevice {
 }
 
 impl MetalDevice {
+    #[cfg(test)]
+    pub(crate) fn force_tier1(&self) {
+        *self.inner.table.lock().expect("table") =
+            TextureTable::with_tier(&self.inner.device, true).expect("tier 1 table");
+    }
+
     pub(crate) fn new(device: Device) -> Result<Self> {
         let queue = device.new_command_queue();
         let table = TextureTable::new(&device)?;
@@ -1419,12 +1431,22 @@ impl GpuDevice for MetalDevice {
         };
         let source = from_utf8(bytes)
             .map_err(|_| GpuError::ShaderCompile("metal: MSL source is not valid UTF-8".into()))?;
+        let tier1_source;
+        let source = if lock(&self.inner.table)?.tier1 {
+            tier1_source = format!("#define ZSL_METAL_TIER1 1\n{source}");
+            tier1_source.as_str()
+        } else {
+            source
+        };
         let library = self
             .inner
             .device
             .new_library_with_source(source, &metal::CompileOptions::new())
             .map_err(|e| GpuError::ShaderCompile(format!("metal: MSL compile failed: {e}")))?;
-        Ok(lock(&self.inner.shaders)?.insert(library))
+        Ok(lock(&self.inner.shaders)?.insert(MetalShader {
+            library,
+            texture_table: source.contains("ZSL_TEXTURE_ARGS("),
+        }))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
@@ -1439,9 +1461,12 @@ impl GpuDevice for MetalDevice {
             let library = shaders
                 .get(desc.shader)
                 .ok_or_else(|| GpuError::Backend("metal: invalid shader handle".into()))?;
-            library.get_function(desc.entry, None).map_err(|e| {
-                GpuError::PipelineCreation(format!("metal: function `{}`: {e}", desc.entry))
-            })?
+            library
+                .library
+                .get_function(desc.entry, None)
+                .map_err(|e| {
+                    GpuError::PipelineCreation(format!("metal: function `{}`: {e}", desc.entry))
+                })?
         };
         let state = self
             .inner

@@ -16,6 +16,8 @@ pub(crate) const MAX_VERTEX_BUFFERS: u32 = PUSH_BUFFER_INDEX as u32;
 
 /// Table size. A texture sits at its handle's slot index, as on Vulkan. This caps bound textures.
 pub(crate) const TABLE_CAPACITY: u32 = 4096;
+pub(crate) const TIER1_CAPACITY: usize = 16;
+pub(crate) const TEXTURE_IDS_BUFFER_INDEX: u64 = 18;
 
 /// Dummy shader with the table's layout, compiled so Metal hands out an encoder. Never run.
 const PROBE_MSL: &str = "#include <metal_stdlib>
@@ -30,6 +32,7 @@ fragment float4 zengpu_table_probe(const device ZslTexture* zsl_textures [[buffe
 ";
 
 pub(crate) struct TextureTable {
+    pub(crate) tier1: bool,
     encoder: ArgumentEncoder,
     buffer: Buffer,
     stride: u64,
@@ -39,8 +42,19 @@ pub(crate) struct TextureTable {
 
 impl TextureTable {
     pub(crate) fn new(device: &DeviceRef) -> Result<Self> {
+        Self::with_tier(
+            device,
+            device.argument_buffers_support() == metal::MTLArgumentBuffersTier::Tier1,
+        )
+    }
+
+    pub(crate) fn with_tier(device: &DeviceRef, tier1: bool) -> Result<Self> {
+        let tier1_probe = "#include <metal_stdlib>\nusing namespace metal;\nstruct Table { array<texture2d<float>,16> tex [[id(0)]]; array<sampler,16> smp [[id(16)]]; };\nfragment float4 zengpu_table_probe(constant Table& t [[buffer(17)]]) { return t.tex[0].sample(t.smp[0], float2(0.0)); }";
         let library = device
-            .new_library_with_source(PROBE_MSL, &CompileOptions::new())
+            .new_library_with_source(
+                if tier1 { tier1_probe } else { PROBE_MSL },
+                &CompileOptions::new(),
+            )
             .map_err(|e| GpuError::Backend(format!("metal: texture table probe: {e}")))?;
         let function = library
             .get_function("zengpu_table_probe", None)
@@ -49,10 +63,15 @@ impl TextureTable {
         let align = encoder.alignment().max(1);
         let stride = encoder.encoded_length().div_ceil(align) * align;
         let buffer = device.new_buffer(
-            stride * u64::from(TABLE_CAPACITY),
+            if tier1 {
+                stride
+            } else {
+                stride * u64::from(TABLE_CAPACITY)
+            },
             MTLResourceOptions::StorageModeShared,
         );
         Ok(Self {
+            tier1,
             encoder,
             buffer,
             stride,
@@ -65,12 +84,59 @@ impl TextureTable {
         let Some(entry) = self.bound.get_mut(slot as usize) else {
             return false;
         };
-        self.encoder
-            .set_argument_buffer(&self.buffer, u64::from(slot) * self.stride);
-        self.encoder.set_texture(0, texture);
-        self.encoder.set_sampler_state(1, sampler);
+        if !self.tier1 {
+            self.encoder
+                .set_argument_buffer(&self.buffer, u64::from(slot) * self.stride);
+            self.encoder.set_texture(0, texture);
+            self.encoder.set_sampler_state(1, sampler);
+        }
         *entry = Some((texture.clone(), sampler.clone()));
         true
+    }
+
+    /// A fresh buffer per draw: later bindings must not overwrite in-flight arguments.
+    pub(crate) fn snapshot(
+        &self,
+        device: &DeviceRef,
+        slots: &[u32],
+    ) -> Result<(Buffer, [u32; TIER1_CAPACITY], Vec<Texture>)> {
+        let slots: Vec<u32> = if slots.is_empty() {
+            // Older callers put a table ID in scalars. Keep working for small tables.
+            if self.used() as usize > TIER1_CAPACITY {
+                return Err(GpuError::Unsupported("metal tier 1: list the draw's texture IDs in Bindings::textures when more than 16 textures are bound".into()));
+            }
+            self.bound
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t.as_ref().map(|_| i as u32))
+                .take(TIER1_CAPACITY)
+                .collect()
+        } else {
+            slots.to_vec()
+        };
+        if slots.len() > TIER1_CAPACITY {
+            return Err(GpuError::Unsupported(
+                "metal tier 1: at most 16 textures per draw; split the draw".into(),
+            ));
+        }
+        let buffer = device.new_buffer(
+            self.encoder.encoded_length(),
+            MTLResourceOptions::StorageModeShared,
+        );
+        self.encoder.set_argument_buffer(&buffer, 0);
+        let mut ids = [u32::MAX; TIER1_CAPACITY];
+        let mut resident = Vec::new();
+        for (i, slot) in slots.into_iter().enumerate() {
+            let (texture, sampler) = self.get(slot).ok_or_else(|| {
+                GpuError::Backend(format!("metal tier 1: texture slot {slot} is not bound"))
+            })?;
+            self.encoder.set_texture(i as u64, &texture);
+            self.encoder
+                .set_sampler_state((TIER1_CAPACITY + i) as u64, &sampler);
+            ids[i] = slot;
+            resident.push(texture);
+        }
+        Ok((buffer, ids, resident))
     }
 
     pub(crate) fn unbind(&mut self, slot: u32, texture: &Texture) {

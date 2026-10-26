@@ -1,6 +1,7 @@
 //! Render command recording straight into an `MTLCommandBuffer`.
 
 use std::ffi::c_void;
+use std::mem::size_of_val;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -18,7 +19,7 @@ use zengpu_hal::{
 
 use super::convert;
 use super::device::{Inner, MetalPipeline, RenderPipeline};
-use super::table::{PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX};
+use super::table::{PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX, TEXTURE_IDS_BUFFER_INDEX};
 
 /// The push block's size limit, as on Vulkan: 64 four-byte words.
 const PUSH_BYTES: usize = 256;
@@ -36,6 +37,7 @@ pub struct MetalCommandList {
     encoder: Option<RenderCommandEncoder>,
     pipeline: Option<Arc<RenderPipeline>>,
     index: Option<Buffer>,
+    binding_valid: bool,
     /// The current pass's attachment size, which scissors must stay inside.
     extent: (u32, u32),
 }
@@ -52,6 +54,7 @@ impl MetalCommandList {
             encoder: None,
             pipeline: None,
             index: None,
+            binding_valid: true,
             extent: (0, 0),
         }
     }
@@ -197,7 +200,12 @@ impl RenderCommands for MetalCommandList {
             .lock()
             .map(|t| t.resident())
             .unwrap_or_default();
-        let table = self.inner.table.lock().ok().map(|t| t.buffer().clone());
+        let table = self
+            .inner
+            .table
+            .lock()
+            .ok()
+            .and_then(|t| (!t.tier1).then(|| t.buffer().clone()));
         let enc = autoreleasepool(|| cmd.new_render_command_encoder(rpd).to_owned());
         if let Some(table) = &table {
             enc.set_vertex_buffer(TEXTURE_BUFFER_INDEX, Some(table), 0);
@@ -277,9 +285,37 @@ impl RenderCommands for MetalCommandList {
     }
 
     fn bind(&mut self, bindings: Bindings<'_>) {
+        self.binding_valid = true;
         let Some(enc) = self.encoder("bind") else {
             return;
         };
+        if let Ok(table) = self.inner.table.lock()
+            && table.tier1
+            && self.pipeline.as_ref().is_some_and(|p| p.texture_table)
+        {
+            match table.snapshot(&self.inner.device, bindings.textures) {
+                Ok((buffer, ids, resident)) => {
+                    enc.set_vertex_buffer(TEXTURE_BUFFER_INDEX, Some(&buffer), 0);
+                    enc.set_fragment_buffer(TEXTURE_BUFFER_INDEX, Some(&buffer), 0);
+                    let bytes = size_of_val(&ids) as u64;
+                    let ptr = ids.as_ptr().cast();
+                    enc.set_vertex_bytes(TEXTURE_IDS_BUFFER_INDEX, bytes, ptr);
+                    enc.set_fragment_bytes(TEXTURE_IDS_BUFFER_INDEX, bytes, ptr);
+                    for texture in &resident {
+                        enc.use_resource_at(
+                            texture,
+                            MTLResourceUsage::Read,
+                            metal::MTLRenderStages::Vertex | metal::MTLRenderStages::Fragment,
+                        );
+                    }
+                }
+                Err(error) => {
+                    log::error!("[zengpu-metal] {error}; draw skipped");
+                    self.binding_valid = false;
+                    return;
+                }
+            }
+        }
         let mut pc = [0u8; PUSH_BYTES];
         let mut len = 0usize;
         let words = bindings
@@ -337,6 +373,9 @@ impl RenderCommands for MetalCommandList {
     }
 
     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        if !self.binding_valid {
+            return;
+        }
         let Some(p) = self.pipeline.clone() else {
             log::error!("[zengpu-metal] draw without a pipeline; skipped");
             return;
@@ -357,6 +396,9 @@ impl RenderCommands for MetalCommandList {
     }
 
     fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>) {
+        if !self.binding_valid {
+            return;
+        }
         let (Some(p), Some(index)) = (self.pipeline.clone(), self.index.clone()) else {
             log::error!("[zengpu-metal] draw_indexed without a pipeline or index buffer; skipped");
             return;
@@ -388,6 +430,9 @@ impl RenderCommands for MetalCommandList {
     }
 
     fn draw_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32) {
+        if !self.binding_valid {
+            return;
+        }
         let Some(p) = self.pipeline.clone() else {
             log::error!("[zengpu-metal] draw_indirect without a pipeline; skipped");
             return;
@@ -419,6 +464,9 @@ impl RenderCommands for MetalCommandList {
         draw_count: u32,
         stride: u32,
     ) {
+        if !self.binding_valid {
+            return;
+        }
         let (Some(p), Some(index)) = (self.pipeline.clone(), self.index.clone()) else {
             log::error!(
                 "[zengpu-metal] draw_indexed_indirect without a pipeline or index buffer; skipped"
