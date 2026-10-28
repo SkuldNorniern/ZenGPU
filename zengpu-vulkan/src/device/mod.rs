@@ -3301,6 +3301,100 @@ mod tests {
         dev.destroy_shader(shader);
     }
 
+    #[test]
+    fn storage_level_slots_reusable_after_release() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL: ZslShader = zsl!(
+            push P { w: u32, h: u32, r: f32, g: f32, b: f32, a: f32 }
+            @workgroup_size(8, 8)
+            kernel fill(dst: image, p: P, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < p.w && y < p.h {
+                    dst.store(x, y, p.r, p.g, p.b, p.a)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        if vk_dev.limits().max_storage_textures == 0 {
+            return;
+        }
+        let shader = dev.create_shader(FILL.spirv_desc().unwrap()).unwrap();
+        let fill = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [8, 8, 1],
+            })
+            .unwrap();
+        let tex = dev
+            .create_texture(TextureDesc {
+                mip_levels: 4,
+                usage: TextureUsage::STORAGE | TextureUsage::TRANSFER_SRC,
+                ..tex_desc(TexDim::D2)
+            })
+            .unwrap();
+
+        // Each cycle takes 3 slots. Without release, the loop exhausts the table.
+        let cycles = vk_dev.bindless.level_view_capacity / 3 + 2;
+        for _ in 0..cycles {
+            for level in 1..4 {
+                dev.storage_level(tex, level).unwrap();
+            }
+            dev.release_storage_levels(tex).unwrap();
+        }
+        assert_eq!(
+            vk_dev.bindless.level_slots.lock().unwrap().free.len(),
+            vk_dev.bindless.level_view_capacity as usize
+        );
+
+        // Recreated views still write their own mip.
+        for level in 0..4u32 {
+            let (w, h) = (8 >> level, 8 >> level);
+            let slot = dev.storage_level(tex, level).unwrap();
+            dev.dispatch(
+                fill,
+                Bindings {
+                    buffers: &[],
+                    textures: &[],
+                    images: &[slot],
+                    scalars: &[
+                        Scalar::U32(w),
+                        Scalar::U32(h),
+                        Scalar::F32(1.0),
+                        Scalar::F32(0.0),
+                        Scalar::F32(1.0),
+                        Scalar::F32(1.0),
+                    ],
+                },
+                [1, 1, 1],
+            )
+            .unwrap();
+            let row = w * 4;
+            let len = u64::from(row * h);
+            let buf = dev.create_buffer(rw_desc(len)).unwrap();
+            let mut region = TextureRegion::rect(0, 0, w, h);
+            region.mip_level = level;
+            dev.copy_texture_region_to_buffer(tex, region, buf, 0, row)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let raw = dev.read_buffer(buf, 0, len).unwrap();
+            dev.destroy_buffer(buf);
+            for texel in raw.as_chunks::<4>().0 {
+                assert_eq!(texel, &[255, 0, 255, 255][..], "mip {level}");
+            }
+        }
+
+        dev.destroy_texture(tex);
+        assert!(dev.release_storage_levels(tex).is_ok());
+        dev.destroy_pipeline(fill);
+        dev.destroy_shader(shader);
+    }
+
     /// Host cost of one trivial one-workgroup dispatch.
     ///
     /// Run with `cargo test --release -p zengpu-vulkan dispatch_overhead -- --ignored --nocapture`.

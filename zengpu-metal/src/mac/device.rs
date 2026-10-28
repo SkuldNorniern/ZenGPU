@@ -3,6 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::mem::take;
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1409,6 +1410,19 @@ impl GpuDevice for MetalDevice {
             blit.end_encoding();
         });
         self.inner.commit_and_wait(&cmd)
+    }
+
+    fn release_storage_levels(&self, texture: TextureHandle) -> Result<()> {
+        let mut textures = lock(&self.inner.textures)?;
+        let Some(entry) = textures.get_mut(texture) else {
+            return Ok(());
+        };
+        let slots = take(&mut entry.level_slots);
+        let mut views = lock(&self.inner.level_views)?;
+        for (_, slot) in slots {
+            views.release(slot);
+        }
+        Ok(())
     }
 
     fn storage_level(&self, texture: TextureHandle, level: u32) -> Result<u32> {

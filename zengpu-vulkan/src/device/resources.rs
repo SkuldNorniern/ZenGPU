@@ -1,3 +1,5 @@
+use std::mem::take;
+
 use super::*;
 
 impl VulkanDevice {
@@ -121,6 +123,25 @@ impl VulkanDevice {
             for mip in 0..levels {
                 tex.mark_ready(mip, 0);
             }
+        }
+        Ok(())
+    }
+
+    /// Destroys the level views of `texture` and frees their storage slots. Caller guarantees no
+    /// in-flight work uses them. A stale handle is a no-op.
+    pub(crate) fn release_storage_levels_impl(&self, texture: TextureHandle) -> Result<()> {
+        let mut textures = self.textures.lock().unwrap();
+        let Some(tex) = textures.get_mut(texture) else {
+            return Ok(());
+        };
+        let views = take(&mut tex.level_views);
+        if views.is_empty() {
+            return Ok(());
+        }
+        let mut level_slots = self.bindless.level_slots.lock().unwrap();
+        for level in views {
+            level_slots.release(level.slot);
+            unsafe { self.inner.device.destroy_image_view(level.view, None) };
         }
         Ok(())
     }

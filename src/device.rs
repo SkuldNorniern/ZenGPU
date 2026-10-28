@@ -476,6 +476,10 @@ impl GpuDevice for Device {
         self.inner.storage_level(texture, level)
     }
 
+    fn release_storage_levels(&self, texture: TextureHandle) -> Result<()> {
+        self.inner.release_storage_levels(texture)
+    }
+
     fn supports_anisotropic_filtering(&self) -> bool {
         self.inner.supports_anisotropic_filtering()
     }

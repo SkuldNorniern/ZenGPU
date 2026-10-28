@@ -740,6 +740,10 @@ impl GpuDevice for VulkanDevice {
         self.storage_level_impl(texture, level)
     }
 
+    fn release_storage_levels(&self, texture: TextureHandle) -> Result<()> {
+        self.release_storage_levels_impl(texture)
+    }
+
     fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
         self.write_textures_impl(writes)
     }

@@ -267,6 +267,15 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
     }
 
+    /// Frees the `storage_level` slots of mips above 0, so the texture stops using them. A later
+    /// `storage_level` call recreates them. A stale handle is a no-op.
+    ///
+    /// Nothing in flight may reference those slots, as with `destroy_buffer`. The default does
+    /// nothing, which is valid: releasing is only a way to reclaim slots.
+    fn release_storage_levels(&self, _texture: TextureHandle) -> Result<()> {
+        Ok(())
+    }
+
     /// Nothing may still reference the image, as with `destroy_buffer`. A stale handle is a no-op.
     fn destroy_texture(&self, texture: TextureHandle);
 
