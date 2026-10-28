@@ -472,6 +472,10 @@ impl GpuDevice for Device {
         self.inner.generate_mipmaps(texture)
     }
 
+    fn storage_level(&self, texture: TextureHandle, level: u32) -> Result<u32> {
+        self.inner.storage_level(texture, level)
+    }
+
     fn supports_anisotropic_filtering(&self) -> bool {
         self.inner.supports_anisotropic_filtering()
     }

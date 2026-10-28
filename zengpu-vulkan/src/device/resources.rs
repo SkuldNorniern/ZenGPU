@@ -125,6 +125,91 @@ impl VulkanDevice {
         Ok(())
     }
 
+    /// Storage-table slot for mip `level` of `texture`. Level 0 is the texture's own slot. Higher
+    /// levels get a single-level view on first use, bound in a slot past the texture-index range.
+    pub(crate) fn storage_level_impl(&self, texture: TextureHandle, level: u32) -> Result<u32> {
+        let mut textures = self.textures.lock().unwrap();
+        let tex = textures
+            .get_mut(texture)
+            .ok_or_else(|| GpuError::Backend("storage_level: stale texture handle".to_string()))?;
+        if !tex.usage.contains(vk::ImageUsageFlags::STORAGE) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "texture",
+                needed: "STORAGE",
+            }));
+        }
+        if level >= tex.mip_levels {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "mip level {level} out of range; the texture has {} levels",
+                    tex.mip_levels
+                ),
+            )));
+        }
+        if level == 0 {
+            return Ok(texture.index());
+        }
+        if let Some(existing) = tex.level_views.iter().find(|v| v.level == level) {
+            return Ok(existing.slot);
+        }
+        let slot = self
+            .bindless
+            .level_slots
+            .lock()
+            .unwrap()
+            .alloc(texture.index())
+            .ok_or_else(|| {
+                GpuError::Unsupported(format!(
+                    "the storage-image table has no free level-view slot ({} in use)",
+                    self.bindless.level_view_capacity
+                ))
+            })?;
+        let view = unsafe {
+            self.inner.device.create_image_view(
+                &vk::ImageViewCreateInfo {
+                    image: tex.image,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    format: tex.format,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: level,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+        let view = match view {
+            Ok(v) => v,
+            Err(e) => {
+                self.bindless.level_slots.lock().unwrap().release(slot);
+                return Err(GpuError::Backend(format!("vkCreateImageView: {e}")));
+            }
+        };
+        let info = vk::DescriptorImageInfo {
+            sampler: vk::Sampler::null(),
+            image_view: view,
+            image_layout: vk::ImageLayout::GENERAL,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.bindless.set,
+            dst_binding: STORAGE_IMAGE_BINDING,
+            dst_array_element: slot,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            p_image_info: &info,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.update_descriptor_sets(&[write], &[]);
+        }
+        tex.level_views.push(LevelView { level, view, slot });
+        Ok(slot)
+    }
+
     /// Register a `STORAGE` buffer in every SSBO table, at its slot index. Called
     /// by `create_buffer`.
     ///

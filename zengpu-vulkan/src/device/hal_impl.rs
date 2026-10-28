@@ -691,6 +691,7 @@ impl GpuDevice for VulkanDevice {
             ready: vec![0; array_layers as usize],
             resting: VulkanTexture::resting_layout(usage),
             storage_view,
+            level_views: Vec::new(),
         });
         if storage && let Err(e) = self.init_storage_texture(handle) {
             self.destroy_texture(handle);
@@ -735,6 +736,10 @@ impl GpuDevice for VulkanDevice {
         self.generate_mipmaps_impl(texture)
     }
 
+    fn storage_level(&self, texture: TextureHandle, level: u32) -> Result<u32> {
+        self.storage_level_impl(texture, level)
+    }
+
     fn write_textures(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
         self.write_textures_impl(writes)
     }
@@ -766,6 +771,12 @@ impl GpuDevice for VulkanDevice {
         let mut textures = self.textures.lock().unwrap();
         let mut bound_textures = self.bindless.bound_textures.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
+        if let Some(tex) = textures.get(texture) {
+            let mut level_slots = self.bindless.level_slots.lock().unwrap();
+            for level in &tex.level_views {
+                level_slots.release(level.slot);
+            }
+        }
         let (removed, tex) = if !self.inner.serials.idle() {
             if let Some(tex) = textures.retire(texture) {
                 lifetime.deferred.push((

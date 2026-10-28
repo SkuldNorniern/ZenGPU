@@ -835,9 +835,14 @@ impl VulkanDevice {
             }
         }
         for &idx in bindings.images {
-            let texture = textures
-                .get_by_slot_index(idx)
-                .filter(|_| idx < self.bindless.storage_capacity)
+            // Level-view slots map to their parent texture's slot.
+            let owner = if idx < self.bindless.storage_capacity {
+                Some(idx)
+            } else {
+                self.bindless.level_slots.lock().unwrap().owner(idx)
+            };
+            let texture = owner
+                .and_then(|owner| textures.get_by_slot_index(owner))
                 .ok_or_else(|| {
                     GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
                         "image binding index {idx} is not a live texture"

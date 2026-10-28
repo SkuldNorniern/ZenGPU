@@ -1,6 +1,7 @@
 //! `GpuDevice` for Metal: resources, transfers, compute.
 
 use std::any::Any;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
@@ -13,7 +14,7 @@ use metal::{
     BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
     ComputeCommandEncoderRef, ComputePipelineState, DepthStencilState, Device, Library,
     MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType,
-    MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage,
+    MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
 use objc::rc::autoreleasepool;
@@ -41,6 +42,44 @@ pub(crate) struct MetalBuffer {
 pub(crate) struct MetalTexture {
     pub(crate) tex: Texture,
     pub(crate) desc: TextureDesc,
+    /// `(level, slot)` of each single-level view from `storage_level`.
+    pub(crate) level_slots: Vec<(u32, u32)>,
+}
+
+/// Image slots for single-level views, past the texture-index range.
+const LEVEL_VIEW_BASE: u32 = 1 << 30;
+const LEVEL_VIEW_CAPACITY: u32 = 1024;
+
+#[derive(Default)]
+pub(crate) struct LevelViews {
+    next: u32,
+    free: Vec<u32>,
+    views: HashMap<u32, Texture>,
+}
+
+impl LevelViews {
+    fn alloc(&mut self, view: Texture) -> Option<u32> {
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None if self.next < LEVEL_VIEW_CAPACITY => {
+                self.next += 1;
+                LEVEL_VIEW_BASE + self.next - 1
+            }
+            None => return None,
+        };
+        self.views.insert(slot, view);
+        Some(slot)
+    }
+
+    fn release(&mut self, slot: u32) {
+        if self.views.remove(&slot).is_some() {
+            self.free.push(slot);
+        }
+    }
+
+    fn get(&self, slot: u32) -> Option<Texture> {
+        self.views.get(&slot).cloned()
+    }
 }
 
 /// Draw target: a `RENDER_TARGET` or `DEPTH_STENCIL` texture, or a drawable's.
@@ -84,6 +123,7 @@ pub(crate) struct Inner {
     pub(crate) samplers: Mutex<SlotMap<marker::Sampler, SamplerState>>,
     pub(crate) targets: Mutex<SlotMap<marker::RenderTarget, MetalTarget>>,
     pub(crate) table: Mutex<TextureTable>,
+    pub(crate) level_views: Mutex<LevelViews>,
     /// Last committed buffer. Earlier ones finish first, so waiting on it waits for the device.
     pub(crate) last_submit: Mutex<Option<CommandBuffer>>,
     pub(crate) lost: AtomicBool,
@@ -316,6 +356,7 @@ impl MetalDevice {
                 samplers: Mutex::new(SlotMap::default()),
                 targets: Mutex::new(SlotMap::default()),
                 table: Mutex::new(table),
+                level_views: Mutex::new(LevelViews::default()),
                 last_submit: Mutex::new(None),
                 lost: AtomicBool::new(false),
                 completions: Arc::default(),
@@ -709,18 +750,28 @@ impl MetalDevice {
         };
         let images: Vec<Texture> = {
             let textures = lock(&self.inner.textures)?;
+            let views = lock(&self.inner.level_views)?;
             op.bindings
                 .images
                 .iter()
-                .map(|&slot| match textures.get_by_slot_index(slot) {
-                    Some(t) if t.desc.usage.contains(TextureUsage::STORAGE) => Ok(t.tex.clone()),
-                    Some(_) => Err(GpuError::InvalidUsage(UsageError::MissingUsage {
-                        resource: "bound image",
-                        needed: "STORAGE",
-                    })),
-                    None => Err(GpuError::Backend(
-                        "metal: invalid image slot in bindings".into(),
-                    )),
+                .map(|&slot| {
+                    if slot >= LEVEL_VIEW_BASE {
+                        return views.get(slot).ok_or_else(|| {
+                            GpuError::Backend("metal: invalid image slot in bindings".into())
+                        });
+                    }
+                    match textures.get_by_slot_index(slot) {
+                        Some(t) if t.desc.usage.contains(TextureUsage::STORAGE) => {
+                            Ok(t.tex.clone())
+                        }
+                        Some(_) => Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                            resource: "bound image",
+                            needed: "STORAGE",
+                        })),
+                        None => Err(GpuError::Backend(
+                            "metal: invalid image slot in bindings".into(),
+                        )),
+                    }
                 })
                 .collect::<Result<_>>()?
         };
@@ -1140,7 +1191,11 @@ impl GpuDevice for MetalDevice {
         td.set_usage(usage);
         td.set_storage_mode(self.inner.texture_storage(&desc));
         let tex = self.inner.device.new_texture(&td);
-        Ok(lock(&self.inner.textures)?.insert(MetalTexture { tex, desc }))
+        Ok(lock(&self.inner.textures)?.insert(MetalTexture {
+            tex,
+            desc,
+            level_slots: Vec::new(),
+        }))
     }
 
     fn upload_texture_data(&self, texture: TextureHandle, data: &[u8]) -> Result<()> {
@@ -1356,6 +1411,42 @@ impl GpuDevice for MetalDevice {
         self.inner.commit_and_wait(&cmd)
     }
 
+    fn storage_level(&self, texture: TextureHandle, level: u32) -> Result<u32> {
+        let mut textures = lock(&self.inner.textures)?;
+        let entry = textures
+            .get_mut(texture)
+            .ok_or_else(|| GpuError::Backend("metal: invalid texture handle".into()))?;
+        if !entry.desc.usage.contains(TextureUsage::STORAGE) {
+            return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                resource: "texture",
+                needed: "STORAGE",
+            }));
+        }
+        let levels = entry.desc.mip_levels.max(1);
+        if level >= levels {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!("mip level {level} out of range; the texture has {levels} levels"),
+            )));
+        }
+        if level == 0 {
+            return Ok(texture.index());
+        }
+        if let Some(&(_, slot)) = entry.level_slots.iter().find(|(l, _)| *l == level) {
+            return Ok(slot);
+        }
+        let view = entry.tex.new_texture_view_from_slice(
+            convert::pixel_format(entry.desc.format),
+            MTLTextureType::D2,
+            NSRange::new(u64::from(level), 1),
+            NSRange::new(0, 1),
+        );
+        let slot = lock(&self.inner.level_views)?
+            .alloc(view)
+            .ok_or_else(|| GpuError::Unsupported("metal: no free level-view slot".into()))?;
+        entry.level_slots.push((level, slot));
+        Ok(slot)
+    }
+
     fn destroy_texture(&self, texture: TextureHandle) {
         let removed = self
             .inner
@@ -1363,6 +1454,13 @@ impl GpuDevice for MetalDevice {
             .lock()
             .ok()
             .and_then(|mut t| t.remove(texture));
+        if let Some(t) = &removed
+            && let Ok(mut views) = self.inner.level_views.lock()
+        {
+            for &(_, slot) in &t.level_slots {
+                views.release(slot);
+            }
+        }
         if let (Some(t), Ok(mut table)) = (removed, self.inner.table.lock()) {
             table.unbind(texture.index(), &t.tex);
         }

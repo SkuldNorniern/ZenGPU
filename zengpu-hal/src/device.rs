@@ -258,6 +258,15 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::UnsupportedFeatures(Features::GRAPHICS))
     }
 
+    /// A slot for `Bindings::images` that writes mip `level` of a `STORAGE` texture. Level 0 is
+    /// the texture's own slot. Lives until the texture is destroyed.
+    ///
+    /// Errors for a stale handle, a texture without `STORAGE`, or `level >= mip_levels`.
+    /// The default returns `UnsupportedFeatures`.
+    fn storage_level(&self, _texture: TextureHandle, _level: u32) -> Result<u32> {
+        Err(GpuError::UnsupportedFeatures(Features::COMPUTE))
+    }
+
     /// Nothing may still reference the image, as with `destroy_buffer`. A stale handle is a no-op.
     fn destroy_texture(&self, texture: TextureHandle);
 

@@ -47,6 +47,9 @@ const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
 const MAX_BINDLESS_TEXTURES: u32 = 1024;
 
+/// Storage-image slots for single-level views (`storage_level`), past the texture-index range.
+const MAX_LEVEL_VIEW_SLOTS: u32 = 256;
+
 /// Bindless SSBO table for `buffer<f32>` access. Every `STORAGE` buffer is registered here,
 /// whatever its ZSL element type: buffers are untyped at the HAL.
 const SSBO_BINDING_F32: u32 = 0;
@@ -62,6 +65,7 @@ const SSBO_BINDING_U32: u32 = 2;
 const SSBO_BINDING_I32: u32 = 3;
 
 /// Storage-image table: each `STORAGE` texture's mip 0, in `GENERAL` layout, at its own slot.
+/// Level views take slots above the texture-index range.
 const STORAGE_IMAGE_BINDING: u32 = 4;
 
 /// SSBO tables sharing the storage-buffer budget (`f32`/`u32`/`i32`). Append-only: new tables take
@@ -80,7 +84,51 @@ struct BindlessState {
     texture_capacity: u32,
     /// Storage-image table slots; 0 if compute cannot store to images.
     storage_capacity: u32,
+    /// Slots past `storage_capacity` for level views; 0 if there is no storage table.
+    level_view_capacity: u32,
+    level_slots: Mutex<LevelSlots>,
     bound_textures: Mutex<Vec<bool>>,
+}
+
+/// Free list for the level-view slots above the texture-index range.
+struct LevelSlots {
+    base: u32,
+    free: Vec<u32>,
+    /// Texture slot index that owns each level slot, `None` when free.
+    owners: Vec<Option<u32>>,
+}
+
+impl LevelSlots {
+    fn new(base: u32, count: u32) -> Self {
+        Self {
+            base,
+            free: (base..base + count).rev().collect(),
+            owners: vec![None; count as usize],
+        }
+    }
+
+    fn alloc(&mut self, owner: u32) -> Option<u32> {
+        let slot = self.free.pop()?;
+        self.owners[(slot - self.base) as usize] = Some(owner);
+        Some(slot)
+    }
+
+    fn release(&mut self, slot: u32) {
+        let Some(index) = slot.checked_sub(self.base) else {
+            return;
+        };
+        if let Some(owner) = self.owners.get_mut(index as usize) {
+            *owner = None;
+            self.free.push(slot);
+        }
+    }
+
+    fn owner(&self, slot: u32) -> Option<u32> {
+        self.owners
+            .get(slot.checked_sub(self.base)? as usize)
+            .copied()
+            .flatten()
+    }
 }
 
 // SAFETY: handles are u64 values, lifetimes controlled through `VulkanDevice`.
@@ -561,6 +609,15 @@ pub(crate) struct VulkanTexture {
     /// Mip 0 view for the storage-image table, when `view` has more levels than a storage
     /// descriptor takes. Else null.
     pub storage_view: vk::ImageView,
+    /// Single-level views from `storage_level`, for mips above 0.
+    pub level_views: Vec<LevelView>,
+}
+
+/// One mip of a `STORAGE` texture, bound at `slot` in the storage-image table.
+pub(crate) struct LevelView {
+    pub level: u32,
+    pub view: vk::ImageView,
+    pub slot: u32,
 }
 
 impl VulkanTexture {
@@ -578,6 +635,9 @@ impl VulkanTexture {
         unsafe {
             if self.storage_view != vk::ImageView::null() {
                 device.destroy_image_view(self.storage_view, None);
+            }
+            for level in &self.level_views {
+                device.destroy_image_view(level.view, None);
             }
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
@@ -1254,8 +1314,24 @@ fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32, u32)> {
     Ok((buffer_capacity, texture_capacity, storage_capacity))
 }
 
+/// Level-view slots after the texture-index range, within the same storage-image budget.
+fn level_view_capacity(limits: DeviceLimits, used: u32, storage_capacity: u32) -> u32 {
+    if storage_capacity == 0 {
+        return 0;
+    }
+    MAX_LEVEL_VIEW_SLOTS
+        .min(limits.max_storage_textures - storage_capacity)
+        .min(limits.max_update_after_bind_descriptors - used - storage_capacity)
+}
+
 fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
     let (buffer_capacity, texture_capacity, storage_capacity) = bindless_capacities(limits)?;
+    let level_view_capacity = level_view_capacity(
+        limits,
+        buffer_capacity * SSBO_TYPED_TABLE_COUNT + texture_capacity,
+        storage_capacity,
+    );
+    let storage_table = storage_capacity + level_view_capacity;
     let mut bindings = vec![
         vk::DescriptorSetLayoutBinding {
             binding: SSBO_BINDING_F32,
@@ -1290,7 +1366,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         bindings.push(vk::DescriptorSetLayoutBinding {
             binding: STORAGE_IMAGE_BINDING,
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-            descriptor_count: storage_capacity,
+            descriptor_count: storage_table,
             stage_flags: vk::ShaderStageFlags::ALL,
             ..Default::default()
         });
@@ -1332,7 +1408,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
     if storage_capacity != 0 {
         pool_sizes.push(vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_IMAGE,
-            descriptor_count: storage_capacity,
+            descriptor_count: storage_table,
         });
     }
     let pool = unsafe {
@@ -1373,6 +1449,8 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         buffer_capacity,
         texture_capacity,
         storage_capacity,
+        level_view_capacity,
+        level_slots: Mutex::new(LevelSlots::new(storage_capacity, level_view_capacity)),
         bound_textures: Mutex::new(vec![false; texture_capacity as usize]),
     })
 }
@@ -3085,6 +3163,142 @@ mod tests {
         );
         dev.destroy_buffer(out);
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn storage_level_writes_each_mip() {
+        use zengpu_spirv::{ZslShader, zsl};
+
+        const FILL: ZslShader = zsl!(
+            push P { w: u32, h: u32, r: f32, g: f32, b: f32, a: f32 }
+            @workgroup_size(8, 8)
+            kernel fill(dst: image, p: P, id: global_id) {
+                let x = id.x
+                let y = id.y
+                if x < p.w && y < p.h {
+                    dst.store(x, y, p.r, p.g, p.b, p.a)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let vk_dev = dev.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        if vk_dev.limits().max_storage_textures == 0 {
+            return;
+        }
+        let shader = dev.create_shader(FILL.spirv_desc().unwrap()).unwrap();
+        let fill = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [8, 8, 1],
+            })
+            .unwrap();
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 8,
+                height: 8,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::STORAGE | TextureUsage::TRANSFER_SRC,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 4,
+                array_layers: 1,
+            })
+            .unwrap();
+
+        let colours: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ];
+        assert_eq!(dev.storage_level(tex, 0).unwrap(), tex.index());
+        for (level, [r, g, b, a]) in colours.iter().copied().enumerate() {
+            let level = level as u32;
+            let (w, h) = (8 >> level, 8 >> level);
+            let slot = dev.storage_level(tex, level).unwrap();
+            assert_eq!(dev.storage_level(tex, level).unwrap(), slot);
+            dev.dispatch(
+                fill,
+                Bindings {
+                    buffers: &[],
+                    textures: &[],
+                    images: &[slot],
+                    scalars: &[
+                        Scalar::U32(w),
+                        Scalar::U32(h),
+                        Scalar::F32(r),
+                        Scalar::F32(g),
+                        Scalar::F32(b),
+                        Scalar::F32(a),
+                    ],
+                },
+                [1, 1, 1],
+            )
+            .unwrap();
+        }
+
+        for (level, colour) in colours.iter().enumerate() {
+            let level = level as u32;
+            let (w, h) = (8 >> level, 8 >> level);
+            let row = w * 4;
+            let len = u64::from(row * h);
+            let buf = dev.create_buffer(rw_desc(len)).unwrap();
+            let mut region = TextureRegion::rect(0, 0, w, h);
+            region.mip_level = level;
+            dev.copy_texture_region_to_buffer(tex, region, buf, 0, row)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            let raw = dev.read_buffer(buf, 0, len).unwrap();
+            dev.destroy_buffer(buf);
+            let want: [u8; 4] = colour.map(|c| (c * 255.0) as u8);
+            for texel in raw.as_chunks::<4>().0 {
+                assert_eq!(texel, &want[..], "mip {level}");
+            }
+        }
+
+        assert!(matches!(
+            dev.storage_level(tex, 4),
+            Err(GpuError::InvalidUsage(UsageError::BindingMismatch(_)))
+        ));
+        let sampled = dev
+            .create_texture(TextureDesc {
+                mip_levels: 4,
+                usage: TextureUsage::SAMPLED,
+                ..tex_desc(TexDim::D2)
+            })
+            .unwrap();
+        assert!(matches!(
+            dev.storage_level(sampled, 1),
+            Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                needed: "STORAGE",
+                ..
+            }))
+        ));
+        dev.destroy_texture(sampled);
+
+        // Level views must return their slots on destroy, or this runs out.
+        let churn = vk_dev.bindless.level_view_capacity / 3 + 2;
+        for _ in 0..churn {
+            let t = dev
+                .create_texture(TextureDesc {
+                    mip_levels: 4,
+                    usage: TextureUsage::STORAGE,
+                    ..tex_desc(TexDim::D2)
+                })
+                .unwrap();
+            for level in 1..4 {
+                dev.storage_level(t, level).unwrap();
+            }
+            dev.destroy_texture(t);
+        }
+
+        dev.destroy_texture(tex);
+        dev.destroy_pipeline(fill);
+        dev.destroy_shader(shader);
     }
 
     /// Host cost of one trivial one-workgroup dispatch.
