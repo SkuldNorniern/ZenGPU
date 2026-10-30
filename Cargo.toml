@@ -23,7 +23,7 @@ resolver = "3"
 members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-tile", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zengpu-opengl", "zen-window-handle"]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -43,20 +43,20 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [workspace.dependencies]
-zengpu-hal = { path = "zengpu-hal", version = "0.0.1" }
-zengpu-cpu = { path = "zengpu-cpu", version = "0.0.1" }
-zengpu-vulkan = { path = "zengpu-vulkan", version = "0.0.1" }
-zengpu-compute = { path = "zengpu-compute", version = "0.0.1" }
-zengpu-spirv = { path = "zengpu-spirv", version = "0.0.1" }
-zengpu-spv = { path = "zengpu-spv", version = "0.0.1" }
-zengpu-zsl = { path = "zengpu-zsl", version = "0.0.1" }
-zengpu-zslc = { path = "zengpu-zslc", version = "0.0.1" }
-zengpu-tile = { path = "zengpu-tile", version = "0.0.1" }
-zengpu-cuda = { path = "zengpu-cuda", version = "0.0.1" }
-zengpu-metal = { path = "zengpu-metal", version = "0.0.1" }
-zengpu-hip = { path = "zengpu-hip", version = "0.0.1" }
-zengpu-dx12 = { path = "zengpu-dx12", version = "0.0.1" }
-zengpu-opengl = { path = "zengpu-opengl", version = "0.0.1" }
+zengpu-hal = { path = "zengpu-hal", version = "0.1.0" }
+zengpu-cpu = { path = "zengpu-cpu", version = "0.1.0" }
+zengpu-vulkan = { path = "zengpu-vulkan", version = "0.1.0" }
+zengpu-compute = { path = "zengpu-compute", version = "0.1.0" }
+zengpu-spirv = { path = "zengpu-spirv", version = "0.1.0" }
+zengpu-spv = { path = "zengpu-spv", version = "0.1.0" }
+zengpu-zsl = { path = "zengpu-zsl", version = "0.1.0" }
+zengpu-zslc = { path = "zengpu-zslc", version = "0.1.0" }
+zengpu-tile = { path = "zengpu-tile", version = "0.1.0" }
+zengpu-cuda = { path = "zengpu-cuda", version = "0.1.0" }
+zengpu-metal = { path = "zengpu-metal", version = "0.1.0" }
+zengpu-hip = { path = "zengpu-hip", version = "0.1.0" }
+zengpu-dx12 = { path = "zengpu-dx12", version = "0.1.0" }
+zengpu-opengl = { path = "zengpu-opengl", version = "0.1.0" }
 zen-window-handle = { path = "zen-window-handle", version = "0.1.0" }
 log = "0.4"
 

@@ -1,9 +1,9 @@
 # ZenGPU
 
-Pre-alpha GPU runtime for Rust: one device model for graphics and compute,
+Early GPU runtime for Rust: one device model for graphics and compute,
 and ZSL, a Rust-flavoured shader language that compiles to every backend.
 
-> Pre-alpha. APIs still move before `0.1.0`.
+> Early API. Check the backend status below before enabling optional paths.
 
 Resource handles preserve a process-unique table identity as well as their slot
 and generation. Handles from another device, including a replacement device,
@@ -23,7 +23,7 @@ helpers. Raw slot-based dispatches can opt into full-handle checks with
 
 ```toml
 [dependencies]
-zengpu = "0.0.1"
+zengpu = "0.1.0"
 ```
 
 ```rust,ignore
@@ -54,6 +54,12 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 | CUDA (`cuda`) | no | yes | Linux, Windows |
 | CPU (`cpu`) | no | yes | all, for conformance tests |
 | DirectX 12 (`dx12`) | skeleton | skeleton | Windows |
+| OpenGL (`opengl`) | placeholder | placeholder | no adapters yet |
+
+GPU image codec calls are reserved through `image_codec_caps`, `decode_image`
+and `encode_image`. Every current backend reports no codec support and returns
+`Unsupported`; there is no implicit CPU codec fallback. Qualcomm NPU, Google
+Cloud TPU and Edge TPU remain planned targets in `zengpu::accelerator`.
 
 Other features: `compute` (default) for device arrays, pooling and
 elementwise kernels. GEMM and other BLAS routines live in the ZenBLAS repo.
@@ -105,7 +111,7 @@ More in [`examples/`](examples/).
 ## Crates
 
 Depend on `zengpu`. Subcrates: `zengpu-hal` (types and traits), one per
-backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-cpu`),
+backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-opengl`, `-cpu`),
 `zengpu-compute`, `zengpu-spirv` and `zengpu-zsl` (shaders),
 `zengpu-spv` (SPIR-V checks), `zengpu-conformance`.
 

@@ -1822,7 +1822,7 @@ version = "0.1.0"
 
 [[package]]
 name = "zengpu"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "log",
  "raw-window-handle",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "zengpu-compute"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-hal",
  "zengpu-spirv",
@@ -1850,7 +1850,7 @@ dependencies = [
 
 [[package]]
 name = "zengpu-conformance"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-compute",
  "zengpu-cpu",
@@ -1863,14 +1863,14 @@ dependencies = [
 
 [[package]]
 name = "zengpu-cpu"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-hal",
 ]
 
 [[package]]
 name = "zengpu-cuda"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "cc",
  "cuda-oxide",
@@ -1881,7 +1881,7 @@ dependencies = [
 
 [[package]]
 name = "zengpu-dx12"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "log",
  "zengpu-hal",
@@ -1889,14 +1889,14 @@ dependencies = [
 
 [[package]]
 name = "zengpu-hal"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zen-window-handle",
 ]
 
 [[package]]
 name = "zengpu-hip"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "log",
  "zengpu-compute",
@@ -1907,7 +1907,7 @@ dependencies = [
 
 [[package]]
 name = "zengpu-metal"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "block",
  "core-graphics-types",
@@ -1921,14 +1921,14 @@ dependencies = [
 
 [[package]]
 name = "zengpu-opengl"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-hal",
 ]
 
 [[package]]
 name = "zengpu-spirv"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-hal",
  "zengpu-zsl",
@@ -1936,11 +1936,11 @@ dependencies = [
 
 [[package]]
 name = "zengpu-spv"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "zengpu-tile"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-cuda",
  "zengpu-hal",
@@ -1952,7 +1952,7 @@ dependencies = [
 
 [[package]]
 name = "zengpu-vulkan"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "ash",
  "log",
@@ -1965,14 +1965,14 @@ dependencies = [
 
 [[package]]
 name = "zengpu-zsl"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zengpu-zslc",
 ]
 
 [[package]]
 name = "zengpu-zslc"
-version = "0.0.1"
+version = "0.1.0"
 
 [[package]]
 name = "zerocopy"

@@ -23,5 +23,5 @@ metal = ["zengpu-zsl/metal"]
 dx = ["zengpu-zsl/dx"]
 
 [dependencies]
-zengpu-zsl = { path = "../zengpu-zsl", version = "0.0.1" }
+zengpu-zsl = { path = "../zengpu-zsl", version = "0.1.0" }
 zengpu-hal.workspace = true
