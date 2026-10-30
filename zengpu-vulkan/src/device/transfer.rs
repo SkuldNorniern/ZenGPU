@@ -62,6 +62,34 @@ impl StagingRing {
             && self.spares.iter().map(|s| s.size).sum::<u64>() <= SPARE_MAX_BYTES - size
     }
 
+    /// Replace idle undersized buffers when a changing workload fills the pool.
+    /// Never remove reservations or buffers still being read by the GPU.
+    fn make_spare_room(&mut self, size: u64, completed: u64) -> Vec<BufferHandle> {
+        let mut released = Vec::new();
+        if size > SPARE_MAX_BYTES {
+            return released;
+        }
+        let busy = |s: &&Spare| s.serial == PENDING || s.serial > completed;
+        if self.spares.iter().filter(busy).count() >= SPARE_MAX_BUFFERS
+            || self.spares.iter().filter(busy).map(|s| s.size).sum::<u64>() > SPARE_MAX_BYTES - size
+        {
+            return released;
+        }
+        while !self.can_keep_spare(size) {
+            let Some((index, _)) = self
+                .spares
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.serial != PENDING && s.serial <= completed)
+                .min_by_key(|(_, s)| s.size)
+            else {
+                break;
+            };
+            released.push(self.spares.swap_remove(index).buffer);
+        }
+        released
+    }
+
     fn settle_spare(&mut self, buffer: BufferHandle, serial: u64) -> bool {
         let Some(spare) = self.spares.iter_mut().find(|s| s.buffer == buffer) else {
             return false;
@@ -477,12 +505,17 @@ impl VulkanDevice {
             return Ok((buffer, 0, true));
         }
         let buffer = self.create_staging(len)?;
+        let released = ring.make_spare_room(len, completed);
         if ring.can_keep_spare(len) {
             ring.spares.push(Spare {
                 buffer,
                 size: len,
                 serial: PENDING,
             });
+        }
+        drop(ring);
+        for old in released {
+            self.destroy_buffer(old);
         }
         Ok((buffer, 0, true))
     }
@@ -512,6 +545,18 @@ impl VulkanDevice {
             return Err(GpuError::Backend(
                 "staging buffer is not host visible".into(),
             ));
+        }
+        if pitch == row {
+            // SAFETY: check_write validated the packed source length, and stage
+            // reserved the destination span. Host input and staging do not alias.
+            unsafe {
+                copy_nonoverlapping(
+                    write.data.as_ptr(),
+                    buf.mapped.add(at as usize),
+                    row * write.region.height as usize,
+                );
+            }
+            return Ok(());
         }
         for y in 0..write.region.height as usize {
             let src = &write.data[y * pitch..y * pitch + row];
@@ -717,6 +762,47 @@ mod tests {
     }
 
     #[test]
+    fn a_full_spare_pool_can_adapt_to_larger_uploads_without_reusing_busy_buffers() {
+        let mut ring = StagingRing {
+            spares: (0..SPARE_MAX_BUFFERS)
+                .map(|i| Spare {
+                    buffer: BufferHandle::from_parts(i as u32, 0),
+                    size: 16,
+                    serial: if i == 0 { PENDING } else { 4 },
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(
+            ring.make_spare_room(1024, 3).is_empty(),
+            "every buffer is busy"
+        );
+        assert_eq!(ring.spares.len(), SPARE_MAX_BUFFERS);
+        let released = ring.make_spare_room(1024, 4);
+        assert_eq!(released.len(), 1);
+        assert_ne!(
+            released[0],
+            BufferHandle::from_parts(0, 0),
+            "a reservation stays alive"
+        );
+        assert!(ring.can_keep_spare(1024));
+        assert!(ring.make_spare_room(SPARE_MAX_BYTES + 1, 4).is_empty());
+        let count = ring.spares.len();
+        assert!(
+            ring.make_spare_room(SPARE_MAX_BYTES, 4).is_empty(),
+            "busy bytes prevent retaining this size"
+        );
+        assert_eq!(
+            ring.spares.len(),
+            count,
+            "do not discard spares when replacement cannot fit"
+        );
+        ring.spares[0].serial = 4;
+        assert_eq!(ring.make_spare_room(SPARE_MAX_BYTES, 4).len(), count);
+        assert!(ring.can_keep_spare(SPARE_MAX_BYTES));
+    }
+
+    #[test]
     fn overflow_retention_is_bounded_by_bytes_and_buffer_count() {
         let mut ring = StagingRing::default();
         assert!(ring.can_keep_spare(SPARE_MAX_BYTES));
@@ -784,12 +870,20 @@ mod tests {
         let mut first = None;
         for value in 1..=16 {
             let data = [value; 16];
+            let mut padded = [0xFF; 20];
+            padded[..8].copy_from_slice(&data[..8]);
+            padded[12..].copy_from_slice(&data[8..]);
+            let (upload, pitch): (&[u8], u32) = if value % 2 == 0 {
+                (&padded, 12) // No trailing padding is required after the last row.
+            } else {
+                (&data, 8)
+            };
             device
                 .write_textures(&[TextureWrite {
                     texture,
                     region: TextureRegion::rect(0, 0, 2, 2),
-                    data: &data,
-                    bytes_per_row: 8,
+                    data: upload,
+                    bytes_per_row: pitch,
                 }])
                 .expect("upload")
                 .wait(Duration::from_secs(5))
