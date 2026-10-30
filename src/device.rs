@@ -2,11 +2,12 @@ use core::any::Any;
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
 use zengpu_hal::{
-    BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
-    ComputePipelineHints, DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities,
-    ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest, MemoryBudget,
-    PipelineHandle, ReadSubmission, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
-    Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
+    BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeCaps, ComputeOp,
+    ComputePipelineDesc, ComputePipelineHints, DeviceLimits, DispatchOp, Format, FormatCaps,
+    GpuDevice, HalCapabilities, ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest,
+    MemoryBudget, PipelineHandle, PipelineStats, ReadSubmission, Result, SamplerDesc,
+    SamplerHandle, ShaderDesc, ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion,
+    TextureWrite,
 };
 
 impl Debug for Device {
@@ -26,6 +27,18 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn compute_caps(&self) -> ComputeCaps {
+        self.inner.compute_caps()
+    }
+
+    pub fn pipeline_stats(&self, pipeline: PipelineHandle) -> Option<PipelineStats> {
+        self.inner.pipeline_stats(pipeline)
+    }
+
+    /// Releases idle backend caches without waiting for pending GPU work.
+    pub fn trim_memory(&self) -> u64 {
+        self.inner.trim_memory()
+    }
     pub fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
         self.inner.image_codec_caps(codec)
     }
@@ -266,6 +279,17 @@ impl Device {
 /// Inherent methods with the same name win for direct calls. The trait methods apply only when the
 /// trait is in scope.
 impl GpuDevice for Device {
+    fn compute_caps(&self) -> ComputeCaps {
+        self.inner.compute_caps()
+    }
+
+    fn pipeline_stats(&self, pipeline: PipelineHandle) -> Option<PipelineStats> {
+        self.inner.pipeline_stats(pipeline)
+    }
+
+    fn trim_memory(&self) -> u64 {
+        self.inner.trim_memory()
+    }
     fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
         self.inner.image_codec_caps(codec)
     }
@@ -532,6 +556,24 @@ mod tests {
     }
 
     impl GpuDevice for AsyncOnly {
+        fn compute_caps(&self) -> ComputeCaps {
+            let mut caps = ComputeCaps::scalar_only();
+            caps.subgroup_sizes = (32, 64);
+            caps.default_subgroup = 32;
+            caps.shared_bytes = 32 << 10;
+            caps.max_workgroup = 256;
+            caps
+        }
+        fn pipeline_stats(&self, pipeline: PipelineHandle) -> Option<PipelineStats> {
+            (pipeline.index() == 7).then_some(PipelineStats {
+                vgprs: 24,
+                max_threads: 256,
+                ..Default::default()
+            })
+        }
+        fn trim_memory(&self) -> u64 {
+            4096
+        }
         fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
             let mut caps = ImageCodecCaps::default();
             caps.decode = codec == ImageCodec::Png;
@@ -602,6 +644,23 @@ mod tests {
             assert_eq!((offset, len), (5, 2));
             Ok(Box::new(CompletedReadback::new(cycle, vec![4, 5])))
         }
+    }
+
+    #[test]
+    fn public_devices_preserve_backend_capabilities_statistics_and_trimming() {
+        let device = Device {
+            inner: Box::new(AsyncOnly),
+        };
+        let pipeline = PipelineHandle::from_parts(7, 0);
+        let expected_caps = AsyncOnly.compute_caps();
+        let expected_stats = AsyncOnly.pipeline_stats(pipeline);
+        assert_eq!(device.compute_caps(), expected_caps);
+        assert_eq!(device.pipeline_stats(pipeline), expected_stats);
+        assert_eq!(device.trim_memory(), 4096);
+        let hal: &dyn GpuDevice = &device;
+        assert_eq!(hal.compute_caps(), expected_caps);
+        assert_eq!(hal.pipeline_stats(pipeline), expected_stats);
+        assert_eq!(hal.trim_memory(), 4096);
     }
 
     #[test]
