@@ -4,8 +4,9 @@ use std::fmt::{Debug, Formatter, Result as FmtResult};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferDesc, BufferHandle, ComputeOp, ComputePipelineDesc,
     ComputePipelineHints, DeviceLimits, DispatchOp, Format, FormatCaps, GpuDevice, HalCapabilities,
-    MemoryBudget, PipelineHandle, ReadSubmission, Result, SamplerDesc, SamplerHandle, ShaderDesc,
-    ShaderHandle, Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
+    ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest, MemoryBudget,
+    PipelineHandle, ReadSubmission, Result, SamplerDesc, SamplerHandle, ShaderDesc, ShaderHandle,
+    Submission, TextureDesc, TextureHandle, TextureRegion, TextureWrite,
 };
 
 impl Debug for Device {
@@ -25,6 +26,27 @@ pub struct Device {
 }
 
 impl Device {
+    pub fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
+        self.inner.image_codec_caps(codec)
+    }
+
+    /// Optional async GPU decode. Existing backends return `Unsupported`.
+    pub fn decode_image(
+        &self,
+        cycle_id: u64,
+        request: ImageDecodeRequest<'_>,
+    ) -> Result<Submission> {
+        self.inner.decode_image(cycle_id, request)
+    }
+
+    /// Optional async GPU encode and readback. Existing backends return `Unsupported`.
+    pub fn encode_image(
+        &self,
+        cycle_id: u64,
+        request: ImageEncodeRequest,
+    ) -> Result<ReadSubmission> {
+        self.inner.encode_image(cycle_id, request)
+    }
     pub fn capabilities(&self) -> HalCapabilities {
         self.inner.capabilities()
     }
@@ -244,6 +266,17 @@ impl Device {
 /// Inherent methods with the same name win for direct calls. The trait methods apply only when the
 /// trait is in scope.
 impl GpuDevice for Device {
+    fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
+        self.inner.image_codec_caps(codec)
+    }
+
+    fn decode_image(&self, cycle_id: u64, request: ImageDecodeRequest<'_>) -> Result<Submission> {
+        self.inner.decode_image(cycle_id, request)
+    }
+
+    fn encode_image(&self, cycle_id: u64, request: ImageEncodeRequest) -> Result<ReadSubmission> {
+        self.inner.encode_image(cycle_id, request)
+    }
     fn backend(&self) -> BackendPreference {
         self.inner.backend()
     }
@@ -499,6 +532,25 @@ mod tests {
     }
 
     impl GpuDevice for AsyncOnly {
+        fn image_codec_caps(&self, codec: ImageCodec) -> ImageCodecCaps {
+            let mut caps = ImageCodecCaps::default();
+            caps.decode = codec == ImageCodec::Png;
+            caps.encode = codec == ImageCodec::Png;
+            caps
+        }
+        fn decode_image(&self, cycle: u64, request: ImageDecodeRequest<'_>) -> Result<Submission> {
+            assert_eq!(request.codec, ImageCodec::Png);
+            assert_eq!(request.encoded, b"encoded");
+            assert_eq!(request.destination.index(), 3);
+            assert_eq!(request.max_decoded_bytes, 64);
+            Ok(Box::new(CompletedSubmission::new(cycle)))
+        }
+        fn encode_image(&self, cycle: u64, request: ImageEncodeRequest) -> Result<ReadSubmission> {
+            assert_eq!(request.codec, ImageCodec::Png);
+            assert_eq!(request.source.index(), 4);
+            assert_eq!(request.max_encoded_bytes, 16);
+            Ok(Box::new(CompletedReadback::new(cycle, vec![1, 2, 3])))
+        }
         fn as_any(&self) -> &dyn Any {
             self
         }
@@ -549,6 +601,64 @@ mod tests {
         ) -> Result<ReadSubmission> {
             assert_eq!((offset, len), (5, 2));
             Ok(Box::new(CompletedReadback::new(cycle, vec![4, 5])))
+        }
+    }
+
+    #[test]
+    fn public_and_hal_devices_preserve_async_codec_overrides() {
+        let device = Device {
+            inner: Box::new(AsyncOnly),
+        };
+        let decode = ImageDecodeRequest::new(
+            ImageCodec::Png,
+            b"encoded",
+            TextureHandle::from_parts(3, 0),
+            64,
+        );
+        let encode = ImageEncodeRequest::new(ImageCodec::Png, TextureHandle::from_parts(4, 0), 16);
+        assert!(device.image_codec_caps(ImageCodec::Png).decode);
+        assert!(!device.image_codec_caps(ImageCodec::Jpeg).encode);
+        assert_eq!(device.decode_image(1, decode).unwrap().cycle_id(), 1);
+        let read = device.encode_image(2, encode).unwrap();
+        assert_eq!(read.cycle_id(), 2);
+        assert_eq!(read.into_bytes().unwrap(), [1, 2, 3]);
+        let hal: &dyn GpuDevice = &device;
+        assert!(hal.image_codec_caps(ImageCodec::Png).encode);
+        assert_eq!(hal.decode_image(3, decode).unwrap().cycle_id(), 3);
+        let read = hal.encode_image(4, encode).unwrap();
+        assert_eq!(read.cycle_id(), 4);
+        assert_eq!(read.into_bytes().unwrap(), [1, 2, 3]);
+    }
+
+    #[cfg(feature = "cpu")]
+    #[test]
+    fn cpu_devices_do_not_advertise_or_emulate_gpu_codecs() {
+        use crate::Instance;
+        use zengpu_hal::AdapterRequest;
+        let device = Instance::builder()
+            .cpu()
+            .build()
+            .request_adapter(AdapterRequest::default())
+            .unwrap()
+            .open_default()
+            .unwrap();
+        for codec in [
+            ImageCodec::Png,
+            ImageCodec::Jpeg,
+            ImageCodec::WebP,
+            ImageCodec::Avif,
+            ImageCodec::Bmp,
+        ] {
+            assert_eq!(device.image_codec_caps(codec), ImageCodecCaps::default());
+            let texture = TextureHandle::from_parts(0, 0);
+            assert!(matches!(
+                device.decode_image(1, ImageDecodeRequest::new(codec, b"image", texture, 64)),
+                Err(GpuError::Unsupported(_))
+            ));
+            assert!(matches!(
+                device.encode_image(2, ImageEncodeRequest::new(codec, texture, 64)),
+                Err(GpuError::Unsupported(_))
+            ));
         }
     }
 

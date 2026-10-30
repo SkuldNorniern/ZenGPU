@@ -65,6 +65,7 @@ pub use device::Device;
 pub use instance::Instance;
 
 pub use zengpu_hal as hal;
+pub use zengpu_hal::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
 
 pub use zengpu_spirv as spirv;
 

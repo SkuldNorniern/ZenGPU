@@ -4,6 +4,7 @@
 use core::any::Any;
 
 use crate::caps::ComputeCaps;
+use crate::codec::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
 use crate::command::{Bindings, ComputeOp, DispatchOp};
 use crate::desc::{
     BufferDesc, ComputePipelineDesc, ComputePipelineHints, PipelineStats, SamplerDesc, ShaderDesc,
@@ -46,6 +47,28 @@ pub trait GpuDevice: Send + Sync {
     /// `None` when the backend cannot report a budget.
     fn memory_budget(&self) -> Option<MemoryBudget> {
         None
+    }
+
+    /// Actual GPU still-image codec support for this format. Existing backends
+    /// claim none; CPU codec availability must not set these flags.
+    fn image_codec_caps(&self, _codec: ImageCodec) -> ImageCodecCaps {
+        ImageCodecCaps::default()
+    }
+
+    /// Queues bounded image decoding without waiting for GPU completion. Check
+    /// `image_codec_caps` first. An implementing backend must stage borrowed
+    /// encoded bytes before returning and retain resources until completion.
+    /// The default refuses; it never invokes a CPU decoder.
+    fn decode_image(&self, _cycle_id: u64, _request: ImageDecodeRequest<'_>) -> Result<Submission> {
+        Err(GpuError::Unsupported("GPU image decoding".into()))
+    }
+
+    /// Queues bounded image encoding. Poll the returned readback before taking
+    /// its compressed bytes. `into_bytes`/`read_into` can wait, as for any other
+    /// readback; starting this operation must not wait for GPU completion.
+    /// The default refuses; it never invokes a CPU encoder.
+    fn encode_image(&self, _cycle_id: u64, _request: ImageEncodeRequest) -> Result<ReadSubmission> {
+        Err(GpuError::Unsupported("GPU image encoding".into()))
     }
 
     /// Releases idle, rebuildable backend caches without waiting for GPU work.

@@ -7,6 +7,7 @@
 
 mod adapter;
 mod caps;
+mod codec;
 mod command;
 mod desc;
 mod device;
@@ -21,6 +22,7 @@ mod types;
 
 pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
 pub use caps::{ComputeCaps, ElemType, MmaShape};
+pub use codec::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
 pub use command::{Bindings, BufferCopyOp, ComputeOp, DispatchOp, Scalar};
 pub use device::GpuDevice;
 pub use graphics::{
