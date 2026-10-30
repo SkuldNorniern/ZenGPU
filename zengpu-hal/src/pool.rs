@@ -35,9 +35,6 @@ impl TexturePool {
 
     pub fn acquire(&mut self, device: &dyn GpuDevice, desc: TextureDesc) -> Result<TextureHandle> {
         let reused = self.free.get_mut(&desc).and_then(VecDeque::pop_back);
-        if self.free.get(&desc).is_some_and(VecDeque::is_empty) {
-            self.free.remove(&desc);
-        }
         let texture = match reused {
             Some((texture, _)) => {
                 self.free_bytes = self.free_bytes.saturating_sub(bytes_of(&desc));
@@ -70,13 +67,21 @@ impl TexturePool {
             .or_default()
             .push_back((texture, self.clock));
         self.free_bytes = self.free_bytes.saturating_add(bytes_of(&desc));
-        self.trim(device, self.budget);
+        self.evict(device, self.budget);
     }
 
     /// Destroys free textures, oldest first, until `keep` bytes remain.
     ///
     /// Under memory pressure, pass less than the budget.
     pub fn trim(&mut self, device: &dyn GpuDevice, keep: u64) {
+        self.free.retain(|_, list| !list.is_empty());
+        self.evict(device, keep);
+    }
+
+    fn evict(&mut self, device: &dyn GpuDevice, keep: u64) {
+        if self.free_bytes > keep {
+            self.free.retain(|_, list| !list.is_empty());
+        }
         while self.free_bytes > keep {
             let Some(desc) = self.oldest_free() else {
                 break;

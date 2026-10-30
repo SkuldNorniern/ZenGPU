@@ -44,6 +44,7 @@ struct PoolState {
 
 impl PoolState {
     fn trim(&mut self, keep: u64) -> Vec<(BufferHandle, u64)> {
+        self.free.retain(|_, list| !list.is_empty());
         let mut removed = Vec::new();
         while self.cached_bytes > keep {
             let Some(size) = self.free.keys().copied().max() else {
@@ -147,9 +148,6 @@ impl BufferPool {
             if reused.is_some() {
                 state.cached_bytes -= allocation_size;
                 state.cached_buffers -= 1;
-            }
-            if state.free.get(&allocation_size).is_some_and(Vec::is_empty) {
-                state.free.remove(&allocation_size);
             }
             reused
         };
