@@ -163,7 +163,8 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
-        self.one_shot_submit_tracked(cycle_id, uses, record)
+        // Compute callers already reaped before taking their resource-table locks.
+        self.one_shot_submit_tracked_inner(cycle_id, uses, record)
             .map(|(submission, _)| submission)
     }
 
@@ -177,6 +178,18 @@ impl VulkanDevice {
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
         self.reap_orphans();
+        self.one_shot_submit_tracked_inner(cycle_id, uses, record)
+    }
+
+    fn one_shot_submit_tracked_inner<F>(
+        &self,
+        cycle_id: u64,
+        uses: &[u32],
+        record: F,
+    ) -> Result<(Submission, u64)>
+    where
+        F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
+    {
         let cmd = self.cmd_list_pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
@@ -447,6 +460,7 @@ impl VulkanDevice {
         cycle_id: u64,
         ops: &[ComputeOp<'_>],
     ) -> Result<Submission> {
+        self.reap_orphans();
         if ops.is_empty() {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
@@ -671,6 +685,7 @@ impl VulkanDevice {
         cycle_id: u64,
         ops: &[DispatchOp<'_>],
     ) -> Result<Submission> {
+        self.reap_orphans();
         if ops.is_empty() {
             return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
         }
