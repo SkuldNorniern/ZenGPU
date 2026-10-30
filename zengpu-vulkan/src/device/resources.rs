@@ -77,7 +77,7 @@ impl VulkanDevice {
             };
             (tex.image, view, tex.mip_levels)
         };
-        self.one_shot_submit(|dev, cmd| {
+        let (initialization, _) = self.one_shot_submit_tracked(0, &[], |dev, cmd| {
             let to_general = vk::ImageMemoryBarrier {
                 old_layout: vk::ImageLayout::UNDEFINED,
                 new_layout: vk::ImageLayout::GENERAL,
@@ -108,6 +108,9 @@ impl VulkanDevice {
             }
             Ok(())
         })?;
+        // Later uploads and kernels use the same queue. Keep the transition alive
+        // through the submission's orphan tracking instead of waiting on the host.
+        drop(initialization);
         let info = vk::DescriptorImageInfo {
             sampler: vk::Sampler::null(),
             image_view: view,
