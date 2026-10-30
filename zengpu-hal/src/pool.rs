@@ -5,7 +5,7 @@
 //! is safe for later work, since the queue runs in order. Contents are stale, so write all of a
 //! texture before reading it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::desc::TextureDesc;
 use crate::device::GpuDevice;
@@ -15,7 +15,7 @@ use crate::handle::TextureHandle;
 /// Textures are matched by creation description.
 #[derive(Debug)]
 pub struct TexturePool {
-    free: HashMap<TextureDesc, Vec<(TextureHandle, u64)>>,
+    free: HashMap<TextureDesc, VecDeque<(TextureHandle, u64)>>,
     live: HashMap<TextureHandle, TextureDesc>,
     free_bytes: u64,
     budget: u64,
@@ -34,7 +34,10 @@ impl TexturePool {
     }
 
     pub fn acquire(&mut self, device: &dyn GpuDevice, desc: TextureDesc) -> Result<TextureHandle> {
-        let reused = self.free.get_mut(&desc).and_then(Vec::pop);
+        let reused = self.free.get_mut(&desc).and_then(VecDeque::pop_back);
+        if self.free.get(&desc).is_some_and(VecDeque::is_empty) {
+            self.free.remove(&desc);
+        }
         let texture = match reused {
             Some((texture, _)) => {
                 self.free_bytes = self.free_bytes.saturating_sub(bytes_of(&desc));
@@ -46,18 +49,27 @@ impl TexturePool {
         Ok(texture)
     }
 
-    /// Textures the pool did not hand out are destroyed, not pooled.
+    /// Textures the pool did not hand out are destroyed, not pooled. Duplicate
+    /// returns of an already cached handle are ignored. Return a handle only
+    /// once per checkout; old aliases cannot identify a later checkout.
     pub fn release(&mut self, device: &dyn GpuDevice, texture: TextureHandle) {
         let Some(desc) = self.live.remove(&texture) else {
+            if self
+                .free
+                .values()
+                .any(|list| list.iter().any(|(cached, _)| *cached == texture))
+            {
+                return;
+            }
             device.destroy_texture(texture);
             return;
         };
-        self.clock += 1;
+        self.clock = self.clock.saturating_add(1);
         self.free
             .entry(desc)
             .or_default()
-            .push((texture, self.clock));
-        self.free_bytes += bytes_of(&desc);
+            .push_back((texture, self.clock));
+        self.free_bytes = self.free_bytes.saturating_add(bytes_of(&desc));
         self.trim(device, self.budget);
     }
 
@@ -66,13 +78,15 @@ impl TexturePool {
     /// Under memory pressure, pass less than the budget.
     pub fn trim(&mut self, device: &dyn GpuDevice, keep: u64) {
         while self.free_bytes > keep {
-            let Some((desc, at)) = self.oldest_free() else {
+            let Some(desc) = self.oldest_free() else {
                 break;
             };
             let Some(list) = self.free.get_mut(&desc) else {
                 break;
             };
-            let (texture, _) = list.remove(at);
+            let Some((texture, _)) = list.pop_front() else {
+                break;
+            };
             if list.is_empty() {
                 self.free.remove(&desc);
             }
@@ -94,16 +108,12 @@ impl TexturePool {
         self.live.len()
     }
 
-    fn oldest_free(&self) -> Option<(TextureDesc, usize)> {
+    fn oldest_free(&self) -> Option<TextureDesc> {
         self.free
             .iter()
-            .flat_map(|(desc, list)| {
-                list.iter()
-                    .enumerate()
-                    .map(move |(i, (_, at))| (*at, *desc, i))
-            })
-            .min_by_key(|(at, _, _)| *at)
-            .map(|(_, desc, i)| (desc, i))
+            .filter_map(|(desc, list)| list.front().map(|(_, at)| (*at, *desc)))
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, desc)| desc)
     }
 }
 
@@ -111,13 +121,17 @@ impl TexturePool {
 fn bytes_of(desc: &TextureDesc) -> u64 {
     let texel = u64::from(desc.format.bytes_per_texel()) * u64::from(desc.samples.max(1));
     let mut total = 0u64;
-    for mip in 0..desc.mip_levels.max(1) {
+    let mips = desc.mip_levels.max(1);
+    for mip in 0..mips.min(u32::BITS) {
         let w = u64::from((desc.width >> mip).max(1));
         let h = u64::from((desc.height >> mip).max(1));
         let d = u64::from((desc.depth >> mip).max(1));
-        total += w * h * d * texel;
+        total = total.saturating_add(w.saturating_mul(h).saturating_mul(d).saturating_mul(texel));
     }
-    total * u64::from(desc.array_layers.max(1))
+    // Overspecified descriptors must not overflow a shift or require billions
+    // of iterations in accounting. Dimensions beyond bit 31 all clamp to one.
+    total = total.saturating_add(u64::from(mips.saturating_sub(u32::BITS)).saturating_mul(texel));
+    total.saturating_mul(u64::from(desc.array_layers.max(1)))
 }
 
 #[cfg(test)]
@@ -125,6 +139,60 @@ mod tests {
     use super::*;
     use crate::desc::TexDim;
     use crate::types::{Format, TextureUsage};
+    use crate::{
+        BufferDesc, BufferHandle, GpuError, HalCapabilities, SamplerDesc, SamplerHandle, SlotMap,
+        marker,
+    };
+    use core::any::Any;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Textures {
+        slots: Mutex<SlotMap<marker::Texture, TextureDesc>>,
+        destroyed: Mutex<Vec<TextureHandle>>,
+    }
+
+    fn unsupported<T>() -> Result<T> {
+        Err(GpuError::Unsupported("test texture device".into()))
+    }
+
+    impl GpuDevice for Textures {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn capabilities(&self) -> HalCapabilities {
+            HalCapabilities::default()
+        }
+        fn create_buffer(&self, _: BufferDesc) -> Result<BufferHandle> {
+            unsupported()
+        }
+        fn write_buffer(&self, _: BufferHandle, _: u64, _: &[u8]) -> Result<()> {
+            unsupported()
+        }
+        fn read_buffer(&self, _: BufferHandle, _: u64, _: u64) -> Result<Vec<u8>> {
+            unsupported()
+        }
+        fn destroy_buffer(&self, _: BufferHandle) {}
+        fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+            Ok(self.slots.lock().unwrap().insert(desc))
+        }
+        fn upload_texture_data(&self, texture: TextureHandle, _: &[u8]) -> Result<()> {
+            if self.slots.lock().unwrap().get(texture).is_some() {
+                Ok(())
+            } else {
+                Err(GpuError::Backend("stale texture".into()))
+            }
+        }
+        fn destroy_texture(&self, texture: TextureHandle) {
+            if self.slots.lock().unwrap().remove(texture).is_some() {
+                self.destroyed.lock().unwrap().push(texture);
+            }
+        }
+        fn create_sampler(&self, _: SamplerDesc) -> Result<SamplerHandle> {
+            unsupported()
+        }
+        fn destroy_sampler(&self, _: SamplerHandle) {}
+    }
 
     fn tile(size: u32) -> TextureDesc {
         TextureDesc {
@@ -149,5 +217,72 @@ mod tests {
             ..tile(4)
         };
         assert_eq!(bytes_of(&mipped), (16 + 4) * 4 * 3);
+        assert_eq!(
+            bytes_of(&TextureDesc {
+                mip_levels: 33,
+                ..tile(1)
+            }),
+            33 * 4
+        );
+        assert_eq!(
+            bytes_of(&TextureDesc {
+                mip_levels: u32::MAX,
+                ..tile(1)
+            }),
+            u64::from(u32::MAX) * 4
+        );
+        assert_eq!(
+            bytes_of(&TextureDesc {
+                width: u32::MAX,
+                height: u32::MAX,
+                depth: u32::MAX,
+                ..tile(1)
+            }),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn duplicate_returns_do_not_destroy_cached_textures_or_hand_them_out_twice() {
+        let device = Textures::default();
+        let mut pool = TexturePool::new(1024);
+        let texture = pool.acquire(&device, tile(4)).unwrap();
+        pool.release(&device, texture);
+        pool.release(&device, texture);
+        assert_eq!(pool.free_bytes(), 64);
+        assert!(device.destroyed.lock().unwrap().is_empty());
+        let reused = pool.acquire(&device, tile(4)).unwrap();
+        assert_eq!(reused, texture);
+        device.upload_texture_data(reused, &[255; 64]).unwrap();
+        let other = pool.acquire(&device, tile(4)).unwrap();
+        assert_ne!(reused, other);
+        pool.release(&device, reused);
+        pool.release(&device, other);
+        pool.clear(&device);
+        assert_eq!(device.destroyed.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn trimming_preserves_oldest_first_order_across_texture_descriptions() {
+        let device = Textures::default();
+        let mut pool = TexturePool::new(1024);
+        let first = pool.acquire(&device, tile(2)).unwrap();
+        let middle = pool.acquire(&device, tile(4)).unwrap();
+        let last = pool.acquire(&device, tile(2)).unwrap();
+        for texture in [first, middle, last] {
+            pool.release(&device, texture);
+        }
+        pool.trim(&device, 80);
+        assert_eq!(&*device.destroyed.lock().unwrap(), &[first]);
+        assert_eq!(pool.free_bytes(), 80);
+        assert_eq!(pool.acquire(&device, tile(2)).unwrap(), last);
+        assert_eq!(pool.free_bytes(), 64);
+        pool.clear(&device);
+        assert_eq!(&*device.destroyed.lock().unwrap(), &[first, middle]);
+        assert_eq!(
+            pool.live(),
+            1,
+            "trimming never touches a checked-out texture"
+        );
     }
 }
