@@ -692,6 +692,7 @@ impl GpuDevice for VulkanDevice {
             resting: VulkanTexture::resting_layout(usage),
             storage_view,
             level_views: Vec::new(),
+            bound_sampler: None,
         });
         if storage && let Err(e) = self.init_storage_texture(handle) {
             self.destroy_texture(handle);

@@ -16,14 +16,19 @@ impl VulkanDevice {
         if texture.index() >= self.bindless.texture_capacity {
             return None;
         }
-        let textures = self.textures.lock().unwrap();
-        let (view, layout) = textures.get(texture).map(|t| (t.view, t.resting))?;
+        let mut textures = self.textures.lock().unwrap();
+        let tex = textures.get_mut(texture)?;
         let samplers = self.samplers.lock().unwrap();
         let vk_sampler = *samplers.get(sampler)?;
+        // Validate both handles before using the cache: retired samplers and reused slots
+        // must not make a stale descriptor look valid.
+        if tex.bound_sampler == Some(sampler) {
+            return Some(texture.index());
+        }
         let info = vk::DescriptorImageInfo {
             sampler: vk_sampler,
-            image_view: view,
-            image_layout: layout,
+            image_view: tex.view,
+            image_layout: tex.resting,
         };
         let write = vk::WriteDescriptorSet {
             dst_set: self.bindless.set,
@@ -38,6 +43,7 @@ impl VulkanDevice {
             self.inner.device.update_descriptor_sets(&[write], &[]);
         }
         self.bindless.bound_textures.lock().unwrap()[texture.index() as usize] = true;
+        tex.bound_sampler = Some(sampler);
         Some(texture.index())
     }
 

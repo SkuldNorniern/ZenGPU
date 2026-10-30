@@ -611,6 +611,8 @@ pub(crate) struct VulkanTexture {
     pub storage_view: vk::ImageView,
     /// Single-level views from `storage_level`, for mips above 0.
     pub level_views: Vec<LevelView>,
+    /// Last sampler written to this texture's sampled descriptor, including its generation.
+    pub bound_sampler: Option<SamplerHandle>,
 }
 
 /// One mip of a `STORAGE` texture, bound at `slot` in the storage-image table.
@@ -2639,6 +2641,7 @@ mod tests {
             })
             .unwrap();
         let slot = device.bind_texture(src, sampler).unwrap();
+        assert_eq!(device.bind_texture(src, sampler), Some(slot), "cached bind");
 
         let out_format = Format::Rgba32Float;
         let (out, target) = render_target(device, out_format, 2, 1);
@@ -2657,6 +2660,69 @@ mod tests {
         device.destroy_texture(out);
         device.destroy_sampler(sampler);
         device.destroy_texture(src);
+    }
+
+    #[test]
+    fn sampled_descriptor_cache_validates_handles_and_rebinds_reused_slots() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        let texture = device.create_texture(tex_desc(TexDim::D2)).unwrap();
+        let sampler = device.create_sampler(SamplerDesc::default()).unwrap();
+        let slot = device.bind_texture(texture, sampler).unwrap();
+        assert_eq!(device.bind_texture(texture, sampler), Some(slot));
+        assert_eq!(
+            device
+                .textures
+                .lock()
+                .unwrap()
+                .get(texture)
+                .unwrap()
+                .bound_sampler,
+            Some(sampler)
+        );
+        device.destroy_sampler(sampler);
+        assert_eq!(
+            device.bind_texture(texture, sampler),
+            None,
+            "stale cached sampler"
+        );
+        let next_sampler = device
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Nearest,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        assert_ne!(next_sampler, sampler);
+        assert_eq!(device.bind_texture(texture, next_sampler), Some(slot));
+        assert_eq!(
+            device
+                .textures
+                .lock()
+                .unwrap()
+                .get(texture)
+                .unwrap()
+                .bound_sampler,
+            Some(next_sampler)
+        );
+        device.destroy_texture(texture);
+        assert_eq!(device.bind_texture(texture, next_sampler), None);
+        let next_texture = device.create_texture(tex_desc(TexDim::D2)).unwrap();
+        assert_eq!(next_texture.index(), texture.index(), "exercise slot reuse");
+        assert!(
+            device
+                .textures
+                .lock()
+                .unwrap()
+                .get(next_texture)
+                .unwrap()
+                .bound_sampler
+                .is_none()
+        );
+        assert!(device.bind_texture(next_texture, next_sampler).is_some());
+        device.destroy_texture(next_texture);
+        device.destroy_sampler(next_sampler);
     }
 
     fn vulkan(dev: &TestDevice) -> &VulkanDevice {
