@@ -1835,6 +1835,7 @@ dependencies = [
  "zengpu-hal",
  "zengpu-hip",
  "zengpu-metal",
+ "zengpu-opengl",
  "zengpu-spirv",
  "zengpu-vulkan",
 ]
@@ -1916,6 +1917,13 @@ dependencies = [
  "zen-window-handle",
  "zengpu-hal",
  "zengpu-spirv",
+]
+
+[[package]]
+name = "zengpu-opengl"
+version = "0.0.1"
+dependencies = [
+ "zengpu-hal",
 ]
 
 [[package]]

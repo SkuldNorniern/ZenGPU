@@ -18,6 +18,8 @@ pub enum BackendPreference {
     Hip,
     /// Graphics and compute.
     Dx12,
+    /// Reserved for the unimplemented legacy OpenGL backend.
+    OpenGl,
 }
 
 /// Used by `Auto` selection.

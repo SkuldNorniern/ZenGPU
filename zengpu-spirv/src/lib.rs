@@ -108,6 +108,9 @@ impl ZslShader {
         backend: BackendPreference,
     ) -> HalResult<(ShaderDesc<'_>, &'static str)> {
         match backend {
+            BackendPreference::OpenGl => Err(GpuError::Unsupported(
+                "OpenGL shader lowering is not implemented".into(),
+            )),
             BackendPreference::Hip => Ok((ShaderDesc::hip(self.hip_src()?), "zsl_kernel")),
             BackendPreference::Metal => Ok((ShaderDesc::msl(self.msl_src()?), "zsl_main")),
             BackendPreference::Cuda => Ok((ShaderDesc::cuda_src(self.cuda_src()?), "zsl_kernel")),
@@ -316,6 +319,7 @@ mod zsl_native_tests {
     //! Native ZSL syntax through the `zsl!` macro (no syn/quote in the pipeline).
 
     use crate::{ZslShader, zsl};
+    use zengpu_hal::{BackendPreference, GpuError};
 
     const SPIRV_MAGIC: u32 = 0x0723_0203;
 
@@ -338,6 +342,13 @@ mod zsl_native_tests {
         );
         assert!(!SHADER.spv.unwrap().is_empty());
         assert_eq!(SHADER.spv.unwrap()[0], SPIRV_MAGIC, "valid SPIR-V header");
+        assert!(
+            matches!(
+                SHADER.for_backend(BackendPreference::OpenGl),
+                Err(GpuError::Unsupported(_))
+            ),
+            "the OpenGL placeholder must not silently receive Vulkan SPIR-V"
+        );
         #[cfg(feature = "hip")]
         assert!(SHADER.hip.unwrap().contains("zsl_kernel"));
     }

@@ -1,6 +1,6 @@
 # ZenGPU native-first GPU runtime (graphics + general compute).
-# Root is the `zengpu` crate and the workspace root; member crates are added as
-# they gain real content rather than as empty placeholders.
+# Root is the `zengpu` crate and the workspace root. Unimplemented backends are
+# explicitly marked and never advertise usable adapters.
 [package]
 name = "zengpu"
 description = "A native-first GPU runtime for Rust: graphics and general compute under one device."
@@ -20,7 +20,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-tile", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zen-window-handle"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-tile", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zengpu-opengl", "zen-window-handle"]
 
 [workspace.package]
 version = "0.0.1"
@@ -56,6 +56,7 @@ zengpu-cuda = { path = "zengpu-cuda", version = "0.0.1" }
 zengpu-metal = { path = "zengpu-metal", version = "0.0.1" }
 zengpu-hip = { path = "zengpu-hip", version = "0.0.1" }
 zengpu-dx12 = { path = "zengpu-dx12", version = "0.0.1" }
+zengpu-opengl = { path = "zengpu-opengl", version = "0.0.1" }
 zen-window-handle = { path = "zen-window-handle", version = "0.1.0" }
 log = "0.4"
 
@@ -80,6 +81,8 @@ metal = ["zengpu-metal", "zengpu-spirv/metal"]
 hip = ["zengpu-hip", "zengpu-spirv/hip"]
 # DirectX 12 backend (Windows, graphics + compute).
 dx12 = ["zengpu-dx12"]
+# Future OpenGL path for older hardware. Placeholder only; provides no adapters.
+opengl = ["dep:zengpu-opengl"]
 
 [dependencies]
 zengpu-hal.workspace = true
@@ -90,6 +93,7 @@ zengpu-cuda = { workspace = true, optional = true }
 zengpu-metal = { workspace = true, optional = true }
 zengpu-hip = { workspace = true, optional = true }
 zengpu-dx12 = { workspace = true, optional = true }
+zengpu-opengl = { workspace = true, optional = true }
 zengpu-spirv.workspace = true
 log.workspace = true
 

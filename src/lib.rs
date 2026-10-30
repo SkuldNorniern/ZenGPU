@@ -11,6 +11,7 @@
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
 //! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
 //! | `dx12`    | no      | DirectX 12 backend (Windows), not yet implemented. |
+//! | `opengl`  | no      | Placeholder for older hardware; no usable adapters yet. |
 //!
 //! # Backends
 //!
@@ -121,3 +122,7 @@ pub use zengpu_hip as hip;
 /// DirectX 12 backend (Windows, graphics + compute).
 #[cfg(feature = "dx12")]
 pub use zengpu_dx12 as dx12;
+
+/// OpenGL placeholder. No driver loading or usable adapters are implemented.
+#[cfg(feature = "opengl")]
+pub use zengpu_opengl as opengl;
