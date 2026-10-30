@@ -87,7 +87,7 @@ struct BindlessState {
     storage_capacity: u32,
     /// Slots past `storage_capacity` for level views; 0 if there is no storage table.
     level_view_capacity: u32,
-    level_slots: Mutex<LevelSlots>,
+    level_slots: Arc<Mutex<LevelSlots>>,
     bound_textures: Mutex<Vec<bool>>,
 }
 
@@ -241,6 +241,7 @@ struct VulkanSubmission {
     textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
     samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
     pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
+    level_slots: Arc<Mutex<LevelSlots>>,
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
     orphans: Orphans,
     state: Mutex<VulkanSubmissionState>,
@@ -274,6 +275,7 @@ impl VulkanSubmission {
             &self.textures,
             &self.samplers,
             &self.pipelines,
+            &self.level_slots,
             deferred,
         );
     }
@@ -357,6 +359,7 @@ impl VulkanSubmission {
             textures: Arc::clone(&self.textures),
             samplers: Arc::clone(&self.samplers),
             pipelines: Arc::clone(&self.pipelines),
+            level_slots: Arc::clone(&self.level_slots),
             lifetime: Arc::clone(&self.lifetime),
             orphans: Arc::clone(&self.orphans),
             state: Mutex::new(state),
@@ -671,6 +674,7 @@ fn destroy_deferred_vulkan(
     textures: &Mutex<SlotMap<marker::Texture, VulkanTexture>>,
     samplers: &Mutex<SlotMap<marker::Sampler, vk::Sampler>>,
     pipelines: &Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>,
+    level_slots: &Mutex<LevelSlots>,
     deferred: Vec<DeferredVulkanResource>,
 ) {
     for resource in deferred {
@@ -686,6 +690,12 @@ fn destroy_deferred_vulkan(
                 buffers.lock().unwrap().release_retired(index);
             }
             DeferredVulkanResource::Texture(index, texture) => {
+                {
+                    let mut slots = level_slots.lock().unwrap();
+                    for level in &texture.level_views {
+                        slots.release(level.slot);
+                    }
+                }
                 unsafe { texture.destroy(&inner.device) };
                 textures.lock().unwrap().release_retired(index);
             }
@@ -776,6 +786,7 @@ impl VulkanDevice {
             &self.textures,
             &self.samplers,
             &self.pipelines,
+            &self.bindless.level_slots,
             ready,
         );
     }
@@ -1454,7 +1465,10 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         texture_capacity,
         storage_capacity,
         level_view_capacity,
-        level_slots: Mutex::new(LevelSlots::new(storage_capacity, level_view_capacity)),
+        level_slots: Arc::new(Mutex::new(LevelSlots::new(
+            storage_capacity,
+            level_view_capacity,
+        ))),
         bound_textures: Mutex::new(vec![false; texture_capacity as usize]),
     })
 }
@@ -3292,6 +3306,38 @@ mod tests {
             })
             .unwrap();
         dev.destroy_texture(tex);
+    }
+
+    #[test]
+    fn retired_texture_keeps_its_level_slots_until_queue_completion() {
+        let Some(dev) = try_device() else { return };
+        let native = vulkan(&dev);
+        if native.bindless.level_view_capacity == 0 {
+            return;
+        }
+        let texture = dev
+            .create_texture(TextureDesc {
+                mip_levels: 3,
+                usage: TextureUsage::SAMPLED | TextureUsage::STORAGE,
+                ..tex_desc(TexDim::D2)
+            })
+            .unwrap();
+        let slot = dev.storage_level(texture, 1).unwrap();
+        native.wait_idle().unwrap();
+        // A logical in-flight serial gives a deterministic retirement test even
+        // when a tiny kernel completes before the host can inspect its slots.
+        let serial = native.inner.serials.next();
+        dev.destroy_texture(texture);
+        assert_eq!(
+            native.bindless.level_slots.lock().unwrap().owner(slot),
+            Some(texture.index())
+        );
+        native.inner.serials.complete(serial);
+        native.collect_garbage();
+        assert_eq!(
+            native.bindless.level_slots.lock().unwrap().owner(slot),
+            None
+        );
     }
 
     #[test]

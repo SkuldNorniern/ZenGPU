@@ -781,12 +781,6 @@ impl GpuDevice for VulkanDevice {
         let mut textures = self.textures.lock().unwrap();
         let mut bound_textures = self.bindless.bound_textures.lock().unwrap();
         let mut lifetime = self.lifetime.lock().unwrap();
-        if let Some(tex) = textures.get(texture) {
-            let mut level_slots = self.bindless.level_slots.lock().unwrap();
-            for level in &tex.level_views {
-                level_slots.release(level.slot);
-            }
-        }
         let (removed, tex) = if !self.inner.serials.idle() {
             if let Some(tex) = textures.retire(texture) {
                 lifetime.deferred.push((
@@ -805,6 +799,12 @@ impl GpuDevice for VulkanDevice {
             bound_textures[texture.index() as usize] = false;
         }
         if let Some(tex) = tex {
+            {
+                let mut level_slots = self.bindless.level_slots.lock().unwrap();
+                for level in &tex.level_views {
+                    level_slots.release(level.slot);
+                }
+            }
             unsafe { tex.destroy(&self.inner.device) };
         }
     }

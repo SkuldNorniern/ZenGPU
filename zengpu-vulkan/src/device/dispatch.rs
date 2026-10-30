@@ -226,6 +226,7 @@ impl VulkanDevice {
             textures: Arc::clone(&self.textures),
             samplers: Arc::clone(&self.samplers),
             pipelines: Arc::clone(&self.pipelines),
+            level_slots: Arc::clone(&self.bindless.level_slots),
             lifetime: Arc::clone(&self.lifetime),
             orphans: Arc::clone(&self.orphans),
             state: Mutex::new(VulkanSubmissionState {
