@@ -47,6 +47,7 @@
 //! # }
 //! ```
 
+pub mod accelerator;
 pub mod adapter;
 pub mod detect;
 pub mod device;
