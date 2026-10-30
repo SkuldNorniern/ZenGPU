@@ -1,8 +1,8 @@
 //! Moves texels between host, buffers and texture parts without waiting for the GPU.
 //!
 //! Host data goes through one reused staging ring. A span returns once the submission reading it
-//! finishes; the ring grows when a write does not fit. Each copy ends with a barrier for whatever
-//! reads next.
+//! finishes; the ring grows when a write does not fit. Busy-ring overflow uses a bounded buffer
+//! pool. Each copy ends with a barrier for whatever reads next.
 
 use std::collections::VecDeque;
 use std::ptr::copy_nonoverlapping;
@@ -21,6 +21,9 @@ const RING_START: u64 = 4 << 20;
 const RING_MAX: u64 = 64 << 20;
 /// Ring offsets are kept below this, which every copy accepts.
 const RING_ALIGN: u64 = 16;
+/// Bound retained overflow memory even after a burst of asynchronous uploads.
+const SPARE_MAX_BYTES: u64 = 16 << 20;
+const SPARE_MAX_BUFFERS: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 struct Span {
@@ -33,9 +36,40 @@ pub(crate) struct StagingRing {
     buffer: Option<(BufferHandle, u64)>,
     head: u64,
     in_use: VecDeque<Span>,
+    spares: Vec<Spare>,
+}
+
+struct Spare {
+    buffer: BufferHandle,
+    size: u64,
+    serial: u64,
 }
 
 impl StagingRing {
+    fn take_spare(&mut self, len: u64, completed: u64) -> Option<BufferHandle> {
+        let spare = self
+            .spares
+            .iter_mut()
+            .filter(|s| s.serial != PENDING && s.serial <= completed && s.size >= len)
+            .min_by_key(|s| s.size)?;
+        spare.serial = PENDING;
+        Some(spare.buffer)
+    }
+
+    fn can_keep_spare(&self, size: u64) -> bool {
+        self.spares.len() < SPARE_MAX_BUFFERS
+            && size <= SPARE_MAX_BYTES
+            && self.spares.iter().map(|s| s.size).sum::<u64>() <= SPARE_MAX_BYTES - size
+    }
+
+    fn settle_spare(&mut self, buffer: BufferHandle, serial: u64) -> bool {
+        let Some(spare) = self.spares.iter_mut().find(|s| s.buffer == buffer) else {
+            return false;
+        };
+        spare.serial = serial;
+        true
+    }
+
     fn reclaim(&mut self, completed: u64) {
         while self
             .in_use
@@ -94,6 +128,37 @@ struct Placed {
 }
 
 impl VulkanDevice {
+    /// Releases idle upload staging buffers without waiting for GPU work. Returns
+    /// their buffer capacities in bytes (the driver allocation can be larger).
+    /// Busy spans and reservations currently being filled remain owned until a
+    /// later call. The next upload lazily allocates staging again.
+    pub fn trim_staging_memory(&self) -> u64 {
+        self.reap_orphans();
+        let completed = self.inner.serials.completed();
+        let mut ring = self.staging.lock().unwrap();
+        ring.reclaim(completed);
+        let mut released = Vec::new();
+        if ring.in_use.is_empty()
+            && let Some(buffer) = ring.buffer.take()
+        {
+            released.push(buffer);
+        }
+        ring.spares.retain(|spare| {
+            if spare.serial != PENDING && spare.serial <= completed {
+                released.push((spare.buffer, spare.size));
+                false
+            } else {
+                true
+            }
+        });
+        drop(ring);
+        let bytes = released.iter().map(|(_, size)| size).sum();
+        for (buffer, _) in released {
+            self.destroy_buffer(buffer);
+        }
+        bytes
+    }
+
     pub(crate) fn write_textures_impl(&self, writes: &[TextureWrite<'_>]) -> Result<Submission> {
         if writes.is_empty() {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
@@ -107,10 +172,13 @@ impl VulkanDevice {
         let total: u64 = sizes.iter().map(|s| s.next_multiple_of(RING_ALIGN)).sum();
         let (staging, base, own_buffer) = self.stage(total)?;
         let submitted = self.fill_and_submit(writes, &sizes, (staging, base));
+        let serial = submitted.as_ref().map_or(0, |(_, serial)| *serial);
         if own_buffer {
-            self.destroy_buffer(staging);
+            let kept = self.staging.lock().unwrap().settle_spare(staging, serial);
+            if !kept {
+                self.destroy_buffer(staging);
+            }
         } else {
-            let serial = submitted.as_ref().map_or(0, |(_, serial)| *serial);
             self.staging.lock().unwrap().settle(base, serial);
         }
         let (submission, _) = submitted?;
@@ -379,9 +447,10 @@ impl VulkanDevice {
         }
     }
 
-    /// Room for `len` bytes: in the ring if it fits, else grow it when idle, else a one-off buffer.
-    /// Also returns whether the buffer is a one-off to free after.
+    /// Room for `len` bytes: in the ring, an idle overflow buffer, or a new allocation.
+    /// The boolean marks overflow buffers, which are settled separately from ring spans.
     fn stage(&self, len: u64) -> Result<(BufferHandle, u64, bool)> {
+        self.reap_orphans();
         let completed = self.inner.serials.completed();
         let mut ring = self.staging.lock().unwrap();
         ring.reclaim(completed);
@@ -404,8 +473,18 @@ impl VulkanDevice {
             ring.take(0, len, PENDING);
             return Ok((fresh, 0, false));
         }
-        drop(ring);
-        Ok((self.create_staging(len)?, 0, true))
+        if let Some(buffer) = ring.take_spare(len, completed) {
+            return Ok((buffer, 0, true));
+        }
+        let buffer = self.create_staging(len)?;
+        if ring.can_keep_spare(len) {
+            ring.spares.push(Spare {
+                buffer,
+                size: len,
+                serial: PENDING,
+            });
+        }
+        Ok((buffer, 0, true))
     }
 
     fn create_staging(&self, size: u64) -> Result<BufferHandle> {
@@ -600,11 +679,176 @@ fn record_buffer_to_images(
 mod tests {
     use super::*;
 
+    #[test]
+    fn overflow_buffers_wait_for_completion_and_choose_the_smallest_fit() {
+        let mut ring = StagingRing::default();
+        let a = BufferHandle::from_parts(1, 0);
+        let b = BufferHandle::from_parts(2, 0);
+        ring.spares = vec![
+            Spare {
+                buffer: a,
+                size: 1024,
+                serial: 3,
+            },
+            Spare {
+                buffer: b,
+                size: 512,
+                serial: 4,
+            },
+        ];
+        assert_eq!(ring.take_spare(256, 2), None);
+        assert_eq!(ring.take_spare(256, 4), Some(b));
+        assert_eq!(ring.take_spare(256, 4), Some(a));
+        assert_eq!(
+            ring.take_spare(256, 4),
+            None,
+            "reserved buffers cannot be reused"
+        );
+        assert!(ring.settle_spare(b, 5));
+        assert_eq!(ring.take_spare(256, 4), None, "GPU still reads the buffer");
+        assert_eq!(ring.take_spare(256, 5), Some(b));
+        assert!(ring.settle_spare(b, 0));
+        assert_eq!(
+            ring.take_spare(256, 5),
+            Some(b),
+            "failed writes return their buffer"
+        );
+        assert!(!ring.settle_spare(BufferHandle::from_parts(9, 0), 0));
+    }
+
+    #[test]
+    fn overflow_retention_is_bounded_by_bytes_and_buffer_count() {
+        let mut ring = StagingRing::default();
+        assert!(ring.can_keep_spare(SPARE_MAX_BYTES));
+        assert!(!ring.can_keep_spare(SPARE_MAX_BYTES + 1));
+        ring.spares.push(Spare {
+            buffer: BufferHandle::from_parts(1, 0),
+            size: SPARE_MAX_BYTES,
+            serial: 0,
+        });
+        assert!(!ring.can_keep_spare(1));
+        ring.spares = (0..SPARE_MAX_BUFFERS)
+            .map(|i| Spare {
+                buffer: BufferHandle::from_parts(i as u32, 0),
+                size: 16,
+                serial: 0,
+            })
+            .collect();
+        assert!(!ring.can_keep_spare(16));
+    }
+
+    #[test]
+    fn busy_ring_uploads_reuse_one_overflow_buffer_and_keep_their_texels() {
+        use crate::instance::VulkanInstance;
+        use std::time::Duration;
+        use zengpu_hal::{
+            AdapterRequest, DeviceRequest, Format, GpuInstance, TexDim, TextureDesc, TextureUsage,
+        };
+
+        let _guard = crate::test_gpu_lock();
+        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+            eprintln!("no Vulkan adapter; skipping overflow upload test");
+            return;
+        };
+        let device = adapter.open(DeviceRequest::default()).expect("device");
+        let native = device
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("Vulkan");
+        let (_, base, overflow) = native.stage(RING_START).expect("reserve whole ring");
+        assert!(!overflow);
+        assert_eq!(
+            native.trim_staging_memory(),
+            0,
+            "a caller still fills the ring"
+        );
+        let texture = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format: Format::Rgba8Unorm,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_DST
+                    | TextureUsage::TRANSFER_SRC,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .expect("texture");
+        let readback = device
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .expect("readback");
+        let mut first = None;
+        for value in 1..=16 {
+            let data = [value; 16];
+            device
+                .write_textures(&[TextureWrite {
+                    texture,
+                    region: TextureRegion::rect(0, 0, 2, 2),
+                    data: &data,
+                    bytes_per_row: 8,
+                }])
+                .expect("upload")
+                .wait(Duration::from_secs(5))
+                .expect("upload done");
+            {
+                let ring = native.staging.lock().unwrap();
+                assert_eq!(
+                    ring.spares.len(),
+                    1,
+                    "one allocation across repeated uploads"
+                );
+                assert_eq!(
+                    *first.get_or_insert(ring.spares[0].buffer),
+                    ring.spares[0].buffer
+                );
+            }
+            device
+                .copy_texture_region_to_buffer(
+                    texture,
+                    TextureRegion::rect(0, 0, 2, 2),
+                    readback,
+                    0,
+                    8,
+                )
+                .expect("copy")
+                .wait(Duration::from_secs(5))
+                .expect("readback done");
+            assert_eq!(device.read_buffer(readback, 0, 16).expect("pixels"), data);
+        }
+        native.staging.lock().unwrap().settle(base, 0);
+        assert_eq!(native.trim_staging_memory(), RING_START + 16);
+        {
+            let ring = native.staging.lock().unwrap();
+            assert!(ring.buffer.is_none() && ring.spares.is_empty());
+        }
+        device
+            .write_textures(&[TextureWrite {
+                texture,
+                region: TextureRegion::rect(0, 0, 2, 2),
+                data: &[42; 16],
+                bytes_per_row: 8,
+            }])
+            .expect("upload after trimming")
+            .wait(Duration::from_secs(5))
+            .expect("done");
+        device.destroy_buffer(readback);
+        device.destroy_texture(texture);
+    }
+
     fn ring(size: u64) -> (StagingRing, u64) {
         let ring = StagingRing {
             buffer: None,
             head: 0,
             in_use: VecDeque::new(),
+            spares: Vec::new(),
         };
         (ring, size)
     }
