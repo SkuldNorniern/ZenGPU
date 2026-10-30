@@ -568,39 +568,42 @@ impl GpuDevice for VulkanDevice {
                 .create_image(&image_info, None)
                 .map_err(|e| GpuError::Backend(format!("vkCreateImage: {e}")))?
         };
-        let mem_reqs = unsafe { self.inner.device.get_image_memory_requirements(image) };
-        let type_index = self.find_memory_type(
+        let mut dedicated = vk::MemoryDedicatedRequirements::default();
+        let mut requirements = vk::MemoryRequirements2::default().push_next(&mut dedicated);
+        unsafe {
+            self.inner.device.get_image_memory_requirements2(
+                &vk::ImageMemoryRequirementsInfo2::default().image(image),
+                &mut requirements,
+            );
+        }
+        let mem_reqs = requirements.memory_requirements;
+        let Some(type_index) = self.find_memory_type(
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
-        let type_index = match type_index {
-            Some(i) => i,
-            None => {
+        ) else {
+            unsafe { self.inner.device.destroy_image(image, None) };
+            return Err(GpuError::OutOfMemory(MemoryUsage::GpuOnly));
+        };
+        let allocation = match self.image_memory.lock().unwrap().allocate(
+            &self.inner.device,
+            image,
+            mem_reqs,
+            type_index,
+            dedicated.requires_dedicated_allocation == vk::TRUE
+                || dedicated.prefers_dedicated_allocation == vk::TRUE,
+        ) {
+            Ok(allocation) => allocation,
+            Err(error) => {
                 unsafe { self.inner.device.destroy_image(image, None) };
-                return Err(GpuError::OutOfMemory(MemoryUsage::GpuOnly));
+                return Err(error);
             }
         };
-        let memory = unsafe {
-            match self.inner.device.allocate_memory(
-                &vk::MemoryAllocateInfo {
-                    allocation_size: mem_reqs.size,
-                    memory_type_index: type_index,
-                    ..Default::default()
-                },
-                None,
-            ) {
-                Ok(m) => m,
-                Err(_) => {
-                    self.inner.device.destroy_image(image, None);
-                    return Err(GpuError::OutOfMemory(MemoryUsage::GpuOnly));
-                }
-            }
-        };
-        if let Err(e) = unsafe { self.inner.device.bind_image_memory(image, memory, 0) } {
-            unsafe {
-                self.inner.device.destroy_image(image, None);
-                self.inner.device.free_memory(memory, None);
-            }
+        if let Err(e) = unsafe {
+            self.inner
+                .device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())
+        } {
+            unsafe { self.inner.device.destroy_image(image, None) };
             return Err(GpuError::Backend(format!("vkBindImageMemory: {e}")));
         }
         let view_type = match desc.dimension {
@@ -639,7 +642,6 @@ impl GpuDevice for VulkanDevice {
                 Ok(v) => v,
                 Err(e) => {
                     self.inner.device.destroy_image(image, None);
-                    self.inner.device.free_memory(memory, None);
                     return Err(GpuError::Backend(format!("vkCreateImageView: {e}")));
                 }
             }
@@ -666,7 +668,6 @@ impl GpuDevice for VulkanDevice {
                     Err(e) => {
                         self.inner.device.destroy_image_view(view, None);
                         self.inner.device.destroy_image(image, None);
-                        self.inner.device.free_memory(memory, None);
                         return Err(GpuError::Backend(format!("vkCreateImageView: {e}")));
                     }
                 }
@@ -677,7 +678,7 @@ impl GpuDevice for VulkanDevice {
         let handle = self.textures.lock().unwrap().insert(VulkanTexture {
             image,
             view,
-            memory,
+            _allocation: allocation,
             format,
             extent: vk::Extent2D {
                 width: desc.width,

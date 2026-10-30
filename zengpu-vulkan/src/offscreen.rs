@@ -119,11 +119,7 @@ impl Drop for OffscreenTarget {
     fn drop(&mut self) {
         self.render_targets.lock().unwrap().remove(self.target);
         if let Some(tex) = self.textures.lock().unwrap().remove(self.texture) {
-            unsafe {
-                self.inner.device.destroy_image_view(tex.view, None);
-                self.inner.device.destroy_image(tex.image, None);
-                self.inner.device.free_memory(tex.memory, None);
-            }
+            unsafe { tex.destroy(&self.inner.device) };
         }
     }
 }

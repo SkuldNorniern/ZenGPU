@@ -30,6 +30,7 @@ mod dispatch;
 mod format;
 mod graphics;
 mod hal_impl;
+mod image_memory;
 mod resources;
 mod transfer;
 
@@ -592,7 +593,7 @@ unsafe impl Sync for VulkanBuffer {}
 pub(crate) struct VulkanTexture {
     pub image: vk::Image,
     pub view: vk::ImageView,
-    pub memory: vk::DeviceMemory,
+    pub _allocation: image_memory::ImageAllocation,
     pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub depth: u32,
@@ -643,7 +644,6 @@ impl VulkanTexture {
             }
             device.destroy_image_view(self.view, None);
             device.destroy_image(self.image, None);
-            device.free_memory(self.memory, None);
         }
     }
 
@@ -727,6 +727,7 @@ pub struct VulkanDevice {
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
     /// Reused for host-visible uploads.
     staging: Mutex<transfer::StagingRing>,
+    image_memory: Mutex<image_memory::ImageMemory>,
     transfer_slots: Mutex<Option<dispatch::TransferSlots>>,
     orphans: Orphans,
 }
@@ -1210,6 +1211,7 @@ impl VulkanDevice {
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
             staging: Mutex::new(transfer::StagingRing::default()),
+            image_memory: Mutex::new(image_memory::ImageMemory::default()),
             transfer_slots: Mutex::new(None),
             orphans: Arc::default(),
         })
@@ -3096,6 +3098,174 @@ mod tests {
             dimension,
             mip_levels: 1,
             array_layers: 1,
+        }
+    }
+
+    #[test]
+    fn pooled_texture_memory_keeps_surviving_texels_and_releases_empty_blocks() {
+        use std::collections::HashSet;
+        let Some(dev) = try_device() else { return };
+        let device = vulkan(&dev);
+        let desc = TextureDesc {
+            width: 256,
+            height: 256,
+            usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST | TextureUsage::TRANSFER_SRC,
+            ..tex_desc(TexDim::D2)
+        };
+        let textures: Vec<_> = (0..128)
+            .map(|_| device.create_texture(desc).unwrap())
+            .collect();
+        let allocations: HashSet<_> = {
+            let table = device.textures.lock().unwrap();
+            textures
+                .iter()
+                .map(|&t| table.get(t).unwrap()._allocation.memory())
+                .collect()
+        };
+        eprintln!(
+            "128 tile textures use {} Vulkan memory allocations",
+            allocations.len()
+        );
+        // Drivers may request dedicated allocations. Verify pooling whenever this
+        // device opted into a block rather than overriding its dedicated preference.
+        if !device.image_memory.lock().unwrap().blocks_empty() {
+            assert!(allocations.len() < textures.len());
+        }
+        let data: Vec<Vec<u8>> = (0..128u8)
+            .map(|i| [i, 255 - i, i / 2, 255].repeat(256 * 256))
+            .collect();
+        let writes: Vec<_> = textures
+            .iter()
+            .zip(&data)
+            .map(|(&texture, bytes)| zengpu_hal::TextureWrite {
+                texture,
+                region: TextureRegion::rect(0, 0, 256, 256),
+                data: bytes,
+                bytes_per_row: 1024,
+            })
+            .collect();
+        device
+            .write_textures(&writes)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        for &texture in textures.iter().step_by(2) {
+            device.destroy_texture(texture);
+        }
+        let replacements: Vec<_> = (0..64)
+            .map(|_| device.create_texture(desc).unwrap())
+            .collect();
+        let clear = vec![233; 256 * 256 * 4];
+        let writes: Vec<_> = replacements
+            .iter()
+            .map(|&texture| zengpu_hal::TextureWrite {
+                texture,
+                region: TextureRegion::rect(0, 0, 256, 256),
+                data: &clear,
+                bytes_per_row: 1024,
+            })
+            .collect();
+        device
+            .write_textures(&writes)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let output = device
+            .create_buffer(BufferDesc {
+                size: 256 * 256 * 4,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        for (i, &texture) in textures.iter().enumerate().skip(1).step_by(2) {
+            device
+                .copy_texture_region_to_buffer(
+                    texture,
+                    TextureRegion::rect(0, 0, 256, 256),
+                    output,
+                    0,
+                    1024,
+                )
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                device.read_buffer(output, 0, 256 * 256 * 4).unwrap(),
+                data[i]
+            );
+            device.destroy_texture(texture);
+        }
+        for texture in replacements {
+            device.destroy_texture(texture);
+        }
+        device.destroy_buffer(output);
+        assert!(
+            device.image_memory.lock().unwrap().blocks_empty(),
+            "last texture frees its entire block"
+        );
+    }
+
+    #[test]
+    #[ignore = "manual tile allocation benchmark"]
+    fn tile_pyramid_allocation_timing() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+        let Some(dev) = try_device() else { return };
+        let device = vulkan(&dev);
+        let mut dimensions = Vec::new();
+        let (mut w, mut h) = (6000u32, 4000u32);
+        loop {
+            for y in (0..h).step_by(256) {
+                for x in (0..w).step_by(256) {
+                    dimensions.push(((w - x).min(256), (h - y).min(256)));
+                }
+            }
+            if w == 1 && h == 1 {
+                break;
+            }
+            (w, h) = ((w / 2).max(1), (h / 2).max(1));
+        }
+        for round in 0..6 {
+            for dedicated in [true, false] {
+                device.image_memory.lock().unwrap().force_dedicated = dedicated;
+                let start = Instant::now();
+                let textures: Vec<_> = dimensions
+                    .iter()
+                    .map(|&(width, height)| {
+                        device
+                            .create_texture(TextureDesc {
+                                width,
+                                height,
+                                ..tex_desc(TexDim::D2)
+                            })
+                            .unwrap()
+                    })
+                    .collect();
+                let elapsed = start.elapsed();
+                let table = device.textures.lock().unwrap();
+                let memories: HashMap<_, _> = textures
+                    .iter()
+                    .map(|&t| {
+                        let allocation = &table.get(t).unwrap()._allocation;
+                        (allocation.memory(), allocation.reserved_bytes())
+                    })
+                    .collect();
+                let used: u64 = textures
+                    .iter()
+                    .map(|&t| table.get(t).unwrap()._allocation.used_bytes())
+                    .sum();
+                let reserved: u64 = memories.values().sum();
+                drop(table);
+                eprintln!(
+                    "round {round}, dedicated={dedicated}: {} textures, {} allocations, {:.3} ms, {used} required / {reserved} reserved bytes",
+                    textures.len(),
+                    memories.len(),
+                    elapsed.as_secs_f64() * 1000.0
+                );
+                for texture in textures {
+                    device.destroy_texture(texture);
+                }
+            }
         }
     }
 
