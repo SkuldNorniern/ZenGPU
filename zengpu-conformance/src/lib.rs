@@ -851,6 +851,95 @@ mod devarray_elementwise_tests {
     }
 
     #[test]
+    fn buffer_pool_limits_reuse_storage_and_never_trim_live_arrays() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::with_cache_limit(cpu.clone(), 512);
+        let a = pool.alloc(vec![64], DType::F32).unwrap();
+        let b = pool.alloc(vec![64], DType::F32).unwrap();
+        let large = pool.alloc(vec![256], DType::F32).unwrap();
+        let large_handle = large.buffer;
+        assert_eq!(pool.stats().live_bytes, 1536);
+        assert_eq!(pool.stats().live_allocations, 3);
+        pool.free(a);
+        let expected_reuse = b.buffer;
+        pool.free(b);
+        pool.free(large);
+        assert!(cpu.buffer_size(large_handle).is_err());
+        assert_eq!(
+            (pool.stats().cached_bytes, pool.stats().cached_buffers),
+            (512, 2)
+        );
+        let live = pool.alloc(vec![64], DType::F32).unwrap();
+        assert_eq!(live.buffer, expected_reuse);
+        assert_eq!(pool.trim_unused(0), 256);
+        assert_eq!(pool.stats().live_bytes, 256);
+        assert!(cpu.buffer_size(live.buffer).is_ok());
+        assert_eq!(pool.set_cache_limit(0), 0);
+        let last = live.buffer;
+        pool.free(live);
+        assert!(cpu.buffer_size(last).is_err());
+        assert_eq!(pool.stats().cached_bytes, 0);
+        assert_eq!(pool.stats().live_allocations, 0);
+    }
+
+    #[test]
+    fn buffer_pool_pressure_releases_large_unused_classes_first() {
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = BufferPool::new(cpu.clone());
+        let small = pool.alloc(vec![64], DType::F32).unwrap();
+        let medium = pool.alloc(vec![128], DType::F32).unwrap();
+        let large = pool.alloc(vec![256], DType::F32).unwrap();
+        let live = pool.alloc(vec![128], DType::F32).unwrap();
+        let (s, m, l) = (small.buffer, medium.buffer, large.buffer);
+        for array in [small, medium, large] {
+            pool.free(array);
+        }
+        assert_eq!(pool.set_cache_limit(600), 1536);
+        assert_eq!(pool.stats().cached_bytes, 256);
+        assert_eq!(pool.stats().cache_limit, 600);
+        assert!(cpu.buffer_size(s).is_ok());
+        assert!(cpu.buffer_size(m).is_err());
+        assert!(cpu.buffer_size(l).is_err());
+        assert!(cpu.buffer_size(live.buffer).is_ok());
+        assert_eq!(pool.set_cache_limit(0), 256);
+        pool.free(live);
+        assert_eq!(pool.stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_buffer_reuse_and_pressure_keep_live_data_separate() {
+        use std::thread;
+        let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
+        let pool = Arc::new(BufferPool::with_cache_limit(cpu.clone(), 1024));
+        thread::scope(|scope| {
+            for worker in 0..4u8 {
+                let pool = Arc::clone(&pool);
+                scope.spawn(move || {
+                    for i in 0..100 {
+                        let array = pool.alloc(vec![64], DType::F32).unwrap();
+                        pool.device()
+                            .write_buffer(array.buffer, 0, &[worker; 4])
+                            .unwrap();
+                        assert_eq!(
+                            pool.device().read_buffer(array.buffer, 0, 4).unwrap(),
+                            [worker; 4]
+                        );
+                        if worker == 0 {
+                            pool.set_cache_limit(if i % 2 == 0 { 0 } else { 1024 });
+                        }
+                        pool.free(array);
+                    }
+                });
+            }
+        });
+        let stats = pool.stats();
+        assert_eq!(stats.live_allocations, 0);
+        assert!(stats.cached_bytes <= stats.cache_limit);
+        assert_eq!(pool.trim_unused(0), stats.cached_bytes);
+        assert_eq!(pool.stats().cached_buffers, 0);
+    }
+
+    #[test]
     fn pools_reject_foreign_and_manually_reconstructed_arrays() {
         let cpu: Arc<dyn GpuDevice> = Arc::new(CpuDevice::new());
         let owner = BufferPool::new(cpu.clone());

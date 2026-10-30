@@ -91,7 +91,7 @@ pub use zengpu_hal::{
 };
 
 #[cfg(feature = "compute")]
-pub use zengpu_compute::{BufferPool, DeviceArray, ElementwiseKernels};
+pub use zengpu_compute::{BufferPool, BufferPoolStats, DeviceArray, ElementwiseKernels};
 
 /// Concrete Vulkan types for windowed, backend-aware code. Most code needs only [`Instance`].
 #[cfg(feature = "vulkan")]

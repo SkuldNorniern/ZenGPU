@@ -8,7 +8,7 @@ pub mod ops;
 
 pub use elementwise::ElementwiseKernels;
 pub use ops::OpList;
-pub use pool::BufferPool;
+pub use pool::{BufferPool, BufferPoolStats};
 
 use pool::checked_len;
 use zengpu_hal::{BufferHandle, DType, GpuDevice, Result, UsageError};
