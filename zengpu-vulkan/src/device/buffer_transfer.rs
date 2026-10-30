@@ -307,6 +307,29 @@ mod tests {
     }
 
     #[test]
+    fn transient_fence_errors_keep_readback_resources_until_idle() {
+        let _guard = crate::test_gpu_lock();
+        let Some(device) = device() else { return };
+        let source = buffer(&*device, 4, BufferUsage::READBACK, MemoryUsage::Upload);
+        device.write_buffer(source, 0, &[1, 2, 3, 4]).unwrap();
+        let read = device.submit_read_buffer(14, source, 0, 4).unwrap();
+        let native = device.as_any().downcast_ref::<VulkanDevice>().unwrap();
+        *FORCED_FENCE_STATUS_ERROR.lock().unwrap() = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        drop(read);
+        assert_eq!(native.orphans.lock().unwrap().len(), 1);
+        *FORCED_FENCE_STATUS_ERROR.lock().unwrap() = Some(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        native.reap_orphans();
+        assert_eq!(
+            native.orphans.lock().unwrap().len(),
+            1,
+            "query errors do not complete work"
+        );
+        native.wait_idle().unwrap();
+        assert!(native.orphans.lock().unwrap().is_empty());
+        device.destroy_buffer(source);
+    }
+
+    #[test]
     fn dropping_async_reads_keeps_staging_alive_until_completion() {
         let _guard = crate::test_gpu_lock();
         let Some(device) = device() else { return };

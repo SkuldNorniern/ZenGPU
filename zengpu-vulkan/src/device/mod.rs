@@ -7,6 +7,7 @@ use std::{
     mem,
     path::PathBuf,
     ptr::{copy_nonoverlapping, null, null_mut},
+    result::Result as StdResult,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -160,6 +161,9 @@ impl VulkanSubmissionState {
 /// buffer and deferred frees once the work finishes.
 type Orphans = Arc<Mutex<Vec<VulkanSubmission>>>;
 
+#[cfg(test)]
+static FORCED_FENCE_STATUS_ERROR: Mutex<Option<vk::Result>> = Mutex::new(None);
+
 enum DeferredVulkanResource {
     Buffer(u32, VulkanBuffer),
     Texture(u32, VulkanTexture),
@@ -251,6 +255,13 @@ struct VulkanSubmission {
 }
 
 impl VulkanSubmission {
+    fn fence_status(&self, fence: vk::Fence) -> StdResult<bool, vk::Result> {
+        #[cfg(test)]
+        if let Some(error) = FORCED_FENCE_STATUS_ERROR.lock().unwrap().take() {
+            return Err(error);
+        }
+        unsafe { self.inner.device.get_fence_status(fence) }
+    }
     fn complete_locked(&self, state: &mut VulkanSubmissionState) {
         if let Some(fence) = state.fence.take() {
             self.fence_pool.release(fence);
@@ -295,12 +306,13 @@ impl GpuSubmission for VulkanSubmission {
         let Some(fence) = state.fence else {
             return Ok(SubmissionStatus::Complete);
         };
-        let signaled = unsafe {
-            self.inner
-                .device
-                .get_fence_status(fence)
-                .map_err(|e| map_vk_err("vkGetFenceStatus", e))?
-        };
+        if self.inner.serials.completed() >= self.serial {
+            self.complete_locked(&mut state);
+            return Ok(SubmissionStatus::Complete);
+        }
+        let signaled = self
+            .fence_status(fence)
+            .map_err(|e| map_vk_err("vkGetFenceStatus", e))?;
         if signaled {
             self.complete_locked(&mut state);
             Ok(SubmissionStatus::Complete)
@@ -314,6 +326,10 @@ impl GpuSubmission for VulkanSubmission {
         let Some(fence) = state.fence else {
             return Ok(());
         };
+        if self.inner.serials.completed() >= self.serial {
+            self.complete_locked(&mut state);
+            return Ok(());
+        }
         let result = unsafe {
             self.inner
                 .device
@@ -336,15 +352,22 @@ impl Drop for VulkanSubmission {
         let Some(fence) = state.fence else {
             return;
         };
-        match unsafe { self.inner.device.get_fence_status(fence) } {
+        let status = if self.inner.serials.completed() >= self.serial {
+            Ok(true)
+        } else {
+            self.fence_status(fence)
+        };
+        match status {
             Ok(true) => self.complete_locked(&mut state),
-            Ok(false) => {
-                let orphan = self.orphan(state);
-                self.orphans.lock().unwrap().push(orphan);
-            }
-            Err(_) => {
+            Err(vk::Result::ERROR_DEVICE_LOST) => {
                 unsafe { self.inner.device.destroy_fence(fence, None) };
                 self.release_in_flight();
+            }
+            // A host/device allocation error while querying a fence does not
+            // prove completion. Keep resources until a later query or idle wait.
+            Ok(false) | Err(_) => {
+                let orphan = self.orphan(state);
+                self.orphans.lock().unwrap().push(orphan);
             }
         }
     }
@@ -755,9 +778,13 @@ impl VulkanDevice {
     pub(crate) fn reap_orphans(&self) {
         let done: Vec<VulkanSubmission> = {
             let mut orphans = self.orphans.lock().unwrap();
-            let (done, running): (Vec<_>, Vec<_>) = mem::take(&mut *orphans)
-                .into_iter()
-                .partition(|orphan| !matches!(orphan.poll(), Ok(SubmissionStatus::Pending)));
+            let (done, running): (Vec<_>, Vec<_>) =
+                mem::take(&mut *orphans).into_iter().partition(|orphan| {
+                    matches!(
+                        orphan.poll(),
+                        Ok(SubmissionStatus::Complete) | Err(GpuError::DeviceLost)
+                    )
+                });
             *orphans = running;
             done
         };
@@ -1565,7 +1592,9 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.inner.device.device_wait_idle();
+            if self.inner.device.device_wait_idle().is_ok() {
+                self.inner.serials.complete(self.inner.serials.submitted());
+            }
         }
         self.reap_orphans();
         if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {
