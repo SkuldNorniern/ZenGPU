@@ -758,11 +758,7 @@ mod tests {
             .expect("Vulkan");
         let (_, base, overflow) = native.stage(RING_START).expect("reserve whole ring");
         assert!(!overflow);
-        assert_eq!(
-            native.trim_staging_memory(),
-            0,
-            "a caller still fills the ring"
-        );
+        assert_eq!(device.trim_memory(), 0, "a caller still fills the ring");
         let texture = device
             .create_texture(TextureDesc {
                 width: 2,
@@ -824,7 +820,7 @@ mod tests {
             assert_eq!(device.read_buffer(readback, 0, 16).expect("pixels"), data);
         }
         native.staging.lock().unwrap().settle(base, 0);
-        assert_eq!(native.trim_staging_memory(), RING_START + 16);
+        assert_eq!(device.trim_memory(), RING_START + 16);
         {
             let ring = native.staging.lock().unwrap();
             assert!(ring.buffer.is_none() && ring.spares.is_empty());

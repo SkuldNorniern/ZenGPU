@@ -48,6 +48,14 @@ pub trait GpuDevice: Send + Sync {
         None
     }
 
+    /// Releases idle, rebuildable backend caches without waiting for GPU work.
+    /// Live resources, pending submissions and caller reservations remain valid.
+    /// Returns released buffer capacities in bytes, not driver allocation sizes.
+    /// Backends without such caches return zero.
+    fn trim_memory(&self) -> u64 {
+        0
+    }
+
     /// The handle is generational. Contents are unspecified, so write every byte before reading it.
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle>;
 

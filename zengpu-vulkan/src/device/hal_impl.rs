@@ -133,6 +133,10 @@ impl GpuDevice for VulkanDevice {
         self.inner.memory_budget()
     }
 
+    fn trim_memory(&self) -> u64 {
+        self.trim_staging_memory()
+    }
+
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
         self.collect_garbage();
         let alloc_size = desc.size.max(4).next_multiple_of(4);
