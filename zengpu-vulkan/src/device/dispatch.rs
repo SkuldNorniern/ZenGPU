@@ -20,6 +20,7 @@ impl VulkanDevice {
             }
             self.inner.serials.complete(self.inner.serials.submitted());
         }
+        self.reap_orphans();
         self.collect_garbage();
         Ok(())
     }
@@ -164,7 +165,7 @@ impl VulkanDevice {
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
         // Compute callers already reaped before taking their resource-table locks.
-        self.one_shot_submit_tracked_inner(cycle_id, uses, record)
+        self.one_shot_submit_tracked_inner(cycle_id, uses, None, record)
             .map(|(submission, _)| submission)
     }
 
@@ -178,13 +179,14 @@ impl VulkanDevice {
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
         self.reap_orphans();
-        self.one_shot_submit_tracked_inner(cycle_id, uses, record)
+        self.one_shot_submit_tracked_inner(cycle_id, uses, None, record)
     }
 
-    fn one_shot_submit_tracked_inner<F>(
+    pub(super) fn one_shot_submit_tracked_inner<F>(
         &self,
         cycle_id: u64,
         uses: &[u32],
+        retained: Option<Arc<buffer_transfer::AsyncBuffer>>,
         record: F,
     ) -> Result<(Submission, u64)>
     where
@@ -203,7 +205,13 @@ impl VulkanDevice {
             return Err(e);
         }
 
-        let fence = self.fence_pool.acquire()?;
+        let fence = match self.fence_pool.acquire() {
+            Ok(fence) => fence,
+            Err(error) => {
+                self.cmd_list_pool.release(cmd);
+                return Err(error);
+            }
+        };
         let submit_info = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
@@ -245,6 +253,7 @@ impl VulkanDevice {
             state: Mutex::new(VulkanSubmissionState {
                 fence: Some(fence),
                 cmd: Some(cmd),
+                retained,
             }),
         });
         Ok((submission, serial))

@@ -1,10 +1,19 @@
 use super::*;
 use zengpu_hal::{
     BackendPreference, ComputeCaps, DType, Format, FormatCaps, MmaShape, PipelineStats,
-    TextureRegion, TextureWrite, TransferCaps,
+    ReadSubmission, TextureRegion, TextureWrite, TransferCaps,
 };
 
 impl GpuDevice for VulkanDevice {
+    fn submit_read_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        len: u64,
+    ) -> Result<ReadSubmission> {
+        self.submit_read_buffer_impl(cycle_id, buffer, offset, len)
+    }
     fn backend(&self) -> BackendPreference {
         BackendPreference::Vulkan
     }

@@ -25,6 +25,7 @@ use zengpu_hal::{
     WindowHandles, marker,
 };
 
+mod buffer_transfer;
 mod cooperative;
 mod dispatch;
 mod format;
@@ -144,12 +145,14 @@ struct FencePool {
 struct VulkanSubmissionState {
     fence: Option<vk::Fence>,
     cmd: Option<vk::CommandBuffer>,
+    retained: Option<Arc<buffer_transfer::AsyncBuffer>>,
 }
 
 impl VulkanSubmissionState {
     const DONE: Self = Self {
         fence: None,
         cmd: None,
+        retained: None,
     };
 }
 
@@ -256,6 +259,7 @@ impl VulkanSubmission {
             self.cmd_pool.release(cmd);
         }
         self.release_in_flight();
+        state.retained = None;
     }
 
     fn timeout_ns(timeout: Duration) -> u64 {
