@@ -24,6 +24,13 @@ jobs:
         with:
           fetch-depth: 0
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      # CI has built the packaged crates on this commit. Assemble fresh archives
+      # here for the release, without publishing anything to crates.io.
+      - name: Assemble release archives
+        run: cargo package --workspace --all-features --no-verify --locked --target-dir target/release-packages
+
       - name: Generate release notes
         run: |
           # Find the previous versioned tag (skip the tag we're currently cutting).
@@ -67,6 +74,7 @@ jobs:
           PRERELEASE_FLAG=""
           echo "${{ github.ref_name }}" | grep -q -- "-" && PRERELEASE_FLAG="--prerelease"
           gh release create "${{ github.ref_name }}" \
+            target/release-packages/package/*.crate \
             --title "ZenGPU ${{ github.ref_name }}" \
             --notes-file release_notes.md \
             $PRERELEASE_FLAG

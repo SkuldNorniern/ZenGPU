@@ -33,9 +33,9 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-      - name: Assemble publishable workspace packages
+      - name: Assemble and build publishable workspace packages
         if: runner.os == 'Linux'
-        run: cargo package --workspace --no-verify
+        run: cargo package --workspace --all-features --locked --target-dir target/release-packages
 
   msrv:
     runs-on: ${{ matrix.os }}
