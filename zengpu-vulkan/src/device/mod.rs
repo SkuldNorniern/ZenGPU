@@ -766,6 +766,9 @@ pub struct VulkanDevice {
     staging: Mutex<transfer::StagingRing>,
     image_memory: Mutex<image_memory::ImageMemory>,
     transfer_slots: Mutex<Option<dispatch::TransferSlots>>,
+    /// Raw synchronous waits can fail without proving the GPU finished. Retain
+    /// their fence/command buffer and block host access until a retry completes.
+    failed_raw: Mutex<Vec<dispatch::RawSubmit>>,
     orphans: Orphans,
 }
 
@@ -1255,6 +1258,7 @@ impl VulkanDevice {
             staging: Mutex::new(transfer::StagingRing::default()),
             image_memory: Mutex::new(image_memory::ImageMemory::default()),
             transfer_slots: Mutex::new(None),
+            failed_raw: Mutex::new(Vec::new()),
             orphans: Arc::default(),
         })
     }
@@ -1597,6 +1601,7 @@ impl Drop for VulkanDevice {
             }
         }
         self.reap_orphans();
+        let _ = self.recover_raw_waits();
         if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {
             slots.destroy(&self.inner.device);
         }
@@ -1900,6 +1905,67 @@ mod tests {
         assert!(matches!(outcome, Err(GpuError::Backend(message))
             if message.contains("open_with_surface")));
         device.wait_idle().expect("device remains usable");
+    }
+
+    #[test]
+    fn fresh_texture_batch_preserves_disjoint_regions_and_orders_overlapping_writes() {
+        use zengpu_hal::TextureWrite;
+        let Some(dev) = try_device() else { return };
+        let tex = dev
+            .create_texture(TextureDesc {
+                width: 4,
+                height: 2,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                ..tex_desc(TexDim::D2)
+            })
+            .unwrap();
+        let red = [255u8, 0, 0, 255].repeat(4);
+        let green = [0u8, 255, 0, 255].repeat(4);
+        let blue = [0u8, 0, 255, 255];
+        let writes = [
+            TextureWrite {
+                texture: tex,
+                region: TextureRegion::rect(0, 0, 2, 2),
+                data: &red,
+                bytes_per_row: 8,
+            },
+            TextureWrite {
+                texture: tex,
+                region: TextureRegion::rect(2, 0, 2, 2),
+                data: &green,
+                bytes_per_row: 8,
+            },
+            TextureWrite {
+                texture: tex,
+                region: TextureRegion::rect(1, 1, 1, 1),
+                data: &blue,
+                bytes_per_row: 4,
+            },
+        ];
+        dev.write_textures(&writes)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let out = dev.create_buffer(rw_desc(32)).unwrap();
+        dev.copy_texture_region_to_buffer(tex, TextureRegion::rect(0, 0, 4, 2), out, 0, 16)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        let got = dev.read_buffer(out, 0, 32).unwrap();
+        for (i, pixel) in got.as_chunks::<4>().0.iter().enumerate() {
+            let expected = if i == 5 {
+                &blue[..]
+            } else if i % 4 < 2 {
+                &red[..4]
+            } else {
+                &green[..4]
+            };
+            assert_eq!(pixel, expected, "pixel {i}");
+        }
+        dev.destroy_buffer(out);
+        dev.destroy_texture(tex);
     }
 
     #[test]

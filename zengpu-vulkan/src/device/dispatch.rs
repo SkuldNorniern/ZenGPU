@@ -4,6 +4,9 @@ use super::*;
 /// (which spans VRAM).
 const SMALL_BAR_HEAP: u64 = 512 << 20;
 
+#[cfg(test)]
+static FORCED_RAW_WAIT_ERROR: Mutex<Option<vk::Result>> = Mutex::new(None);
+
 impl VulkanDevice {
     pub fn context(&self) -> DeviceContext {
         DeviceContext::from_inner(Arc::clone(&self.inner))
@@ -20,6 +23,7 @@ impl VulkanDevice {
             }
             self.inner.serials.complete(self.inner.serials.submitted());
         }
+        self.recover_raw_waits()?;
         self.reap_orphans();
         self.collect_garbage();
         Ok(())
@@ -29,49 +33,47 @@ impl VulkanDevice {
     pub fn submit_and_wait(&self, list: VulkanCommandList) -> Result<()> {
         let cmd = list.cmd;
         let pool = Arc::clone(&list.pool);
-        unsafe {
-            self.inner
-                .device
-                .end_command_buffer(cmd)
-                .map_err(|e| GpuError::Backend(format!("end_command_buffer: {e}")))?;
+        let ended = unsafe { self.inner.device.end_command_buffer(cmd) }
+            .map_err(|e| map_vk_err("vkEndCommandBuffer", e));
+        if let Err(error) = ended {
+            pool.release(cmd);
+            return Err(error);
         }
-        let fence = self.fence_pool.acquire()?;
+        let fence = match self.fence_pool.acquire() {
+            Ok(fence) => fence,
+            Err(error) => {
+                pool.release(cmd);
+                return Err(error);
+            }
+        };
         let submit_info = vk::SubmitInfo {
             command_buffer_count: 1,
             p_command_buffers: &cmd,
             ..Default::default()
         };
-        let mut submitted = false;
-        let _queue = self.inner.queue_lock.lock().unwrap();
-        let submit_result = unsafe {
-            self.inner
-                .device
-                .queue_submit(self.inner.queue, &[submit_info], fence)
-                .map_err(|e| map_vk_err("vkQueueSubmit", e))
-        };
-        let mut serial = None;
-        if submit_result.is_ok() {
-            submitted = true;
-            serial = Some(self.inner.serials.next());
-        }
-        let wait_result = submit_result.and_then(|()| unsafe {
-            self.inner
-                .device
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(|e| map_vk_err("vkWaitForFences", e))
-        });
-        if let (Some(serial), Ok(())) = (serial, &wait_result) {
-            self.inner.serials.complete(serial);
-        }
-        if !submitted || wait_result.is_ok() {
-            self.fence_pool.release(fence);
-            pool.release(cmd);
-        } else {
+        let submitted = {
+            let _queue = self.inner.queue_lock.lock().unwrap();
             unsafe {
-                self.inner.device.destroy_fence(fence, None);
+                self.inner
+                    .device
+                    .queue_submit(self.inner.queue, &[submit_info], fence)
+            }
+            .map_err(|e| map_vk_err("vkQueueSubmit", e))
+            .map(|()| self.inner.serials.next())
+        };
+        match submitted {
+            Ok(serial) => self.finish_raw(RawSubmit {
+                cmd,
+                fence,
+                serial,
+                pool,
+            }),
+            Err(error) => {
+                self.fence_pool.release(fence);
+                pool.release(cmd);
+                Err(error)
             }
         }
-        wait_result
     }
 
     /// Records a one-shot command buffer with `f` and waits for it to complete.
@@ -93,6 +95,7 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
+        self.recover_raw_waits()?;
         let cmd = self.cmd_list_pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
@@ -128,7 +131,12 @@ impl VulkanDevice {
             .map(|()| self.inner.serials.next())
         };
         match submitted {
-            Ok(serial) => Ok(RawSubmit { cmd, fence, serial }),
+            Ok(serial) => Ok(RawSubmit {
+                cmd,
+                fence,
+                serial,
+                pool: Arc::clone(&self.cmd_list_pool),
+            }),
             Err(e) => {
                 self.fence_pool.release(fence);
                 self.cmd_list_pool.release(cmd);
@@ -138,25 +146,69 @@ impl VulkanDevice {
     }
 
     pub(crate) fn finish_raw(&self, pending: RawSubmit) -> Result<()> {
-        let RawSubmit { cmd, fence, serial } = pending;
-        let waited = unsafe {
-            self.inner
-                .device
-                .wait_for_fences(&[fence], true, u64::MAX)
-                .map_err(|e| map_vk_err("vkWaitForFences", e))
-        };
-        match waited {
+        match self.wait_raw(&pending) {
             Ok(()) => {
-                self.inner.serials.complete(serial);
-                self.fence_pool.release(fence);
-                self.cmd_list_pool.release(cmd);
+                self.recycle_raw(pending);
                 Ok(())
             }
+            Err(GpuError::DeviceLost) => {
+                self.abandon_raw(pending);
+                Err(GpuError::DeviceLost)
+            }
             Err(e) => {
-                unsafe { self.inner.device.destroy_fence(fence, None) };
+                self.failed_raw.lock().unwrap().push(pending);
                 Err(e)
             }
         }
+    }
+
+    fn wait_raw(&self, pending: &RawSubmit) -> Result<()> {
+        if self.inner.serials.completed() >= pending.serial {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(error) = FORCED_RAW_WAIT_ERROR.lock().unwrap().take() {
+            return Err(map_vk_err("vkWaitForFences", error));
+        }
+        unsafe {
+            self.inner
+                .device
+                .wait_for_fences(&[pending.fence], true, u64::MAX)
+                .map_err(|e| map_vk_err("vkWaitForFences", e))
+        }
+    }
+
+    fn recycle_raw(&self, pending: RawSubmit) {
+        self.inner.serials.complete(pending.serial);
+        self.fence_pool.release(pending.fence);
+        pending.pool.release(pending.cmd);
+    }
+
+    fn abandon_raw(&self, pending: RawSubmit) {
+        // Device loss stops its work; unlike a transient host error it cannot
+        // recover. Do not keep shared pool owners alive through device teardown.
+        self.inner.lost.store(true, Ordering::Release);
+        self.inner.serials.complete(pending.serial);
+        unsafe { self.inner.device.destroy_fence(pending.fence, None) };
+        pending.pool.release(pending.cmd);
+    }
+
+    /// Does not touch resource tables or deferred frees: callers can hold their
+    /// buffer-table / transfer-slot locks while establishing safe host access.
+    pub(super) fn recover_raw_waits(&self) -> Result<()> {
+        let mut pending = self.failed_raw.lock().unwrap();
+        while let Some(work) = pending.last() {
+            if let Err(error) = self.wait_raw(work) {
+                if matches!(error, GpuError::DeviceLost) {
+                    for work in pending.drain(..) {
+                        self.abandon_raw(work);
+                    }
+                }
+                return Err(error);
+            }
+            self.recycle_raw(pending.pop().expect("last entry exists"));
+        }
+        Ok(())
     }
 
     /// The submission owns the fence and command buffer until it completes.
@@ -302,11 +354,12 @@ impl VulkanDevice {
             });
         }
         let mut slots = self.transfer_slots.lock().unwrap();
-        let slots = transfer_slots(self, &mut slots)?;
+        self.recover_raw_waits()?;
+        let slots = transfer_slots(self, &mut slots, false, data.len() as u64)?;
         let mut in_flight: [Option<RawSubmit>; 2] = [None, None];
         let result = (|| {
             for (i, chunk) in data.chunks(STAGING_CHUNK as usize).enumerate() {
-                let slot = &slots.upload[i % 2];
+                let slot = &slots[i % 2];
                 if let Some(pending) = in_flight[i % 2].take() {
                     self.finish_raw(pending)?;
                 }
@@ -354,12 +407,16 @@ impl VulkanDevice {
     }
 
     pub(super) fn staged_read(&self, src: vk::Buffer, offset: u64, out: &mut [u8]) -> Result<()> {
+        if out.is_empty() {
+            return Ok(());
+        }
         let mut slots = self.transfer_slots.lock().unwrap();
-        let slots = transfer_slots(self, &mut slots)?;
+        self.recover_raw_waits()?;
+        let slots = transfer_slots(self, &mut slots, true, out.len() as u64)?;
         let total = out.len() as u64;
         let chunks = total.div_ceil(STAGING_CHUNK) as usize;
         let enqueue = |i: usize| -> Result<RawSubmit> {
-            let slot = &slots.readback[i % 2];
+            let slot = &slots[i % 2];
             let src_offset = offset + i as u64 * STAGING_CHUNK;
             let len = STAGING_CHUNK.min(total - i as u64 * STAGING_CHUNK);
             self.submit_raw(|dev, cmd| {
@@ -414,7 +471,7 @@ impl VulkanDevice {
                 if let Some(pending) = in_flight[i % 2].take() {
                     self.finish_raw(pending)?;
                 }
-                let slot = &slots.readback[i % 2];
+                let slot = &slots[i % 2];
                 unsafe { copy_nonoverlapping(slot.mapped, chunk.as_mut_ptr(), chunk.len()) };
             }
             Ok(())
@@ -958,6 +1015,7 @@ pub(crate) struct RawSubmit {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     serial: u64,
+    pool: Arc<CmdListPool>,
 }
 
 /// Largest write sent inline with vkCmdUpdateBuffer (the Vulkan limit).
@@ -973,41 +1031,18 @@ pub(crate) struct HostSlot {
 }
 
 /// Staging for buffers the host cannot map: two write-combined upload slots, two host-cached
-/// readback slots. Kept after first use: allocating and zeroing 8 MiB per transfer costs more than
-/// the transfer.
+/// readback slots, allocated only for the direction and chunk count needed. Kept after first
+/// use: allocating and zeroing 8 MiB per transfer costs more than the transfer.
+#[derive(Default)]
 pub(crate) struct TransferSlots {
-    upload: [HostSlot; 2],
-    readback: [HostSlot; 2],
+    upload: Vec<HostSlot>,
+    readback: Vec<HostSlot>,
 }
 
-// SAFETY: raw handles and mapped pointers, used only under the device's
+// SAFETY: raw handles and mapped pointers, used only under the device's transfer_slots mutex.
 unsafe impl Send for TransferSlots {}
 
 impl TransferSlots {
-    fn new(device: &VulkanDevice) -> Result<Self> {
-        let mut made: Vec<HostSlot> = Vec::with_capacity(4);
-        for readback in [false, false, true, true] {
-            match HostSlot::new(device, readback) {
-                Ok(slot) => made.push(slot),
-                Err(e) => {
-                    for slot in made {
-                        slot.destroy(&device.inner.device);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        let mut made = made.into_iter();
-        let mut next = || {
-            made.next()
-                .ok_or(GpuError::OutOfMemory(MemoryUsage::Upload))
-        };
-        Ok(Self {
-            upload: [next()?, next()?],
-            readback: [next()?, next()?],
-        })
-    }
-
     /// Free every slot; the device must be idle.
     pub(crate) fn destroy(self, dev: &Device) {
         for slot in self.upload.into_iter().chain(self.readback) {
@@ -1016,16 +1051,48 @@ impl TransferSlots {
     }
 }
 
+impl VulkanDevice {
+    /// Releases idle synchronous buffer staging without waiting for an active
+    /// transfer or for a failed fence wait. Returns buffer capacities in bytes.
+    pub(crate) fn trim_buffer_staging(&self) -> u64 {
+        let Ok(mut slots) = self.transfer_slots.try_lock() else {
+            return 0;
+        };
+        let Ok(pending) = self.failed_raw.try_lock() else {
+            return 0;
+        };
+        if pending
+            .iter()
+            .any(|work| work.serial > self.inner.serials.completed())
+        {
+            return 0;
+        }
+        let Some(slots) = slots.take() else { return 0 };
+        let bytes = (slots.upload.len() + slots.readback.len()) as u64 * STAGING_CHUNK;
+        slots.destroy(&self.inner.device);
+        bytes
+    }
+}
+
 fn transfer_slots<'a>(
     device: &VulkanDevice,
     slots: &'a mut Option<TransferSlots>,
-) -> Result<&'a TransferSlots> {
-    if slots.is_none() {
-        *slots = Some(TransferSlots::new(device)?);
+    readback: bool,
+    bytes: u64,
+) -> Result<&'a [HostSlot]> {
+    let slots = slots.get_or_insert_with(TransferSlots::default);
+    let direction = if readback {
+        &mut slots.readback
+    } else {
+        &mut slots.upload
+    };
+    let needed = bytes.div_ceil(STAGING_CHUNK).min(2) as usize;
+    while direction.len() < needed {
+        // Keep successfully created slots if a later allocation fails. No GPU work
+        // has been submitted yet, and the next transfer can reuse them.
+        direction.push(HostSlot::new(device, readback)?);
     }
-    slots
-        .as_ref()
-        .ok_or(GpuError::OutOfMemory(MemoryUsage::Upload))
+    Ok(direction)
 }
 
 impl HostSlot {
@@ -1100,5 +1167,135 @@ impl HostSlot {
             dev.destroy_buffer(self.buffer, None);
             dev.free_memory(self.memory, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_slot_tests {
+    use super::*;
+    use crate::instance::VulkanInstance;
+    use zengpu_hal::{AdapterRequest, BufferDesc, DeviceRequest, GpuInstance};
+
+    #[test]
+    fn a_lost_device_does_not_retain_raw_pool_owners() {
+        let _guard = crate::test_gpu_lock();
+        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+            return;
+        };
+        let device = adapter.open(DeviceRequest::default()).expect("device");
+        let native = device
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("Vulkan");
+        let work = native.submit_raw(|_, _| Ok(())).expect("submit");
+        // Make the injected loss safe on real hardware without publishing the
+        // completed serial: the error branch must still dispose of this work.
+        unsafe {
+            native
+                .inner
+                .device
+                .wait_for_fences(&[work.fence], true, u64::MAX)
+                .expect("GPU idle");
+        }
+        *FORCED_RAW_WAIT_ERROR.lock().unwrap() = Some(vk::Result::ERROR_DEVICE_LOST);
+        assert!(matches!(native.finish_raw(work), Err(GpuError::DeviceLost)));
+        assert!(native.failed_raw.lock().unwrap().is_empty());
+        assert!(native.is_lost());
+    }
+
+    #[test]
+    fn buffer_transfer_slots_grow_only_for_the_direction_and_chunks_used() {
+        let _guard = crate::test_gpu_lock();
+        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
+            eprintln!("no Vulkan adapter; skipping transfer slot test");
+            return;
+        };
+        let device = adapter.open(DeviceRequest::default()).expect("device");
+        let native = device
+            .as_any()
+            .downcast_ref::<VulkanDevice>()
+            .expect("Vulkan");
+        // Empty reads must neither allocate nor enqueue a zero-size Vulkan copy.
+        native
+            .staged_read(vk::Buffer::null(), 0, &mut [])
+            .expect("empty read");
+        assert!(native.transfer_slots.lock().unwrap().is_none());
+        let size = STAGING_CHUNK + 4;
+        let buffer = device
+            .create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .expect("buffer");
+        let raw = native
+            .buffers
+            .lock()
+            .unwrap()
+            .get(buffer)
+            .expect("live buffer")
+            .buffer;
+        let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        // Force staging even on a device that exposes host-mappable GPU memory.
+        native
+            .staged_write(raw, 0, &data[..65540])
+            .expect("small upload");
+        let upload = {
+            let slots = native.transfer_slots.lock().unwrap();
+            let slots = slots.as_ref().expect("upload staging");
+            assert_eq!((slots.upload.len(), slots.readback.len()), (1, 0));
+            slots.upload[0].buffer
+        };
+        let mut back = vec![0; 65540];
+        native
+            .staged_read(raw, 0, &mut back)
+            .expect("small readback");
+        assert_eq!(back, data[..65540]);
+        // A transient wait error must retain the live fence/command buffer and
+        // prevent both slot reuse and mapped public buffer access until recovery.
+        *FORCED_RAW_WAIT_ERROR.lock().unwrap() = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        assert!(native.staged_write(raw, 0, &data[..65540]).is_err());
+        assert_eq!(native.failed_raw.lock().unwrap().len(), 1);
+        assert_eq!(
+            native.trim_buffer_staging(),
+            0,
+            "failed waits still own staging"
+        );
+        *FORCED_RAW_WAIT_ERROR.lock().unwrap() = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+        assert!(device.write_buffer(buffer, 0, &[42; 4]).is_err());
+        assert_eq!(native.failed_raw.lock().unwrap().len(), 1);
+        native.recover_raw_waits().expect("retry the fence wait");
+        assert!(native.failed_raw.lock().unwrap().is_empty());
+        {
+            let slots = native.transfer_slots.lock().unwrap();
+            let slots = slots.as_ref().expect("readback staging");
+            assert_eq!((slots.upload.len(), slots.readback.len()), (1, 1));
+        }
+        native
+            .staged_write(raw, 0, &data)
+            .expect("two-chunk upload");
+        back.resize(size as usize, 0);
+        native
+            .staged_read(raw, 0, &mut back)
+            .expect("two-chunk readback");
+        assert_eq!(back, data);
+        {
+            let slots = native.transfer_slots.lock().unwrap();
+            let slots = slots.as_ref().expect("both directions");
+            assert_eq!((slots.upload.len(), slots.readback.len()), (2, 2));
+            assert_eq!(
+                slots.upload[0].buffer, upload,
+                "growth reuses the first slot"
+            );
+        }
+        assert_eq!(device.trim_memory(), STAGING_CHUNK * 4);
+        assert!(native.transfer_slots.lock().unwrap().is_none());
+        native
+            .staged_write(raw, 0, &data[..65540])
+            .expect("upload after trim");
+        assert_eq!(device.trim_memory(), STAGING_CHUNK);
+        device.destroy_buffer(buffer);
     }
 }

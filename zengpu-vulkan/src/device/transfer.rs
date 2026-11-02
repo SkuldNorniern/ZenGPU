@@ -4,7 +4,7 @@
 //! finishes; the ring grows when a write does not fit. Busy-ring overflow uses a bounded buffer
 //! pool. Each copy ends with a barrier for whatever reads next.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::ptr::copy_nonoverlapping;
 
 use ash::{Device, vk};
@@ -155,6 +155,18 @@ struct Placed {
     row_texels: u32,
 }
 
+/// A batch can initialize several regions of the same mip/layer. Only its first
+/// write may discard undefined contents; later writes must preserve earlier ones.
+fn batch_write_ready(
+    initialized: &mut HashSet<(vk::Image, u32, u32)>,
+    image: vk::Image,
+    region: TextureRegion,
+    was_ready: bool,
+) -> bool {
+    let first = initialized.insert((image, region.mip_level, region.layer));
+    was_ready || !first
+}
+
 impl VulkanDevice {
     /// Releases idle upload staging buffers without waiting for GPU work. Returns
     /// their buffer capacities in bytes (the driver allocation can be larger).
@@ -223,6 +235,7 @@ impl VulkanDevice {
         (staging, base): (BufferHandle, u64),
     ) -> Result<(Submission, u64)> {
         let mut placed = Vec::with_capacity(writes.len());
+        let mut initialized = HashSet::with_capacity(writes.len());
         let mut at = base;
         for (write, size) in writes.iter().zip(sizes) {
             self.copy_rows_into(staging, at, write)?;
@@ -231,7 +244,12 @@ impl VulkanDevice {
                 image,
                 resting,
                 region: write.region,
-                was_ready: self.is_ready(write.texture, write.region),
+                was_ready: batch_write_ready(
+                    &mut initialized,
+                    image,
+                    write.region,
+                    self.is_ready(write.texture, write.region),
+                ),
                 offset: at,
                 row_texels: write.region.width,
             });
@@ -723,6 +741,42 @@ fn record_buffer_to_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_write_to_a_fresh_subresource_discards_contents() {
+        let mut initialized = HashSet::new();
+        let image = vk::Image::null();
+        let base = TextureRegion::rect(0, 0, 2, 2);
+        assert!(!batch_write_ready(&mut initialized, image, base, false));
+        let other_region = TextureRegion::rect(2, 0, 2, 2);
+        assert!(batch_write_ready(
+            &mut initialized,
+            image,
+            other_region,
+            false
+        ));
+        assert!(!batch_write_ready(
+            &mut initialized,
+            image,
+            TextureRegion {
+                mip_level: 1,
+                ..base
+            },
+            false
+        ));
+        assert!(!batch_write_ready(
+            &mut initialized,
+            image,
+            TextureRegion { layer: 1, ..base },
+            false
+        ));
+        assert!(batch_write_ready(
+            &mut initialized,
+            image,
+            TextureRegion { layer: 2, ..base },
+            true
+        ));
+    }
 
     #[test]
     fn overflow_buffers_wait_for_completion_and_choose_the_smallest_fit() {

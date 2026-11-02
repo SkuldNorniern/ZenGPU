@@ -143,7 +143,7 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn trim_memory(&self) -> u64 {
-        self.trim_staging_memory()
+        self.trim_staging_memory() + self.trim_buffer_staging()
     }
 
     fn create_buffer(&self, desc: BufferDesc) -> Result<BufferHandle> {
@@ -265,6 +265,7 @@ impl GpuDevice for VulkanDevice {
 
     fn write_buffer(&self, buffer: BufferHandle, offset: u64, data: &[u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
+        self.recover_raw_waits()?;
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
         if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
@@ -299,6 +300,7 @@ impl GpuDevice for VulkanDevice {
 
     fn read_buffer(&self, buffer: BufferHandle, offset: u64, len: u64) -> Result<Vec<u8>> {
         let buffers = self.buffers.lock().unwrap();
+        self.recover_raw_waits()?;
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
         if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
@@ -340,6 +342,7 @@ impl GpuDevice for VulkanDevice {
 
     fn read_buffer_into(&self, buffer: BufferHandle, offset: u64, dst: &mut [u8]) -> Result<()> {
         let buffers = self.buffers.lock().unwrap();
+        self.recover_raw_waits()?;
         let buf = buffers.get(buffer).ok_or_else(|| stale(buffer, &buffers))?;
         if self.buffer_busy(buffer.index()) {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
