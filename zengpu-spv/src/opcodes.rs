@@ -109,6 +109,9 @@ pub fn lookup(opcode: u16) -> OpInfo {
             true,
             IdsAt { idx: &[0, 1, 3] },
         ),
+        98 => OpInfo::new("OpImageRead", true, true, IdsAt { idx: &[0, 1] }),
+        99 => OpInfo::new("OpImageWrite", false, false, IdsAt { idx: &[0, 1, 2] }),
+        104 => OpInfo::new("OpImageQuerySize", true, true, IdsAt { idx: &[0] }),
         109 => OpInfo::new("OpConvertFToU", true, true, AllIds),
         110 => OpInfo::new("OpConvertFToS", true, true, AllIds),
         111 => OpInfo::new("OpConvertSToF", true, true, AllIds),
@@ -219,4 +222,27 @@ pub fn decode_string(words: &[u32]) -> String {
         }
     }
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_image_ops_name_their_ids() {
+        let read = lookup(98);
+        assert_eq!(read.name, "OpImageRead");
+        assert!(read.has_result_type && read.has_result_id);
+        assert_eq!(id_operands(read.trailing, &[3, 4]), vec![3, 4]);
+
+        let write = lookup(99);
+        assert_eq!(write.name, "OpImageWrite");
+        assert!(!write.has_result_type && !write.has_result_id);
+        assert_eq!(id_operands(write.trailing, &[3, 4, 5]), vec![3, 4, 5]);
+
+        let size = lookup(104);
+        assert_eq!(size.name, "OpImageQuerySize");
+        assert!(size.has_result_type && size.has_result_id);
+        assert_eq!(id_operands(size.trailing, &[6]), vec![6]);
+    }
 }
