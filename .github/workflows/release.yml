@@ -26,6 +26,19 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Check tag and workspace versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: python
+        run: |
+          import json, os, subprocess
+          metadata = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], text=True))
+          members = set(metadata["workspace_members"])
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          mismatches = [f"{p['name']}={p['version']}" for p in metadata["packages"] if p["id"] in members and p["version"] != expected]
+          if mismatches:
+              raise SystemExit("Release tag does not match workspace versions: " + ", ".join(mismatches))
+
       # CI has built the packaged crates on this commit. Assemble fresh archives
       # here for the release, without publishing anything to crates.io.
       - name: Assemble release archives

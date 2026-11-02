@@ -133,8 +133,6 @@ the selected adapter:
 ZENGPU_REQUIRE_METAL=1 cargo test -p zengpu-metal graphics_tests -- --test-threads=1 --nocapture
 ```
 
-Release validation and crate publishing order: [RELEASING.md](RELEASING.md).
-
 ## License
 
 [Apache-2.0](LICENSE).
