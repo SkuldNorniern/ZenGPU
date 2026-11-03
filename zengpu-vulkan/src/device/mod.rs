@@ -50,6 +50,10 @@ const MAX_BINDLESS_BUFFERS: u32 = 4096;
 
 const MAX_BINDLESS_TEXTURES: u32 = 1024;
 
+/// Floor for probe-and-halve: stop shrinking before going below these.
+const MIN_BINDLESS_BUFFERS: u32 = 64;
+const MIN_BINDLESS_TEXTURES: u32 = 64;
+
 /// Storage-image slots for single-level views (`storage_level`), past the texture-index range.
 const MAX_LEVEL_VIEW_SLOTS: u32 = 256;
 
@@ -1374,14 +1378,14 @@ fn level_view_capacity(limits: DeviceLimits, used: u32, storage_capacity: u32) -
         .min(limits.max_update_after_bind_descriptors - used - storage_capacity)
 }
 
-fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
-    let (buffer_capacity, texture_capacity, storage_capacity) = bindless_capacities(limits)?;
-    let level_view_capacity = level_view_capacity(
-        limits,
-        buffer_capacity * SSBO_TYPED_TABLE_COUNT + texture_capacity,
-        storage_capacity,
-    );
-    let storage_table = storage_capacity + level_view_capacity;
+fn create_bindless_layout(
+    dev: &ash::Device,
+    buffer_capacity: u32,
+    texture_capacity: u32,
+    storage_capacity: u32,
+    lv_cap: u32,
+) -> Result<vk::DescriptorSetLayout> {
+    let storage_table = storage_capacity + lv_cap;
     let mut bindings = vec![
         vk::DescriptorSetLayoutBinding {
             binding: SSBO_BINDING_F32,
@@ -1431,7 +1435,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         p_binding_flags: binding_flags.as_ptr(),
         ..Default::default()
     };
-    let layout = unsafe {
+    unsafe {
         dev.create_descriptor_set_layout(
             &vk::DescriptorSetLayoutCreateInfo {
                 flags: vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL,
@@ -1442,20 +1446,90 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
             },
             None,
         )
-        .map_err(|e| GpuError::Backend(format!("bindless layout: {e}")))?
+        .map_err(|e| GpuError::Backend(format!("bindless layout: {e}")))
+    }
+}
+
+fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
+    let (mut buf_cap, mut tex_cap, mut stor_cap) = bindless_capacities(limits)?;
+
+    // Some drivers (e.g. Qualcomm Adreno X1-45) report enormous descriptor limits but return
+    // VK_ERROR_OUT_OF_HOST_MEMORY when vkCreatePipelineLayout references a layout that actually
+    // uses them.  Probe with a throw-away pipeline layout and halve capacities on each failure.
+    let layout = loop {
+        let lv_cap = level_view_capacity(
+            limits,
+            buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap,
+            stor_cap,
+        );
+        let layout = create_bindless_layout(dev, buf_cap, tex_cap, stor_cap, lv_cap)?;
+
+        let push_range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::ALL,
+            offset: 0,
+            size: 256,
+        };
+        let probe = unsafe {
+            dev.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo {
+                    set_layout_count: 1,
+                    p_set_layouts: &layout,
+                    push_constant_range_count: 1,
+                    p_push_constant_ranges: &push_range,
+                    ..Default::default()
+                },
+                None,
+            )
+        };
+
+        match probe {
+            Ok(test_layout) => {
+                unsafe { dev.destroy_pipeline_layout(test_layout, None) };
+                break layout;
+            }
+            Err(vk::Result::ERROR_OUT_OF_HOST_MEMORY) => {
+                unsafe { dev.destroy_descriptor_set_layout(layout, None) };
+                let next_buf = buf_cap / 2;
+                let next_tex = tex_cap / 2;
+                if next_buf < MIN_BINDLESS_BUFFERS || next_tex < MIN_BINDLESS_TEXTURES {
+                    return Err(GpuError::Unsupported(format!(
+                        "vkCreatePipelineLayout OOM even with minimal bindless sizes \
+                         ({buf_cap} buffers, {tex_cap} textures)"
+                    )));
+                }
+                log::warn!(
+                    "bindless probe: vkCreatePipelineLayout OOM at {buf_cap} buffers / \
+                     {tex_cap} textures; retrying at {next_buf} / {next_tex}"
+                );
+                buf_cap = next_buf;
+                tex_cap = next_tex;
+                stor_cap /= 2;
+            }
+            Err(e) => {
+                unsafe { dev.destroy_descriptor_set_layout(layout, None) };
+                return Err(GpuError::Backend(format!("vkCreatePipelineLayout probe: {e}")));
+            }
+        }
     };
+
+    let lv_cap = level_view_capacity(
+        limits,
+        buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap,
+        stor_cap,
+    );
+    let storage_table = stor_cap + lv_cap;
 
     let mut pool_sizes = vec![
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: buffer_capacity * SSBO_TYPED_TABLE_COUNT,
+            descriptor_count: buf_cap * SSBO_TYPED_TABLE_COUNT,
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: texture_capacity,
+            descriptor_count: tex_cap,
         },
     ];
-    if storage_capacity != 0 {
+    if stor_cap != 0 {
         pool_sizes.push(vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_IMAGE,
             descriptor_count: storage_table,
@@ -1496,15 +1570,12 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         layout,
         pool,
         set,
-        buffer_capacity,
-        texture_capacity,
-        storage_capacity,
-        level_view_capacity,
-        level_slots: Arc::new(Mutex::new(LevelSlots::new(
-            storage_capacity,
-            level_view_capacity,
-        ))),
-        bound_textures: Mutex::new(vec![false; texture_capacity as usize]),
+        buffer_capacity: buf_cap,
+        texture_capacity: tex_cap,
+        storage_capacity: stor_cap,
+        level_view_capacity: lv_cap,
+        level_slots: Arc::new(Mutex::new(LevelSlots::new(stor_cap, lv_cap))),
+        bound_textures: Mutex::new(vec![false; tex_cap as usize]),
     })
 }
 
