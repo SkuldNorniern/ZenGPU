@@ -1,4 +1,6 @@
 //! ZenGPU Vulkan backend, Vulkan 1.2+.
+//!
+//! Some calls here use `ash` types, so an `ash` upgrade can break this crate's API.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

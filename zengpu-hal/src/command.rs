@@ -11,7 +11,8 @@ pub enum Scalar {
 }
 
 /// Resources are referenced by slot index ([`crate::Handle::index`]), not by a per-pipeline
-/// descriptor slot. That keeps the compiler ABI stable as kernels gain arguments.
+/// descriptor slot. That keeps the compiler ABI stable as kernels gain arguments. A slot has no
+/// generation, so a destroyed resource can't be detected here.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bindings<'a> {
     pub buffers: &'a [u32],

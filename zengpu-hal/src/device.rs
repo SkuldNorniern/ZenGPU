@@ -406,8 +406,8 @@ pub trait GpuDevice: Send + Sync {
         )
     }
 
-    /// Waits for a submission, up to a timeout. A `wait` timeout does not cancel the work. Keep the
-    /// handle and all referenced resources until it completes.
+    /// Starts a batch of dispatches as one submission and returns it. Keep the handle and all
+    /// referenced resources until it completes.
     ///
     /// The default has no async submission and runs synchronously.
     fn submit_batch(&self, cycle_id: u64, ops: &[DispatchOp<'_>]) -> Result<Submission> {

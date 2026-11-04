@@ -474,8 +474,8 @@ impl TextureRegion {
 pub struct TextureWrite<'a> {
     pub texture: TextureHandle,
     pub region: TextureRegion,
-    /// Tightly packed texel rows, top row first.
+    /// Texel rows, top row first, `bytes_per_row` apart.
     pub data: &'a [u8],
-    /// Bytes from one row to the next. Must be at least the region width.
+    /// Bytes from one row to the next. Must be at least the region's width in bytes.
     pub bytes_per_row: u32,
 }

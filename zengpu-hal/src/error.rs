@@ -1,4 +1,4 @@
-//! Enum-based errors with no external crates. Raw backend types never leak into the public API.
+//! Enum-based errors with no external crates, and no raw backend types.
 
 use core::fmt::{Display, Formatter, Result as FmtResult};
 use core::result::Result as CoreResult;
