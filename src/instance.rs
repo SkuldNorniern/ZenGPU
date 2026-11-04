@@ -175,25 +175,6 @@ impl InstanceBuilder {
         }
     }
 
-    /// Adds DX12. Never fails here. Yields no adapters off Windows. DXGI enumeration is not
-    /// yet implemented.
-    #[cfg(feature = "dx12")]
-    pub fn dx12(mut self) -> Self {
-        self.backends
-            .push(Box::new(zengpu_dx12::Dx12Instance::new()));
-        self
-    }
-
-    /// Registers the OpenGL placeholder. It currently returns no adapters, even
-    /// for an explicit `BackendPreference::OpenGl` request. This does not enable
-    /// an older-hardware fallback until the backend is implemented.
-    #[cfg(feature = "opengl")]
-    pub fn opengl(mut self) -> Self {
-        self.backends
-            .push(Box::new(zengpu_opengl::OpenGlInstance::new()));
-        self
-    }
-
     /// Add the CPU reference backend. Never fails.
     #[cfg(feature = "cpu")]
     pub fn cpu(mut self) -> Self {
@@ -205,50 +186,6 @@ impl InstanceBuilder {
         Instance {
             backends: self.backends,
         }
-    }
-}
-
-#[cfg(all(test, feature = "opengl"))]
-mod opengl_tests {
-    use super::Instance;
-    use zengpu_hal::{AdapterRequest, BackendPreference};
-
-    #[test]
-    fn the_opengl_placeholder_never_advertises_a_device() {
-        let instance = Instance::builder().opengl().build();
-        assert!(instance.enumerate_adapters().is_empty());
-        assert!(
-            instance
-                .request_adapter(AdapterRequest::default())
-                .is_none()
-        );
-        assert!(
-            instance
-                .request_adapter(AdapterRequest {
-                    backend: BackendPreference::OpenGl,
-                    ..Default::default()
-                })
-                .is_none()
-        );
-    }
-
-    #[cfg(feature = "cpu")]
-    #[test]
-    fn an_explicit_opengl_request_does_not_select_the_cpu_oracle() {
-        let instance = Instance::builder().opengl().cpu().build();
-        assert!(
-            instance
-                .request_adapter(AdapterRequest::default())
-                .is_some()
-        );
-        assert!(
-            instance
-                .request_adapter(AdapterRequest {
-                    backend: BackendPreference::OpenGl,
-                    ..Default::default()
-                })
-                .is_none()
-        );
     }
 }
 

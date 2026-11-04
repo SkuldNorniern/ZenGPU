@@ -53,8 +53,6 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 | HIP/ROCm (`hip`) | no | yes | Linux |
 | CUDA (`cuda`) | no | yes | Linux, Windows |
 | CPU (`cpu`) | no | yes | all, for conformance tests |
-| DirectX 12 (`dx12`) | skeleton | skeleton | Windows |
-| OpenGL (`opengl`) | placeholder | placeholder | no adapters yet |
 
 GPU image codec calls are reserved through `image_codec_caps`, `decode_image`
 and `encode_image`. Every current backend reports no codec support and returns
@@ -111,9 +109,9 @@ More in [`examples/`](examples/).
 ## Crates
 
 Depend on `zengpu`. Subcrates: `zengpu-hal` (types and traits), one per
-backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-dx12`, `-opengl`, `-cpu`),
+backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-cpu`),
 `zengpu-compute`, `zengpu-spirv` and `zengpu-zsl` (shaders),
-`zengpu-spv` (SPIR-V checks), `zengpu-conformance`.
+`zengpu-spv` (SPIR-V checks).
 
 ## Building
 

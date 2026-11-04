@@ -27,6 +27,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/SkuldNorniern/ZenGPU"
 homepage = "https://github.com/SkuldNorniern/ZenGPU"
 authors = ["Skuld Norniern <skuldnorniern@gmail.com>"]
@@ -79,10 +80,6 @@ cuda = ["zengpu-cuda", "zengpu-spirv/cuda"]
 metal = ["zengpu-metal", "zengpu-spirv/metal"]
 # AMD ROCm/HIP compute backend (compute HAL only).
 hip = ["zengpu-hip", "zengpu-spirv/hip"]
-# DirectX 12 backend (Windows, graphics + compute).
-dx12 = ["zengpu-dx12"]
-# Future OpenGL path for older hardware. Placeholder only; provides no adapters.
-opengl = ["dep:zengpu-opengl"]
 
 [dependencies]
 zengpu-hal.workspace = true
@@ -92,8 +89,6 @@ zengpu-compute = { workspace = true, optional = true }
 zengpu-cuda = { workspace = true, optional = true }
 zengpu-metal = { workspace = true, optional = true }
 zengpu-hip = { workspace = true, optional = true }
-zengpu-dx12 = { workspace = true, optional = true }
-zengpu-opengl = { workspace = true, optional = true }
 zengpu-spirv.workspace = true
 log.workspace = true
 

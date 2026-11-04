@@ -266,12 +266,6 @@ impl Device {
     pub fn as_hip(&self) -> Option<&zengpu_hip::HipDevice> {
         self.inner.as_any().downcast_ref()
     }
-
-    /// `Dx12Device`, or `None` if not DX12.
-    #[cfg(feature = "dx12")]
-    pub fn as_dx12(&self) -> Option<&zengpu_dx12::Dx12Device> {
-        self.inner.as_any().downcast_ref()
-    }
 }
 
 /// Lets `&Device` coerce to `&dyn GpuDevice`.

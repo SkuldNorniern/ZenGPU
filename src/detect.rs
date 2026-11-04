@@ -4,7 +4,7 @@ use zengpu_hal::{AdapterInfo, GpuInstance};
 #[derive(Debug, Clone)]
 pub struct BackendAvailability {
     /// Short identifier matching the Cargo feature name: `"vulkan"`, `"cuda"`, `"metal"`, `"hip"`,
-    /// `"dx12"`, `"opengl"`, `"cpu"`.
+    /// `"cpu"`.
     pub name: &'static str,
     /// Adapters the backend sees. Never empty: empty backends are dropped.
     pub adapters: Vec<AdapterInfo>,
@@ -14,7 +14,7 @@ pub struct BackendAvailability {
 /// runtime.
 ///
 /// Only compiled-in features are checked. A build with only `--features cuda` never probes Vulkan.
-/// The list is in probe order: Metal (on macOS), Vulkan, CUDA, HIP, DX12, OpenGL, CPU. The native backend
+/// The list is in probe order: Metal (on macOS), Vulkan, CUDA, HIP, CPU. The native backend
 /// comes first.
 ///
 /// # Example
@@ -73,18 +73,6 @@ fn probe_all(out: &mut Vec<BackendAvailability>) {
         if let Ok(inst) = zengpu_hip::HipInstance::new() {
             push_if_nonempty(out, "hip", &inst);
         }
-    }
-
-    #[cfg(feature = "dx12")]
-    {
-        let inst = zengpu_dx12::Dx12Instance::new();
-        push_if_nonempty(out, "dx12", &inst);
-    }
-
-    #[cfg(feature = "opengl")]
-    {
-        let inst = zengpu_opengl::OpenGlInstance::new();
-        push_if_nonempty(out, "opengl", &inst);
     }
 
     #[cfg(feature = "cpu")]

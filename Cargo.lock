@@ -1831,11 +1831,9 @@ dependencies = [
  "zengpu-compute",
  "zengpu-cpu",
  "zengpu-cuda",
- "zengpu-dx12",
  "zengpu-hal",
  "zengpu-hip",
  "zengpu-metal",
- "zengpu-opengl",
  "zengpu-spirv",
  "zengpu-vulkan",
 ]

@@ -1,5 +1,6 @@
 [package]
 name = "zengpu-conformance"
+publish = false
 description = "ZenGPU conformance harness: validates backend correctness against the CPU reference backend."
 version.workspace = true
 edition.workspace = true

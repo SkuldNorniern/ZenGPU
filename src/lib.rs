@@ -10,8 +10,6 @@
 //! | `cuda`    | no      | CUDA Driver API backend (NVIDIA, compute only). |
 //! | `cpu`     | no      | CPU reference backend for conformance tests. |
 //! | `hip`     | no      | HIP/ROCm backend (AMD, compute only). |
-//! | `dx12`    | no      | DirectX 12 backend (Windows), not yet implemented. |
-//! | `opengl`  | no      | Placeholder for older hardware; no usable adapters yet. |
 //!
 //! # Backends
 //!
@@ -20,7 +18,7 @@
 //! Use [`Device::as_vulkan`] for swapchain and frame-graph work, and `Device::as_cpu` for the
 //! CPU conformance oracle.
 //! Sub-crates are re-exported under [`vulkan`], [`compute`], `cpu`, `cuda`,
-//! [`metal`], `hip`, `dx12`.
+//! [`metal`], `hip`.
 //!
 //! ```no_run
 //! use zengpu::{Instance, AdapterRequest, BufferDesc, BufferUsage, MemoryUsage};
@@ -120,11 +118,3 @@ pub use zengpu_metal as metal;
 /// AMD ROCm/HIP compute backend.
 #[cfg(feature = "hip")]
 pub use zengpu_hip as hip;
-
-/// DirectX 12 backend (Windows, graphics + compute).
-#[cfg(feature = "dx12")]
-pub use zengpu_dx12 as dx12;
-
-/// OpenGL placeholder. No driver loading or usable adapters are implemented.
-#[cfg(feature = "opengl")]
-pub use zengpu_opengl as opengl;

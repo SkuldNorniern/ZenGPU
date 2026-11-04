@@ -1,5 +1,6 @@
 [package]
 name = "zengpu-tile"
+publish = false
 description = "ZenGPU tile layer: block-level kernels lowered to ZSL, with an O0 reference schedule."
 version.workspace = true
 edition.workspace = true

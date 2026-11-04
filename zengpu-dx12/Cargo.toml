@@ -1,5 +1,6 @@
 [package]
 name = "zengpu-dx12"
+publish = false
 description = "ZenGPU DirectX 12 backend (Windows, graphics + compute): skeleton."
 version.workspace = true
 edition.workspace = true
