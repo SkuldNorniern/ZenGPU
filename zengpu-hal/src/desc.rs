@@ -135,6 +135,8 @@ pub enum AddressMode {
     ClampToEdge,
     Repeat,
     MirrorRepeat,
+    /// Outside the texture reads `SamplerDesc::border`.
+    ClampToBorder,
 }
 
 /// Border color for clamp-to-border. The three presets need no extra device feature on any backend.
@@ -159,7 +161,7 @@ pub struct SamplerDesc {
     pub lod_max: f32,
     /// `None` for a normal sampler. Set this for shadow-map PCF.
     pub compare: Option<CompareFn>,
-    /// Used only by clamp-to-border address modes.
+    /// Used only by [`AddressMode::ClampToBorder`].
     pub border: BorderColor,
 }
 

@@ -204,6 +204,7 @@ pub(crate) fn address(mode: AddressMode) -> MTLSamplerAddressMode {
         AddressMode::ClampToEdge => MTLSamplerAddressMode::ClampToEdge,
         AddressMode::Repeat => MTLSamplerAddressMode::Repeat,
         AddressMode::MirrorRepeat => MTLSamplerAddressMode::MirrorRepeat,
+        AddressMode::ClampToBorder => MTLSamplerAddressMode::ClampToBorderColor,
     }
 }
 

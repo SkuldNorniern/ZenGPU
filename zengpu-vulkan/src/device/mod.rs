@@ -6960,6 +6960,21 @@ mod tests {
     }
 
     #[test]
+    fn a_sampler_can_clamp_to_its_border() {
+        use zengpu_hal::{AddressMode, BorderColor, SamplerDesc};
+
+        let Some(dev) = try_device() else { return };
+        let sampler = dev
+            .create_sampler(SamplerDesc {
+                address: AddressMode::ClampToBorder,
+                border: BorderColor::OpaqueWhite,
+                ..SamplerDesc::default()
+            })
+            .expect("sampler");
+        dev.destroy_sampler(sampler);
+    }
+
+    #[test]
     fn zsl_mul_add_f32_runs_through_vulkan() {
         use zengpu_shader::{ZslShader, zsl};
 

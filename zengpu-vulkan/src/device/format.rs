@@ -19,6 +19,7 @@ pub(crate) fn address_to_vk(a: AddressMode) -> vk::SamplerAddressMode {
         AddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
         AddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
         AddressMode::MirrorRepeat => vk::SamplerAddressMode::MIRRORED_REPEAT,
+        AddressMode::ClampToBorder => vk::SamplerAddressMode::CLAMP_TO_BORDER,
     }
 }
 
