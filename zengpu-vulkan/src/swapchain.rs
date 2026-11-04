@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use ash::{Device, khr, vk};
 use zengpu_hal::{GpuError, PresentMode, Result, SurfaceError};
 
+use crate::device::format::hal_format_to_vk;
 use crate::device::{VulkanDevice, VulkanDeviceInner};
 use crate::instance::VulkanShared;
 #[cfg(target_os = "macos")]
@@ -27,6 +28,8 @@ struct SwapchainResources {
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
     extent: vk::Extent2D,
+    format: vk::Format,
+    present_mode: vk::PresentModeKHR,
     /// Signalled when a frame's commands finish. One per swapchain image: presentation can hold it
     /// after the next acquire returns a different image, so a per-slot set could be re-signalled
     /// while in use.
@@ -55,8 +58,6 @@ pub struct Swapchain {
     surface_loader: khr::surface::Instance,
     swapchain_loader: khr::swapchain::Device,
     surface: vk::SurfaceKHR,
-    format: vk::Format,
-    present_mode: vk::PresentModeKHR,
     cmd_pool: vk::CommandPool,
     cmd_buffers: Vec<vk::CommandBuffer>,
     image_available: Vec<vk::Semaphore>,
@@ -135,7 +136,12 @@ impl Swapchain {
             surface,
             config.present_mode,
         )?;
-        let format = pick_format(&surface_loader, inner.physical, surface)?;
+        let format = pick_format(
+            &surface_loader,
+            inner.physical,
+            surface,
+            hal_format_to_vk(config.format),
+        )?;
 
         let (swapchain, images, extent) = create_swapchain(
             &surface_loader,
@@ -170,8 +176,6 @@ impl Swapchain {
             surface_loader,
             swapchain_loader,
             surface,
-            format,
-            present_mode,
             cmd_pool,
             cmd_buffers,
             image_available,
@@ -182,6 +186,8 @@ impl Swapchain {
                 images,
                 image_views,
                 extent,
+                format,
+                present_mode,
                 render_finished,
             }),
             frame_state: Mutex::new(FrameState {
@@ -200,7 +206,7 @@ impl Swapchain {
     }
 
     pub fn format(&self) -> zengpu_hal::Format {
-        crate::from_vk_format(self.format).expect("swapchain has unsupported vk::Format")
+        crate::from_vk_format(self.raw_format()).expect("swapchain has unsupported vk::Format")
     }
 
     pub fn extent(&self) -> (u32, u32) {
@@ -209,7 +215,7 @@ impl Swapchain {
     }
 
     pub(crate) fn raw_format(&self) -> vk::Format {
-        self.format
+        self.resources.lock().unwrap().format
     }
 
     pub(crate) fn raw_extent(&self) -> vk::Extent2D {
@@ -353,6 +359,27 @@ impl Swapchain {
         self.recreate(&mut res, width, height)
     }
 
+    /// Recreates the swapchain to `config`, as near as the surface allows.
+    pub fn configure(&self, config: zengpu_hal::SurfaceConfig) -> Result<()> {
+        let physical = self.inner.physical;
+        let wanted = hal_format_to_vk(config.format);
+        let format = pick_format(&self.surface_loader, physical, self.surface, wanted)?;
+        let present_mode = pick_present_mode(
+            &self.surface_loader,
+            physical,
+            self.surface,
+            config.present_mode,
+        )?;
+        let mut res = self.resources.lock().unwrap();
+        let before = (res.format, res.present_mode);
+        (res.format, res.present_mode) = (format, present_mode);
+        let made = self.recreate(&mut res, config.width, config.height);
+        if made.is_err() {
+            (res.format, res.present_mode) = before;
+        }
+        made
+    }
+
     pub(crate) fn wait_idle(&self) -> Result<()> {
         let _queue = self.inner.queue_lock.lock().unwrap();
         unsafe {
@@ -377,14 +404,14 @@ impl Swapchain {
             &self.swapchain_loader,
             self.inner.physical,
             self.surface,
-            self.format,
-            self.present_mode,
+            res.format,
+            res.present_mode,
             width,
             height,
             old_swapchain,
         )?;
 
-        let image_views = match create_image_views(&self.inner.device, &images, self.format) {
+        let image_views = match create_image_views(&self.inner.device, &images, res.format) {
             Ok(views) => views,
             Err(e) => {
                 unsafe { self.swapchain_loader.destroy_swapchain(swapchain, None) };
@@ -622,20 +649,22 @@ fn pick_format(
     surface_loader: &khr::surface::Instance,
     physical: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
+    wanted: vk::Format,
 ) -> Result<vk::Format> {
     let formats = unsafe {
         surface_loader
             .get_physical_device_surface_formats(physical, surface)
             .map_err(|e| GpuError::Backend(format!("surface formats: {e}")))?
     };
-    choose_format(&formats)
+    choose_format(&formats, wanted)
         .ok_or_else(|| GpuError::Backend("no usable surface formats".to_string()))
 }
 
-/// Linear 8-bit first, since sRGB would change blending.
-fn choose_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Format> {
+/// `wanted` if offered, then linear 8-bit, since sRGB would change blending.
+fn choose_format(formats: &[vk::SurfaceFormatKHR], wanted: vk::Format) -> Option<vk::Format> {
     let offered = |wanted| formats.iter().map(|f| f.format).find(|f| *f == wanted);
-    offered(vk::Format::B8G8R8A8_UNORM)
+    offered(wanted)
+        .or_else(|| offered(vk::Format::B8G8R8A8_UNORM))
         .or_else(|| offered(vk::Format::R8G8B8A8_UNORM))
         .or_else(|| {
             formats
@@ -1098,7 +1127,14 @@ mod tests {
     #[test]
     fn surface_format_prefers_linear_8_bit_and_refuses_what_hal_cannot_name() {
         use vk::Format as F;
-        let pick = |formats: &[F]| choose_format(&offered(formats));
+        let pick = |formats: &[F]| choose_format(&offered(formats), F::R16G16B16A16_SFLOAT);
+        assert_eq!(
+            choose_format(
+                &offered(&[F::B8G8R8A8_UNORM, F::R8G8B8A8_SRGB]),
+                F::R8G8B8A8_SRGB
+            ),
+            Some(F::R8G8B8A8_SRGB)
+        );
         assert_eq!(
             pick(&[F::R8G8B8A8_UNORM, F::B8G8R8A8_UNORM]),
             Some(F::B8G8R8A8_UNORM)

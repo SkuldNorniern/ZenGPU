@@ -129,7 +129,7 @@ impl Surface for VulkanSurface {
     type CommandList = VulkanCommandList;
 
     fn configure(&self, config: SurfaceConfig) -> Result<()> {
-        self.swapchain.resize(config.width, config.height)?;
+        self.swapchain.configure(config)?;
         self.rebuild_targets();
         Ok(())
     }
@@ -331,5 +331,43 @@ mod tests {
                 "opening another surface must reuse completed command buffers"
             );
         }
+
+        let surface = device
+            .create_surface(
+                &handles,
+                SurfaceConfig {
+                    width: 64,
+                    height: 64,
+                    format: zengpu_hal::Format::Bgra8Unorm,
+                    present_mode: zengpu_hal::PresentMode::Fifo,
+                },
+            )
+            .expect("surface");
+        surface
+            .configure(SurfaceConfig {
+                width: 64,
+                height: 64,
+                format: zengpu_hal::Format::Rgba8Unorm,
+                present_mode: zengpu_hal::PresentMode::Immediate,
+            })
+            .expect("configure");
+        let frame = (0..10)
+            .find_map(|_| match surface.acquire().expect("acquire") {
+                Acquire::Frame(frame) => Some(frame),
+                Acquire::Skip => None,
+            })
+            .expect("drawable surface");
+        let mut list = device.create_command_list().expect("command list");
+        list.begin_render_pass(&RenderPassDesc {
+            color: &[ColorAttachment {
+                target: frame.target(),
+                load: LoadOp::Clear([0.0, 0.0, 0.0, 1.0]),
+                store: true,
+                sample_after: false,
+            }],
+            depth: None,
+        });
+        list.end_render_pass();
+        surface.present(frame, list).expect("present");
     }
 }

@@ -89,11 +89,9 @@ pub trait GraphicsDevice: crate::GpuDevice {
     fn supports_non_solid_fill(&self) -> bool;
 }
 
-/// The frame was skipped: the window is minimized, or the surface was recreated.
-///
-/// The caller drops the frame.
 pub enum Acquire<F> {
     Frame(F),
+    /// Draw nothing: the window is minimized, or the surface was recreated.
     Skip,
 }
 
@@ -102,6 +100,8 @@ pub trait Surface {
     type Frame: Frame;
     type CommandList: RenderCommands;
 
+    /// Applies `config`, as near as the surface allows. Read `format` afterwards, since pipelines
+    /// made for another format no longer fit.
     fn configure(&self, config: SurfaceConfig) -> Result<()>;
 
     fn resize(&self, width: u32, height: u32) -> Result<()>;
