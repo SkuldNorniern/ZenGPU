@@ -56,8 +56,7 @@ One `zsl!` gives SPIR-V, HIP, CUDA and MSL; `ZslShader::for_backend` picks one.
 
 GPU image codec calls are reserved through `image_codec_caps`, `decode_image`
 and `encode_image`. Every current backend reports no codec support and returns
-`Unsupported`; there is no implicit CPU codec fallback. Qualcomm NPU, Google
-Cloud TPU and Edge TPU remain planned targets in `zengpu::accelerator`.
+`Unsupported`; there is no implicit CPU codec fallback.
 
 Other features: `compute` (default) for device arrays, pooling and
 elementwise kernels. GEMM and other BLAS routines live in the ZenBLAS repo.

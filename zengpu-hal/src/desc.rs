@@ -39,15 +39,6 @@ pub struct TextureDesc {
     pub array_layers: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RenderTargetDesc {
-    pub width: u32,
-    pub height: u32,
-    pub format: Format,
-    /// MSAA sample count. `1` means no multisampling.
-    pub samples: u32,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum ShaderSource<'a> {
     /// SPIR-V words as raw bytes. The length must be a multiple of 4.

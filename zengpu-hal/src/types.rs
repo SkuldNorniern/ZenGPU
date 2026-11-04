@@ -41,11 +41,6 @@ pub enum MemoryUsage {
     Readback,
     /// Host-visible device-local where available. For small frequent writes.
     CpuToGpu,
-    /// Per-frame scratch: sub-allocated and recycled.
-    Transient,
-    Persistent,
-    /// `GpuOnly` memory, reused by size class.
-    Pooled,
 }
 
 /// Bitflags over `u32`, combined with `|`.
@@ -101,12 +96,7 @@ impl Features {
     pub const DESCRIPTOR_INDEXING: Self = Self(1 << 2);
     pub const TIMESTAMPS: Self = Self(1 << 3);
     pub const FLOAT16: Self = Self(1 << 4);
-    pub const BFLOAT16: Self = Self(1 << 5);
-    pub const INT8_DOT: Self = Self(1 << 6);
-    pub const TENSOR_CORES: Self = Self(1 << 7);
-    pub const ASYNC_COMPUTE: Self = Self(1 << 8);
-    pub const MULTI_QUEUE: Self = Self(1 << 9);
-    pub const UNIFIED_MEMORY: Self = Self(1 << 10);
+    pub const UNIFIED_MEMORY: Self = Self(1 << 5);
 
     pub const fn empty() -> Self {
         Self(0)

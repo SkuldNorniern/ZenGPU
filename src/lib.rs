@@ -45,12 +45,13 @@
 //! # }
 //! ```
 
-pub mod accelerator;
-pub mod adapter;
-pub mod detect;
-pub mod device;
-pub mod instance;
-pub mod log;
+mod adapter;
+mod detect;
+mod device;
+mod instance;
+// Nothing starts it yet.
+#[allow(dead_code)]
+mod log;
 #[cfg(any(
     feature = "vulkan",
     all(any(target_os = "macos", target_os = "ios"), feature = "metal")
@@ -60,7 +61,7 @@ pub mod native;
 pub use adapter::Adapter;
 pub use detect::{BackendAvailability, detect_backends};
 pub use device::Device;
-pub use instance::Instance;
+pub use instance::{Instance, InstanceBuilder};
 
 pub use zengpu_hal as hal;
 pub use zengpu_hal::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
@@ -80,12 +81,12 @@ pub use zengpu_hal::{
     DepthAttachment, DepthState, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, Features,
     FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
     GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp, MemoryUsage, PipelineHandle,
-    PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc,
-    RenderTargetDesc, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle,
-    StencilFaceState, StencilOp, StencilState, StepMode, Submission, SubmissionStatus, Surface,
-    SurfaceConfig, SurfaceError, TargetHandle, TextureDesc, TextureHandle, TextureRegion,
-    TextureUsage, TextureWrite, TransferCaps, UsageError, VertexAttribute, VertexFormat,
-    VertexLayout, Viewport, ViewportScissor, WindowHandles,
+    PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, Result,
+    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, StencilFaceState, StencilOp,
+    StencilState, StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig, SurfaceError,
+    TargetHandle, TextureDesc, TextureHandle, TextureRegion, TextureUsage, TextureWrite,
+    TransferCaps, UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport,
+    ViewportScissor, WindowHandles,
 };
 
 #[cfg(feature = "compute")]

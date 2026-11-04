@@ -70,8 +70,8 @@ pub(crate) fn buffer_usage_to_vk(usage: BufferUsage) -> vk::BufferUsageFlags {
 
 pub(crate) fn memory_usage_to_vk(usage: MemoryUsage) -> vk::MemoryPropertyFlags {
     match usage {
-        MemoryUsage::GpuOnly | MemoryUsage::Pooled => vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        MemoryUsage::Upload | MemoryUsage::Transient | MemoryUsage::Persistent => {
+        MemoryUsage::GpuOnly => vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        MemoryUsage::Upload => {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
         }
         MemoryUsage::CpuToGpu => {

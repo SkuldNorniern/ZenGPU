@@ -11,8 +11,6 @@ pub struct AdapterRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DeviceRequest {
-    pub backend: BackendPreference,
-    pub power: PowerPreference,
     /// Features that must be present, or device creation fails.
     pub required: Features,
     /// Features to enable if available, ignored if not.

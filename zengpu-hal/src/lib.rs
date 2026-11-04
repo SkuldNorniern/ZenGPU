@@ -14,7 +14,6 @@ mod device;
 mod error;
 mod graphics;
 mod handle;
-mod pool;
 mod request;
 mod submission;
 mod surface;
@@ -29,7 +28,6 @@ pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,
     RenderPassDesc, Surface, ViewportScissor,
 };
-pub use pool::TexturePool;
 pub use request::{
     AdapterRequest, DeviceLimits, DeviceRequest, FormatCaps, HalCapabilities, MemoryBudget,
     TransferCaps,
@@ -44,14 +42,14 @@ pub use desc::{
     AddressMode, BlendComponent, BlendFactor, BlendMode, BlendOp, BlendState, BorderColor,
     BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, ComputePipelineHints, CullMode,
     DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, PipelineStats, PolygonMode,
-    PrimitiveTopology, RasterState, RenderTargetDesc, SamplerDesc, ShaderDesc, ShaderSource,
-    StencilFaceState, StencilOp, StencilState, StepMode, SurfaceConfig, TexDim, TextureDesc,
-    TextureRegion, TextureWrite, VertexAttribute, VertexFormat, VertexLayout,
+    PrimitiveTopology, RasterState, SamplerDesc, ShaderDesc, ShaderSource, StencilFaceState,
+    StencilOp, StencilState, StepMode, SurfaceConfig, TexDim, TextureDesc, TextureRegion,
+    TextureWrite, VertexAttribute, VertexFormat, VertexLayout,
 };
 pub use error::{GpuError, Result, SurfaceError, UsageError};
 pub use handle::{
     BufferHandle, Handle, PipelineHandle, QueryPoolHandle, SamplerHandle, ShaderHandle, SlotMap,
-    SurfaceHandle, TargetHandle, TextureHandle, marker,
+    TargetHandle, TextureHandle, marker,
 };
 pub use types::{
     BackendPreference, BufferUsage, DType, Features, Format, MemoryUsage, PowerPreference,
