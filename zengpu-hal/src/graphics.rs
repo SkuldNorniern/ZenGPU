@@ -9,7 +9,7 @@ use crate::desc::{GraphicsPipelineDesc, SurfaceConfig};
 use crate::error::Result;
 use crate::handle::{BufferHandle, PipelineHandle, QueryPoolHandle, TargetHandle};
 use crate::surface::WindowHandles;
-use crate::types::{Rect, Viewport};
+use crate::types::{Format, Rect, Viewport};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoadOp {
@@ -108,6 +108,9 @@ pub trait Surface {
 
     /// Current backbuffer size in pixels.
     fn size(&self) -> (u32, u32);
+
+    /// Backbuffer format, which pipelines must target. May differ from the one requested.
+    fn format(&self) -> Format;
 
     fn acquire(&self) -> Result<Acquire<Self::Frame>>;
 

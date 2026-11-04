@@ -144,6 +144,10 @@ impl Surface for VulkanSurface {
         self.swapchain.extent()
     }
 
+    fn format(&self) -> zengpu_hal::Format {
+        self.swapchain.format()
+    }
+
     fn acquire(&self) -> Result<Acquire<VulkanFrame>> {
         if self.inner.lost.load(Ordering::Acquire) {
             return Err(GpuError::DeviceLost);

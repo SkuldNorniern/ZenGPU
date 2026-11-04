@@ -10,8 +10,8 @@ use objc::runtime::{Class, NO, Object, YES};
 use objc::{msg_send, sel, sel_impl};
 use zen_window_handle::WindowHandle;
 use zengpu_hal::{
-    Acquire, Frame, GpuError, GraphicsDevice, GraphicsPipelineDesc, PipelineHandle, PresentMode,
-    QueryPoolHandle, Result, Surface, SurfaceConfig, TargetHandle, WindowHandles,
+    Acquire, Format, Frame, GpuError, GraphicsDevice, GraphicsPipelineDesc, PipelineHandle,
+    PresentMode, QueryPoolHandle, Result, Surface, SurfaceConfig, TargetHandle, WindowHandles,
 };
 
 use super::command::MetalCommandList;
@@ -180,6 +180,13 @@ impl Surface for MetalSurface {
             .lock()
             .map(|c| (c.width, c.height))
             .unwrap_or((0, 0))
+    }
+
+    fn format(&self) -> Format {
+        self.config
+            .lock()
+            .map(|c| c.format)
+            .unwrap_or(Format::Bgra8Unorm)
     }
 
     fn acquire(&self) -> Result<Acquire<Self::Frame>> {

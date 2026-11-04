@@ -628,12 +628,21 @@ fn pick_format(
             .get_physical_device_surface_formats(physical, surface)
             .map_err(|e| GpuError::Backend(format!("surface formats: {e}")))?
     };
-    formats
-        .iter()
-        .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
-        .or_else(|| formats.first())
-        .map(|f| f.format)
-        .ok_or_else(|| GpuError::Backend("no surface formats".to_string()))
+    choose_format(&formats)
+        .ok_or_else(|| GpuError::Backend("no usable surface formats".to_string()))
+}
+
+/// Linear 8-bit first, since sRGB would change blending.
+fn choose_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Format> {
+    let offered = |wanted| formats.iter().map(|f| f.format).find(|f| *f == wanted);
+    offered(vk::Format::B8G8R8A8_UNORM)
+        .or_else(|| offered(vk::Format::R8G8B8A8_UNORM))
+        .or_else(|| {
+            formats
+                .iter()
+                .map(|f| f.format)
+                .find(|f| crate::from_vk_format(*f).is_some())
+        })
 }
 
 fn pick_present_mode(
@@ -1070,4 +1079,39 @@ pub(crate) fn create_platform_surface(
     Err(GpuError::Backend(
         "unsupported surface platform".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn offered(formats: &[vk::Format]) -> Vec<vk::SurfaceFormatKHR> {
+        formats
+            .iter()
+            .map(|&format| vk::SurfaceFormatKHR {
+                format,
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn surface_format_prefers_linear_8_bit_and_refuses_what_hal_cannot_name() {
+        use vk::Format as F;
+        let pick = |formats: &[F]| choose_format(&offered(formats));
+        assert_eq!(
+            pick(&[F::R8G8B8A8_UNORM, F::B8G8R8A8_UNORM]),
+            Some(F::B8G8R8A8_UNORM)
+        );
+        assert_eq!(
+            pick(&[F::R8G8B8A8_SRGB, F::R8G8B8A8_UNORM]),
+            Some(F::R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            pick(&[F::R5G6B5_UNORM_PACK16, F::R8G8B8A8_SRGB]),
+            Some(F::R8G8B8A8_SRGB)
+        );
+        assert_eq!(pick(&[F::R5G6B5_UNORM_PACK16]), None);
+        assert_eq!(pick(&[]), None);
+    }
 }
