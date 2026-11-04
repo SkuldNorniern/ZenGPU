@@ -886,7 +886,9 @@ mod tests {
         };
 
         let _guard = crate::test_gpu_lock();
-        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Ok(instance) = VulkanInstance::new() else {
+            return;
+        };
         let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
             eprintln!("no Vulkan adapter; skipping overflow upload test");
             return;

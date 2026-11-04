@@ -1179,7 +1179,9 @@ mod transfer_slot_tests {
     #[test]
     fn a_lost_device_does_not_retain_raw_pool_owners() {
         let _guard = crate::test_gpu_lock();
-        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Ok(instance) = VulkanInstance::new() else {
+            return;
+        };
         let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
             return;
         };
@@ -1207,7 +1209,9 @@ mod transfer_slot_tests {
     #[test]
     fn buffer_transfer_slots_grow_only_for_the_direction_and_chunks_used() {
         let _guard = crate::test_gpu_lock();
-        let instance = VulkanInstance::new().expect("Vulkan instance");
+        let Ok(instance) = VulkanInstance::new() else {
+            return;
+        };
         let Some(adapter) = instance.request_adapter(AdapterRequest::default()) else {
             eprintln!("no Vulkan adapter; skipping transfer slot test");
             return;

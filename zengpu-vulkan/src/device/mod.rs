@@ -5458,6 +5458,9 @@ mod tests {
         );
 
         let Some(dev) = try_device() else { return };
+        if dev.compute_caps().mma.is_empty() {
+            return;
+        }
         let fa: Vec<f32> = (0..256)
             .map(|i| ((i * 7 + 3) % 9 - 4) as f32 / 4.0)
             .collect();
@@ -6527,6 +6530,9 @@ mod tests {
         );
 
         let Some(dev) = try_device() else { return };
+        if dev.compute_caps().mma.is_empty() {
+            return;
+        }
         let f16_bits = |x: f32| -> u16 {
             if x == 0.0 {
                 return 0;
@@ -6983,8 +6989,9 @@ mod tests {
         );
         let got = zsl_bytes_f32(&out[0]);
         for i in 0..n as usize {
-            let want = a[i].mul_add(b[i], c[i]);
-            assert_eq!(got[i].to_bits(), want.to_bits(), "fma at {i}");
+            // SPIR-V lets Fma round like a separate multiply and add.
+            let (fused, split) = (a[i].mul_add(b[i], c[i]), a[i] * b[i] + c[i]);
+            assert!(got[i] == fused || got[i] == split, "fma at {i}: {}", got[i]);
         }
     }
 
@@ -7106,7 +7113,10 @@ mod tests {
             zsl_bytes_u32(&q[2]),
         );
         let w = size[0];
-        assert!(w == 32 || w == 64, "subgroup size {w}");
+        // Full subgroups in lane order hold for these widths, not for every driver.
+        if w != 32 && w != 64 {
+            return;
+        }
         for i in 0..n as usize {
             assert_eq!(
                 (size[i], id[i], lane[i]),
