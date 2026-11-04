@@ -6,6 +6,9 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
+use std::env;
+use std::fs::read_to_string;
+use std::path::Path;
 
 use zengpu_zslc::frontend::parser::Shader;
 use zengpu_zslc::ir::Backend;
@@ -112,7 +115,8 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
             pub fn to_scalars(&self) -> [::zengpu_shader::_zsl_priv::Scalar; {n}] {{ [{body}] }} \
         }}"
     );
-    code.parse()
+    with_shader_crate(&code)
+        .parse()
         .map_err(|_| "ZslPushConst: generated code failed to parse".to_string())
 }
 
@@ -139,6 +143,34 @@ pub fn zsl(input: TokenStream) -> TokenStream {
     match compile_zsl_all(&src) {
         Ok(ts) => ts,
         Err(msg) => compile_error_tokens(&msg),
+    }
+}
+
+/// Points generated code at the shader crate as the crate being compiled can name it.
+fn with_shader_crate(code: &str) -> String {
+    let package = env::var("CARGO_PKG_NAME").unwrap_or_default();
+    let manifest = env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .and_then(|dir| read_to_string(Path::new(&dir).join("Cargo.toml")).ok());
+    let shader_crate = match manifest {
+        Some(manifest) => shader_crate_path(&manifest, &package),
+        None => "::zengpu_shader",
+    };
+    code.replace("::zengpu_shader", shader_crate)
+}
+
+/// Its own dependency when the manifest names one, otherwise through `zengpu`.
+fn shader_crate_path(manifest: &str, package: &str) -> &'static str {
+    let names_it = |line: &str| {
+        let key = line.split('=').next().unwrap_or_default().trim();
+        key == "zengpu-shader"
+            || key.starts_with("zengpu-shader.")
+            || key.ends_with(".zengpu-shader]")
+    };
+    if package == "zengpu-shader" || manifest.lines().any(names_it) {
+        "::zengpu_shader"
+    } else {
+        "::zengpu::shader"
     }
 }
 
@@ -314,7 +346,8 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     s.push_str(&reflection_to_slice_str(&reflection, types));
     s.push_str(" }");
 
-    s.parse()
+    with_shader_crate(&s)
+        .parse()
         .map_err(|_| "ZSL: generated ZslShader literal failed to parse".to_string())
 }
 
@@ -453,6 +486,22 @@ fn compile_error_tokens(msg: &str) -> TokenStream {
 #[cfg(test)]
 mod gate_tests {
     use super::*;
+
+    #[test]
+    fn generated_code_names_the_shader_crate_the_caller_can_reach() {
+        let direct = "::zengpu_shader";
+        let through = "::zengpu::shader";
+        let path = |manifest| shader_crate_path(manifest, "app");
+        assert_eq!(path("[dependencies]\nzengpu = \"0.1\"\n"), through);
+        assert_eq!(path("[dependencies]\nzengpu-shader = \"0.1\"\n"), direct);
+        assert_eq!(path("zengpu-shader.workspace = true\n"), direct);
+        assert_eq!(
+            path("[dependencies.zengpu-shader]\nversion = \"0.1\"\n"),
+            direct
+        );
+        assert_eq!(path("zengpu-shader-extras = \"1\"\n"), through);
+        assert_eq!(shader_crate_path("", "zengpu-shader"), direct);
+    }
 
     fn ok() -> Result<(), String> {
         Ok(())
