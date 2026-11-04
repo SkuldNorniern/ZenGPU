@@ -458,11 +458,11 @@ impl GpuDevice for Device {
         self.inner.is_lost()
     }
 
-    fn device_ordinal(&self) -> i32 {
+    fn device_ordinal(&self) -> Option<u32> {
         self.inner.device_ordinal()
     }
 
-    fn can_peer(&self, peer_ordinal: i32) -> bool {
+    fn can_peer(&self, peer_ordinal: u32) -> bool {
         self.inner.can_peer(peer_ordinal)
     }
 

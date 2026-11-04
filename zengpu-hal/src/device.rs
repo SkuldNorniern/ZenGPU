@@ -158,13 +158,13 @@ pub trait GpuDevice: Send + Sync {
         Err(GpuError::Unsupported("texture-to-buffer copy".into()))
     }
 
-    /// Backend device ordinal, or `-1` when the backend does not expose one.
-    fn device_ordinal(&self) -> i32 {
-        -1
+    /// Backend device ordinal, when the backend exposes one.
+    fn device_ordinal(&self) -> Option<u32> {
+        None
     }
 
     /// Whether direct device-to-device copies from `peer_ordinal` are usable.
-    fn can_peer(&self, _peer_ordinal: i32) -> bool {
+    fn can_peer(&self, _peer_ordinal: u32) -> bool {
         false
     }
 

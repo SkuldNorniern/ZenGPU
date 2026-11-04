@@ -1626,13 +1626,16 @@ impl GpuDevice for HipDevice {
         .wait(Duration::MAX)
     }
 
-    fn device_ordinal(&self) -> i32 {
-        self.core.info.ordinal
+    fn device_ordinal(&self) -> Option<u32> {
+        u32::try_from(self.core.info.ordinal).ok()
     }
 
-    fn can_peer(&self, peer_ordinal: i32) -> bool {
+    fn can_peer(&self, peer_ordinal: u32) -> bool {
         let ordinal = self.core.info.ordinal;
-        if peer_ordinal == ordinal || peer_ordinal < 0 {
+        let Ok(peer_ordinal) = i32::try_from(peer_ordinal) else {
+            return false;
+        };
+        if peer_ordinal == ordinal {
             return false;
         }
         let Ok(mut cache) = self.core.peer_access.lock() else {
@@ -1723,7 +1726,7 @@ impl GpuDevice for HipDevice {
 
         self.core.synchronize()?;
         src_device.core.synchronize()?;
-        if self.can_peer(src_ordinal) {
+        if u32::try_from(src_ordinal).is_ok_and(|peer| self.can_peer(peer)) {
             self.core.activate()?;
             unsafe {
                 self.core.check(
