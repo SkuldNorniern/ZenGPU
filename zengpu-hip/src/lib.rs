@@ -3875,7 +3875,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             }
         }
 
-        const HALF_IO_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const HALF_IO_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32 }
             @workgroup_size(64)
             kernel half_io(xh: device buffer<f16>, xb: device buffer<bf16>, yh: device mut buffer<f16>, yb: device mut buffer<bf16>, sum: device mut buffer<f32>, xf: device buffer<f32>, zh: device mut buffer<f16>, zb: device mut buffer<bf16>, p: P, id: global_id) {
@@ -4033,7 +4033,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const TRIG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const TRIG_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { len: u32 }
             @workgroup_size(64)
             kernel trig(src: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
@@ -4085,7 +4085,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const FINITE_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const FINITE_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { len: u32 }
             @workgroup_size(64)
             kernel classify(src: device buffer<f32>, out: device mut buffer<u32>, p: P, id: global_id) {
@@ -4145,7 +4145,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const DOT4_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const DOT4_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32 }
             @workgroup_size(64)
             kernel dot4(x: device buffer<i32>, y: device buffer<u32>, k: device buffer<i32>, z: device buffer<u32>, out_i: device mut buffer<i32>, out_iu: device mut buffer<i32>, out_u: device mut buffer<u32>, p: P, id: global_id) {
@@ -4446,7 +4446,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             }
         }
 
-        const PACKED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const PACKED_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32 }
             @workgroup_size(64)
             kernel packed(x: device buffer<u32>, y: device buffer<u32>, z: device buffer<u32>, f: device buffer<f32>, o1: device mut buffer<u32>, o2: device mut buffer<u32>, o3: device mut buffer<u32>, o4: device mut buffer<u32>, o5: device mut buffer<u32>, o6: device mut buffer<u32>, o7: device mut buffer<u32>, o8: device mut buffer<u32>, of: device mut buffer<f32>, o9: device mut buffer<u32>, o10: device mut buffer<u32>, p: P, id: global_id) {
@@ -4617,7 +4617,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
 
         /// gfx12 WMMA: f16 and packed-i8 `C = A*B + C`. SPIR-V has no `frag_row`/`frag_get`/`frag_set`: the
         /// lane probe is in `FRAG_PROBE`.
-        const FRAG_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const FRAG_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel frag_gemm(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>, ba: device buffer<u32>, bb: device buffer<u32>, ci: device buffer<i32>, oi: device mut buffer<i32>) {
                 let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
@@ -4634,7 +4634,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
         );
 
         /// Needs `frag_get`/`frag_set`, which SPIR-V cannot express, so HIP only.
-        const FRAG_GET_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const FRAG_GET_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel frag_get_bump(a: device buffer<f16>, b: device buffer<f16>, c: device buffer<f32>, out: device mut buffer<f32>) {
                 let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
@@ -4646,7 +4646,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             }
         );
 
-        const TYPED_SHARED_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const TYPED_SHARED_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel typed_shared(a: device buffer<f32>, b: device buffer<f32>, c: device buffer<f32>, ia: device buffer<i8>, ib: device buffer<i8>, ci: device buffer<i32>, wide: device buffer<i32>, ui: device buffer<u8>, e: device buffer<f32>, out: device mut buffer<f32>, oi: device mut buffer<i32>, rh: device mut buffer<f32>, rq: device mut buffer<i32>, ru: device mut buffer<u32>) {
                 shared sa: array<f16, 256>
@@ -4823,7 +4823,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
         }
 
         /// Loads B from an N x K row-major source with `frag_load_b_t`, with no transpose stage.
-        const FRAG_BT_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const FRAG_BT_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel frag_bt(a: device buffer<f16>, b: device buffer<f16>, ai: device buffer<u32>, bi: device buffer<u32>, c: device buffer<f32>, ci: device buffer<i32>, out: device mut buffer<f32>, oi: device mut buffer<i32>) {
                 let fa: frag<f16, 16, 16, a> = frag_load_a(a, 0, 16)
@@ -4927,7 +4927,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const FEATURES_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const FEATURES_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel scalar_features(ua: device buffer<u32>, ia: device buffer<i32>, fa: device buffer<f32>, sb: device buffer<i8>, ub: device buffer<u8>, ou: device mut buffer<u32>, oi: device mut buffer<i32>, of: device mut buffer<f32>, ob: device mut buffer<i8>, oub: device mut buffer<u8>, oh: device mut buffer<i32>, oh2: device mut buffer<i32>, ofr: device mut buffer<f32>, osel: device mut buffer<i32>, id: global_id) {
                 let i = id.x
@@ -5297,7 +5297,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
         }
 
         /// Vector copy shader over `u32x4` elements, with a scalar tail past the last full vector.
-        const VEC_COPY_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const VEC_COPY_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32, tail: u32 }
             @workgroup_size(64)
             kernel vec_copy(src: device buffer<u32x4>, out: device mut buffer<u32x4>, words: device buffer<u32>, out_words: device mut buffer<u32>, p: P, id: global_id) {
@@ -5434,7 +5434,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             0x7e00, 0x0000, 0x8000, 0x3555, 0x01f7,
         ];
 
-        const BITS_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const BITS_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel bits(x: device buffer<u32>, y: device buffer<f32>, z: device buffer<f32>, lo: device mut buffer<f32>, hi: device mut buffer<f32>, packed: device mut buffer<u32>, bf: device mut buffer<f32>, bu: device mut buffer<u32>, bi: device mut buffer<i32>, sb: device mut buffer<i32>, ub: device mut buffer<u32>, id: global_id) {
                 lo[id.x] = f16_lo(x[id.x])
@@ -5586,7 +5586,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
         }
 
         /// Stores `u32x4`, runs a barrier, then loads f16 fragments and runs one mma.
-        const VIEW_MMA_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const VIEW_MMA_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel view_mma(a: device buffer<u32x4>, b: device buffer<u32x4>, c: device buffer<f32>, out: device mut buffer<f32>) {
                 shared sa: array<f16, 256>
@@ -5666,7 +5666,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
         }
 
         /// One buffer, two params: `x` written as u32x4, `xh` read as f16 after a barrier.
-        const ALIAS_BUF_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const ALIAS_BUF_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(32)
             kernel alias_buf(src: device buffer<u32x4>, x: device mut buffer<u32x4>, xh: device buffer<f16>, out: device mut buffer<f32>, id: global_id) {
                 x[id.x] = src[id.x]
@@ -5744,7 +5744,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             (key(a) as i64 - key(b) as i64).unsigned_abs() as u32
         }
 
-        const GLU_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const GLU_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32, act: u32 }
             @workgroup_size(256)
             kernel glu(gate: device buffer<f32>, up: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
@@ -5824,7 +5824,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const ROUND_EVEN_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const ROUND_EVEN_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             @workgroup_size(64)
             kernel round_even(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
                 let i = id.x
@@ -5867,7 +5867,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(shader);
         }
 
-        const QUANT_Q8_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const QUANT_Q8_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { n: u32 }
             @workgroup_size(256)
             kernel quantize_q8(x: device buffer<f32>, xq: device mut buffer<i8>, xs: device mut buffer<f32>, p: P, id: global_id) {
@@ -6065,7 +6065,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             device.destroy_shader(gs);
         }
 
-        const GEMV_Q4K_Q8_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const GEMV_Q4K_Q8_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { rows: u32, nb: u32, units: u32, iters: u32, xbase: u32 }
             @workgroup_size(256)
             kernel gemv_q8_q4k(w: device buffer<u32x4>, xq: device buffer<u32x4>, xs: device buffer<f32>, y: device mut buffer<f32>, p: P, id: global_id) {
@@ -6210,7 +6210,7 @@ extern "C" __global__ void inc(unsigned int* data, unsigned int n) {
             }
         );
 
-        const NORM_ROPE_ZSL: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+        const NORM_ROPE_ZSL: zengpu_shader::ZslShader = zengpu_shader::zsl!(
             push P { d: u32, heads: u32, rope: u32, dk: u32, base: f32, eps: f32, flags: u32 }
             @workgroup_size(128)
             kernel norm_rope(x: device mut buffer<f32>, w: device buffer<f32>, factors: device buffer<f32>, meta: device buffer<u32>, p: P, id: global_id) {

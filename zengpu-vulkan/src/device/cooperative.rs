@@ -134,7 +134,7 @@ pub(super) fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
 
     const MIXED: ZslShader = zsl!(
         @workgroup_size(32)

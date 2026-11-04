@@ -367,7 +367,7 @@ mod cpu_vs_vulkan_tests {
         AdapterRequest, ComputePipelineDesc, DeviceRequest, GpuDevice, GpuInstance, Scalar,
         ShaderDesc,
     };
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
     use zengpu_vulkan::VulkanInstance;
 
     const VEC_ADD_SHADER: ZslShader = zsl!(
@@ -1084,7 +1084,7 @@ mod half_buffer_tests {
         AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
         GpuInstance, MemoryUsage, Scalar,
     };
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
     use zengpu_vulkan::VulkanInstance;
 
     const HALF_IO_ZSL: ZslShader = zsl!(

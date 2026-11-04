@@ -110,7 +110,7 @@ More in [`examples/`](examples/).
 
 Depend on `zengpu`. Subcrates: `zengpu-hal` (types and traits), one per
 backend (`zengpu-vulkan`, `-metal`, `-hip`, `-cuda`, `-cpu`),
-`zengpu-compute`, `zengpu-spirv` and `zengpu-zsl` (shaders),
+`zengpu-compute`, `zengpu-shader` and `zengpu-zsl` (shaders),
 `zengpu-spv` (SPIR-V checks).
 
 ## Building

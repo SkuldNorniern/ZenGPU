@@ -1841,8 +1841,8 @@ mod tests {
     /// Keep exercising f16 on devices whose integer matrix unit uses a different K.
     fn mixed_or_float_shader(
         dev: &dyn GpuDevice,
-        mixed: &zengpu_spirv::ZslShader,
-        float: &zengpu_spirv::ZslShader,
+        mixed: &zengpu_shader::ZslShader,
+        float: &zengpu_shader::ZslShader,
     ) -> (ShaderHandle, bool) {
         let int8 = has_mma(dev, zengpu_hal::DType::I8);
         let chosen = if int8 {
@@ -1864,7 +1864,7 @@ mod tests {
 
     #[test]
     fn cooperative_pipelines_reject_incompatible_subgroups() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
         const MATRIX: ZslShader = zsl!(
             @workgroup_size(32)
             kernel matrix(a: device buffer<f16>, b: device buffer<f16>, out: device mut buffer<f32>) {
@@ -2465,16 +2465,16 @@ mod tests {
     const CLEAR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
     const TEXELS: [[f32; 4]; 2] = [[0.25, 0.5, 0.75, 1.0], [1.0, 0.75, 0.5, 0.25]];
 
-    const QUAD_VS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    const QUAD_VS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
         vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
             let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
             (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
         }
     );
-    const HALF_RED_FS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    const HALF_RED_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
         fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 0.5) }
     );
-    const SAMPLE_FS: zengpu_spirv::ZslShader = zengpu_spirv::zsl!(
+    const SAMPLE_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
         push P { slot: u32 }
         fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
             tex[p.slot].sample(uv)
@@ -2695,7 +2695,7 @@ mod tests {
 
     fn quad_pipeline(
         device: &VulkanDevice,
-        fs: &zengpu_spirv::ZslShader,
+        fs: &zengpu_shader::ZslShader,
         format: Format,
         blend: Option<BlendState>,
     ) -> PipelineHandle {
@@ -3088,7 +3088,7 @@ mod tests {
     #[test]
     fn pipeline_cache_is_persisted_to_disk() {
         use std::time::{SystemTime, UNIX_EPOCH};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const CACHE_TEST_ZSL: ZslShader = zsl!(
             @workgroup_size(1)
@@ -3614,7 +3614,7 @@ mod tests {
 
     #[test]
     fn storage_level_writes_each_mip() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FILL: ZslShader = zsl!(
             push P { w: u32, h: u32, r: f32, g: f32, b: f32, a: f32 }
@@ -3750,7 +3750,7 @@ mod tests {
 
     #[test]
     fn storage_level_slots_reusable_after_release() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FILL: ZslShader = zsl!(
             push P { w: u32, h: u32, r: f32, g: f32, b: f32, a: f32 }
@@ -3850,7 +3850,7 @@ mod tests {
     fn dispatch_overhead() {
         use std::time::{Duration, Instant};
 
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const TOUCH: ZslShader = zsl!(
             @workgroup_size(64)
@@ -3929,7 +3929,7 @@ mod tests {
 
     #[test]
     fn pipeline_stats_order_tiny_and_heavy_kernels_when_reported() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const TINY: ZslShader = zsl!(
             @workgroup_size(64)
@@ -4005,7 +4005,7 @@ mod tests {
 
     #[test]
     fn mixed_copy_dispatch_submission_round_trips_device_local_data() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const DOUBLE_ZSL: ZslShader = zsl!(
             push P { len: u32 }
@@ -4104,7 +4104,7 @@ mod tests {
 
     #[test]
     fn compute_chains_texture_passes_in_one_submission() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const INVERT: ZslShader = zsl!(
             push P { w: u32, h: u32 }
@@ -4240,7 +4240,7 @@ mod tests {
 
     #[test]
     fn dispatch_batch_chains_ops_with_visible_writes() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const ADD_ZSL: ZslShader = zsl!(
             push P { len: u32 }
@@ -4387,7 +4387,7 @@ mod tests {
 
     #[test]
     fn dispatch_rejects_invalid_bindless_buffer_indices() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FILL_ZSL: ZslShader = zsl!(
             @workgroup_size(1)
@@ -4505,7 +4505,7 @@ mod tests {
     #[test]
     fn concurrent_dispatches_share_the_queue_safely() {
         use std::sync::{Arc, Barrier};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FILL_ZSL: ZslShader = zsl!(
             push P { value: f32 }
@@ -4585,7 +4585,7 @@ mod tests {
 
     #[test]
     fn zsl_trigonometry_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const TRIG_ZSL: ZslShader = zsl!(
             push P { len: u32 }
@@ -4652,7 +4652,7 @@ mod tests {
 
     #[test]
     fn zsl_dot4_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const DOT4_ZSL: ZslShader = zsl!(
             push P { n: u32 }
@@ -4960,7 +4960,7 @@ mod tests {
 
     #[test]
     fn zsl_packed_ops_run_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const PACKED_ZSL: ZslShader = zsl!(
             push P { n: u32 }
@@ -5129,7 +5129,7 @@ mod tests {
 
     #[test]
     fn zsl_bitwise_ops_unpack_nibbles_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const NIBBLES_ZSL: ZslShader = zsl!(
             push P { n: u32 }
@@ -5214,7 +5214,7 @@ mod tests {
 
     #[test]
     fn signed_remainders_keep_the_dividend_sign() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
         const REM: ZslShader = zsl!(
             push P { len: u32 }
             @workgroup_size(32)
@@ -5300,7 +5300,7 @@ mod tests {
 
     #[test]
     fn zsl_scalar_features_run_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FEATURES_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -5436,7 +5436,7 @@ mod tests {
     /// `frag_load_a/b` from f32 shared: each subgroup stages its tile in f16 workgroup memory.
     #[test]
     fn zsl_frag_ab_from_shared_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const SHARED_AB_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -5541,7 +5541,7 @@ mod tests {
     /// `u32x4` buffer elements on SPIR-V. Scalar tail past the last full vector.
     #[test]
     fn zsl_u32x4_copy_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const VEC_COPY_ZSL: ZslShader = zsl!(
             push P { n: u32, tail: u32 }
@@ -5642,7 +5642,7 @@ mod tests {
     /// `C = A*B + C` on one 16x16x16 tile. Exercise each supported input type.
     #[test]
     fn zsl_frag_mma_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FRAG_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -5805,7 +5805,7 @@ mod tests {
     /// Stores narrow into shared arrays on RADV (RNE for f16 and bf16).
     #[test]
     fn zsl_typed_shared_round_trips_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const TYPED_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -5981,7 +5981,7 @@ mod tests {
     /// `frag_load_a/b` load straight from f16 and i8 shared arrays, with no f16 stage.
     #[test]
     fn zsl_frag_from_typed_shared_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const SHARED_FRAG: ZslShader = zsl!(
             @workgroup_size(32)
@@ -6157,7 +6157,7 @@ mod tests {
     /// cooperative load.
     #[test]
     fn zsl_frag_load_b_t_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const BT_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -6312,7 +6312,7 @@ mod tests {
     /// and tie inputs.
     #[test]
     fn zsl_bit_builtins_run_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const BITS_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -6508,7 +6508,7 @@ mod tests {
     /// `view` shared arrays on RADV: u32x4 stores through an f16 view, barrier, f16 loads, one mma.
     #[test]
     fn zsl_shared_view_mma_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const VIEW_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -6629,7 +6629,7 @@ mod tests {
     /// One buffer, two params (u32x4 writes, f16 reads after a barrier), on RADV.
     #[test]
     fn zsl_one_buffer_two_element_types_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const ALIAS_ZSL: ZslShader = zsl!(
             @workgroup_size(32)
@@ -6798,7 +6798,7 @@ mod tests {
 
     #[test]
     fn zsl_finite_classification_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FINITE_ZSL: ZslShader = zsl!(
             push P { len: u32 }
@@ -6896,7 +6896,7 @@ mod tests {
     /// Bindings: `inputs`, then `outputs` (byte sizes, zero-filled).
     fn run_zsl(
         dev: &dyn GpuDevice,
-        shader: &zengpu_spirv::ZslShader,
+        shader: &zengpu_shader::ZslShader,
         block: [u32; 3],
         groups: [u32; 3],
         inputs: &[Vec<u8>],
@@ -6961,7 +6961,7 @@ mod tests {
 
     #[test]
     fn zsl_mul_add_f32_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FMA3: ZslShader = zsl!(
             @workgroup_size(64)
@@ -6997,7 +6997,7 @@ mod tests {
 
     #[test]
     fn zsl_scatter_add_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const SCATTER: ZslShader = zsl!(
             push Scatter { n: u32 }
@@ -7032,7 +7032,7 @@ mod tests {
 
     #[test]
     fn zsl_workgroup_reduce_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const WG_REDUCE: ZslShader = zsl!(
             push P { n: u32 }
@@ -7076,7 +7076,7 @@ mod tests {
 
     #[test]
     fn zsl_subgroup_ops_run_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const QUERY: ZslShader = zsl!(
             @workgroup_size(256)
@@ -7138,7 +7138,7 @@ mod tests {
 
     #[test]
     fn zsl_tiled_gemm_runs_through_vulkan() {
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const GEMM: ZslShader = zsl!(
             push Shape { m: u32, n: u32, k: u32 }

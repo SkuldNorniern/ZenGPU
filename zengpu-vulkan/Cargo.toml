@@ -28,4 +28,4 @@ objc = "0.2"
 
 # Native ZSL shaders for the in-crate tests and the pipeline_repro example.
 [dev-dependencies]
-zengpu-spirv.workspace = true
+zengpu-shader.workspace = true

@@ -77,7 +77,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn metal_saxpy() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const SAXPY: ZslShader = zsl!(
             push P { n: u32, alpha: f32 }
@@ -126,7 +126,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn too_many_bindings_is_an_error() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FILL: ZslShader = zsl!(
             push P { v: f32 }
@@ -260,7 +260,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn integer_and_rounding_builtins_match_the_host() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const OPS: ZslShader = zsl!(
             @workgroup_size(64)
@@ -363,7 +363,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn fragment_elements_follow_their_mapping() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const FRAG: ZslShader = zsl!(
             @workgroup_size(32)
@@ -431,7 +431,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn integer_mma_is_exact() {
         use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, MemoryUsage};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const IMMA: ZslShader = zsl!(
             @workgroup_size(32)
@@ -545,7 +545,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn half_fragments_load_from_f32_shared() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const STAGED: ZslShader = zsl!(
             @workgroup_size(32)
@@ -610,7 +610,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn f32_fragments_multiply_in_f32() {
         use zengpu_hal::{Bindings, ComputePipelineDesc, DType};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const F32_MMA: ZslShader = zsl!(
             @workgroup_size(32)
@@ -695,7 +695,7 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn metal_vec_add_multi_threadgroup() {
         use zengpu_hal::{Bindings, ComputePipelineDesc};
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const ADD: ZslShader = zsl!(
             push P { n: u32 }
@@ -866,7 +866,7 @@ mod tests {
             Bindings, BufferCopyOp, BufferUsage, ComputeOp, ComputePipelineDesc, DispatchOp,
             MemoryUsage, SubmissionStatus,
         };
-        use zengpu_spirv::{ZslShader, zsl};
+        use zengpu_shader::{ZslShader, zsl};
 
         const INC: ZslShader = zsl!(
             push P { n: u32 }
@@ -965,7 +965,7 @@ mod graphics_tests {
         TextureHandle, TextureUsage, VertexAttribute, VertexFormat, VertexLayout, Viewport,
         ViewportScissor,
     };
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
 
     const RED: [u8; 4] = [255, 0, 0, 255];
     const BLACK: [u8; 4] = [0, 0, 0, 255];

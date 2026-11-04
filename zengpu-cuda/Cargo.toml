@@ -24,4 +24,4 @@ log.workspace = true
 cc = "1"
 
 [dev-dependencies]
-zengpu-spirv = { workspace = true, features = ["cuda"] }
+zengpu-shader = { workspace = true, features = ["cuda"] }

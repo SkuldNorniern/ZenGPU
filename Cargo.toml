@@ -20,7 +20,7 @@ workspace = true
 
 [workspace]
 resolver = "3"
-members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-spirv", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-tile", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zengpu-opengl", "zen-window-handle"]
+members = ["zengpu-hal", "zengpu-cpu", "zengpu-vulkan", "zengpu-compute", "zengpu-conformance", "zengpu-shader", "zengpu-spv", "zengpu-zsl", "zengpu-zslc", "zengpu-tile", "zengpu-cuda", "zengpu-metal", "zengpu-hip", "zengpu-dx12", "zengpu-opengl", "zen-window-handle"]
 
 [workspace.package]
 version = "0.1.0"
@@ -48,7 +48,7 @@ zengpu-hal = { path = "zengpu-hal", version = "0.1.0" }
 zengpu-cpu = { path = "zengpu-cpu", version = "0.1.0" }
 zengpu-vulkan = { path = "zengpu-vulkan", version = "0.1.0" }
 zengpu-compute = { path = "zengpu-compute", version = "0.1.0" }
-zengpu-spirv = { path = "zengpu-spirv", version = "0.1.0" }
+zengpu-shader = { path = "zengpu-shader", version = "0.1.0" }
 zengpu-spv = { path = "zengpu-spv", version = "0.1.0" }
 zengpu-zsl = { path = "zengpu-zsl", version = "0.1.0" }
 zengpu-zslc = { path = "zengpu-zslc", version = "0.1.0" }
@@ -75,11 +75,11 @@ cpu = ["zengpu-cpu"]
 # Device arrays, pooled allocation, and elementwise kernels.
 compute = ["zengpu-compute"]
 # CUDA Driver API compute backend (NVIDIA GPUs, compute HAL only).
-cuda = ["zengpu-cuda", "zengpu-spirv/cuda"]
+cuda = ["zengpu-cuda", "zengpu-shader/cuda"]
 # Apple Metal backend (macOS, graphics + compute). Turns on ZSL's MSL output.
-metal = ["zengpu-metal", "zengpu-spirv/metal"]
+metal = ["zengpu-metal", "zengpu-shader/metal"]
 # AMD ROCm/HIP compute backend (compute HAL only).
-hip = ["zengpu-hip", "zengpu-spirv/hip"]
+hip = ["zengpu-hip", "zengpu-shader/hip"]
 
 [dependencies]
 zengpu-hal.workspace = true
@@ -89,7 +89,7 @@ zengpu-compute = { workspace = true, optional = true }
 zengpu-cuda = { workspace = true, optional = true }
 zengpu-metal = { workspace = true, optional = true }
 zengpu-hip = { workspace = true, optional = true }
-zengpu-spirv.workspace = true
+zengpu-shader.workspace = true
 log.workspace = true
 
 [dev-dependencies]

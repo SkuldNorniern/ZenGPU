@@ -22,6 +22,6 @@ zengpu-hal.workspace = true
 zengpu-cpu.workspace = true
 zengpu-vulkan.workspace = true
 zengpu-compute.workspace = true
-zengpu-spirv = { workspace = true, features = ["hip", "metal"] }
+zengpu-shader = { workspace = true, features = ["hip", "metal"] }
 zengpu-hip.workspace = true
 zengpu-metal.workspace = true

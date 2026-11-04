@@ -5,7 +5,7 @@
 use zengpu_hal::{
     ComputePipelineDesc, DType, GpuDevice, GpuError, PipelineHandle, Result, Scalar, ShaderHandle,
 };
-use zengpu_spirv::{ZslShader, zsl};
+use zengpu_shader::{ZslShader, zsl};
 
 use crate::{BufferPool, DeviceArray, OpList};
 

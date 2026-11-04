@@ -164,7 +164,7 @@ mod zsl_parity_tests {
         RenderPassDesc, SamplerDesc, Scalar, TexDim, TextureDesc, TextureHandle, TextureUsage,
         Viewport, ViewportScissor,
     };
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
 
     fn open() -> Option<VulkanDevice> {
         VulkanInstance::new_with_surface()

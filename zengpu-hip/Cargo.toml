@@ -22,6 +22,6 @@ log.workspace = true
 
 
 [dev-dependencies]
-zengpu-spirv = { workspace = true, features = ["hip"] }
+zengpu-shader = { workspace = true, features = ["hip"] }
 zengpu-zslc.workspace = true
 zengpu-compute.workspace = true

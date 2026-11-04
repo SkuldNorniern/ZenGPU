@@ -14,7 +14,7 @@
 //! deprecation diagnostics before removing them. Prefer [`CompiledModule`] in new code.
 //!
 //! ```ignore
-//! use zengpu_spirv::{zsl, ZslShader};
+//! use zengpu_shader::{zsl, ZslShader};
 //!
 //! const KERNEL: ZslShader = zsl!(
 //!     push P { n: u32, scale: f32 }
@@ -36,7 +36,7 @@ use zengpu_hal::{
 };
 
 #[cfg(test)]
-extern crate self as zengpu_spirv;
+extern crate self as zengpu_shader;
 
 /// Buffer element kind in `ZslShader` reflection. Own copy: `zengpu-zsl` is a proc-macro crate and
 /// exports no types.
@@ -297,7 +297,7 @@ pub mod _zsl_priv {
 /// # Example
 ///
 /// ```ignore
-/// use zengpu_spirv::{ZslPushConst, ZslMat4};
+/// use zengpu_shader::{ZslPushConst, ZslMat4};
 ///
 /// #[derive(ZslPushConst)]
 /// struct ScalePush {

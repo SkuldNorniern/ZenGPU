@@ -3,7 +3,7 @@
 //! No runtime dispatch: both backends expose the same calls. Shaders: one `zsl!` via [`shader`].
 
 use zengpu_hal::{BackendPreference, ShaderDesc};
-use zengpu_spirv::ZslShader;
+use zengpu_shader::ZslShader;
 
 #[cfg(all(any(target_os = "macos", target_os = "ios"), feature = "metal"))]
 pub use zengpu_metal::{

@@ -14,7 +14,7 @@ use zengpu_hal::{
     GraphicsPipelineDesc, PrimitiveTopology, ShaderDesc, StepMode, VertexAttribute, VertexFormat,
     VertexLayout,
 };
-use zengpu_spirv::{ZslShader, zsl};
+use zengpu_shader::{ZslShader, zsl};
 use zengpu_vulkan::{DepthTarget, OffscreenTarget, VulkanInstance};
 
 const VS: ZslShader = zsl!(

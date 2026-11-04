@@ -65,13 +65,13 @@ pub use instance::Instance;
 pub use zengpu_hal as hal;
 pub use zengpu_hal::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
 
-pub use zengpu_spirv as spirv;
+pub use zengpu_shader as shader;
 
-/// `zsl!`: compile ZSL to all backends at build time. Syntax: [`zengpu_spirv::zsl`].
-pub use zengpu_spirv::zsl;
+/// `zsl!`: compile ZSL to all backends at build time. Syntax: [`zengpu_shader::zsl`].
+pub use zengpu_shader::zsl;
 
 /// Compiled shader for all backends, from [`zsl!`].
-pub use zengpu_spirv::ZslShader;
+pub use zengpu_shader::ZslShader;
 
 pub use zengpu_hal::{
     Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendComponent,

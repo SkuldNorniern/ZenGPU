@@ -1,4 +1,4 @@
-//! ZSL proc-macro glue over `zengpu-zslc`. Use `zengpu_spirv!` or `zengpu`.
+//! ZSL proc-macro glue over `zengpu-zslc`. Use `zengpu_shader!` or `zengpu`.
 //!
 //! Legacy forms (`push P { ... }`, `device mut buffer<T>`, `shared name: array<T, N>`, `barrier()`)
 //! are deprecated.
@@ -16,7 +16,7 @@ use zengpu_zslc::ir::types::TypeId;
 use zengpu_zslc::{backend, frontend};
 
 /// Derives `to_scalars()` for a push struct: fields `u32`, `i32` or `f32` only, in declaration
-/// order. Result goes to `Bindings::scalars`. Import via `use zengpu_spirv::ZslPushConst;`.
+/// order. Result goes to `Bindings::scalars`. Import via `use zengpu_shader::ZslPushConst;`.
 #[proc_macro_derive(ZslPushConst)]
 pub fn derive_zsl_push_const(input: TokenStream) -> TokenStream {
     match push_const_impl(input) {
@@ -82,18 +82,18 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
         }
         match type_name.as_str() {
             "u32" => exprs.push(format!(
-                "::zengpu_spirv::_zsl_priv::Scalar::U32(self.{fname})"
+                "::zengpu_shader::_zsl_priv::Scalar::U32(self.{fname})"
             )),
             "i32" => exprs.push(format!(
-                "::zengpu_spirv::_zsl_priv::Scalar::I32(self.{fname})"
+                "::zengpu_shader::_zsl_priv::Scalar::I32(self.{fname})"
             )),
             "f32" => exprs.push(format!(
-                "::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname})"
+                "::zengpu_shader::_zsl_priv::Scalar::F32(self.{fname})"
             )),
             "ZslMat4" => {
                 for i in 0..16 {
                     exprs.push(format!(
-                        "::zengpu_spirv::_zsl_priv::Scalar::F32(self.{fname}.0[{i}])"
+                        "::zengpu_shader::_zsl_priv::Scalar::F32(self.{fname}.0[{i}])"
                     ));
                 }
             }
@@ -109,7 +109,7 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
     let body = exprs.join(", ");
     let code = format!(
         "impl {name} {{ \
-            pub fn to_scalars(&self) -> [::zengpu_spirv::_zsl_priv::Scalar; {n}] {{ [{body}] }} \
+            pub fn to_scalars(&self) -> [::zengpu_shader::_zsl_priv::Scalar; {n}] {{ [{body}] }} \
         }}"
     );
     code.parse()
@@ -119,12 +119,12 @@ fn push_const_impl(input: TokenStream) -> Result<TokenStream, String> {
 /// Compiles native ZSL source to a `ZslShader` that holds every backend form, built at
 /// compile time.
 ///
-/// The returned `zengpu_spirv::ZslShader` carries SPIR-V (Vulkan), HIP C++ (ROCm), MSL
+/// The returned `zengpu_shader::ZslShader` carries SPIR-V (Vulkan), HIP C++ (ROCm), MSL
 /// (Metal) and CUDA C++ (NVIDIA), all compiled from the same ZSL source. Pick the form at
 /// runtime with `ZslShader::for_backend`.
 ///
 /// ```ignore
-/// const SHADER: ZslShader = zengpu_spirv::zsl!(
+/// const SHADER: ZslShader = zengpu_shader::zsl!(
 ///     push Push { n: u32, scale: f32 }
 ///     @workgroup_size(64)
 ///     kernel scale(p: Push, src: device buffer<f32>, dst: device mut buffer<f32>, id: global_id) {
@@ -204,7 +204,7 @@ fn gate_outcomes(
 
 fn not_compiled_in(backend: Backend) -> String {
     format!(
-        "the `{0}` backend is not compiled in; enable zengpu-spirv's `{0}` feature",
+        "the `{0}` backend is not compiled in; enable zengpu-shader's `{0}` feature",
         backend.name()
     )
 }
@@ -284,7 +284,7 @@ fn compile_zsl_all(src: &str) -> Result<TokenStream, String> {
     gate_outcomes(required, &lowered.outcomes())?;
 
     let mut s = String::new();
-    s.push_str("::zengpu_spirv::ZslShader { spv: ");
+    s.push_str("::zengpu_shader::ZslShader { spv: ");
     match &lowered.spv {
         Ok(words) => {
             s.push_str("Ok(");
@@ -384,7 +384,7 @@ fn reflection_to_slice_str(reflection: &ModuleReflection, types: &TypeArena) -> 
         if i > 0 {
             s.push(',');
         }
-        s.push_str("::zengpu_spirv::ParamLayout { name: ");
+        s.push_str("::zengpu_shader::ParamLayout { name: ");
         push_str_lit(&mut s, &p.name);
         s.push_str(", offset: ");
         s.push_str(&p.layout.offset.to_string());
@@ -394,26 +394,26 @@ fn reflection_to_slice_str(reflection: &ModuleReflection, types: &TypeArena) -> 
         match (&p.layout.kind, p.binding) {
             (LayoutKind::BufferIndex { elem }, Some(binding)) => {
                 s.push_str(&format!(
-                    "::zengpu_spirv::ParamKind::BufferIndex {{ elem: ::zengpu_spirv::ScalarKind::{}, binding: {} }}",
+                    "::zengpu_shader::ParamKind::BufferIndex {{ elem: ::zengpu_shader::ScalarKind::{}, binding: {} }}",
                     scalar_kind_name(*elem, types),
                     binding.binding,
                 ));
             }
             (LayoutKind::TextureIndex, Some(binding)) => {
                 s.push_str(&format!(
-                    "::zengpu_spirv::ParamKind::TextureIndex {{ binding: {} }}",
+                    "::zengpu_shader::ParamKind::TextureIndex {{ binding: {} }}",
                     binding.binding,
                 ));
             }
             (LayoutKind::ImageIndex, Some(binding)) => {
                 s.push_str(&format!(
-                    "::zengpu_spirv::ParamKind::ImageIndex {{ binding: {} }}",
+                    "::zengpu_shader::ParamKind::ImageIndex {{ binding: {} }}",
                     binding.binding,
                 ));
             }
             (LayoutKind::Scalar { ty }, None) => {
                 s.push_str(&format!(
-                    "::zengpu_spirv::ParamKind::Scalar {{ kind: ::zengpu_spirv::ScalarKind::{} }}",
+                    "::zengpu_shader::ParamKind::Scalar {{ kind: ::zengpu_shader::ScalarKind::{} }}",
                     scalar_kind_name(*ty, types),
                 ));
             }

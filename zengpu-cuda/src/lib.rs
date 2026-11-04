@@ -2997,7 +2997,7 @@ mod tests {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use zengpu_spirv::{ZslShader, zsl};
+    use zengpu_shader::{ZslShader, zsl};
 
     const TRIG_ZSL: ZslShader = zsl!(
         push P { len: u32 }

@@ -17,7 +17,7 @@ workspace = true
 
 [dependencies]
 zengpu-hal.workspace = true
-zengpu-spirv.workspace = true
+zengpu-shader.workspace = true
 
 [dev-dependencies]
-zengpu-spirv = { workspace = true, features = ["hip", "metal"] }
+zengpu-shader = { workspace = true, features = ["hip", "metal"] }
