@@ -26,6 +26,7 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
         Format::R32Float => MTLPixelFormat::R32Float,
         Format::Depth32Float => MTLPixelFormat::Depth32Float,
         Format::Depth24PlusStencil8 => MTLPixelFormat::Depth32Float_Stencil8,
+        _ => MTLPixelFormat::Invalid,
     }
 }
 
@@ -60,6 +61,7 @@ pub(crate) fn format_caps(format: Format, float32_filtering: bool) -> FormatCaps
             render_target: true,
             ..FormatCaps::default()
         },
+        _ => FormatCaps::default(),
     }
 }
 

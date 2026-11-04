@@ -22,7 +22,7 @@ fn main() {
                 DeviceType::Integrated => "integrated",
                 DeviceType::Virtual => "virtual",
                 DeviceType::Cpu => "cpu",
-                DeviceType::Unknown => "unknown",
+                _ => "unknown",
             };
             println!(
                 "  [{}] {}  ({})  vendor={:#06x}  device={:#06x}",

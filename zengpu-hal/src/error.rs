@@ -9,6 +9,7 @@ use crate::types::{Features, MemoryUsage};
 pub type Result<T> = CoreResult<T, GpuError>;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GpuError {
     DeviceLost,
     /// A bounded wait expired. The work may still be running.
@@ -29,6 +30,7 @@ pub enum GpuError {
 
 /// Most of these are caught by the validation layer before they reach the driver.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum UsageError {
     /// A handle whose generation no longer matches its slot (use-after-free).
     StaleHandle {
@@ -44,6 +46,7 @@ pub enum UsageError {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SurfaceError {
     /// The surface is no longer usable and must be recreated.
     Lost,

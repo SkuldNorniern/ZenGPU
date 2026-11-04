@@ -4,6 +4,7 @@ use core::ops::{BitOr, BitOrAssign};
 
 /// `Auto` picks the best native backend. WebGPU is not a target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum BackendPreference {
     #[default]
     Auto,
@@ -207,6 +208,7 @@ pub enum PresentMode {
 /// Ways a format can be used on a device, as reported by
 /// [`GpuDevice::format_caps`](crate::GpuDevice::format_caps).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Format {
     Rgba8Unorm,
     Rgba8UnormSrgb,
@@ -245,7 +247,7 @@ impl Format {
         }
     }
 
-    pub const ALL: [Format; 13] = [
+    pub const ALL: &'static [Format] = &[
         Format::Rgba8Unorm,
         Format::Rgba8UnormSrgb,
         Format::Bgra8Unorm,

@@ -7,6 +7,7 @@ use crate::request::{AdapterRequest, DeviceLimits, DeviceRequest, HalCapabilitie
 use crate::types::BackendPreference;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum DeviceType {
     Discrete,
     Integrated,

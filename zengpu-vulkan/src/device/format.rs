@@ -46,6 +46,7 @@ pub(crate) fn hal_format_to_vk(format: Format) -> vk::Format {
         Format::R32Float => vk::Format::R32_SFLOAT,
         Format::Depth32Float => vk::Format::D32_SFLOAT,
         Format::Depth24PlusStencil8 => vk::Format::D24_UNORM_S8_UINT,
+        _ => vk::Format::UNDEFINED,
     }
 }
 

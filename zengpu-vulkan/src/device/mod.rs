@@ -29,7 +29,7 @@ use zengpu_hal::{
 mod buffer_transfer;
 mod cooperative;
 mod dispatch;
-mod format;
+pub(crate) mod format;
 mod graphics;
 mod hal_impl;
 mod image_memory;
@@ -2369,7 +2369,7 @@ mod tests {
         let Some(dev) = try_device() else {
             return;
         };
-        for format in zengpu_hal::Format::ALL {
+        for &format in zengpu_hal::Format::ALL {
             let caps = dev.format_caps(format);
             if format.is_depth_stencil() {
                 assert!(caps.render_target, "{format:?} as depth");
@@ -2393,7 +2393,7 @@ mod tests {
         if !dev.capabilities().transfers.buffer_texture_copy {
             return;
         }
-        for format in zengpu_hal::Format::ALL {
+        for &format in zengpu_hal::Format::ALL {
             if format.is_depth_stencil() || !dev.format_caps(format).sampled {
                 continue;
             }
@@ -2919,7 +2919,7 @@ mod tests {
             return;
         };
         let device = vulkan(&dev);
-        for format in Format::ALL {
+        for &format in Format::ALL {
             if !format.is_depth_stencil() && device.format_caps(format).render_target {
                 clear_round_trip(device, format);
             }
@@ -2989,7 +2989,7 @@ mod tests {
             return;
         };
         let device = vulkan(&dev);
-        for format in Format::ALL {
+        for &format in Format::ALL {
             let caps = device.format_caps(format);
             if !format.is_depth_stencil() && caps.render_target && caps.blendable {
                 blend_round_trip(device, format);
@@ -3006,7 +3006,7 @@ mod tests {
         if !device.format_caps(Format::Rgba32Float).render_target {
             return;
         }
-        for format in Format::ALL {
+        for &format in Format::ALL {
             if !format.is_depth_stencil() && device.format_caps(format).sampled {
                 sample_round_trip(device, format);
             }
