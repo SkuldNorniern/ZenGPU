@@ -37,6 +37,7 @@ pub use submission::{
     SubmissionStatus,
 };
 pub use surface::WindowHandles;
+pub use zen_window_handle as window_handle;
 
 pub use desc::{
     AddressMode, BlendComponent, BlendFactor, BlendMode, BlendOp, BlendState, BorderColor,

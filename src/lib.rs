@@ -64,7 +64,6 @@ pub use device::Device;
 pub use instance::{Instance, InstanceBuilder};
 
 pub use zengpu_hal as hal;
-pub use zengpu_hal::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
 
 pub use zengpu_shader as shader;
 
@@ -74,20 +73,7 @@ pub use zengpu_shader::zsl;
 /// Compiled shader for all backends, from [`zsl!`].
 pub use zengpu_shader::ZslShader;
 
-pub use zengpu_hal::{
-    Acquire, AdapterInfo, AdapterRequest, AddressMode, BackendPreference, Bindings, BlendComponent,
-    BlendFactor, BlendMode, BlendOp, BlendState, BufferCopyOp, BufferDesc, BufferHandle,
-    BufferUsage, ColorAttachment, ColorTargetState, ComputeOp, ComputePipelineDesc, DType,
-    DepthAttachment, DepthState, DeviceLimits, DeviceRequest, DeviceType, DispatchOp, Features,
-    FilterMode, Format, Frame, GpuAdapter, GpuDevice, GpuError, GpuInstance, GpuSubmission,
-    GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, LoadOp, MemoryUsage, PipelineHandle,
-    PowerPreference, PresentMode, PrimitiveTopology, Rect, RenderCommands, RenderPassDesc, Result,
-    SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, StencilFaceState, StencilOp,
-    StencilState, StepMode, Submission, SubmissionStatus, Surface, SurfaceConfig, SurfaceError,
-    TargetHandle, TextureDesc, TextureHandle, TextureRegion, TextureUsage, TextureWrite,
-    TransferCaps, UsageError, VertexAttribute, VertexFormat, VertexLayout, Viewport,
-    ViewportScissor, WindowHandles,
-};
+pub use zengpu_hal::*;
 
 #[cfg(feature = "compute")]
 pub use zengpu_compute::{BufferPool, BufferPoolStats, DeviceArray, ElementwiseKernels};
