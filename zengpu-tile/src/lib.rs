@@ -1056,8 +1056,10 @@ mod tests {
                 bk: s.bk,
             };
             let (shape, notes) = run_case(&*dev, &target, case, &s.schedule).unwrap();
-            assert_eq!(shape, "mma", "{m}x{n}x{k} {notes:?}");
-            assert!(notes.is_empty(), "{m}x{n}x{k} {notes:?}");
+            if target.has_mma_f16 {
+                assert_eq!(shape, "mma", "{m}x{n}x{k} {notes:?}");
+                assert!(notes.is_empty(), "{m}x{n}x{k} {notes:?}");
+            }
 
             let s = suggest(&target, DType::I8, m, n, k);
             let case = Case {
