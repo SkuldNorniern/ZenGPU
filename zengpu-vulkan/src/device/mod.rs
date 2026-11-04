@@ -1457,11 +1457,8 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
     // VK_ERROR_OUT_OF_HOST_MEMORY when vkCreatePipelineLayout references a layout that actually
     // uses them.  Probe with a throw-away pipeline layout and halve capacities on each failure.
     let layout = loop {
-        let lv_cap = level_view_capacity(
-            limits,
-            buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap,
-            stor_cap,
-        );
+        let lv_cap =
+            level_view_capacity(limits, buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap, stor_cap);
         let layout = create_bindless_layout(dev, buf_cap, tex_cap, stor_cap, lv_cap)?;
 
         let push_range = vk::PushConstantRange {
@@ -1507,16 +1504,14 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
             }
             Err(e) => {
                 unsafe { dev.destroy_descriptor_set_layout(layout, None) };
-                return Err(GpuError::Backend(format!("vkCreatePipelineLayout probe: {e}")));
+                return Err(GpuError::Backend(format!(
+                    "vkCreatePipelineLayout probe: {e}"
+                )));
             }
         }
     };
 
-    let lv_cap = level_view_capacity(
-        limits,
-        buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap,
-        stor_cap,
-    );
+    let lv_cap = level_view_capacity(limits, buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap, stor_cap);
     let storage_table = stor_cap + lv_cap;
 
     let mut pool_sizes = vec![
