@@ -257,10 +257,18 @@ impl VulkanCommandList {
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             ..Default::default()
         };
+        // a target sampled earlier on the queue must not be written before those reads finish
+        let readers = if old == vk::ImageLayout::UNDEFINED {
+            vk::PipelineStageFlags::TOP_OF_PIPE
+        } else {
+            vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::TRANSFER
+        };
         unsafe {
             self.inner.device.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                readers,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
