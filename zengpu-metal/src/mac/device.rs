@@ -379,11 +379,16 @@ impl MetalDevice {
     }
 
     /// Commits without waiting. The queue runs work in order, so later commits and presents see
-    /// it finished.
-    pub fn submit(&self, list: super::command::MetalCommandList) -> Result<()> {
+    /// it finished. The serial is for [`Self::wait_serial`].
+    pub fn submit(&self, list: super::command::MetalCommandList) -> Result<u64> {
         let cmd = list.finish();
         self.inner.commit(&cmd);
-        Ok(())
+        Ok(0)
+    }
+
+    /// Waits for the whole queue for now, never less than asked.
+    pub fn wait_serial(&self, _serial: u64) -> Result<()> {
+        self.wait_idle()
     }
 
     pub fn submit_and_wait(&self, list: super::command::MetalCommandList) -> Result<()> {

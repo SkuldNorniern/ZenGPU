@@ -32,10 +32,10 @@ impl VulkanDevice {
         Ok(())
     }
 
-    /// Submits without waiting. The queue runs work in order, so later submits and presents
-    /// see it finished. Its command buffer and fence come back on a later `submit` or
-    /// [`Self::wait_idle`].
-    pub fn submit(&self, list: VulkanCommandList) -> Result<()> {
+    /// Submits without waiting and returns its serial for [`Self::wait_serial`]. The queue runs
+    /// work in order, so later submits and presents see it finished. Its command buffer and
+    /// fence come back on a later `submit` or [`Self::wait_idle`].
+    pub fn submit(&self, list: VulkanCommandList) -> Result<u64> {
         self.reap_in_flight()?;
         let cmd = list.cmd;
         let pool = Arc::clone(&list.pool);
@@ -75,7 +75,7 @@ impl VulkanDevice {
                     serial,
                     pool,
                 });
-                Ok(())
+                Ok(serial)
             }
             Err(error) => {
                 self.fence_pool.release(fence);
@@ -83,6 +83,27 @@ impl VulkanDevice {
                 Err(error)
             }
         }
+    }
+
+    /// Blocks until the list `submit` gave `serial` for, and all before it, are done.
+    pub fn wait_serial(&self, serial: u64) -> Result<()> {
+        let fences: Vec<vk::Fence> = self
+            .in_flight
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|pending| pending.serial <= serial)
+            .map(|pending| pending.fence)
+            .collect();
+        if !fences.is_empty() {
+            unsafe {
+                self.inner
+                    .device
+                    .wait_for_fences(&fences, true, u64::MAX)
+                    .map_err(|e| map_vk_err("vkWaitForFences", e))?;
+            }
+        }
+        self.reap_in_flight()
     }
 
     /// Takes back finished lists from [`Self::submit`] without blocking.

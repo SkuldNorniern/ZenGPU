@@ -290,11 +290,12 @@ mod zsl_parity_tests {
             });
             cmd.draw(0..6, 0..1);
             cmd.end_render_pass();
-            dev.submit(cmd).expect("submit");
+            dev.submit(cmd).expect("submit")
         };
-        for _ in 0..8 {
-            fill(1.0, 0.0);
-        }
+        let serials: Vec<u64> = (0..8).map(|_| fill(1.0, 0.0)).collect();
+        assert!(serials.windows(2).all(|pair| pair[0] < pair[1]));
+        dev.wait_serial(serials[3]).expect("wait");
+        assert!(dev.in_flight_count() <= 4);
         fill(0.0, 1.0);
         // the copy goes on the queue after them, so it sees the last one
         let buf = dev
