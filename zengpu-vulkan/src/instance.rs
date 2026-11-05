@@ -1,3 +1,4 @@
+use std::env;
 use std::{
     cmp::Reverse,
     ffi::{CStr, c_char, c_void},
@@ -16,6 +17,16 @@ use zengpu_hal::{
 };
 
 use crate::adapter::VulkanAdapter;
+
+/// Validation costs every call, so release builds only turn it on when asked, with
+/// `ZENGPU_VALIDATION=1`. Debug builds turn it on when the layer is there, unless it is `0`.
+fn validation_asked() -> bool {
+    match env::var("ZENGPU_VALIDATION").as_deref() {
+        Ok("1") => true,
+        Ok("0") => false,
+        _ => cfg!(debug_assertions),
+    }
+}
 
 unsafe extern "system" fn vulkan_debug_callback(
     severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -119,8 +130,9 @@ impl VulkanInstance {
             })
         };
 
-        let want_validation =
-            has_layer(b"VK_LAYER_KHRONOS_validation") && has_ext(ext::debug_utils::NAME);
+        let want_validation = validation_asked()
+            && has_layer(b"VK_LAYER_KHRONOS_validation")
+            && has_ext(ext::debug_utils::NAME);
 
         let mut ext_names: Vec<*const c_char> = Vec::new();
         let mut layer_names: Vec<*const c_char> = Vec::new();
