@@ -245,6 +245,85 @@ mod zsl_parity_tests {
         raw.as_chunks::<4>().0.to_vec()
     }
 
+    #[test]
+    fn submitted_work_runs_in_order_without_waiting() {
+        let _guard = crate::test_gpu_lock();
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(corner * 2.0 - 1.0, 0.0, 1.0)
+            }
+        );
+        const COLOR_FS: ZslShader = zsl!(
+            push P { r: f32, g: f32 }
+            fragment fs(c: P) -> f32x4 { f32x4(c.r, c.g, 0.0, 1.0) }
+        );
+        let Some(dev) = open() else { return };
+        let target = OffscreenTarget::new(&dev, Format::Rgba8Unorm, 4, 4).expect("target");
+        let p = pipeline(&dev, &QUAD_VS, &COLOR_FS);
+        let fill = |r: f32, g: f32| {
+            let mut cmd = dev.create_command_list().expect("list");
+            cmd.begin_render_pass(&RenderPassDesc {
+                color: &[ColorAttachment {
+                    target: target.target_handle(),
+                    load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                    store: true,
+                    sample_after: false,
+                }],
+                depth: None,
+            });
+            cmd.set_pipeline(p);
+            cmd.set_viewport_scissor(ViewportScissor {
+                viewport: Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 4.0,
+                    height: 4.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: None,
+            });
+            cmd.bind(Bindings {
+                scalars: &[Scalar::F32(r), Scalar::F32(g)],
+                ..Default::default()
+            });
+            cmd.draw(0..6, 0..1);
+            cmd.end_render_pass();
+            dev.submit(cmd).expect("submit");
+        };
+        for _ in 0..8 {
+            fill(1.0, 0.0);
+        }
+        fill(0.0, 1.0);
+        // the copy goes on the queue after them, so it sees the last one
+        let buf = dev
+            .create_buffer(BufferDesc {
+                size: 64,
+                usage: BufferUsage::READBACK | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Readback,
+            })
+            .expect("readback buffer");
+        dev.copy_offscreen_to_buffer(&target, buf).expect("copy");
+        let raw = dev.read_buffer(buf, 0, 64).expect("read");
+        assert!(
+            raw.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|px| *px == [0, 255, 0, 255]),
+            "{raw:?}"
+        );
+        assert!(dev.in_flight_count() <= 9);
+        dev.wait_idle().expect("idle");
+        assert_eq!(dev.in_flight_count(), 0);
+        fill(1.0, 1.0);
+        dev.wait_idle().expect("idle");
+        fill(1.0, 1.0);
+        // the earlier one was done, the next submit took it back
+        assert_eq!(dev.in_flight_count(), 1);
+        dev.destroy_buffer(buf);
+    }
+
     const RED_FS: ZslShader = zsl!(
         fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
     );

@@ -378,6 +378,14 @@ impl MetalDevice {
         self.inner.wait_idle()
     }
 
+    /// Commits without waiting. The queue runs work in order, so later commits and presents see
+    /// it finished.
+    pub fn submit(&self, list: super::command::MetalCommandList) -> Result<()> {
+        let cmd = list.finish();
+        self.inner.commit(&cmd);
+        Ok(())
+    }
+
     pub fn submit_and_wait(&self, list: super::command::MetalCommandList) -> Result<()> {
         let cmd = list.finish();
         self.inner.commit_and_wait(&cmd)

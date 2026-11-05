@@ -773,6 +773,8 @@ pub struct VulkanDevice {
     /// Raw synchronous waits can fail without proving the GPU finished. Retain
     /// their fence/command buffer and block host access until a retry completes.
     failed_raw: Mutex<Vec<dispatch::RawSubmit>>,
+    /// Lists from [`VulkanDevice::submit`] the GPU may still run.
+    in_flight: Mutex<Vec<dispatch::RawSubmit>>,
     orphans: Orphans,
 }
 
@@ -1263,6 +1265,7 @@ impl VulkanDevice {
             image_memory: Mutex::new(image_memory::ImageMemory::default()),
             transfer_slots: Mutex::new(None),
             failed_raw: Mutex::new(Vec::new()),
+            in_flight: Mutex::new(Vec::new()),
             orphans: Arc::default(),
         })
     }
@@ -1666,6 +1669,7 @@ impl Drop for VulkanDevice {
                 self.inner.serials.complete(self.inner.serials.submitted());
             }
         }
+        self.drain_in_flight();
         self.reap_orphans();
         let _ = self.recover_raw_waits();
         if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {

@@ -1,3 +1,5 @@
+use std::mem;
+
 use super::*;
 
 /// Largest device-local host-visible heap treated as the legacy BAR aperture, not Resizable BAR
@@ -23,10 +25,100 @@ impl VulkanDevice {
             }
             self.inner.serials.complete(self.inner.serials.submitted());
         }
+        self.drain_in_flight();
         self.recover_raw_waits()?;
         self.reap_orphans();
         self.collect_garbage();
         Ok(())
+    }
+
+    /// Submits without waiting. The queue runs work in order, so later submits and presents
+    /// see it finished. Its command buffer and fence come back on a later `submit` or
+    /// [`Self::wait_idle`].
+    pub fn submit(&self, list: VulkanCommandList) -> Result<()> {
+        self.reap_in_flight()?;
+        let cmd = list.cmd;
+        let pool = Arc::clone(&list.pool);
+        let ended = unsafe { self.inner.device.end_command_buffer(cmd) }
+            .map_err(|e| map_vk_err("vkEndCommandBuffer", e));
+        if let Err(error) = ended {
+            pool.release(cmd);
+            return Err(error);
+        }
+        let fence = match self.fence_pool.acquire() {
+            Ok(fence) => fence,
+            Err(error) => {
+                pool.release(cmd);
+                return Err(error);
+            }
+        };
+        let submit_info = vk::SubmitInfo {
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            ..Default::default()
+        };
+        let submitted = {
+            let _queue = self.inner.queue_lock.lock().unwrap();
+            unsafe {
+                self.inner
+                    .device
+                    .queue_submit(self.inner.queue, &[submit_info], fence)
+            }
+            .map_err(|e| map_vk_err("vkQueueSubmit", e))
+            .map(|()| self.inner.serials.next())
+        };
+        match submitted {
+            Ok(serial) => {
+                self.in_flight.lock().unwrap().push(RawSubmit {
+                    cmd,
+                    fence,
+                    serial,
+                    pool,
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.fence_pool.release(fence);
+                pool.release(cmd);
+                Err(error)
+            }
+        }
+    }
+
+    /// Takes back finished lists from [`Self::submit`] without blocking.
+    fn reap_in_flight(&self) -> Result<()> {
+        let mut pending = self.in_flight.lock().unwrap();
+        let mut index = 0;
+        while index < pending.len() {
+            let status = unsafe { self.inner.device.get_fence_status(pending[index].fence) };
+            match status {
+                Ok(true) => {
+                    let done = pending.swap_remove(index);
+                    self.recycle_raw(done);
+                }
+                Ok(false) => index += 1,
+                Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    let lost = pending.swap_remove(index);
+                    self.abandon_raw(lost);
+                    return Err(GpuError::DeviceLost);
+                }
+                Err(e) => return Err(map_vk_err("vkGetFenceStatus", e)),
+            }
+        }
+        Ok(())
+    }
+
+    /// After the device is idle every list from [`Self::submit`] is done.
+    pub(super) fn drain_in_flight(&self) {
+        let done: Vec<RawSubmit> = mem::take(&mut *self.in_flight.lock().unwrap());
+        for pending in done {
+            self.recycle_raw(pending);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_flight_count(&self) -> usize {
+        self.in_flight.lock().unwrap().len()
     }
 
     /// Blocks until the GPU finishes it.
