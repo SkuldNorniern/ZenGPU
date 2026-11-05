@@ -25,7 +25,7 @@ impl log::Log for SimpleLogger {
 
 static LOGGER: SimpleLogger = SimpleLogger;
 
-pub fn init() -> Result<(), SetLoggerError> {
+pub(crate) fn init() -> Result<(), SetLoggerError> {
     let level = parse_rust_log();
     log::set_logger(&LOGGER)?;
     log::set_max_level(level);
