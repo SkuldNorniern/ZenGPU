@@ -290,7 +290,7 @@ mod zsl_parity_tests {
             });
             cmd.draw(0..6, 0..1);
             cmd.end_render_pass();
-            dev.submit(cmd).expect("submit")
+            dev.submit_list(cmd).expect("submit")
         };
         let serials: Vec<u64> = (0..8).map(|_| fill(1.0, 0.0)).collect();
         assert!(serials.windows(2).all(|pair| pair[0] < pair[1]));

@@ -773,7 +773,7 @@ pub struct VulkanDevice {
     /// Raw synchronous waits can fail without proving the GPU finished. Retain
     /// their fence/command buffer and block host access until a retry completes.
     failed_raw: Mutex<Vec<dispatch::RawSubmit>>,
-    /// Lists from [`VulkanDevice::submit`] the GPU may still run.
+    /// Lists from [`VulkanDevice::submit_list`] the GPU may still run.
     in_flight: Mutex<Vec<dispatch::RawSubmit>>,
     orphans: Orphans,
 }

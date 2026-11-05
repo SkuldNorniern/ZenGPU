@@ -34,8 +34,8 @@ impl VulkanDevice {
 
     /// Submits without waiting and returns its serial for [`Self::wait_serial`]. The queue runs
     /// work in order, so later submits and presents see it finished. Its command buffer and
-    /// fence come back on a later `submit` or [`Self::wait_idle`].
-    pub fn submit(&self, list: VulkanCommandList) -> Result<u64> {
+    /// fence come back on a later `submit_list` or [`Self::wait_idle`].
+    pub fn submit_list(&self, list: VulkanCommandList) -> Result<u64> {
         self.reap_in_flight()?;
         let cmd = list.cmd;
         let pool = Arc::clone(&list.pool);
@@ -85,7 +85,7 @@ impl VulkanDevice {
         }
     }
 
-    /// Blocks until the list `submit` gave `serial` for, and all before it, are done.
+    /// Blocks until the list `submit_list` gave `serial` for, and all before it, are done.
     pub fn wait_serial(&self, serial: u64) -> Result<()> {
         let fences: Vec<vk::Fence> = self
             .in_flight
@@ -106,7 +106,7 @@ impl VulkanDevice {
         self.reap_in_flight()
     }
 
-    /// Takes back finished lists from [`Self::submit`] without blocking.
+    /// Takes back finished lists from [`Self::submit_list`] without blocking.
     fn reap_in_flight(&self) -> Result<()> {
         let mut pending = self.in_flight.lock().unwrap();
         let mut index = 0;
@@ -129,7 +129,7 @@ impl VulkanDevice {
         Ok(())
     }
 
-    /// After the device is idle every list from [`Self::submit`] is done.
+    /// After the device is idle every list from [`Self::submit_list`] is done.
     pub(super) fn drain_in_flight(&self) {
         let done: Vec<RawSubmit> = mem::take(&mut *self.in_flight.lock().unwrap());
         for pending in done {
