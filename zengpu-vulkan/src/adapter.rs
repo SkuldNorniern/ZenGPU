@@ -80,9 +80,13 @@ impl VulkanAdapter {
         VulkanDevice::new_with_swapchain(Arc::clone(&self.shared), self.physical, req)
     }
 
-    /// Opens a device that can present, same as `open_with_surface`. Same name on every backend
-    /// (see `zengpu::native`).
+    /// Opens a device that can present when the instance has surface support, else a headless
+    /// one. Same name on every backend (see `zengpu::native`).
     pub fn open_graphics(&self, req: DeviceRequest) -> zengpu_hal::Result<VulkanDevice> {
-        self.open_with_surface(req)
+        if self.shared.surface_extensions {
+            self.open_with_surface(req)
+        } else {
+            self.open_headless(req)
+        }
     }
 }
