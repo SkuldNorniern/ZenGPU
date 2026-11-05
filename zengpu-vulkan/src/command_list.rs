@@ -257,11 +257,13 @@ impl VulkanCommandList {
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             ..Default::default()
         };
-        // a target sampled earlier on the queue must not be written before those reads finish
+        // a swapchain image is acquired with a semaphore waited at color output, and a target
+        // sampled earlier on the queue must not be written before those reads finish
         let readers = if old == vk::ImageLayout::UNDEFINED {
-            vk::PipelineStageFlags::TOP_OF_PIPE
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
         } else {
-            vk::PipelineStageFlags::FRAGMENT_SHADER
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::FRAGMENT_SHADER
                 | vk::PipelineStageFlags::COMPUTE_SHADER
                 | vk::PipelineStageFlags::TRANSFER
         };
