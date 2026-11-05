@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::GraphicsModule;
+use crate::ir::node::FragSrc;
 use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::{ArrayLen, Type, TypeId};
 
@@ -138,6 +139,18 @@ impl Ctx<'_> {
             self.t_mat4
         }
     }
+}
+
+fn writes_buffer(stmts: &[IrStmt]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        IrStmt::AssignBuffer { .. } | IrStmt::AtomicAdd { .. } => true,
+        IrStmt::FragStore { src, .. } => matches!(src, FragSrc::Buffer(_)),
+        IrStmt::If { then, else_, .. } => {
+            writes_buffer(then) || else_.as_deref().is_some_and(writes_buffer)
+        }
+        IrStmt::For { body, .. } => writes_buffer(body),
+        _ => false,
+    })
 }
 
 pub fn lower_graphics(module: &GraphicsModule) -> Result<Vec<u32>, Diagnostic> {
@@ -299,6 +312,10 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         let t_struct_buf = spv.type_struct(&[t_ra_f32]);
         spv.decorate(t_struct_buf, deco::BLOCK, &[]);
         spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
+        // without the vertex and fragment store features a buffer must be marked read only
+        if !writes_buffer(&e.body) {
+            spv.member_decorate(t_struct_buf, 0, deco::NON_WRITABLE, &[]);
+        }
         let t_ra_struct = spv.type_runtime_array(t_struct_buf);
         let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
         let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_f32);
@@ -1508,6 +1525,42 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    /// Whether any struct member is decorated NonWritable.
+    fn marks_read_only(words: &[u32]) -> bool {
+        let mut at = 5;
+        while at < words.len() {
+            let (count, opcode) = ((words[at] >> 16) as usize, words[at] & 0xffff);
+            // OpMemberDecorate: target, member, decoration
+            if opcode == 72 && words.get(at + 3) == Some(&super::deco::NON_WRITABLE) {
+                return true;
+            }
+            at += count.max(1);
+        }
+        false
+    }
+
+    #[test]
+    fn read_only_buffers_are_marked_so() {
+        let reading = lower(
+            r#"
+            vertex vs(vi: vertex_index, b: device buffer<f32>) -> f32x4 {
+                f32x4(b[vi], 0.0, 0.0, 1.0)
+            }
+            "#,
+        );
+        validate(&reading);
+        assert!(marks_read_only(&reading));
+        let writing = lower(
+            r#"
+            fragment fs(@location(0) c: f32x4, b: device mut buffer<f32>) -> f32x4 {
+                b[0] = c.x
+                c
+            }
+            "#,
+        );
+        assert!(!marks_read_only(&writing));
     }
 
     #[test]
