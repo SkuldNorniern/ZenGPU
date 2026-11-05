@@ -602,6 +602,10 @@ impl RenderCommands for VulkanCommandList {
                 len += 4;
             }
         };
+        // the same order the shaders lay the block out in
+        for &idx in bindings.buffers {
+            push(idx.to_ne_bytes());
+        }
         for scalar in bindings.scalars {
             push(match scalar {
                 Scalar::U32(v) => v.to_ne_bytes(),
@@ -610,9 +614,6 @@ impl RenderCommands for VulkanCommandList {
             });
         }
         for &idx in bindings.textures {
-            push(idx.to_ne_bytes());
-        }
-        for &idx in bindings.buffers {
             push(idx.to_ne_bytes());
         }
         if len == 0 {

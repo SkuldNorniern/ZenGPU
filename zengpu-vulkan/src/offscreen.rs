@@ -273,6 +273,51 @@ mod zsl_parity_tests {
     }
 
     #[test]
+    fn buffer_indices_come_before_scalars_in_the_push_block() {
+        let _guard = crate::test_gpu_lock();
+        const FROM_BUFFER_VS: ZslShader = zsl!(
+            push P { other: u32 }
+            vertex vs(vi: vertex_index, b: device buffer<f32>, c: P) -> (f32x4, f32x3) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), f32x3(b[0], f32(c.other), b[1]))
+            }
+        );
+        const COLOR_FS: ZslShader = zsl!(
+            fragment fs(@location(0) color: f32x3) -> f32x4 { color.extend(1.0) }
+        );
+        let Some(dev) = open() else { return };
+        let filled = |values: [f32; 2]| {
+            let buffer = dev
+                .create_buffer(BufferDesc {
+                    size: 8,
+                    usage: BufferUsage::STORAGE,
+                    memory: MemoryUsage::Upload,
+                })
+                .expect("buffer");
+            let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            dev.write_buffer(buffer, 0, &bytes).expect("write");
+            buffer
+        };
+        let (wrong, right) = (filled([0.0, 0.0]), filled([1.0, 1.0]));
+        let target = OffscreenTarget::new(&dev, Format::Rgba8Unorm, 4, 4).expect("target");
+        let p = pipeline(&dev, &FROM_BUFFER_VS, &COLOR_FS);
+        // the scalar is the other buffer's slot, so mixing the two up reads it, valid but wrong
+        let px = draw(
+            &dev,
+            &target,
+            p,
+            Bindings {
+                buffers: &[right.index()],
+                scalars: &[Scalar::U32(wrong.index())],
+                ..Default::default()
+            },
+        );
+        let green = (wrong.index() as f32).min(1.0);
+        let want = [255, (green * 255.0) as u8, 255, 255];
+        assert!(px.iter().all(|p| *p == want), "{px:?} {want:?}");
+    }
+
+    #[test]
     fn texture_indices_follow_scalars_in_the_push_block() {
         let _guard = crate::test_gpu_lock();
         const QUAD_VS: ZslShader = zsl!(
