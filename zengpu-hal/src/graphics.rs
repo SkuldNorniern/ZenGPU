@@ -169,5 +169,31 @@ pub trait RenderCommands {
         stride: u32,
     );
 
+    /// [`Self::draw_indirect`] with the number of draws read on the gpu from the `u32` at
+    /// `count_offset` in `count_buffer`, never more than `max_draws`. Needs
+    /// [`Features::DRAW_INDIRECT_COUNT`](crate::Features::DRAW_INDIRECT_COUNT), records nothing
+    /// without it.
+    fn draw_indirect_count(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
+    );
+
+    /// [`Self::draw_indexed_indirect`] with the count read on the gpu, as
+    /// [`Self::draw_indirect_count`].
+    fn draw_indexed_indirect_count(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
+    );
+
     fn end_render_pass(&mut self);
 }

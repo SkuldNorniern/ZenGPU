@@ -198,6 +198,12 @@ pub struct VulkanCommandList {
 }
 
 impl VulkanCommandList {
+    /// The vulkan buffers behind two handles, `None` if either is stale.
+    fn two_buffers(&self, a: BufferHandle, b: BufferHandle) -> Option<(vk::Buffer, vk::Buffer)> {
+        let buffers = self.buffers.lock().unwrap();
+        Some((buffers.get(a)?.buffer, buffers.get(b)?.buffer))
+    }
+
     /// `cmd` must already be recording.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -748,6 +754,72 @@ impl RenderCommands for VulkanCommandList {
             self.inner
                 .device
                 .cmd_draw_indexed_indirect(self.cmd, vk_buf, offset, draw_count, stride);
+        }
+    }
+
+    fn draw_indirect_count(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
+    ) {
+        let Some(loader) = self.inner.draw_indirect_count.as_ref() else {
+            return;
+        };
+        let Some((draws, counts)) = self.two_buffers(buffer, count_buffer) else {
+            return;
+        };
+        let stride = if stride == 0 {
+            mem::size_of::<vk::DrawIndirectCommand>() as u32
+        } else {
+            stride
+        };
+        unsafe {
+            loader.cmd_draw_indirect_count(
+                self.cmd,
+                draws,
+                offset,
+                counts,
+                count_offset,
+                max_draws,
+                stride,
+            );
+        }
+    }
+
+    fn draw_indexed_indirect_count(
+        &mut self,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
+    ) {
+        let Some(loader) = self.inner.draw_indirect_count.as_ref() else {
+            return;
+        };
+        let Some((draws, counts)) = self.two_buffers(buffer, count_buffer) else {
+            return;
+        };
+        let stride = if stride == 0 {
+            mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32
+        } else {
+            stride
+        };
+        unsafe {
+            loader.cmd_draw_indexed_indirect_count(
+                self.cmd,
+                draws,
+                offset,
+                counts,
+                count_offset,
+                max_draws,
+                stride,
+            );
         }
     }
 

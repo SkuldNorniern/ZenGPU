@@ -115,6 +115,9 @@ impl Features {
     pub const TIMESTAMPS: Self = Self(1 << 3);
     pub const FLOAT16: Self = Self(1 << 4);
     pub const UNIFIED_MEMORY: Self = Self(1 << 5);
+    /// Indirect draws whose count the gpu reads from a buffer, so culling on the gpu decides how
+    /// many draws run.
+    pub const DRAW_INDIRECT_COUNT: Self = Self(1 << 6);
 
     pub const fn empty() -> Self {
         Self(0)

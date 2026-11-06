@@ -504,6 +504,30 @@ impl RenderCommands for MetalCommandList {
         }
     }
 
+    fn draw_indirect_count(
+        &mut self,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _count_buffer: BufferHandle,
+        _count_offset: u64,
+        _max_draws: u32,
+        _stride: u32,
+    ) {
+        log::error!("[zengpu-metal] draw_indirect_count is not supported yet; skipped");
+    }
+
+    fn draw_indexed_indirect_count(
+        &mut self,
+        _buffer: BufferHandle,
+        _offset: u64,
+        _count_buffer: BufferHandle,
+        _count_offset: u64,
+        _max_draws: u32,
+        _stride: u32,
+    ) {
+        log::error!("[zengpu-metal] draw_indexed_indirect_count is not supported yet; skipped");
+    }
+
     fn end_render_pass(&mut self) {
         self.end_encoder();
     }
