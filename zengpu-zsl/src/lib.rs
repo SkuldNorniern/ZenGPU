@@ -159,19 +159,43 @@ fn with_shader_crate(code: &str) -> String {
     code.replace("::zengpu_shader", shader_crate)
 }
 
-/// Its own dependency when the manifest names one, otherwise through `zengpu`.
+/// Its own dependency when the manifest names one, otherwise through `zengpu`. Only dependency
+/// tables count: a `[patch]` or `[workspace.dependencies]` entry does not make the crate one the
+/// caller can name.
 fn shader_crate_path(manifest: &str, package: &str) -> &'static str {
-    let names_it = |line: &str| {
-        let key = line.split('=').next().unwrap_or_default().trim();
-        key == "zengpu-shader"
-            || key.starts_with("zengpu-shader.")
-            || key.ends_with(".zengpu-shader]")
-    };
-    if package == "zengpu-shader" || manifest.lines().any(names_it) {
-        "::zengpu_shader"
-    } else {
-        "::zengpu::shader"
+    const DIRECT: &str = "::zengpu_shader";
+    if package == "zengpu-shader" {
+        return DIRECT;
     }
+    let is_dependencies = |table: &str| {
+        !table.starts_with("workspace")
+            && (table == "dependencies"
+                || table == "dev-dependencies"
+                || table == "build-dependencies"
+                || table.ends_with(".dependencies")
+                || table.ends_with(".dev-dependencies")
+                || table.ends_with(".build-dependencies"))
+    };
+    // keys before any table header count, as cargo reads them
+    let mut in_dependencies = true;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if let Some(table) = line.strip_prefix('[') {
+            let table = table.trim_end_matches(']').trim();
+            if let Some(parent) = table.strip_suffix(".zengpu-shader")
+                && is_dependencies(parent)
+            {
+                return DIRECT;
+            }
+            in_dependencies = is_dependencies(table);
+            continue;
+        }
+        let key = line.split('=').next().unwrap_or_default().trim();
+        if in_dependencies && (key == "zengpu-shader" || key.starts_with("zengpu-shader.")) {
+            return DIRECT;
+        }
+    }
+    "::zengpu::shader"
 }
 
 type Outcome<T> = Result<T, String>;
@@ -500,6 +524,22 @@ mod gate_tests {
             direct
         );
         assert_eq!(path("zengpu-shader-extras = \"1\"\n"), through);
+        // a patch or workspace entry is not a dependency of this crate
+        let patched =
+            "[dependencies]\nzengpu = \"0.1\"\n[patch.crates-io]\nzengpu-shader = \"0.1\"\n";
+        assert_eq!(path(patched), through);
+        assert_eq!(
+            path("[workspace.dependencies]\nzengpu-shader = \"0.1\"\n"),
+            through
+        );
+        assert_eq!(
+            path("[target.'cfg(unix)'.dependencies]\nzengpu-shader = \"0.1\"\n"),
+            direct
+        );
+        assert_eq!(
+            path("[dev-dependencies]\nzengpu-shader = \"0.1\"\n"),
+            direct
+        );
         assert_eq!(shader_crate_path("", "zengpu-shader"), direct);
     }
 
