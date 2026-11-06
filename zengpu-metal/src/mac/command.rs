@@ -13,7 +13,7 @@ use metal::{
 use objc::rc::autoreleasepool;
 use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
-    Bindings, BufferHandle, LoadOp, PipelineHandle, QueryPoolHandle, RenderCommands,
+    Bindings, BufferHandle, IndexFormat, LoadOp, PipelineHandle, QueryPoolHandle, RenderCommands,
     RenderPassDesc, Scalar, TargetHandle, ViewportScissor,
 };
 
@@ -36,7 +36,8 @@ pub struct MetalCommandList {
     cmd: Option<CommandBuffer>,
     encoder: Option<RenderCommandEncoder>,
     pipeline: Option<Arc<RenderPipeline>>,
-    index: Option<Buffer>,
+    /// Bound index buffer, the byte offset its indices start at and their width.
+    index: Option<(Buffer, u64, IndexFormat)>,
     binding_valid: bool,
     /// The current pass's attachment size, which scissors must stay inside.
     extent: (u32, u32),
@@ -343,7 +344,7 @@ impl RenderCommands for MetalCommandList {
         enc.set_fragment_bytes(PUSH_BUFFER_INDEX, len as u64, ptr);
     }
 
-    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle) {
+    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle, offset: u64) {
         let buf = self
             .inner
             .buffers
@@ -357,16 +358,16 @@ impl RenderCommands for MetalCommandList {
         let Some(enc) = self.encoder("set_vertex_buffer") else {
             return;
         };
-        enc.set_vertex_buffer(u64::from(slot), Some(&buf), 0);
+        enc.set_vertex_buffer(u64::from(slot), Some(&buf), offset);
     }
 
-    fn set_index_buffer(&mut self, buffer: BufferHandle) {
+    fn set_index_buffer(&mut self, buffer: BufferHandle, offset: u64, format: IndexFormat) {
         self.index = self
             .inner
             .buffers
             .lock()
             .ok()
-            .and_then(|b| b.get(buffer).map(|b| b.buf.clone()));
+            .and_then(|b| b.get(buffer).map(|b| (b.buf.clone(), offset, format)));
         if self.index.is_none() {
             log::error!("[zengpu-metal] set_index_buffer: stale buffer");
         }
@@ -395,11 +396,12 @@ impl RenderCommands for MetalCommandList {
         );
     }
 
-    fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>) {
+    fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
         if !self.binding_valid {
             return;
         }
-        let (Some(p), Some(index)) = (self.pipeline.clone(), self.index.clone()) else {
+        let (Some(p), Some((index, start, format))) = (self.pipeline.clone(), self.index.clone())
+        else {
             log::error!("[zengpu-metal] draw_indexed without a pipeline or index buffer; skipped");
             return;
         };
@@ -410,16 +412,17 @@ impl RenderCommands for MetalCommandList {
             return;
         }
         let index_count = u64::from(indices.end - indices.start);
-        let offset = u64::from(indices.start) * 4;
+        let offset = start + u64::from(indices.start) * format.bytes();
         let instance_count = u64::from(instances.end - instances.start);
         let base_instance = u64::from(instances.start);
-        let base_vertex: i64 = 0;
+        let base_vertex = i64::from(base_vertex);
+        let index_type = index_type(format);
         let enc_ref: &metal::RenderCommandEncoderRef = enc;
         unsafe {
             let _: () = msg_send![enc_ref,
                 drawIndexedPrimitives: p.primitive
                 indexCount: index_count
-                indexType: MTLIndexType::UInt32
+                indexType: index_type
                 indexBuffer: index.as_ref() as &metal::BufferRef
                 indexBufferOffset: offset
                 instanceCount: instance_count
@@ -467,7 +470,8 @@ impl RenderCommands for MetalCommandList {
         if !self.binding_valid {
             return;
         }
-        let (Some(p), Some(index)) = (self.pipeline.clone(), self.index.clone()) else {
+        let (Some(p), Some((index, start, format))) = (self.pipeline.clone(), self.index.clone())
+        else {
             log::error!(
                 "[zengpu-metal] draw_indexed_indirect without a pipeline or index buffer; skipped"
             );
@@ -491,9 +495,9 @@ impl RenderCommands for MetalCommandList {
         for i in 0..u64::from(draw_count) {
             enc.draw_indexed_primitives_indirect(
                 p.primitive,
-                MTLIndexType::UInt32,
+                index_type(format),
                 &index,
-                0,
+                start,
                 &buf,
                 offset + i * stride,
             );
@@ -502,5 +506,12 @@ impl RenderCommands for MetalCommandList {
 
     fn end_render_pass(&mut self) {
         self.end_encoder();
+    }
+}
+
+fn index_type(format: IndexFormat) -> MTLIndexType {
+    match format {
+        IndexFormat::U16 => MTLIndexType::UInt16,
+        IndexFormat::U32 => MTLIndexType::UInt32,
     }
 }

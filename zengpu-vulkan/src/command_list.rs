@@ -12,9 +12,9 @@ use std::{
 
 use ash::vk;
 use zengpu_hal::{
-    Bindings, BufferHandle, ColorAttachment, DepthAttachment, GpuError, LoadOp, PipelineHandle,
-    QueryPoolHandle, RenderCommands, RenderPassDesc, Result, Scalar, SlotMap, TargetHandle,
-    ViewportScissor, marker,
+    Bindings, BufferHandle, ColorAttachment, DepthAttachment, GpuError, IndexFormat, LoadOp,
+    PipelineHandle, QueryPoolHandle, RenderCommands, RenderPassDesc, Result, Scalar, SlotMap,
+    TargetHandle, ViewportScissor, marker,
 };
 
 use crate::device::{
@@ -190,8 +190,8 @@ pub struct VulkanCommandList {
     current_pipeline: Option<PipelineHandle>,
     /// Layout of the bound graphics pipeline. Scopes push constants for `bind`.
     current_layout: Option<vk::PipelineLayout>,
-    current_vertex_buffers: [Option<BufferHandle>; MAX_VERTEX_BUFFERS],
-    current_index_buffer: Option<BufferHandle>,
+    current_vertex_buffers: [Option<(BufferHandle, u64)>; MAX_VERTEX_BUFFERS],
+    current_index_buffer: Option<(BufferHandle, u64, IndexFormat)>,
     /// Targets from this pass with `sample_after` set: moved to
     /// `SHADER_READ_ONLY_OPTIMAL` in `end_render_pass`.
     pending_shader_read: [Option<TargetHandle>; MAX_COLOR_ATTACHMENTS],
@@ -640,8 +640,8 @@ impl RenderCommands for VulkanCommandList {
         }
     }
 
-    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle) {
-        if self.current_vertex_buffers.get(slot as usize) == Some(&Some(buffer)) {
+    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle, offset: u64) {
+        if self.current_vertex_buffers.get(slot as usize) == Some(&Some((buffer, offset))) {
             return;
         }
         let buffers = self.buffers.lock().unwrap();
@@ -653,15 +653,15 @@ impl RenderCommands for VulkanCommandList {
         unsafe {
             self.inner
                 .device
-                .cmd_bind_vertex_buffers(self.cmd, slot, &[vk_buf], &[0]);
+                .cmd_bind_vertex_buffers(self.cmd, slot, &[vk_buf], &[offset]);
         }
         if let Some(current) = self.current_vertex_buffers.get_mut(slot as usize) {
-            *current = Some(buffer);
+            *current = Some((buffer, offset));
         }
     }
 
-    fn set_index_buffer(&mut self, buffer: BufferHandle) {
-        if self.current_index_buffer == Some(buffer) {
+    fn set_index_buffer(&mut self, buffer: BufferHandle, offset: u64, format: IndexFormat) {
+        if self.current_index_buffer == Some((buffer, offset, format)) {
             return;
         }
         let buffers = self.buffers.lock().unwrap();
@@ -670,12 +670,16 @@ impl RenderCommands for VulkanCommandList {
         };
         let vk_buf = buf.buffer;
         drop(buffers);
+        let kind = match format {
+            IndexFormat::U16 => vk::IndexType::UINT16,
+            IndexFormat::U32 => vk::IndexType::UINT32,
+        };
         unsafe {
             self.inner
                 .device
-                .cmd_bind_index_buffer(self.cmd, vk_buf, 0, vk::IndexType::UINT32);
+                .cmd_bind_index_buffer(self.cmd, vk_buf, offset, kind);
         }
-        self.current_index_buffer = Some(buffer);
+        self.current_index_buffer = Some((buffer, offset, format));
     }
 
     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
@@ -690,14 +694,14 @@ impl RenderCommands for VulkanCommandList {
         }
     }
 
-    fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>) {
+    fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
         unsafe {
             self.inner.device.cmd_draw_indexed(
                 self.cmd,
                 indices.end - indices.start,
                 instances.end - instances.start,
                 indices.start,
-                0,
+                base_vertex,
                 instances.start,
             );
         }

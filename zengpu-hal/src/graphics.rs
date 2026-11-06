@@ -9,7 +9,7 @@ use crate::desc::{GraphicsPipelineDesc, SurfaceConfig};
 use crate::error::Result;
 use crate::handle::{BufferHandle, PipelineHandle, QueryPoolHandle, TargetHandle};
 use crate::surface::WindowHandles;
-use crate::types::{Format, Rect, Viewport};
+use crate::types::{Format, IndexFormat, Rect, Viewport};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LoadOp {
@@ -143,13 +143,17 @@ pub trait RenderCommands {
 
     fn bind(&mut self, bindings: Bindings<'_>);
 
-    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle);
+    /// Vertex data for `slot` starts `offset` bytes into `buffer`.
+    fn set_vertex_buffer(&mut self, slot: u32, buffer: BufferHandle, offset: u64);
 
-    fn set_index_buffer(&mut self, buffer: BufferHandle);
+    /// Indices start `offset` bytes into `buffer`, `format` wide each.
+    fn set_index_buffer(&mut self, buffer: BufferHandle, offset: u64, format: IndexFormat);
 
     fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>);
 
-    fn draw_indexed(&mut self, indices: Range<u32>, instances: Range<u32>);
+    /// `base_vertex` is added to every index before the vertex is read, so many meshes can
+    /// share one vertex and one index buffer.
+    fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>);
 
     /// Layout of `VkDrawIndirectCommand`: four `u32`s, [vertex_count, instance_count, first_vertex,
     /// first_instance]. 16 bytes. `stride` 0 means tightly packed.

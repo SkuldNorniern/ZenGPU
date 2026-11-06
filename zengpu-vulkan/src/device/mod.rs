@@ -2932,6 +2932,118 @@ mod tests {
 
     /// A pass into a never-uploaded target still reads back: it marks the texture as holding
     /// texels, so the copy does not start from `UNDEFINED`.
+    /// Two meshes in one vertex and one index buffer: the draw finds its own by the buffers'
+    /// byte offsets, the 16 bit index width and the base vertex. Missing any of them it reads
+    /// the junk vertices in front, which cover nothing.
+    #[test]
+    fn indexed_draws_find_their_mesh_by_offset_and_base_vertex() {
+        use zengpu_hal::{IndexFormat, StepMode, VertexAttribute, VertexFormat, VertexLayout};
+
+        const POSITION_VS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            vertex vs(@location(0) at: f32x2) -> f32x4 { f32x4(at, 0.0, 1.0) }
+        );
+        const RED_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
+        );
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        let format = Format::Rgba8Unorm;
+        let (tex, target) = render_target(device, format, 2, 2);
+        let attrs = [VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }];
+        let layouts = [VertexLayout {
+            stride: 8,
+            attributes: &attrs,
+            step_mode: StepMode::Vertex,
+        }];
+        let vs = device
+            .create_shader(POSITION_VS.spirv_desc().unwrap())
+            .unwrap();
+        let fs = device.create_shader(RED_FS.spirv_desc().unwrap()).unwrap();
+        let pipeline = device
+            .create_graphics_pipeline(GraphicsPipelineDesc {
+                vertex_shader: vs,
+                fragment_shader: fs,
+                vertex_layouts: &layouts,
+                topology: PrimitiveTopology::TriangleList,
+                color_targets: &[ColorTargetState {
+                    format,
+                    blend: None,
+                }],
+                depth_format: None,
+                depth: DepthState::default(),
+                stencil: None,
+                raster: RasterState::default(),
+                samples: 1,
+            })
+            .unwrap();
+        // four junk vertices at the middle, then a quad over the whole target
+        let mut points = vec![0.0f32; 8];
+        points.extend([
+            -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, 1.0,
+        ]);
+        let vertex_bytes: Vec<u8> = points.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // two junk indices, then the quad's
+        let index_bytes: Vec<u8> = [9u16, 9, 0, 1, 2, 3, 4, 5]
+            .iter()
+            .flat_map(|i| i.to_le_bytes())
+            .collect();
+        let upload = |bytes: &[u8], usage| {
+            let buffer = device
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            device.write_buffer(buffer, 0, bytes).unwrap();
+            buffer
+        };
+        let vertices = upload(&vertex_bytes, BufferUsage::VERTEX);
+        let indices = upload(&index_bytes, BufferUsage::INDEX);
+        let mut cmd = device.create_command_list().unwrap();
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &[ColorAttachment {
+                target,
+                load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                store: true,
+                sample_after: true,
+            }],
+            depth: None,
+        });
+        cmd.set_pipeline(pipeline);
+        cmd.set_viewport_scissor(ViewportScissor {
+            viewport: Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        });
+        // one junk vertex skipped by the offset, three by the base vertex
+        cmd.set_vertex_buffer(0, vertices, 8);
+        cmd.set_index_buffer(indices, 4, IndexFormat::U16);
+        cmd.draw_indexed(0..6, 3, 0..1);
+        cmd.end_render_pass();
+        device.submit_and_wait(cmd).unwrap();
+        let got = read_texels(device, tex, format, 2, 2);
+        assert_texels(format, &got, &[[1.0, 0.0, 0.0, 1.0]; 4]);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(vs);
+        device.destroy_shader(fs);
+        device.destroy_buffer(vertices);
+        device.destroy_buffer(indices);
+        device.destroy_texture(tex);
+    }
+
     #[test]
     fn rendered_and_uploaded_texels_survive_readback_and_load() {
         let Some(dev) = try_graphics_device() else {

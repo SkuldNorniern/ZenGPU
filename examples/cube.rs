@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
-use zengpu::hal::{CompareFn, RasterState};
+use zengpu::hal::{CompareFn, IndexFormat, RasterState};
 use zengpu::native::{NativeDepthTarget, NativeDevice, NativeInstance, NativeSurface, shader};
 use zengpu::{
     Acquire, Bindings, BufferDesc, BufferHandle, BufferUsage, ColorAttachment, ColorTargetState,
@@ -375,9 +375,9 @@ impl ApplicationHandler for App {
                             scalars: &scalars,
                             ..Default::default()
                         });
-                        list.set_vertex_buffer(0, render.vertex_buffer);
-                        list.set_index_buffer(render.index_buffer);
-                        list.draw_indexed(0..CUBE_INDICES.len() as u32, 0..1);
+                        list.set_vertex_buffer(0, render.vertex_buffer, 0);
+                        list.set_index_buffer(render.index_buffer, 0, IndexFormat::U32);
+                        list.draw_indexed(0..CUBE_INDICES.len() as u32, 0, 0..1);
                         list.end_render_pass();
                         let _ = render.surface.present(frame, list);
                     }

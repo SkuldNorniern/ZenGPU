@@ -959,7 +959,7 @@ mod graphics_tests {
     use zengpu_hal::{
         Bindings, BlendState, BufferDesc, BufferHandle, BufferUsage, ColorAttachment,
         ColorTargetState, CompareFn, DepthAttachment, DepthState, DeviceRequest, FilterMode,
-        Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, LoadOp, MemoryUsage,
+        Format, GpuDevice, GraphicsDevice, GraphicsPipelineDesc, IndexFormat, LoadOp, MemoryUsage,
         PipelineHandle, PrimitiveTopology, RasterState, RenderCommands, RenderPassDesc,
         SamplerDesc, Scalar, ShaderDesc, StepMode, TargetHandle, TexDim, TextureDesc,
         TextureHandle, TextureUsage, VertexAttribute, VertexFormat, VertexLayout, Viewport,
@@ -1539,9 +1539,9 @@ mod graphics_tests {
         ));
         cmd.set_pipeline(p);
         cmd.set_viewport_scissor(viewport(4, 2));
-        cmd.set_vertex_buffer(0, lefts);
-        cmd.set_index_buffer(indices);
-        cmd.draw_indexed(0..6, 0..2);
+        cmd.set_vertex_buffer(0, lefts, 0);
+        cmd.set_index_buffer(indices, 0, IndexFormat::U32);
+        cmd.draw_indexed(0..6, 0, 0..2);
         cmd.end_render_pass();
         dev.submit_and_wait(cmd).expect("submit");
         assert!(pixels(&dev, tex, 4, 2).iter().all(|p| *p == RED));

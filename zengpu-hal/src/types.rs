@@ -86,6 +86,23 @@ impl BitOrAssign for BufferUsage {
     }
 }
 
+/// Width of each index in an index buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IndexFormat {
+    U16,
+    #[default]
+    U32,
+}
+
+impl IndexFormat {
+    pub const fn bytes(self) -> u64 {
+        match self {
+            Self::U16 => 2,
+            Self::U32 => 4,
+        }
+    }
+}
+
 /// Bitflags over `u32`, combined with `|`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Features(u32);

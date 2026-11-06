@@ -53,6 +53,6 @@ pub use handle::{
     TargetHandle, TextureHandle, marker,
 };
 pub use types::{
-    BackendPreference, BufferUsage, DType, Features, Format, MemoryUsage, PowerPreference,
-    PresentMode, Rect, TextureUsage, Viewport,
+    BackendPreference, BufferUsage, DType, Features, Format, IndexFormat, MemoryUsage,
+    PowerPreference, PresentMode, Rect, TextureUsage, Viewport,
 };
