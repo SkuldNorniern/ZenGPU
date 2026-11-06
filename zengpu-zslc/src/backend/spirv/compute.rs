@@ -878,7 +878,12 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             Ok(())
         }
 
-        IrStmt::AtomicAdd { buf, index, value } => {
+        IrStmt::AtomicAdd {
+            buf,
+            index,
+            value,
+            old,
+        } => {
             let info = *ctx
                 .buf_params
                 .get(buf)
@@ -908,13 +913,21 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let rhs_id = coerce(ctx, rhs, elem);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
-            if elem == ctx.f32_id {
+            let before = if elem == ctx.f32_id {
                 ctx.spv
-                    .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id);
+                    .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id)
             } else {
                 let t = ctx.spv_ty(elem);
                 ctx.spv
-                    .op_atomic_int(op::ATOMIC_I_ADD, t, ptr_elem, scope, semantics, rhs_id);
+                    .op_atomic_int(op::ATOMIC_I_ADD, t, ptr_elem, scope, semantics, rhs_id)
+            };
+            if let Some(old) = old {
+                let ptr = ctx
+                    .locals
+                    .get(old)
+                    .ok_or_else(|| format!("ZSL: undeclared local `{old}`"))?
+                    .ptr;
+                ctx.spv.op_store(ptr, before);
             }
             Ok(())
         }

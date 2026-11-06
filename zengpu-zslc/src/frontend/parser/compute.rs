@@ -447,42 +447,13 @@ impl<'a> Parser<'a> {
             return Ok(vec![self.parse_frag_store(ctx)?]);
         }
         if self.eat_kw("atomic_add") {
-            self.expect(&Tok::LParen, "`(` after atomic_add")?;
-            let buf = self.ident()?;
-            self.expect(&Tok::Comma, "`,` after atomic_add buffer")?;
-            let index = self.parse_expr(ctx)?;
-            self.expect(&Tok::Comma, "`,` after atomic_add index")?;
-            let value = self.parse_expr(ctx)?;
-            self.expect(&Tok::RParen, "`)` after atomic_add arguments")?;
-            let Some(buffer) = ctx.buffers.get(&buf).copied() else {
-                return self.err(format!("`{buf}` is not a device buffer"));
-            };
-            if !buffer.writable {
-                return self.err(format!(
-                    "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
-                ));
-            }
-            let f32_id = self.types.f32_id();
-            let u32_id = self.types.u32_id();
-            let i32_id = self.types.i32_id();
-            if ![f32_id, u32_id, i32_id].contains(&buffer.elem) {
-                return self.err("atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>");
-            }
-            let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
-            if index_ty != u32_id && index_ty != f32_id {
-                return self.err("atomic_add index must be a u32- or f32-typed expression");
-            }
-            // f32 buffers add f32 values; integer buffers add either integer type, converted.
-            let value_ty = type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types);
-            let fits = if buffer.elem == f32_id {
-                value_ty == f32_id
-            } else {
-                value_ty == u32_id || value_ty == i32_id
-            };
-            if !fits {
-                return self.err("atomic_add value must match the buffer: f32 for buffer<f32>, an integer otherwise");
-            }
-            return Ok(vec![IrStmt::AtomicAdd { buf, index, value }]);
+            let (buf, index, value, _) = self.parse_atomic_add(ctx)?;
+            return Ok(vec![IrStmt::AtomicAdd {
+                buf,
+                index,
+                value,
+                old: None,
+            }]);
         }
         if let Some(Tok::Ident(name)) = self.peek()
             && let Some(&storage) = ctx.textures.get(name)
@@ -664,6 +635,52 @@ impl<'a> Parser<'a> {
         Ok(prelude)
     }
 
+    /// `atomic_add(buffer, index, value)` after its keyword: the buffer, index, value and the
+    /// buffer's element type.
+    fn parse_atomic_add(
+        &mut self,
+        ctx: &mut Ctx,
+    ) -> Result<(String, IrExpr, IrExpr, TypeId), ParseError> {
+        self.expect(&Tok::LParen, "`(` after atomic_add")?;
+        let buf = self.ident()?;
+        self.expect(&Tok::Comma, "`,` after atomic_add buffer")?;
+        let index = self.parse_expr(ctx)?;
+        self.expect(&Tok::Comma, "`,` after atomic_add index")?;
+        let value = self.parse_expr(ctx)?;
+        self.expect(&Tok::RParen, "`)` after atomic_add arguments")?;
+        let Some(buffer) = ctx.buffers.get(&buf).copied() else {
+            return self.err(format!("`{buf}` is not a device buffer"));
+        };
+        if !buffer.writable {
+            return self.err(format!(
+                "`{buf}` is not a mutable device buffer; declare it `device mut buffer`"
+            ));
+        }
+        let f32_id = self.types.f32_id();
+        let u32_id = self.types.u32_id();
+        let i32_id = self.types.i32_id();
+        if ![f32_id, u32_id, i32_id].contains(&buffer.elem) {
+            return self.err("atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>");
+        }
+        let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
+        if index_ty != u32_id && index_ty != f32_id {
+            return self.err("atomic_add index must be a u32- or f32-typed expression");
+        }
+        // f32 buffers add f32 values; integer buffers add either integer type, converted.
+        let value_ty = type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types);
+        let fits = if buffer.elem == f32_id {
+            value_ty == f32_id
+        } else {
+            value_ty == u32_id || value_ty == i32_id
+        };
+        if !fits {
+            return self.err(
+                "atomic_add value must match the buffer: f32 for buffer<f32>, an integer otherwise",
+            );
+        }
+        Ok((buf, index, value, buffer.elem))
+    }
+
     pub(super) fn parse_let(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
         let name = self.ident()?;
         if ctx.shared.contains_key(&name) {
@@ -679,6 +696,20 @@ impl<'a> Parser<'a> {
             Some(self.parse_scalar_type()?)
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
+        if self.eat_kw("atomic_add") {
+            let (buf, index, value, elem) = self.parse_atomic_add(ctx)?;
+            if annot.is_some_and(|ty| ty != elem) {
+                return self.err("atomic_add hands back the buffer's element type");
+            }
+            ctx.locals.insert(name.clone(), elem);
+            ctx.locals_order.push((name.clone(), elem));
+            return Ok(IrStmt::AtomicAdd {
+                buf,
+                index,
+                value,
+                old: Some(name),
+            });
+        }
         let init = self.parse_expr(ctx)?;
         let init = match annot {
             Some(ty) => self.frag_load_for(ctx, init, ty),

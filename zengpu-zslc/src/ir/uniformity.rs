@@ -168,9 +168,18 @@ fn check_stmt(
             reject_if_divergent(ld, divergent)?;
             reject_if_divergent(value, divergent)
         }
-        IrStmt::AssignBuffer { index, value, .. }
-        | IrStmt::AssignShared { index, value, .. }
-        | IrStmt::AtomicAdd { index, value, .. } => {
+        IrStmt::AtomicAdd {
+            index, value, old, ..
+        } => {
+            reject_if_divergent(index, divergent)?;
+            reject_if_divergent(value, divergent)?;
+            // each invocation gets its own old value
+            if let Some(old) = old {
+                locals.insert(old.clone(), false);
+            }
+            Ok(())
+        }
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
             reject_if_divergent(index, divergent)?;
             reject_if_divergent(value, divergent)
         }

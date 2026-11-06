@@ -112,10 +112,16 @@ pub(super) fn rename_stmt(stmt: &IrStmt, map: &HashMap<String, String>) -> IrStm
             index: rename_expr(index, map),
             value: rename_expr(value, map),
         },
-        IrStmt::AtomicAdd { buf, index, value } => IrStmt::AtomicAdd {
+        IrStmt::AtomicAdd {
+            buf,
+            index,
+            value,
+            old,
+        } => IrStmt::AtomicAdd {
             buf: buf.clone(),
             index: rename_expr(index, map),
             value: rename_expr(value, map),
+            old: old.as_ref().map(renamed),
         },
         IrStmt::AssignShared { name, index, value } => IrStmt::AssignShared {
             name: name.clone(),
@@ -273,10 +279,16 @@ pub(super) fn resolve_construct_types_stmt(stmt: &IrStmt, types: &mut TypeArena)
             index: resolve_construct_types_expr(index, types),
             value: resolve_construct_types_expr(value, types),
         },
-        IrStmt::AtomicAdd { buf, index, value } => IrStmt::AtomicAdd {
+        IrStmt::AtomicAdd {
+            buf,
+            index,
+            value,
+            old,
+        } => IrStmt::AtomicAdd {
             buf: buf.clone(),
             index: resolve_construct_types_expr(index, types),
             value: resolve_construct_types_expr(value, types),
+            old: old.clone(),
         },
         IrStmt::AssignShared { name, index, value } => IrStmt::AssignShared {
             name: name.clone(),

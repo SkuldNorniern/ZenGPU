@@ -101,11 +101,13 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
-    /// Mutable device buffers only.
+    /// Mutable device buffers only. `old`, when set, is a local pre-declared like a `Let`'s
+    /// that takes the element's value from before the add.
     AtomicAdd {
         buf: String,
         index: IrExpr,
         value: IrExpr,
+        old: Option<String>,
     },
     /// Six values: x, y, r, g, b and a. Compute only.
     ImageStore {

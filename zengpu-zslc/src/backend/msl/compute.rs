@@ -490,7 +490,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             };
             let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
-        IrStmt::AtomicAdd { buf, index, value } => {
+        IrStmt::AtomicAdd {
+            buf,
+            index,
+            value,
+            old,
+        } => {
             indent(s, depth);
             // The value converts to the buffer's element type.
             let cty = ctx
@@ -498,6 +503,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .buffers
                 .get(buf.as_str())
                 .map_or("float", |&t| scalar_c_type(ctx, t));
+            if let Some(old) = old {
+                let _ = write!(s, "{cty} {old} = ");
+            }
             let _ = writeln!(
                 s,
                 "atomic_fetch_add_explicit(&{}[uint({})], {cty}({}), memory_order_relaxed);",

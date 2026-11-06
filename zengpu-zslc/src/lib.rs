@@ -2714,6 +2714,11 @@ mod portability_tests {
             "atomic_add(o, 0u, u)\natomic_add(ai, 1u, x)\natomic_add(of, 2u, f)",
         ),
         (
+            "atomics hand back the old value",
+            "",
+            "let at = atomic_add(o, 0u, 1u)\no[at + 1u] = u\nlet back: i32 = atomic_add(ai, 1u, x)\nai[2u] = back\nlet was = atomic_add(of, 2u, f)\nof[3u] = was",
+        ),
+        (
             "frag element access",
             "",
             "let c: frag<f32, 16, 16, acc> = frag_zero_acc()\nc = frag_set(c, 0u, f)\nof[i] = frag_get(c, 1u) + f32(frag_row(c, 1u) + frag_col(c, 1u) + frag_len(c))\nfrag_store(of, 0u, 16u, c)",

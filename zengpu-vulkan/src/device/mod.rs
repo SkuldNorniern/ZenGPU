@@ -7405,6 +7405,51 @@ mod tests {
         assert_eq!(zsl_bytes_f32(&out[0]), want);
     }
 
+    /// Every third invocation takes a place from the counter's old value: each place once, no
+    /// gaps, so the kept list is exactly the multiples of three.
+    #[test]
+    fn zsl_atomic_add_hands_each_invocation_its_own_place() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const KEEP: ZslShader = zsl!(
+            push Keep { n: u32 }
+            @workgroup_size(64)
+            kernel keep(count: device mut buffer<u32>, kept: device mut buffer<u32>, p: Keep, id: global_id) {
+                let i = id.x
+                if i < p.n {
+                    if i % 3u == 0u {
+                        let at = atomic_add(count, 0u, 1u)
+                        kept[at] = i
+                    }
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 1000u32;
+        let out = run_zsl(
+            &*dev,
+            &KEEP,
+            [64, 1, 1],
+            [n.div_ceil(64), 1, 1],
+            &[],
+            &[4, u64::from(n) * 4],
+            &[Scalar::U32(n)],
+        );
+        let words = |bytes: &[u8]| -> Vec<u32> {
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|w| u32::from_ne_bytes(*w))
+                .collect()
+        };
+        let count = words(&out[0])[0];
+        let mut kept = words(&out[1])[..count as usize].to_vec();
+        kept.sort_unstable();
+        assert_eq!(kept, (0..n).step_by(3).collect::<Vec<_>>());
+    }
+
     #[test]
     fn zsl_workgroup_reduce_runs_through_vulkan() {
         use zengpu_shader::{ZslShader, zsl};

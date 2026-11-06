@@ -604,7 +604,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             };
             let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
-        IrStmt::AtomicAdd { buf, index, value } => {
+        IrStmt::AtomicAdd {
+            buf,
+            index,
+            value,
+            old,
+        } => {
             indent(s, depth);
             // The value converts to the buffer's element type, which picks the overload.
             let cty = {
@@ -615,6 +620,9 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                     _ => "float",
                 }
             };
+            if let Some(old) = old {
+                let _ = write!(s, "{cty} {old} = ");
+            }
             let _ = writeln!(
                 s,
                 "atomicAdd(&{}[(unsigned int)({})], ({cty})({}));",
