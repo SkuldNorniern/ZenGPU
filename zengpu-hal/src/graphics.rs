@@ -156,7 +156,9 @@ pub trait RenderCommands {
     fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>);
 
     /// Layout of `VkDrawIndirectCommand`: four `u32`s, [vertex_count, instance_count, first_vertex,
-    /// first_instance]. 16 bytes. `stride` 0 means tightly packed.
+    /// first_instance]. 16 bytes. `stride` 0 means tightly packed. Without
+    /// [`Features::MULTI_DRAW_INDIRECT`](crate::Features::MULTI_DRAW_INDIRECT) the draws are
+    /// issued one by one, and a first instance other than 0 is not honoured.
     fn draw_indirect(&mut self, buffer: BufferHandle, offset: u64, draw_count: u32, stride: u32);
 
     /// Layout of `VkDrawIndexedIndirectCommand`: `u32` index_count, instance_count, first_index,

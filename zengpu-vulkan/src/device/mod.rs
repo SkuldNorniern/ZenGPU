@@ -510,6 +510,8 @@ pub(crate) struct VulkanDeviceInner {
     pub dual_src_blend: bool,
     pub fill_mode_non_solid: bool,
     pub sampler_anisotropy: bool,
+    /// `multiDrawIndirect` and `drawIndirectFirstInstance` on: one indirect call runs many draws.
+    pub multi_draw_indirect: bool,
     pub max_sampler_anisotropy: f32,
     /// `Depth24PlusStencil8` here: `D24_UNORM_S8_UINT` if present, else `D32_SFLOAT_S8_UINT`. AMD
     /// exposes no D24S8. "24 plus" allows the wider depth.
@@ -953,7 +955,14 @@ impl VulkanDevice {
         if needs_graphics {
             available_features |= Features::GRAPHICS;
         }
-        if indirect_count {
+        let multi_draw_indirect = needs_graphics
+            && supported_features2.features.multi_draw_indirect == vk::TRUE
+            && supported_features2.features.draw_indirect_first_instance == vk::TRUE;
+        if multi_draw_indirect {
+            available_features |= Features::MULTI_DRAW_INDIRECT;
+        }
+        // a gpu count above one is many draws in one call
+        if indirect_count && multi_draw_indirect {
             available_features |= Features::DRAW_INDIRECT_COUNT;
         }
         let missing_required = req.required.difference(available_features);
@@ -1063,6 +1072,8 @@ impl VulkanDevice {
                 } else {
                     vk::FALSE
                 },
+                multi_draw_indirect: on(multi_draw_indirect),
+                draw_indirect_first_instance: on(multi_draw_indirect),
                 ..Default::default()
             },
             ..Default::default()
@@ -1206,6 +1217,7 @@ impl VulkanDevice {
             dual_src_blend,
             fill_mode_non_solid,
             sampler_anisotropy,
+            multi_draw_indirect,
             max_sampler_anisotropy,
             depth24_stencil8,
             compute_subgroup_sizes,
@@ -2944,6 +2956,105 @@ mod tests {
 
     /// A pass into a never-uploaded target still reads back: it marks the texture as holding
     /// texels, so the copy does not start from `UNDEFINED`.
+    /// One indirect call with two draws, the second from instance 1: each instance covers its
+    /// half of the target, so both halves show only if both draws ran from their own instance.
+    #[test]
+    fn one_indirect_call_runs_each_draw_from_its_first_instance() {
+        use zengpu_hal::{Features, IndexFormat};
+
+        const HALF_VS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            vertex vs(vi: vertex_index, ii: instance_index) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(f32(ii) - 1.0 + corner.x, corner.y * 2.0 - 1.0, 0.0, 1.0)
+            }
+        );
+        const RED_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
+        );
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        if !device
+            .capabilities()
+            .features
+            .contains(Features::MULTI_DRAW_INDIRECT)
+        {
+            return;
+        }
+        let format = Format::Rgba8Unorm;
+        let (tex, target) = render_target(device, format, 2, 2);
+        let vs = device.create_shader(HALF_VS.spirv_desc().unwrap()).unwrap();
+        let fs = device.create_shader(RED_FS.spirv_desc().unwrap()).unwrap();
+        let pipeline = device
+            .create_graphics_pipeline(GraphicsPipelineDesc {
+                vertex_shader: vs,
+                fragment_shader: fs,
+                vertex_layouts: &[],
+                topology: PrimitiveTopology::TriangleList,
+                color_targets: &[ColorTargetState {
+                    format,
+                    blend: None,
+                }],
+                depth_format: None,
+                depth: DepthState::default(),
+                stencil: None,
+                raster: RasterState::default(),
+                samples: 1,
+            })
+            .unwrap();
+        let upload = |bytes: &[u8], usage| {
+            let buffer = device
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            device.write_buffer(buffer, 0, bytes).unwrap();
+            buffer
+        };
+        let le =
+            |values: &[u32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let indices = upload(&le(&[0, 1, 2, 3, 4, 5]), BufferUsage::INDEX);
+        // index count, instance count, first index, base vertex, first instance
+        let draws = upload(&le(&[6, 1, 0, 0, 0, 6, 1, 0, 0, 1]), BufferUsage::INDIRECT);
+        let mut cmd = device.create_command_list().unwrap();
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &[ColorAttachment {
+                target,
+                load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                store: true,
+                sample_after: true,
+            }],
+            depth: None,
+        });
+        cmd.set_pipeline(pipeline);
+        cmd.set_viewport_scissor(ViewportScissor {
+            viewport: Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 2.0,
+                height: 2.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        });
+        cmd.set_index_buffer(indices, 0, IndexFormat::U32);
+        cmd.draw_indexed_indirect(draws, 0, 2, 0);
+        cmd.end_render_pass();
+        device.submit_and_wait(cmd).unwrap();
+        let got = read_texels(device, tex, format, 2, 2);
+        assert_texels(format, &got, &[[1.0, 0.0, 0.0, 1.0]; 4]);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(vs);
+        device.destroy_shader(fs);
+        device.destroy_buffer(indices);
+        device.destroy_buffer(draws);
+        device.destroy_texture(tex);
+    }
+
     /// The gpu decides how many indirect draws run: a count of 0 leaves the target clear, 1
     /// draws the quad.
     #[test]

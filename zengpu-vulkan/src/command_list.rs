@@ -725,10 +725,20 @@ impl RenderCommands for VulkanCommandList {
         } else {
             stride
         };
-        unsafe {
-            self.inner
-                .device
-                .cmd_draw_indirect(self.cmd, vk_buf, offset, draw_count, stride);
+        // one call per draw without the feature, the same result
+        let calls = if self.inner.multi_draw_indirect {
+            vec![(offset, draw_count)]
+        } else {
+            (0..u64::from(draw_count))
+                .map(|i| (offset + i * u64::from(stride), 1))
+                .collect()
+        };
+        for (offset, count) in calls {
+            unsafe {
+                self.inner
+                    .device
+                    .cmd_draw_indirect(self.cmd, vk_buf, offset, count, stride);
+            }
         }
     }
 
@@ -750,10 +760,19 @@ impl RenderCommands for VulkanCommandList {
         } else {
             stride
         };
-        unsafe {
-            self.inner
-                .device
-                .cmd_draw_indexed_indirect(self.cmd, vk_buf, offset, draw_count, stride);
+        let calls = if self.inner.multi_draw_indirect {
+            vec![(offset, draw_count)]
+        } else {
+            (0..u64::from(draw_count))
+                .map(|i| (offset + i * u64::from(stride), 1))
+                .collect()
+        };
+        for (offset, count) in calls {
+            unsafe {
+                self.inner
+                    .device
+                    .cmd_draw_indexed_indirect(self.cmd, vk_buf, offset, count, stride);
+            }
         }
     }
 

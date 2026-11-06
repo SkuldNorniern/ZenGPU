@@ -118,6 +118,9 @@ impl Features {
     /// Indirect draws whose count the gpu reads from a buffer, so culling on the gpu decides how
     /// many draws run.
     pub const DRAW_INDIRECT_COUNT: Self = Self(1 << 6);
+    /// Many draws from one indirect call, each with its own first instance. Without it a
+    /// backend issues them one at a time.
+    pub const MULTI_DRAW_INDIRECT: Self = Self(1 << 7);
 
     pub const fn empty() -> Self {
         Self(0)
