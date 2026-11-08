@@ -3446,6 +3446,44 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_is_reset_and_written_every_frame_and_read_without_waiting() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+        let pool = device.create_query_pool(2).unwrap();
+        let mut last = 0;
+        for _ in 0..3 {
+            let mut commands = device.create_command_list().unwrap();
+            commands.reset_queries(pool, 0, 2);
+            commands.write_timestamp(pool, 0);
+            commands.write_timestamp(pool, 1);
+            // out of range is ignored, not a crash
+            commands.reset_queries(pool, 1, 5);
+            let serial = device.submit_list(commands).unwrap();
+            device.wait_serial(serial).unwrap();
+            let times = device.read_timestamps(pool).unwrap().unwrap();
+            assert_eq!(times.len(), 2);
+            assert!(
+                times[1] >= times[0] && times[0] > last,
+                "{times:?} after {last}"
+            );
+            last = times[1];
+        }
+        // reset and not written again reads as not ready, never a wait
+        let mut commands = device.create_command_list().unwrap();
+        commands.reset_queries(pool, 0, 2);
+        device.submit_and_wait(commands).unwrap();
+        assert_eq!(device.read_timestamps(pool).unwrap(), None);
+    }
+
+    #[test]
     fn pipeline_cache_is_persisted_to_disk() {
         use std::time::{SystemTime, UNIX_EPOCH};
         use zengpu_shader::{ZslShader, zsl};

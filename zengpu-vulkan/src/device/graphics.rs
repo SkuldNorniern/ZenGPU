@@ -354,6 +354,27 @@ impl GraphicsDevice for VulkanDevice {
             .insert(VulkanQueryPool { pool, count }))
     }
 
+    fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
+        let query_pools = self.query_pools.lock().unwrap();
+        let query_pool = query_pools
+            .get(pool)
+            .ok_or_else(|| GpuError::Backend("stale query pool handle".to_string()))?;
+        let mut timestamps = vec![0; query_pool.count as usize];
+        let read = unsafe {
+            self.inner.device.get_query_pool_results(
+                query_pool.pool,
+                0,
+                &mut timestamps,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        match read {
+            Ok(()) => Ok(Some(timestamps)),
+            Err(vk::Result::NOT_READY) => Ok(None),
+            Err(e) => Err(GpuError::Backend(format!("vkGetQueryPoolResults: {e}"))),
+        }
+    }
+
     fn supports_dual_source_blending(&self) -> bool {
         self.inner.dual_src_blend
     }

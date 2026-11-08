@@ -479,6 +479,27 @@ impl RenderCommands for VulkanCommandList {
         }
     }
 
+    fn reset_queries(&mut self, pool: QueryPoolHandle, first: u32, count: u32) {
+        let query_pools = self.query_pools.lock().unwrap();
+        let Some(query_pool) = query_pools.get(pool) else {
+            return;
+        };
+        let Some(end) = first
+            .checked_add(count)
+            .filter(|end| *end <= query_pool.count)
+        else {
+            return;
+        };
+        if end == first {
+            return;
+        }
+        unsafe {
+            self.inner
+                .device
+                .cmd_reset_query_pool(self.cmd, query_pool.pool, first, count);
+        }
+    }
+
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         assert!(
             desc.color.len() <= MAX_COLOR_ATTACHMENTS,

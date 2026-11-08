@@ -267,6 +267,10 @@ impl GraphicsDevice for MetalDevice {
         Err(GpuError::Unsupported("metal: timestamp query pools".into()))
     }
 
+    fn read_timestamps(&self, _pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
+        Err(GpuError::Unsupported("metal: timestamp query pools".into()))
+    }
+
     fn supports_dual_source_blending(&self) -> bool {
         true
     }

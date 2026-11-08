@@ -82,6 +82,10 @@ pub trait GraphicsDevice: crate::GpuDevice {
 
     fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle>;
 
+    /// Every timestamp in `pool` in ticks, or `None` while the GPU has not written them all.
+    /// Never waits. Multiply by `timestamp_period_ns` for nanoseconds.
+    fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>>;
+
     /// `dualSrcBlend` support. Text falls back to `AlphaBlend` when `false`.
     fn supports_dual_source_blending(&self) -> bool;
 
@@ -134,6 +138,9 @@ pub trait RenderCommands {
     fn insert_debug_label(&mut self, label: &str);
 
     fn write_timestamp(&mut self, pool: QueryPoolHandle, index: u32);
+
+    /// Clears `count` queries from `first` so they can be written again. Outside a render pass.
+    fn reset_queries(&mut self, pool: QueryPoolHandle, first: u32, count: u32);
 
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>);
 

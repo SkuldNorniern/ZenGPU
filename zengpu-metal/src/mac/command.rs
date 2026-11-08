@@ -144,6 +144,8 @@ impl RenderCommands for MetalCommandList {
 
     fn write_timestamp(&mut self, _pool: QueryPoolHandle, _index: u32) {}
 
+    fn reset_queries(&mut self, _pool: QueryPoolHandle, _first: u32, _count: u32) {}
+
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         self.end_encoder();
         let Some(cmd) = self.cmd.as_ref() else { return };
