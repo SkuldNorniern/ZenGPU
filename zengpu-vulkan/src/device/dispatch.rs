@@ -1106,7 +1106,7 @@ impl VulkanDevice {
 
 /// Push-constant layout that ZSL kernels expect: buffers, textures, images, then scalars, 4
 /// bytes each.
-pub(super) fn push_constants(
+pub(crate) fn push_constants(
     bindings: &Bindings<'_>,
 ) -> Result<([u8; COMPUTE_PUSH_CONSTANT_BYTES], usize)> {
     let mut pc = [0u8; COMPUTE_PUSH_CONSTANT_BYTES];

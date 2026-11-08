@@ -29,6 +29,7 @@ use zengpu_hal::{
 mod buffer_transfer;
 mod cooperative;
 mod dispatch;
+pub(crate) use dispatch::push_constants;
 pub(crate) mod format;
 mod graphics;
 mod hal_impl;
@@ -4581,6 +4582,127 @@ mod tests {
         dev.destroy_buffer(readback);
         dev.destroy_pipeline(pipeline);
         dev.destroy_shader(shader);
+    }
+
+    #[test]
+    fn a_command_list_runs_compute_between_passes_in_order() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const READ_DEPTH: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel read_depth(src: texture, out: device mut buffer<f32>, id: global_id) {
+                if id.x == 0 {
+                    out[0] = src.load(1, 0).r
+                }
+            }
+        );
+        const WRITE_ARGS: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel write_args(a: device mut buffer<u32>, id: global_id) {
+                if id.x == 0 {
+                    a[0] = 2
+                    a[1] = 1
+                    a[2] = 1
+                }
+            }
+        );
+        const COUNT: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel count(n: device mut buffer<u32>, id: global_id) {
+                let before = atomic_add(n, 0, 1)
+            }
+        );
+        let Some(device) = try_graphics_device() else {
+            return;
+        };
+        let dev = vulkan(&device);
+        assert!(dev.compute_in_command_lists());
+        let pipeline = |zsl: &ZslShader| {
+            let shader = dev.create_shader(zsl.spirv_desc().unwrap()).unwrap();
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap()
+        };
+        let (read, write, count) = (
+            pipeline(&READ_DEPTH),
+            pipeline(&WRITE_ARGS),
+            pipeline(&COUNT),
+        );
+        let depth = dev
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 1,
+                depth: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let target = dev.register_depth_texture(depth).unwrap();
+        let sampler = dev.create_sampler(SamplerDesc::default()).unwrap();
+        let slot = dev.bind_texture(depth, sampler).unwrap();
+        let readable = |size| {
+            dev.create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap()
+        };
+        let (out, counter) = (readable(4), readable(4));
+        dev.write_buffer(counter, 0, &[0; 4]).unwrap();
+        let args = dev
+            .create_buffer(BufferDesc {
+                size: 12,
+                usage: BufferUsage::STORAGE | BufferUsage::INDIRECT,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let mut list = dev.create_command_list().unwrap();
+        list.begin_render_pass(&RenderPassDesc {
+            color: &[],
+            depth: Some(zengpu_hal::DepthAttachment {
+                target,
+                load: LoadOp::clear_depth(0.375),
+                store: true,
+            }),
+        });
+        list.end_render_pass();
+        fn only(buffers: &[u32]) -> Bindings<'_> {
+            Bindings {
+                buffers,
+                ..Default::default()
+            }
+        }
+        list.dispatch(
+            read,
+            Bindings {
+                buffers: &[out.index()],
+                textures: &[slot],
+                ..Default::default()
+            },
+            [1, 1, 1],
+        );
+        list.dispatch(write, only(&[args.index()]), [1, 1, 1]);
+        list.dispatch_indirect(count, only(&[counter.index()]), args, 0);
+        dev.submit_and_wait(list).unwrap();
+        let word = |buffer| dev.read_buffer(buffer, 0, 4).unwrap().try_into().unwrap();
+        assert_eq!(f32::from_ne_bytes(word(out)), 0.375);
+        assert_eq!(u32::from_ne_bytes(word(counter)), 2 * 64);
+        for buffer in [out, counter, args] {
+            dev.destroy_buffer(buffer);
+        }
+        for pipeline in [read, write, count] {
+            dev.destroy_pipeline(pipeline);
+        }
+        dev.destroy_sampler(sampler);
+        dev.destroy_texture(depth);
     }
 
     #[test]

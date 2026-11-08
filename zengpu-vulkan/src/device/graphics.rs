@@ -408,4 +408,8 @@ impl GraphicsDevice for VulkanDevice {
     fn supports_non_solid_fill(&self) -> bool {
         self.inner.fill_mode_non_solid
     }
+
+    fn compute_in_command_lists(&self) -> bool {
+        true
+    }
 }

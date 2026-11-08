@@ -12,14 +12,14 @@ use std::{
 
 use ash::vk;
 use zengpu_hal::{
-    Bindings, BufferHandle, ColorAttachment, DepthAttachment, GpuError, IndexFormat, LoadOp,
-    PipelineHandle, QueryPoolHandle, RenderCommands, RenderPassDesc, Result, Scalar, SlotMap,
-    TargetHandle, ViewportScissor, marker,
+    Bindings, BufferHandle, BufferUsage, ColorAttachment, DepthAttachment, GpuError, IndexFormat,
+    LoadOp, PipelineHandle, QueryPoolHandle, RenderCommands, RenderPassDesc, Result, Scalar,
+    SlotMap, TargetHandle, ViewportScissor, marker,
 };
 
 use crate::device::{
     VulkanBuffer, VulkanDeviceInner, VulkanPipeline, VulkanQueryPool, VulkanRenderTarget,
-    VulkanTexture,
+    VulkanTexture, push_constants,
 };
 
 pub(crate) const COLOR_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
@@ -200,6 +200,99 @@ pub struct VulkanCommandList {
 }
 
 impl VulkanCommandList {
+    /// Waits for earlier work, binds a compute pipeline and its push constants. `None` for a
+    /// stale or graphics pipeline, or bindings past the push constant room.
+    fn compute_setup(
+        &mut self,
+        pipeline: PipelineHandle,
+        bindings: &Bindings<'_>,
+    ) -> Option<vk::PipelineLayout> {
+        let pipelines = self.pipelines.lock().unwrap();
+        let Some(VulkanPipeline::Compute { layout, pipeline }) = pipelines.get(pipeline) else {
+            return None;
+        };
+        let (layout, raw) = (*layout, *pipeline);
+        drop(pipelines);
+        let (pc, pc_len) = push_constants(bindings).ok()?;
+        unsafe {
+            self.global_barrier(
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            );
+            let device = &self.inner.device;
+            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, raw);
+            device.cmd_bind_descriptor_sets(
+                self.cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                layout,
+                0,
+                &[self.bindless_set],
+                &[],
+            );
+            if pc_len != 0 {
+                device.cmd_push_constants(
+                    self.cmd,
+                    layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    &pc[..pc_len],
+                );
+            }
+        }
+        Some(layout)
+    }
+
+    /// Later draws, dispatches, indirect reads and copies see the dispatch's writes.
+    fn after_compute(&mut self) {
+        unsafe {
+            self.global_barrier(
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::PipelineStageFlags::DRAW_INDIRECT
+                    | vk::PipelineStageFlags::VERTEX_INPUT
+                    | vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::INDIRECT_COMMAND_READ
+                    | vk::AccessFlags::INDEX_READ
+                    | vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                    | vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ,
+            );
+        }
+    }
+
+    /// # Safety
+    /// The list is recording and outside a render pass.
+    unsafe fn global_barrier(
+        &self,
+        src_stage: vk::PipelineStageFlags,
+        src_access: vk::AccessFlags,
+        dst_stage: vk::PipelineStageFlags,
+        dst_access: vk::AccessFlags,
+    ) {
+        let barrier = vk::MemoryBarrier {
+            src_access_mask: src_access,
+            dst_access_mask: dst_access,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.cmd,
+                src_stage,
+                dst_stage,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+    }
+
     /// The vulkan buffers behind two handles, `None` if either is stale.
     fn two_buffers(&self, a: BufferHandle, b: BufferHandle) -> Option<(vk::Buffer, vk::Buffer)> {
         let buffers = self.buffers.lock().unwrap();
@@ -905,6 +998,47 @@ impl RenderCommands for VulkanCommandList {
                 max_draws,
                 stride,
             );
+        }
+    }
+
+    fn dispatch(&mut self, pipeline: PipelineHandle, bindings: Bindings<'_>, grid: [u32; 3]) {
+        if grid.contains(&0) {
+            return;
+        }
+        if self.compute_setup(pipeline, &bindings).is_some() {
+            unsafe {
+                self.inner
+                    .device
+                    .cmd_dispatch(self.cmd, grid[0], grid[1], grid[2]);
+            }
+            self.after_compute();
+        }
+    }
+
+    fn dispatch_indirect(
+        &mut self,
+        pipeline: PipelineHandle,
+        bindings: Bindings<'_>,
+        args: BufferHandle,
+        offset: u64,
+    ) {
+        let buffers = self.buffers.lock().unwrap();
+        let Some(buffer) = buffers.get(args).filter(|buffer| {
+            buffer.usage.contains(BufferUsage::INDIRECT)
+                && offset.is_multiple_of(4)
+                && offset.checked_add(12).is_some_and(|end| end <= buffer.size)
+        }) else {
+            return;
+        };
+        let raw = buffer.buffer;
+        drop(buffers);
+        if self.compute_setup(pipeline, &bindings).is_some() {
+            unsafe {
+                self.inner
+                    .device
+                    .cmd_dispatch_indirect(self.cmd, raw, offset);
+            }
+            self.after_compute();
         }
     }
 

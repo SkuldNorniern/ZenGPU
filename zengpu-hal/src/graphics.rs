@@ -91,6 +91,12 @@ pub trait GraphicsDevice: crate::GpuDevice {
 
     /// `fillModeNonSolid` support. Pipeline creation fails for a non-solid fill when `false`.
     fn supports_non_solid_fill(&self) -> bool;
+
+    /// Whether command lists record compute dispatches between render passes. Without it
+    /// [`RenderCommands::dispatch`] and [`RenderCommands::dispatch_indirect`] record nothing.
+    fn compute_in_command_lists(&self) -> bool {
+        false
+    }
 }
 
 pub enum Acquire<F> {
@@ -205,4 +211,20 @@ pub trait RenderCommands {
     );
 
     fn end_render_pass(&mut self);
+
+    /// A compute dispatch between render passes, never inside one. Earlier commands' writes are
+    /// seen, later draws, dispatches and indirect reads see its writes. Records nothing where
+    /// the device has no `compute_in_command_lists`.
+    fn dispatch(&mut self, _pipeline: PipelineHandle, _bindings: Bindings<'_>, _grid: [u32; 3]) {}
+
+    /// As [`Self::dispatch`], with group counts as three `u32` at `offset` in `args`, a buffer
+    /// with `INDIRECT` usage.
+    fn dispatch_indirect(
+        &mut self,
+        _pipeline: PipelineHandle,
+        _bindings: Bindings<'_>,
+        _args: BufferHandle,
+        _offset: u64,
+    ) {
+    }
 }
