@@ -277,6 +277,32 @@ impl VulkanDevice {
             })
     }
 
+    /// Register a depth `texture` as a depth target that shaders sample after each pass draws
+    /// it. It needs a depth format and `RENDER_TARGET | SAMPLED`. `None` for a stale handle or a
+    /// texture that is not that. Unregister when the texture is destroyed.
+    pub fn register_depth_texture(&self, texture: TextureHandle) -> Option<TargetHandle> {
+        let textures = self.textures.lock().unwrap();
+        let tex = textures.get(texture)?;
+        let sampled = tex.resting == vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        if tex.format != DEPTH_FORMAT || !sampled {
+            return None;
+        }
+        Some(
+            self.render_targets
+                .lock()
+                .unwrap()
+                .insert(VulkanRenderTarget {
+                    image: tex.image,
+                    view: tex.view,
+                    format: tex.format,
+                    extent: tex.extent,
+                    layout: vk::ImageLayout::UNDEFINED,
+                    resting: tex.resting,
+                    texture: Some(texture),
+                }),
+        )
+    }
+
     /// Register `texture` as a render target. It needs `TextureUsage::RENDER_TARGET`. `None` for a
     /// stale handle. Unregister when the texture is destroyed.
     pub fn register_color_target(&self, texture: TextureHandle) -> Option<TargetHandle> {

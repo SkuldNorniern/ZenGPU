@@ -3358,6 +3358,89 @@ mod tests {
     }
 
     #[test]
+    fn a_depth_texture_is_drawn_then_sampled_every_frame() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        if !device.format_caps(Format::Rgba32Float).render_target {
+            return;
+        }
+        let depth = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 1,
+                depth: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let target = device.register_depth_texture(depth).unwrap();
+        let sampler = device
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                mip_filter: FilterMode::Nearest,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let slot = device.bind_texture(depth, sampler).unwrap();
+        let (out, out_target) = render_target(device, Format::Rgba32Float, 2, 1);
+        let pipeline = quad_pipeline(device, &SAMPLE_FS, Format::Rgba32Float, None);
+        // the second frame draws over a texture the first one sampled
+        for value in [0.25_f32, 0.75] {
+            let mut cmd = device.create_command_list().unwrap();
+            cmd.begin_render_pass(&RenderPassDesc {
+                color: &[],
+                depth: Some(zengpu_hal::DepthAttachment {
+                    target,
+                    load: LoadOp::clear_depth(value),
+                    store: true,
+                }),
+            });
+            cmd.end_render_pass();
+            device.submit_and_wait(cmd).unwrap();
+            draw_quad(
+                device,
+                out_target,
+                LoadOp::Clear([0.0; 4]),
+                pipeline,
+                &[Scalar::U32(slot)],
+                (2, 1),
+            );
+            let got = read_texels(device, out, Format::Rgba32Float, 2, 1);
+            for texel in got {
+                assert!((texel[0] - value).abs() < 1e-6, "{texel:?} for {value}");
+            }
+        }
+        // a color texture or a depth one that can not be sampled is refused
+        let plain = device
+            .create_texture(TextureDesc {
+                format: Format::Depth32Float,
+                usage: TextureUsage::RENDER_TARGET,
+                width: 2,
+                height: 1,
+                depth: 1,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        assert!(device.register_depth_texture(plain).is_none());
+        assert!(device.register_depth_texture(out).is_none());
+        device.destroy_pipeline(pipeline);
+        device.destroy_texture(out);
+        device.destroy_sampler(sampler);
+        device.destroy_texture(plain);
+        device.destroy_texture(depth);
+    }
+
+    #[test]
     fn colour_formats_sample_nearest() {
         let Some(dev) = try_graphics_device() else {
             return;

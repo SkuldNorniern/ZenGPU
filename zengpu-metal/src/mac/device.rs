@@ -418,6 +418,12 @@ impl MetalDevice {
         self.inner.table.lock().map(|t| t.used()).unwrap_or(0)
     }
 
+    /// A depth texture drawn as a depth target and sampled after. Not on metal yet, always
+    /// `None`: callers keep a path without it.
+    pub fn register_depth_texture(&self, _texture: TextureHandle) -> Option<TargetHandle> {
+        None
+    }
+
     /// Returns the render target for `ColorAttachment::target` or `DepthAttachment::target`, or
     /// `None` if stale.
     pub fn register_color_target(&self, texture: TextureHandle) -> Option<TargetHandle> {

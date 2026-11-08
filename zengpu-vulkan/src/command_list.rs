@@ -195,6 +195,8 @@ pub struct VulkanCommandList {
     /// Targets from this pass with `sample_after` set: moved to
     /// `SHADER_READ_ONLY_OPTIMAL` in `end_render_pass`.
     pending_shader_read: [Option<TargetHandle>; MAX_COLOR_ATTACHMENTS],
+    /// A depth texture drawn in this pass, moved to its sampled layout in `end_render_pass`.
+    pending_depth_read: Option<TargetHandle>,
 }
 
 impl VulkanCommandList {
@@ -232,6 +234,7 @@ impl VulkanCommandList {
             current_vertex_buffers: [None; MAX_VERTEX_BUFFERS],
             current_index_buffer: None,
             pending_shader_read: [None; MAX_COLOR_ATTACHMENTS],
+            pending_depth_read: None,
         }
     }
 
@@ -317,10 +320,48 @@ impl VulkanCommandList {
         }
     }
 
+    /// A depth texture drawn into, to its sampled layout: shaders read it next.
+    fn depth_to_shader_read(&self, image: vk::Image, resting: vk::ImageLayout) {
+        let barrier = vk::ImageMemoryBarrier {
+            old_layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            new_layout: resting,
+            src_access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            dst_access_mask: vk::AccessFlags::SHADER_READ,
+            image,
+            subresource_range: DEPTH_SUBRESOURCE,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            ..Default::default()
+        };
+        unsafe {
+            self.inner.device.cmd_pipeline_barrier(
+                self.cmd,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::VERTEX_SHADER
+                    | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+    }
+
     fn transition_depth(&self, image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout) {
         if old == new {
             return;
         }
+        // a depth texture sampled before: wait for those reads before drawing over it
+        let after_reads = old != vk::ImageLayout::UNDEFINED;
+        let src_stage = if after_reads {
+            vk::PipelineStageFlags::VERTEX_SHADER
+                | vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+        } else {
+            vk::PipelineStageFlags::TOP_OF_PIPE
+        };
         let barrier = vk::ImageMemoryBarrier {
             old_layout: old,
             new_layout: new,
@@ -335,7 +376,7 @@ impl VulkanCommandList {
         unsafe {
             self.inner.device.cmd_pipeline_barrier(
                 self.cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                src_stage,
                 vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -533,6 +574,10 @@ impl RenderCommands for VulkanCommandList {
         let depth_info = desc
             .depth
             .and_then(|d| self.depth_attachment_info(&mut targets, &d));
+        self.pending_depth_read = desc
+            .depth
+            .filter(|d| targets.get(d.target).is_some_and(|rt| rt.texture.is_some()))
+            .map(|d| d.target);
         if let Some((_, e)) = &depth_info {
             extent = *e;
         }
@@ -868,8 +913,18 @@ impl RenderCommands for VulkanCommandList {
             self.inner.dynamic_rendering.cmd_end_rendering(self.cmd);
         }
         let pending = mem::replace(&mut self.pending_shader_read, [None; MAX_COLOR_ATTACHMENTS]);
-        let mut rendered = [None; MAX_COLOR_ATTACHMENTS];
+        let mut rendered = [None; MAX_COLOR_ATTACHMENTS + 1];
         let mut targets = self.render_targets.lock().unwrap();
+        if let Some(rt) = self
+            .pending_depth_read
+            .take()
+            .and_then(|t| targets.get_mut(t))
+        {
+            let image = rt.image;
+            rt.layout = rt.resting;
+            rendered[MAX_COLOR_ATTACHMENTS] = rt.texture;
+            self.depth_to_shader_read(image, rt.resting);
+        }
         for (slot, target) in pending.into_iter().enumerate() {
             if let Some(rt) = target.and_then(|t| targets.get_mut(t)) {
                 let image = rt.image;
