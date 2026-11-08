@@ -100,6 +100,119 @@ fn copy_span(offset: u64, len: u64, size: u64) -> Result<(u64, u64, usize)> {
 }
 
 impl VulkanDevice {
+    /// Copies `data` into its own staging buffer and queues the copy into `target`, without
+    /// waiting. A buffer the host maps is written straight away. Later submits see the data.
+    pub(super) fn submit_write_buffer_impl(
+        &self,
+        cycle: u64,
+        target: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.reap_orphans();
+        let (mapped, size) = {
+            let buffers = self.buffers.lock().unwrap();
+            let buffer = buffers.get(target).ok_or_else(|| stale(target, &buffers))?;
+            (!buffer.mapped.is_null(), buffer.size)
+        };
+        let fits = offset
+            .checked_add(data.len() as u64)
+            .is_some_and(|end| end <= size);
+        if !fits {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "write of {} bytes at {offset} exceeds buffer size {size}",
+                    data.len()
+                ),
+            )));
+        }
+        if mapped || data.is_empty() {
+            self.write_buffer(target, offset, data)?;
+            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle)));
+        }
+        let staging = self.create_buffer(BufferDesc {
+            size: data.len() as u64,
+            usage: BufferUsage::TRANSFER_SRC,
+            memory: MemoryUsage::Upload,
+        })?;
+        let allocation = self
+            .buffers
+            .lock()
+            .unwrap()
+            .remove(staging)
+            .ok_or_else(|| GpuError::Backend("upload staging handle disappeared".into()))?;
+        let storage = Arc::new(AsyncBuffer {
+            inner: Arc::clone(&self.inner),
+            buffer: allocation,
+        });
+        if storage.buffer.mapped.is_null() {
+            return Err(GpuError::Backend(
+                "upload memory is not host visible".into(),
+            ));
+        }
+        // SAFETY: the staging buffer is mapped, as long as `data`, and nothing else uses it.
+        unsafe {
+            copy_nonoverlapping(data.as_ptr(), storage.buffer.mapped, data.len());
+        }
+        let buffers = self.buffers.lock().unwrap();
+        let output = buffers
+            .get(target)
+            .ok_or_else(|| stale(target, &buffers))?
+            .buffer;
+        let input = storage.buffer.buffer;
+        let len = data.len() as u64;
+        let (work, _) = self.one_shot_submit_tracked_inner(
+            cycle,
+            &[target.index()],
+            Some(Arc::clone(&storage)),
+            |device, cmd| {
+                unsafe {
+                    // earlier work reading or writing the target is done before it changes
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::MEMORY_WRITE,
+                            dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_copy_buffer(
+                        cmd,
+                        input,
+                        output,
+                        &[vk::BufferCopy {
+                            src_offset: 0,
+                            dst_offset: offset,
+                            size: len,
+                        }],
+                    );
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[vk::MemoryBarrier {
+                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                            dst_access_mask: vk::AccessFlags::MEMORY_READ
+                                | vk::AccessFlags::MEMORY_WRITE,
+                            ..Default::default()
+                        }],
+                        &[],
+                        &[],
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        drop(buffers);
+        Ok(work)
+    }
+
     pub(super) fn submit_read_buffer_impl(
         &self,
         cycle: u64,

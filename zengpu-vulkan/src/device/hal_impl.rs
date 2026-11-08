@@ -14,6 +14,15 @@ impl GpuDevice for VulkanDevice {
     ) -> Result<ReadSubmission> {
         self.submit_read_buffer_impl(cycle_id, buffer, offset, len)
     }
+    fn submit_write_buffer(
+        &self,
+        cycle_id: u64,
+        buffer: BufferHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<Submission> {
+        self.submit_write_buffer_impl(cycle_id, buffer, offset, data)
+    }
     fn backend(&self) -> BackendPreference {
         BackendPreference::Vulkan
     }

@@ -4706,6 +4706,38 @@ mod tests {
     }
 
     #[test]
+    fn uploads_queue_in_order_without_a_wait_and_mapped_ones_land_at_once() {
+        let Some(dev) = try_device() else { return };
+        let gpu = dev
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let first = dev.submit_write_buffer(1, gpu, 0, &[1; 16]).unwrap();
+        // overlapping, queued after the first: its bytes win where they meet
+        let second = dev.submit_write_buffer(2, gpu, 8, &[2; 8]).unwrap();
+        assert_eq!(second.cycle_id(), 2);
+        second.wait(Duration::from_secs(5)).unwrap();
+        first.wait(Duration::from_secs(5)).unwrap();
+        let read = dev.read_buffer(gpu, 0, 16).unwrap();
+        assert_eq!(read, [[1; 8], [2; 8]].concat());
+        assert!(dev.submit_write_buffer(3, gpu, 12, &[0; 8]).is_err());
+        let mapped = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let done = dev.submit_write_buffer(4, mapped, 0, &[7; 4]).unwrap();
+        assert_eq!(done.poll().unwrap(), zengpu_hal::SubmissionStatus::Complete);
+        dev.destroy_buffer(gpu);
+        dev.destroy_buffer(mapped);
+    }
+
+    #[test]
     fn a_dispatch_runs_as_many_groups_as_an_earlier_kernel_wrote() {
         use zengpu_shader::{ZslShader, zsl};
 
