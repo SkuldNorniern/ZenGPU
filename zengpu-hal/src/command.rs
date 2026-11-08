@@ -40,8 +40,20 @@ pub struct BufferCopyOp {
     pub len: u64,
 }
 
+/// A dispatch whose group counts the GPU wrote: three `u32` (x, y, z) at `offset` in `args`,
+/// a buffer with `INDIRECT` usage. `offset` is a multiple of 4.
+#[derive(Debug, Clone, Copy)]
+pub struct IndirectDispatchOp<'a> {
+    pub pipeline: PipelineHandle,
+    pub bindings: Bindings<'a>,
+    pub args: BufferHandle,
+    pub offset: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ComputeOp<'a> {
     CopyBuffer(BufferCopyOp),
     Dispatch(DispatchOp<'a>),
+    /// Group counts from an earlier op in the same batch are seen.
+    DispatchIndirect(IndirectDispatchOp<'a>),
 }

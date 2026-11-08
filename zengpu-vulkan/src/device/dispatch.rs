@@ -658,6 +658,8 @@ impl VulkanDevice {
                 pc: [u8; COMPUTE_PUSH_CONSTANT_BYTES],
                 pc_len: usize,
                 grid: [u32; 3],
+                /// Group counts read from here instead of `grid`.
+                indirect: Option<(vk::Buffer, u64)>,
             },
         }
 
@@ -720,7 +722,46 @@ impl VulkanDevice {
                         len: copy.len,
                     });
                 }
-                ComputeOp::Dispatch(op) => {
+                ComputeOp::Dispatch(_) | ComputeOp::DispatchIndirect(_) => {
+                    let (pipeline_handle, bindings, grid, indirect) = match op {
+                        ComputeOp::Dispatch(op) => (op.pipeline, op.bindings, op.grid, None),
+                        ComputeOp::DispatchIndirect(op) => {
+                            let args = buffers
+                                .get(op.args)
+                                .ok_or_else(|| stale(op.args, &buffers))?;
+                            if !args.usage.contains(BufferUsage::INDIRECT) {
+                                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                                    resource: "indirect dispatch arguments",
+                                    needed: "INDIRECT",
+                                }));
+                            }
+                            let fits = op.offset.is_multiple_of(4)
+                                && op
+                                    .offset
+                                    .checked_add(12)
+                                    .is_some_and(|end| end <= args.size);
+                            if !fits {
+                                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                                    format!(
+                                        "indirect dispatch arguments at {} do not fit {} bytes, 4 aligned",
+                                        op.offset, args.size
+                                    ),
+                                )));
+                            }
+                            (
+                                op.pipeline,
+                                op.bindings,
+                                [1, 1, 1],
+                                Some((args.buffer, op.offset)),
+                            )
+                        }
+                        ComputeOp::CopyBuffer(_) => unreachable!(),
+                    };
+                    let op = DispatchOp {
+                        pipeline: pipeline_handle,
+                        bindings,
+                        grid,
+                    };
                     if op.grid.contains(&0)
                         || op
                             .grid
@@ -770,6 +811,7 @@ impl VulkanDevice {
                         pc,
                         pc_len,
                         grid: op.grid,
+                        indirect,
                     });
                 }
             }
@@ -783,7 +825,8 @@ impl VulkanDevice {
                 dst_access_mask: vk::AccessFlags::SHADER_READ
                     | vk::AccessFlags::SHADER_WRITE
                     | vk::AccessFlags::TRANSFER_READ
-                    | vk::AccessFlags::TRANSFER_WRITE,
+                    | vk::AccessFlags::TRANSFER_WRITE
+                    | vk::AccessFlags::INDIRECT_COMMAND_READ,
                 ..Default::default()
             };
             unsafe {
@@ -794,7 +837,8 @@ impl VulkanDevice {
                             vk::PipelineStageFlags::COMPUTE_SHADER
                                 | vk::PipelineStageFlags::TRANSFER,
                             vk::PipelineStageFlags::COMPUTE_SHADER
-                                | vk::PipelineStageFlags::TRANSFER,
+                                | vk::PipelineStageFlags::TRANSFER
+                                | vk::PipelineStageFlags::DRAW_INDIRECT,
                             vk::DependencyFlags::empty(),
                             &[barrier],
                             &[],
@@ -828,6 +872,7 @@ impl VulkanDevice {
                             pc,
                             pc_len,
                             grid,
+                            indirect,
                         } => {
                             dev.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, *pipeline);
                             dev.cmd_bind_descriptor_sets(
@@ -847,7 +892,12 @@ impl VulkanDevice {
                                     &pc[..*pc_len],
                                 );
                             }
-                            dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]);
+                            match indirect {
+                                Some((args, offset)) => {
+                                    dev.cmd_dispatch_indirect(cmd, *args, *offset)
+                                }
+                                None => dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]),
+                            }
                         }
                     }
                 }
@@ -1092,6 +1142,10 @@ fn mixed_buffer_uses(ops: &[ComputeOp<'_>]) -> Vec<u32> {
     for op in ops {
         match op {
             ComputeOp::Dispatch(dispatch) => uses.extend_from_slice(dispatch.bindings.buffers),
+            ComputeOp::DispatchIndirect(dispatch) => {
+                uses.extend_from_slice(dispatch.bindings.buffers);
+                uses.push(dispatch.args.index());
+            }
             ComputeOp::CopyBuffer(copy) => uses.extend([copy.src.index(), copy.dst.index()]),
         }
     }

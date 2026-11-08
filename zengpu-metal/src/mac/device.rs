@@ -832,6 +832,9 @@ impl MetalDevice {
             .map(|op| match op {
                 ComputeOp::Dispatch(d) => self.resolve_dispatch(d).map(Resolved::Dispatch),
                 ComputeOp::CopyBuffer(c) => self.resolve_copy(c).map(Resolved::Copy),
+                ComputeOp::DispatchIndirect(_) => {
+                    Err(GpuError::Unsupported("metal: indirect dispatch".into()))
+                }
             })
             .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
@@ -1647,6 +1650,7 @@ impl GpuDevice for MetalDevice {
             .iter()
             .flat_map(|op| match op {
                 ComputeOp::Dispatch(d) => d.bindings.buffers.to_vec(),
+                ComputeOp::DispatchIndirect(d) => d.bindings.buffers.to_vec(),
                 ComputeOp::CopyBuffer(c) => vec![c.src.index(), c.dst.index()],
             })
             .collect();

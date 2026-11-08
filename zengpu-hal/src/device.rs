@@ -432,6 +432,11 @@ pub trait GpuDevice: Send + Sync {
                 ComputeOp::Dispatch(dispatch) => {
                     self.dispatch(dispatch.pipeline, dispatch.bindings, dispatch.grid)?
                 }
+                ComputeOp::DispatchIndirect(_) => {
+                    return Err(crate::GpuError::Unsupported(
+                        "indirect dispatch on this backend".into(),
+                    ));
+                }
             }
         }
         Ok(Box::new(CompletedSubmission::new(cycle_id)))

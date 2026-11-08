@@ -22,7 +22,7 @@ mod types;
 pub use adapter::{AdapterInfo, DeviceType, GpuAdapter, GpuInstance};
 pub use caps::{ComputeCaps, ElemType, MmaShape};
 pub use codec::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
-pub use command::{Bindings, BufferCopyOp, ComputeOp, DispatchOp, Scalar};
+pub use command::{Bindings, BufferCopyOp, ComputeOp, DispatchOp, IndirectDispatchOp, Scalar};
 pub use device::GpuDevice;
 pub use graphics::{
     Acquire, ColorAttachment, DepthAttachment, Frame, GraphicsDevice, LoadOp, RenderCommands,

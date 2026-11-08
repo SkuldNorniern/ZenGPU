@@ -4584,6 +4584,110 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_runs_as_many_groups_as_an_earlier_kernel_wrote() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const WRITE_ARGS: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel write_args(a: device mut buffer<u32>, id: global_id) {
+                if id.x == 0 {
+                    a[0] = 3
+                    a[1] = 1
+                    a[2] = 1
+                }
+            }
+        );
+        const COUNT: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel count(n: device mut buffer<u32>, id: global_id) {
+                let before = atomic_add(n, 0, 1)
+            }
+        );
+        let Some(dev) = try_device() else { return };
+        let pipeline = |zsl: &ZslShader| {
+            let shader = dev.create_shader(zsl.spirv_desc().unwrap()).unwrap();
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap()
+        };
+        let (write, count) = (pipeline(&WRITE_ARGS), pipeline(&COUNT));
+        let buffer = |usage| {
+            dev.create_buffer(BufferDesc {
+                size: 16,
+                usage,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+        };
+        let args = buffer(BufferUsage::STORAGE | BufferUsage::INDIRECT);
+        let counter =
+            buffer(BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC | BufferUsage::TRANSFER_DST);
+        let readback = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        dev.write_buffer(counter, 0, &[0; 16]).unwrap();
+        let run = |ops: &[ComputeOp<'_>]| {
+            dev.submit_compute_ops(7, ops)
+                .unwrap()
+                .wait(Duration::from_secs(5))
+                .unwrap();
+        };
+        run(&[
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline: write,
+                bindings: Bindings {
+                    buffers: &[args.index()],
+                    ..Default::default()
+                },
+                grid: [1, 1, 1],
+            }),
+            ComputeOp::DispatchIndirect(zengpu_hal::IndirectDispatchOp {
+                pipeline: count,
+                bindings: Bindings {
+                    buffers: &[counter.index()],
+                    ..Default::default()
+                },
+                args,
+                offset: 0,
+            }),
+            ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                src: counter,
+                src_offset: 0,
+                dst: readback,
+                dst_offset: 0,
+                len: 4,
+            }),
+        ]);
+        let counted = dev.read_buffer(readback, 0, 4).unwrap();
+        assert_eq!(u32::from_ne_bytes(counted.try_into().unwrap()), 3 * 64);
+        // arguments past the end, unaligned, or in a buffer without INDIRECT are refused
+        for (from, offset) in [(args, 8), (args, 2), (counter, 0)] {
+            let op = ComputeOp::DispatchIndirect(zengpu_hal::IndirectDispatchOp {
+                pipeline: count,
+                bindings: Bindings {
+                    buffers: &[counter.index()],
+                    ..Default::default()
+                },
+                args: from,
+                offset,
+            });
+            assert!(dev.submit_compute_ops(8, &[op]).is_err(), "{offset}");
+        }
+        for buffer in [args, counter, readback] {
+            dev.destroy_buffer(buffer);
+        }
+        dev.destroy_pipeline(write);
+        dev.destroy_pipeline(count);
+    }
+
+    #[test]
     fn compute_chains_texture_passes_in_one_submission() {
         use zengpu_shader::{ZslShader, zsl};
 
