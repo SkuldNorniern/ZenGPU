@@ -328,6 +328,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     };
 
     let textures = e.textures.as_ref().map(|_| {
+        spv.capability_non_uniform_sampled_images();
         let t_image = spv.type_image_2d(t_f32);
         let t_sampled = spv.type_sampled_image(t_image);
         let t_table = spv.type_runtime_array(t_sampled);
@@ -849,6 +850,9 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             }
             let ptr = ctx.spv.op_access_chain(table.t_ptr, table.var, &[slot]);
             let image = ctx.spv.op_load(table.t_sampled, ptr);
+            // the slot is an expression, it may differ across a draw's invocations
+            ctx.spv.decorate(ptr, deco::NON_UNIFORM, &[]);
+            ctx.spv.decorate(image, deco::NON_UNIFORM, &[]);
             let t_vec4 = ctx.t_vec4;
             let lod = match lod {
                 Some(lod) => {
@@ -1525,6 +1529,36 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn a_slot_picked_per_pixel_samples_non_uniform() {
+        use crate::backend::spirv::builder::cap;
+        let words = lower(
+            r#"
+            fragment fs(@location(0) uv: f32x2, tex: textures) -> f32x4 {
+                let slot = u32(step(0.5, uv.x))
+                tex[slot].sample(uv)
+            }
+            "#,
+        );
+        validate(&words);
+        let mut at = 5;
+        let (mut capabilities, mut decorated) = (Vec::new(), 0);
+        while at < words.len() {
+            let (count, opcode) = ((words[at] >> 16) as usize, words[at] & 0xffff);
+            if opcode == 17 {
+                capabilities.push(words[at + 1]);
+            }
+            if opcode == 71 && words.get(at + 2) == Some(&super::deco::NON_UNIFORM) {
+                decorated += 1;
+            }
+            at += count.max(1);
+        }
+        assert!(capabilities.contains(&cap::SHADER_NON_UNIFORM));
+        assert!(capabilities.contains(&cap::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING));
+        // the slot's pointer and the image loaded through it
+        assert_eq!(decorated, 2);
     }
 
     /// Whether any struct member is decorated NonWritable.

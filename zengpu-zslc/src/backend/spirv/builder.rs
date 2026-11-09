@@ -158,6 +158,7 @@ pub mod deco {
     pub const BINDING: u32 = 33;
     pub const DESCRIPTOR_SET: u32 = 34;
     pub const OFFSET: u32 = 35;
+    pub const NON_UNIFORM: u32 = 5300;
 }
 
 #[allow(dead_code)]
@@ -192,6 +193,8 @@ pub(crate) mod cap {
     pub const STORAGE_IMAGE_READ_WITHOUT_FORMAT: u32 = 55;
     pub const STORAGE_IMAGE_WRITE_WITHOUT_FORMAT: u32 = 56;
     pub const RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
+    pub const SHADER_NON_UNIFORM: u32 = 5301;
+    pub const SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING: u32 = 5307;
     pub const ATOMIC_FLOAT32_ADD_EXT: u32 = 6033;
 }
 
@@ -285,6 +288,17 @@ impl SpvBuilder {
         );
         let name = encode_string("SPV_EXT_descriptor_indexing");
         emit_raw(&mut self.extensions, op::EXTENSION, &name);
+    }
+
+    /// Texture slots that differ between invocations of one draw. Without these and a
+    /// `NonUniform` access a driver may use one lane's slot for all, llvmpipe does.
+    pub fn capability_non_uniform_sampled_images(&mut self) {
+        for c in [
+            cap::SHADER_NON_UNIFORM,
+            cap::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING,
+        ] {
+            emit(&mut self.capabilities, op::CAPABILITY, &[c]);
+        }
     }
 
     pub fn capability_image_query(&mut self) {
