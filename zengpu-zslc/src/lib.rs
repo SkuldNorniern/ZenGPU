@@ -2781,6 +2781,7 @@ mod portability_tests {
         for src in [
             "push P { mvp: mat4x4<f32> }\nvertex vs(@location(0) pos: f32x3, p: P) -> f32x4 {\nlet m = p.mvp\nm * pos.extend(1.0)\n}",
             "push P { n: u32 }\nvertex vs(vi: vertex_index, p: P) -> f32x4 {\nf32x4(f32(min(vi, p.n)), f32(max(vi, 2u)), f32(clamp(vi, 1u, 3u)), 1.0)\n}",
+            "push P { n: u32 }\nfragment fs(@location(0) c: f32x3, s: device buffer<f32>, p: P) -> f32x4 {\nlet sum = f32x3(0.0, 0.0, 0.0)\nfor i in 0..4 {\nif i < p.n {\nlet at = i * 3\nsum = sum + f32x3(s[at], s[at + 1], s[at + 2])\n}\n}\nf32x4(c.x + sum.x, c.y + sum.y, c.z + sum.z, 1.0)\n}",
         ] {
             let Ok(Shader::Graphics(m)) = parse_zsl(src) else {
                 panic!("does not parse\n{src}");

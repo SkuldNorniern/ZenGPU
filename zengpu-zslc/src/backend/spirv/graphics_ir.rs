@@ -652,7 +652,43 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             ctx.spv.label();
             Ok(())
         }
-        IrStmt::For { .. } => Err("for-loops are not supported in vertex/fragment shaders".into()),
+        IrStmt::For { var, lo, hi, body } => {
+            let u32_id = ctx.u32_id;
+            let lo_val = lower_expr(ctx, lo)?;
+            let lo_id = coerce(ctx, lo_val, u32_id)?;
+            let hi_val = lower_expr(ctx, hi)?;
+            let hi_id = coerce(ctx, hi_val, u32_id)?;
+            let ptr = ctx
+                .locals
+                .get(var)
+                .ok_or_else(|| format!("undeclared loop variable `{var}`"))?
+                .ptr;
+            ctx.spv.op_store(ptr, lo_id);
+            let header = ctx.spv.fresh_id();
+            let body_label = ctx.spv.fresh_id();
+            let next = ctx.spv.fresh_id();
+            let merge = ctx.spv.fresh_id();
+            ctx.spv.op_branch(header);
+            ctx.spv.label_with_id(header);
+            let (t_u32, t_bool) = (ctx.t_u32, ctx.t_bool);
+            let at = ctx.spv.op_load(t_u32, ptr);
+            let more = ctx.spv.op_ult(t_bool, at, hi_id);
+            ctx.spv.op_loop_merge(merge, next);
+            ctx.spv.op_branch_conditional(more, body_label, merge);
+            ctx.spv.label_with_id(body_label);
+            for s in body {
+                lower_stmt(ctx, s)?;
+            }
+            ctx.spv.op_branch(next);
+            ctx.spv.label_with_id(next);
+            let old = ctx.spv.op_load(t_u32, ptr);
+            let one = ctx.spv.constant_u32(t_u32, 1);
+            let new = ctx.spv.op_iadd(t_u32, old, one);
+            ctx.spv.op_store(ptr, new);
+            ctx.spv.op_branch(header);
+            ctx.spv.label_with_id(merge);
+            Ok(())
+        }
         IrStmt::AssignShared { .. } | IrStmt::Barrier | IrStmt::SharedBarrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }

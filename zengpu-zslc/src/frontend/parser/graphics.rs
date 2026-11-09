@@ -263,6 +263,10 @@ impl<'a> Parser<'a> {
                 body.push(self.parse_gfx_if(ctx)?);
                 continue;
             }
+            if self.eat_kw("for") {
+                body.push(self.parse_gfx_for(ctx)?);
+                continue;
+            }
             if self.eat_kw("discard") {
                 body.push(self.gfx_discard(ctx)?);
                 continue;
@@ -336,6 +340,10 @@ impl<'a> Parser<'a> {
                 stmts.push(self.parse_gfx_if(ctx)?);
                 continue;
             }
+            if self.eat_kw("for") {
+                stmts.push(self.parse_gfx_for(ctx)?);
+                continue;
+            }
             if self.eat_kw("discard") {
                 stmts.push(self.gfx_discard(ctx)?);
                 continue;
@@ -392,6 +400,24 @@ impl<'a> Parser<'a> {
             Some(self.parse_gfx_stmts(ctx)?)
         };
         Ok(IrStmt::If { cond, then, else_ })
+    }
+
+    pub(super) fn parse_gfx_for(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
+        let var = self.ident()?;
+        if ctx.locals.contains_key(&var) {
+            return self.err(format!("`{var}` is already a local"));
+        }
+        if !self.eat_kw("in") {
+            return self.err("expected `in` in for-loop");
+        }
+        let lo = self.parse_g_expr(ctx)?;
+        self.expect(&Tok::DotDot, "`..` in for-loop range")?;
+        let hi = self.parse_g_expr(ctx)?;
+        let u32_id = self.types.u32_id();
+        ctx.locals.insert(var.clone(), u32_id);
+        ctx.locals_order.push((var.clone(), u32_id));
+        let body = self.parse_gfx_stmts(ctx)?;
+        Ok(IrStmt::For { var, lo, hi, body })
     }
 
     pub(super) fn gfx_assign(
