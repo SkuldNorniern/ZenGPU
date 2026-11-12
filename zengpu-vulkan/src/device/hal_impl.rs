@@ -129,6 +129,21 @@ impl GpuDevice for VulkanDevice {
                 )
         };
         let has = |flag| props.optimal_tiling_features.contains(flag);
+        if format.is_compressed() {
+            let enabled = match format {
+                Format::Astc4x4Unorm | Format::Astc4x4UnormSrgb => {
+                    self.inner.texture_compression_astc
+                }
+                _ => self.inner.texture_compression_bc,
+            };
+            return FormatCaps {
+                sampled: enabled && has(vk::FormatFeatureFlags::SAMPLED_IMAGE),
+                filterable: enabled && has(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR),
+                render_target: false,
+                blendable: false,
+                storage: false,
+            };
+        }
         let attachment = if format.is_depth_stencil() {
             vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
         } else {
@@ -489,6 +504,28 @@ impl GpuDevice for VulkanDevice {
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
         self.collect_garbage();
+        if desc.format.is_compressed() {
+            let caps = self.format_caps(desc.format);
+            let drawn_or_stored = [
+                TextureUsage::RENDER_TARGET,
+                TextureUsage::DEPTH_STENCIL,
+                TextureUsage::STORAGE,
+            ]
+            .into_iter()
+            .any(|u| desc.usage.contains(u));
+            if !caps.sampled {
+                return Err(GpuError::Unsupported(format!(
+                    "{:?} is not supported on this device",
+                    desc.format
+                )));
+            }
+            if drawn_or_stored {
+                return Err(GpuError::Unsupported(format!(
+                    "{:?} is sampled only: no render target, depth or storage use",
+                    desc.format
+                )));
+            }
+        }
         let depth_stencil = desc.format.is_depth_stencil();
         if desc.usage.contains(TextureUsage::DEPTH_STENCIL) && !depth_stencil {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
@@ -713,7 +750,7 @@ impl GpuDevice for VulkanDevice {
             mip_levels,
             array_layers,
             usage,
-            texel_bytes: desc.format.bytes_per_texel(),
+            hal_format: desc.format,
             ready: vec![0; array_layers as usize],
             resting: VulkanTexture::resting_layout(usage),
             storage_view,
@@ -746,13 +783,18 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn generate_mipmaps(&self, texture: TextureHandle) -> Result<()> {
-        let usage = {
+        let (usage, format) = {
             let textures = self.textures.lock().unwrap();
             let tex = textures.get(texture).ok_or_else(|| {
                 GpuError::Backend("generate_mipmaps: stale texture handle".to_string())
             })?;
-            tex.usage
+            (tex.usage, tex.hal_format)
         };
+        if format.is_compressed() {
+            return Err(GpuError::Unsupported(
+                "generate_mipmaps: block formats cannot be blitted".into(),
+            ));
+        }
         let needed = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if !usage.contains(needed) {
             return Err(GpuError::InvalidUsage(UsageError::MissingUsage {

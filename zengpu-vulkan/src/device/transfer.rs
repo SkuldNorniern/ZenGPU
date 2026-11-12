@@ -9,8 +9,8 @@ use std::ptr::copy_nonoverlapping;
 
 use ash::{Device, vk};
 use zengpu_hal::{
-    BufferDesc, BufferHandle, BufferUsage, GpuDevice, GpuError, MemoryUsage, Result, Submission,
-    TextureHandle, TextureRegion, TextureWrite, UsageError,
+    BufferDesc, BufferHandle, BufferUsage, Format, GpuDevice, GpuError, MemoryUsage, Result,
+    Submission, TextureHandle, TextureRegion, TextureWrite, UsageError,
 };
 
 use super::VulkanDevice;
@@ -239,6 +239,7 @@ impl VulkanDevice {
         let mut at = base;
         for (write, size) in writes.iter().zip(sizes) {
             self.copy_rows_into(staging, at, write)?;
+            let format = self.texture_format(write.texture)?;
             let (image, resting) = self.image_of(write.texture)?;
             placed.push(Placed {
                 image,
@@ -251,7 +252,7 @@ impl VulkanDevice {
                     self.is_ready(write.texture, write.region),
                 ),
                 offset: at,
-                row_texels: write.region.width,
+                row_texels: packed_row_texels(format, write.region.width),
             });
             at += size.next_multiple_of(RING_ALIGN);
         }
@@ -270,10 +271,10 @@ impl VulkanDevice {
         texture: TextureHandle,
         region: TextureRegion,
     ) -> Result<Submission> {
-        let texel = self.texel_bytes(texture)?;
+        let format = self.texture_format(texture)?;
         self.check_region(texture, region, vk::ImageUsageFlags::TRANSFER_DST)?;
-        let row_texels = rows_in_texels(bytes_per_row, region.width, texel)?;
-        let span = span_bytes(region, bytes_per_row, texel);
+        let row_texels = rows_in_texels(format, bytes_per_row, region.width)?;
+        let span = span_bytes(format, region, bytes_per_row);
         self.check_buffer(buffer, offset, span, BufferUsage::TRANSFER_SRC)?;
         let (image, resting) = self.image_of(texture)?;
         let placed = [Placed {
@@ -309,10 +310,10 @@ impl VulkanDevice {
         offset: u64,
         bytes_per_row: u32,
     ) -> Result<Submission> {
-        let texel = self.texel_bytes(texture)?;
+        let format = self.texture_format(texture)?;
         self.check_region(texture, region, vk::ImageUsageFlags::TRANSFER_SRC)?;
-        let row_texels = rows_in_texels(bytes_per_row, region.width, texel)?;
-        let span = span_bytes(region, bytes_per_row, texel);
+        let row_texels = rows_in_texels(format, bytes_per_row, region.width)?;
+        let span = span_bytes(format, region, bytes_per_row);
         self.check_buffer(buffer, offset, span, BufferUsage::TRANSFER_DST)?;
         let (image, resting) = self.image_of(texture)?;
         let was_ready = self.is_ready(texture, region);
@@ -357,14 +358,22 @@ impl VulkanDevice {
 
     /// Bytes a write takes in staging, rows packed.
     fn check_write(&self, write: &TextureWrite<'_>) -> Result<u64> {
-        let texel = self.texel_bytes(write.texture)?;
+        let format = self.texture_format(write.texture)?;
         self.check_region(
             write.texture,
             write.region,
             vk::ImageUsageFlags::TRANSFER_DST,
         )?;
-        let row = u64::from(write.region.width) * u64::from(texel);
-        let need = span_bytes(write.region, write.bytes_per_row, texel);
+        if format.is_compressed() && !write.bytes_per_row.is_multiple_of(format.block_bytes()) {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                format!(
+                    "rows of {} bytes are not whole {:?} blocks",
+                    write.bytes_per_row, format
+                ),
+            )));
+        }
+        let row = format.row_bytes(write.region.width);
+        let need = span_bytes(format, write.region, write.bytes_per_row);
         if u64::from(write.bytes_per_row) < row || (write.data.len() as u64) < need {
             return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
                 format!(
@@ -376,7 +385,7 @@ impl VulkanDevice {
                 ),
             )));
         }
-        Ok(row * u64::from(write.region.height))
+        Ok(row * u64::from(format.block_rows(write.region.height)))
     }
 
     fn check_region(
@@ -409,6 +418,12 @@ impl VulkanDevice {
             .checked_shr(region.mip_level)
             .unwrap_or(0)
             .max(1);
+        let (bw, bh) = tex.hal_format.block_size();
+        let aligned = region.x.is_multiple_of(bw)
+            && region.y.is_multiple_of(bh)
+            && (region.width.is_multiple_of(bw) || region.x.saturating_add(region.width) == mip_w)
+            && (region.height.is_multiple_of(bh)
+                || region.y.saturating_add(region.height) == mip_h);
         let inside = region.mip_level < tex.mip_levels
             && region.layer < tex.array_layers
             && region.width > 0
@@ -421,7 +436,11 @@ impl VulkanDevice {
                 .y
                 .checked_add(region.height)
                 .is_some_and(|b| b <= mip_h);
-        if inside {
+        if inside && !aligned {
+            Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "block formats need block-aligned regions".into(),
+            )))
+        } else if inside {
             Ok(())
         } else {
             Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
@@ -462,11 +481,11 @@ impl VulkanDevice {
         Ok(())
     }
 
-    fn texel_bytes(&self, texture: TextureHandle) -> Result<u32> {
+    fn texture_format(&self, texture: TextureHandle) -> Result<Format> {
         let textures = self.textures.lock().unwrap();
         textures
             .get(texture)
-            .map(|tex| tex.texel_bytes)
+            .map(|tex| tex.hal_format)
             .ok_or_else(stale_texture)
     }
 
@@ -552,8 +571,9 @@ impl VulkanDevice {
         at: u64,
         write: &TextureWrite<'_>,
     ) -> Result<()> {
-        let texel = self.texel_bytes(write.texture)?;
-        let row = (write.region.width * texel) as usize;
+        let format = self.texture_format(write.texture)?;
+        let row = format.row_bytes(write.region.width) as usize;
+        let rows = format.block_rows(write.region.height) as usize;
         let pitch = write.bytes_per_row as usize;
         let buffers = self.buffers.lock().unwrap();
         let buf = buffers
@@ -568,15 +588,11 @@ impl VulkanDevice {
             // SAFETY: check_write validated the packed source length, and stage
             // reserved the destination span. Host input and staging do not alias.
             unsafe {
-                copy_nonoverlapping(
-                    write.data.as_ptr(),
-                    buf.mapped.add(at as usize),
-                    row * write.region.height as usize,
-                );
+                copy_nonoverlapping(write.data.as_ptr(), buf.mapped.add(at as usize), row * rows);
             }
             return Ok(());
         }
-        for y in 0..write.region.height as usize {
+        for y in 0..rows {
             let src = &write.data[y * pitch..y * pitch + row];
             // SAFETY: the span [at, at + rows * row) was reserved for this write, inside the buffer
             unsafe {
@@ -599,20 +615,27 @@ fn stale_texture() -> GpuError {
     GpuError::Backend("stale texture handle".into())
 }
 
-/// Row pitch in texels, for a buffer-image copy.
-fn rows_in_texels(bytes_per_row: u32, width: u32, texel: u32) -> Result<u32> {
-    if !bytes_per_row.is_multiple_of(texel) || bytes_per_row / texel < width {
+/// Row pitch in texels, for a buffer-image copy. Block formats count whole blocks.
+fn rows_in_texels(format: Format, bytes_per_row: u32, width: u32) -> Result<u32> {
+    let block = format.block_bytes();
+    if !bytes_per_row.is_multiple_of(block) || u64::from(bytes_per_row) < format.row_bytes(width) {
         return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
-            format!("rows of {bytes_per_row} bytes do not hold {width} texels of {texel} bytes"),
+            format!("rows of {bytes_per_row} bytes do not hold {width} texels of {format:?}"),
         )));
     }
-    Ok(bytes_per_row / texel)
+    Ok(bytes_per_row / block * format.block_size().0)
+}
+
+/// Texels in one packed row, rounded up to whole blocks.
+fn packed_row_texels(format: Format, width: u32) -> u32 {
+    let bw = format.block_size().0;
+    width.div_ceil(bw) * bw
 }
 
 /// Bytes from the region's first texel to its last, rows `bytes_per_row` apart.
-fn span_bytes(region: TextureRegion, bytes_per_row: u32, texel: u32) -> u64 {
-    u64::from(region.height.saturating_sub(1)) * u64::from(bytes_per_row)
-        + u64::from(region.width) * u64::from(texel)
+fn span_bytes(format: Format, region: TextureRegion, bytes_per_row: u32) -> u64 {
+    u64::from(format.block_rows(region.height).saturating_sub(1)) * u64::from(bytes_per_row)
+        + format.row_bytes(region.width)
 }
 
 fn subresource(region: TextureRegion) -> vk::ImageSubresourceRange {
@@ -1046,9 +1069,21 @@ mod tests {
     #[test]
     fn spans_and_pitches_are_measured() {
         let region = TextureRegion::rect(0, 0, 3, 2);
-        assert_eq!(span_bytes(region, 64, 4), 64 + 12);
-        assert_eq!(rows_in_texels(64, 3, 4).expect("fits"), 16);
-        assert!(rows_in_texels(10, 3, 4).is_err());
-        assert!(rows_in_texels(66, 3, 4).is_err());
+        let rgba8 = Format::Rgba8Unorm;
+        assert_eq!(span_bytes(rgba8, region, 64), 64 + 12);
+        assert_eq!(rows_in_texels(rgba8, 64, 3).expect("fits"), 16);
+        assert!(rows_in_texels(rgba8, 10, 3).is_err());
+        assert!(rows_in_texels(rgba8, 66, 3).is_err());
+    }
+
+    #[test]
+    fn block_rows_are_counted_in_blocks() {
+        let bc1 = Format::Bc1RgbaUnorm;
+        let region = TextureRegion::rect(0, 0, 5, 5);
+        assert_eq!(packed_row_texels(bc1, 5), 8);
+        assert_eq!(rows_in_texels(bc1, 16, 5).expect("two blocks"), 8);
+        assert!(rows_in_texels(bc1, 8, 5).is_err());
+        assert!(rows_in_texels(bc1, 12, 4).is_err(), "not whole blocks");
+        assert_eq!(span_bytes(bc1, region, 16), 16 + 16);
     }
 }

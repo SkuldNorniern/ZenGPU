@@ -596,8 +596,8 @@ impl MetalDevice {
         region: TextureRegion,
         data: &[u8],
     ) -> Result<Buffer> {
-        let row = region.width * layout.texel_bytes;
-        let image_bytes = u64::from(row) * u64::from(region.height);
+        let row = layout.packed;
+        let image_bytes = u64::from(row) * u64::from(layout.rows);
         if image_bytes > self.inner.device.max_buffer_length() {
             return Err(GpuError::Backend(
                 "metal: staging upload exceeds buffer limit".into(),
@@ -617,7 +617,7 @@ impl MetalDevice {
                 );
             }
         } else {
-            for y in 0..region.height as usize {
+            for y in 0..layout.rows as usize {
                 // SAFETY: layout checked per row. Staging has no GPU readers yet.
                 unsafe {
                     copy_nonoverlapping(
@@ -638,8 +638,8 @@ impl MetalDevice {
         layout: &transfer::Layout,
         region: TextureRegion,
     ) {
-        let row = region.width * layout.texel_bytes;
-        let image_bytes = u64::from(row) * u64::from(region.height);
+        let row = layout.packed;
+        let image_bytes = u64::from(row) * u64::from(layout.rows);
         blit.copy_from_buffer_to_texture(
             staging,
             0,
@@ -1150,14 +1150,11 @@ impl GpuDevice for MetalDevice {
 
     fn copy_texture_to_buffer(&self, texture: TextureHandle, buffer: BufferHandle) -> Result<()> {
         let (_, desc) = self.texture(texture)?;
-        let row = desc
-            .width
-            .checked_mul(desc.format.bytes_per_texel())
-            .ok_or_else(|| {
-                GpuError::from(UsageError::BindingMismatch(
-                    "metal: texture row size overflow".into(),
-                ))
-            })?;
+        let row = u32::try_from(desc.format.row_bytes(desc.width)).map_err(|_| {
+            GpuError::from(UsageError::BindingMismatch(
+                "metal: texture row size overflow".into(),
+            ))
+        })?;
         self.copy_texture_region_to_buffer(
             texture,
             TextureRegion::rect(0, 0, desc.width, desc.height),

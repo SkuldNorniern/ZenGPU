@@ -247,6 +247,20 @@ pub enum Format {
     R32Float,
     Depth32Float,
     Depth24PlusStencil8,
+    /// Packed unsigned floats 11/11/10. No alpha, no negatives.
+    R11G11B10Float,
+    Rg16Float,
+    Bc1RgbaUnorm,
+    Bc1RgbaUnormSrgb,
+    Bc3RgbaUnorm,
+    Bc3RgbaUnormSrgb,
+    Bc4RUnorm,
+    Bc5RgUnorm,
+    Bc6hRgbUfloat,
+    Bc7RgbaUnorm,
+    Bc7RgbaUnormSrgb,
+    Astc4x4Unorm,
+    Astc4x4UnormSrgb,
 }
 
 impl Format {
@@ -254,7 +268,30 @@ impl Format {
         matches!(self, Format::Depth32Float | Format::Depth24PlusStencil8)
     }
 
-    pub const fn bytes_per_texel(self) -> u32 {
+    pub const fn is_compressed(self) -> bool {
+        self.block_size().0 > 1
+    }
+
+    /// Texels per block, `(width, height)`. `(1, 1)` for plain formats.
+    pub const fn block_size(self) -> (u32, u32) {
+        match self {
+            Format::Bc1RgbaUnorm
+            | Format::Bc1RgbaUnormSrgb
+            | Format::Bc3RgbaUnorm
+            | Format::Bc3RgbaUnormSrgb
+            | Format::Bc4RUnorm
+            | Format::Bc5RgUnorm
+            | Format::Bc6hRgbUfloat
+            | Format::Bc7RgbaUnorm
+            | Format::Bc7RgbaUnormSrgb
+            | Format::Astc4x4Unorm
+            | Format::Astc4x4UnormSrgb => (4, 4),
+            _ => (1, 1),
+        }
+    }
+
+    /// Bytes per block. One texel for plain formats.
+    pub const fn block_bytes(self) -> u32 {
         match self {
             Format::R8Unorm => 1,
             Format::R16Float | Format::R16Unorm => 2,
@@ -264,10 +301,42 @@ impl Format {
             | Format::Bgra8UnormSrgb
             | Format::R32Float
             | Format::Depth32Float
-            | Format::Depth24PlusStencil8 => 4,
+            | Format::Depth24PlusStencil8
+            | Format::R11G11B10Float
+            | Format::Rg16Float => 4,
             Format::Rgba16Float | Format::Rgba16Unorm => 8,
             Format::Rgba32Float => 16,
+            Format::Bc1RgbaUnorm | Format::Bc1RgbaUnormSrgb | Format::Bc4RUnorm => 8,
+            Format::Bc3RgbaUnorm
+            | Format::Bc3RgbaUnormSrgb
+            | Format::Bc5RgUnorm
+            | Format::Bc6hRgbUfloat
+            | Format::Bc7RgbaUnorm
+            | Format::Bc7RgbaUnormSrgb
+            | Format::Astc4x4Unorm
+            | Format::Astc4x4UnormSrgb => 16,
         }
+    }
+
+    /// Bytes per texel of a plain format. Zero for block formats, which are sized with
+    /// `row_bytes` and `block_rows`.
+    pub const fn bytes_per_texel(self) -> u32 {
+        if self.is_compressed() {
+            0
+        } else {
+            self.block_bytes()
+        }
+    }
+
+    /// Packed bytes of one row of `width` texels, rounded up to whole blocks.
+    pub const fn row_bytes(self, width: u32) -> u64 {
+        let (bw, _) = self.block_size();
+        width.div_ceil(bw) as u64 * self.block_bytes() as u64
+    }
+
+    /// Block rows that cover `height` texels.
+    pub const fn block_rows(self, height: u32) -> u32 {
+        height.div_ceil(self.block_size().1)
     }
 
     pub const ALL: &'static [Format] = &[
@@ -284,7 +353,75 @@ impl Format {
         Format::R32Float,
         Format::Depth32Float,
         Format::Depth24PlusStencil8,
+        Format::R11G11B10Float,
+        Format::Rg16Float,
+        Format::Bc1RgbaUnorm,
+        Format::Bc1RgbaUnormSrgb,
+        Format::Bc3RgbaUnorm,
+        Format::Bc3RgbaUnormSrgb,
+        Format::Bc4RUnorm,
+        Format::Bc5RgUnorm,
+        Format::Bc6hRgbUfloat,
+        Format::Bc7RgbaUnorm,
+        Format::Bc7RgbaUnormSrgb,
+        Format::Astc4x4Unorm,
+        Format::Astc4x4UnormSrgb,
     ];
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::Format;
+
+    #[test]
+    fn plain_formats_are_one_texel_blocks() {
+        for &f in Format::ALL.iter().filter(|f| !f.is_compressed()) {
+            assert_eq!(f.block_size(), (1, 1), "{f:?}");
+            assert_eq!(f.bytes_per_texel(), f.block_bytes(), "{f:?}");
+            assert_eq!(f.row_bytes(3), 3 * u64::from(f.block_bytes()), "{f:?}");
+            assert_eq!(f.block_rows(5), 5, "{f:?}");
+        }
+        assert_eq!(Format::R11G11B10Float.block_bytes(), 4);
+        assert_eq!(Format::Rg16Float.block_bytes(), 4);
+    }
+
+    #[test]
+    fn block_formats_size_rows_by_blocks() {
+        let cases = [
+            (Format::Bc1RgbaUnorm, 8),
+            (Format::Bc1RgbaUnormSrgb, 8),
+            (Format::Bc4RUnorm, 8),
+            (Format::Bc3RgbaUnorm, 16),
+            (Format::Bc3RgbaUnormSrgb, 16),
+            (Format::Bc5RgUnorm, 16),
+            (Format::Bc6hRgbUfloat, 16),
+            (Format::Bc7RgbaUnorm, 16),
+            (Format::Bc7RgbaUnormSrgb, 16),
+            (Format::Astc4x4Unorm, 16),
+            (Format::Astc4x4UnormSrgb, 16),
+        ];
+        for (f, bytes) in cases {
+            assert!(f.is_compressed(), "{f:?}");
+            assert_eq!(f.block_size(), (4, 4), "{f:?}");
+            assert_eq!(f.block_bytes(), bytes, "{f:?}");
+            assert_eq!(f.bytes_per_texel(), 0, "{f:?}");
+            assert_eq!(f.row_bytes(4), u64::from(bytes), "{f:?}");
+            assert_eq!(f.row_bytes(1), u64::from(bytes), "{f:?}");
+            assert_eq!(f.row_bytes(9), 3 * u64::from(bytes), "{f:?}");
+            assert_eq!(f.block_rows(4), 1, "{f:?}");
+            assert_eq!(f.block_rows(5), 2, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn all_lists_every_variant_once() {
+        let mut names: Vec<String> = Format::ALL.iter().map(|f| format!("{f:?}")).collect();
+        names.sort();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count);
+        assert_eq!(count, 26);
+    }
 }
 
 /// Axis-aligned pixel rectangle, for scissor and damage regions.

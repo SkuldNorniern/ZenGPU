@@ -51,6 +51,8 @@ pub(crate) fn from_vk_format(f: vk::Format) -> Option<zengpu_hal::Format> {
         vk::Format::R8_UNORM => Format::R8Unorm,
         vk::Format::R16_SFLOAT => Format::R16Float,
         vk::Format::R16_UNORM => Format::R16Unorm,
+        vk::Format::B10G11R11_UFLOAT_PACK32 => Format::R11G11B10Float,
+        vk::Format::R16G16_SFLOAT => Format::Rg16Float,
         vk::Format::R32_SFLOAT => Format::R32Float,
         vk::Format::D32_SFLOAT => Format::Depth32Float,
         vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT => {

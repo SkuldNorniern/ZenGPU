@@ -10,6 +10,10 @@ pub(crate) struct Layout {
     pub image_bytes: u64,
     pub span_bytes: u64,
     pub texel_bytes: u32,
+    #[cfg(target_os = "macos")]
+    pub packed: u32,
+    #[cfg(target_os = "macos")]
+    pub rows: u32,
 }
 
 fn invalid(reason: &str) -> GpuError {
@@ -66,11 +70,10 @@ pub(crate) fn texture_layout(
     {
         return Err(invalid("texture region out of bounds"));
     }
-    let texel_bytes = desc.format.bytes_per_texel();
-    let packed = region
-        .width
-        .checked_mul(texel_bytes)
-        .ok_or_else(|| invalid("texture row size overflow"))?;
+    let texel_bytes = desc.format.block_bytes();
+    let packed = u32::try_from(desc.format.row_bytes(region.width))
+        .map_err(|_| invalid("texture row size overflow"))?;
+    let rows = desc.format.block_rows(region.height);
     let row_bytes = if pitch == 0 && allow_packed {
         packed
     } else {
@@ -79,13 +82,17 @@ pub(crate) fn texture_layout(
     if row_bytes < packed {
         return Err(invalid("invalid texture row pitch"));
     }
-    let image_bytes = u64::from(row_bytes) * u64::from(region.height);
-    let span_bytes = u64::from(row_bytes) * u64::from(region.height - 1) + u64::from(packed);
+    let image_bytes = u64::from(row_bytes) * u64::from(rows);
+    let span_bytes = u64::from(row_bytes) * u64::from(rows - 1) + u64::from(packed);
     Ok(Layout {
         row_bytes,
         image_bytes,
         span_bytes,
         texel_bytes,
+        #[cfg(target_os = "macos")]
+        packed,
+        #[cfg(target_os = "macos")]
+        rows,
     })
 }
 

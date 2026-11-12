@@ -18,7 +18,7 @@ use std::{
 use ash::{Device, ext, khr, vk};
 use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, BufferUsage, CompareFn, ComputeOp, ComputePipelineDesc,
-    DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, GpuDevice, GpuError,
+    DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, Format, GpuDevice, GpuError,
     GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryBudget,
     MemoryUsage, PipelineHandle, PolygonMode, QueryPoolHandle, Result, SamplerDesc, SamplerHandle,
     Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus,
@@ -514,6 +514,10 @@ pub(crate) struct VulkanDeviceInner {
     /// `multiDrawIndirect` and `drawIndirectFirstInstance` on: one indirect call runs many draws.
     pub multi_draw_indirect: bool,
     pub max_sampler_anisotropy: f32,
+    /// `textureCompressionBC` on: the BC block formats may be created.
+    pub texture_compression_bc: bool,
+    /// `textureCompressionASTC_LDR` on: the ASTC block formats may be created.
+    pub texture_compression_astc: bool,
     /// `Depth24PlusStencil8` here: `D24_UNORM_S8_UINT` if present, else `D32_SFLOAT_S8_UINT`. AMD
     /// exposes no D24S8. "24 plus" allows the wider depth.
     pub depth24_stencil8: vk::Format,
@@ -639,7 +643,7 @@ pub(crate) struct VulkanTexture {
     pub mip_levels: u32,
     pub array_layers: u32,
     pub usage: vk::ImageUsageFlags,
-    pub texel_bytes: u32,
+    pub hal_format: Format,
     /// Per array layer, one bit per mip that holds texels in the resting layout. A partial write to
     /// a level not ready leaves the rest undefined.
     pub ready: Vec<u32>,
@@ -1027,6 +1031,8 @@ impl VulkanDevice {
                 .limits
                 .max_sampler_anisotropy
         };
+        let texture_compression_bc = supported_features.texture_compression_bc == vk::TRUE;
+        let texture_compression_astc = supported_features.texture_compression_astc_ldr == vk::TRUE;
 
         let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
             shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
@@ -1075,6 +1081,8 @@ impl VulkanDevice {
                 },
                 multi_draw_indirect: on(multi_draw_indirect),
                 draw_indirect_first_instance: on(multi_draw_indirect),
+                texture_compression_bc: on(texture_compression_bc),
+                texture_compression_astc_ldr: on(texture_compression_astc),
                 ..Default::default()
             },
             ..Default::default()
@@ -1220,6 +1228,8 @@ impl VulkanDevice {
             sampler_anisotropy,
             multi_draw_indirect,
             max_sampler_anisotropy,
+            texture_compression_bc,
+            texture_compression_astc,
             depth24_stencil8,
             compute_subgroup_sizes,
             compute_full_subgroups: compute_subgroup_sizes.is_some()
@@ -2404,6 +2414,9 @@ mod tests {
                 assert!(caps.render_target, "{format:?} as depth");
                 continue;
             }
+            if format.is_compressed() {
+                continue;
+            }
             assert!(caps.sampled && caps.render_target, "{format:?}: {caps:?}");
         }
         let half = dev.format_caps(zengpu_hal::Format::Rgba16Float);
@@ -2423,7 +2436,10 @@ mod tests {
             return;
         }
         for &format in zengpu_hal::Format::ALL {
-            if format.is_depth_stencil() || !dev.format_caps(format).sampled {
+            if format.is_depth_stencil()
+                || format.is_compressed()
+                || !dev.format_caps(format).sampled
+            {
                 continue;
             }
             round_trip(&*dev, format);
@@ -2518,6 +2534,12 @@ mod tests {
         Float,
     }
 
+    /// Formats whose texels these helpers encode and decode. Block formats and the packed
+    /// 11/11/10 format get their own checks.
+    fn has_codec(format: Format) -> bool {
+        !format.is_depth_stencil() && !format.is_compressed() && format != Format::R11G11B10Float
+    }
+
     fn lane(format: Format) -> Lane {
         match format {
             Format::Rgba8Unorm
@@ -2526,7 +2548,7 @@ mod tests {
             | Format::Bgra8UnormSrgb
             | Format::R8Unorm => Lane::Unorm8,
             Format::Rgba16Unorm | Format::R16Unorm => Lane::Unorm16,
-            Format::Rgba16Float | Format::R16Float => Lane::Half,
+            Format::Rgba16Float | Format::R16Float | Format::Rg16Float => Lane::Half,
             _ => Lane::Float,
         }
     }
@@ -2949,7 +2971,7 @@ mod tests {
         };
         let device = vulkan(&dev);
         for &format in Format::ALL {
-            if !format.is_depth_stencil() && device.format_caps(format).render_target {
+            if has_codec(format) && device.format_caps(format).render_target {
                 clear_round_trip(device, format);
             }
         }
@@ -3352,7 +3374,7 @@ mod tests {
         let device = vulkan(&dev);
         for &format in Format::ALL {
             let caps = device.format_caps(format);
-            if !format.is_depth_stencil() && caps.render_target && caps.blendable {
+            if has_codec(format) && caps.render_target && caps.blendable {
                 blend_round_trip(device, format);
             }
         }
@@ -3451,9 +3473,166 @@ mod tests {
             return;
         }
         for &format in Format::ALL {
-            if !format.is_depth_stencil() && device.format_caps(format).sampled {
+            if has_codec(format) && device.format_caps(format).sampled {
                 sample_round_trip(device, format);
             }
+        }
+    }
+
+    /// Bits of a power-of-two `[r, g, b]` (or zero) in `R11G11B10Float`.
+    fn pack_r11g11b10(rgb: [f32; 3]) -> u32 {
+        let field = |v: f32, mant: u32| {
+            if v == 0.0 {
+                0
+            } else {
+                ((v.log2() as i32 + 15) as u32) << mant
+            }
+        };
+        field(rgb[0], 6) | (field(rgb[1], 6) << 11) | (field(rgb[2], 5) << 22)
+    }
+
+    fn plain_texture(device: &VulkanDevice, format: Format, w: u32, h: u32) -> TextureHandle {
+        device
+            .create_texture(TextureDesc {
+                width: w,
+                height: h,
+                depth: 1,
+                format,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn r11g11b10_and_rg16_read_back_known_texels() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        let packed: Vec<u8> = [[1.0, 0.5, 2.0], [0.0, 0.25, 1.0]]
+            .iter()
+            .flat_map(|rgb| pack_r11g11b10(*rgb).to_le_bytes())
+            .collect();
+        let tex = plain_texture(device, Format::R11G11B10Float, 2, 1);
+        device.upload_texture_data(tex, &packed).unwrap();
+        let buf = device.create_buffer(rw_desc(8)).unwrap();
+        device
+            .copy_texture_region_to_buffer(tex, TextureRegion::rect(0, 0, 2, 1), buf, 0, 8)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(device.read_buffer(buf, 0, 8).unwrap(), packed);
+        device.destroy_buffer(buf);
+        device.destroy_texture(tex);
+
+        let texels = [[0.25, 0.5, 0.0, 1.0], [1.0, 0.75, 0.0, 1.0]];
+        let bytes: Vec<u8> = texels
+            .iter()
+            .flat_map(|t| encode(Format::Rg16Float, *t))
+            .collect();
+        let tex = plain_texture(device, Format::Rg16Float, 2, 1);
+        device.upload_texture_data(tex, &bytes).unwrap();
+        let got = read_texels(device, tex, Format::Rg16Float, 2, 1);
+        assert_texels(Format::Rg16Float, &got, &texels);
+        device.destroy_texture(tex);
+    }
+
+    #[test]
+    fn bc1_block_uploads_and_samples_its_colour() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        if !device.format_caps(Format::Bc1RgbaUnorm).sampled {
+            return;
+        }
+        let tex = device
+            .create_texture(TextureDesc {
+                width: 4,
+                height: 4,
+                depth: 1,
+                format: Format::Bc1RgbaUnorm,
+                usage: TextureUsage::SAMPLED
+                    | TextureUsage::TRANSFER_SRC
+                    | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        // Both endpoints pure red in RGB565, every index 0.
+        let block = [0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0];
+        device.upload_texture_data(tex, &block).unwrap();
+        let buf = device.create_buffer(rw_desc(8)).unwrap();
+        device
+            .copy_texture_region_to_buffer(tex, TextureRegion::rect(0, 0, 4, 4), buf, 0, 8)
+            .unwrap()
+            .wait(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(device.read_buffer(buf, 0, 8).unwrap(), block);
+        device.destroy_buffer(buf);
+
+        let sampler = device
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Nearest,
+                mag_filter: FilterMode::Nearest,
+                mip_filter: FilterMode::Nearest,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let slot = device.bind_texture(tex, sampler).unwrap();
+        let out_format = Format::Rgba32Float;
+        let (out, target) = render_target(device, out_format, 2, 2);
+        let pipeline = quad_pipeline(device, &SAMPLE_FS, out_format, None);
+        draw_quad(
+            device,
+            target,
+            LoadOp::Clear([0.0; 4]),
+            pipeline,
+            &[Scalar::U32(slot)],
+            (2, 2),
+        );
+        let got = read_texels(device, out, out_format, 2, 2);
+        assert_texels(out_format, &got, &[[1.0, 0.0, 0.0, 1.0]; 4]);
+        device.destroy_pipeline(pipeline);
+        device.destroy_texture(out);
+        device.destroy_sampler(sampler);
+        device.destroy_texture(tex);
+    }
+
+    #[test]
+    fn compressed_formats_refuse_drawn_and_stored_use() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        for usage in [
+            TextureUsage::RENDER_TARGET,
+            TextureUsage::DEPTH_STENCIL,
+            TextureUsage::STORAGE,
+        ] {
+            let made = device.create_texture(TextureDesc {
+                width: 4,
+                height: 4,
+                depth: 1,
+                format: Format::Bc7RgbaUnorm,
+                usage: usage | TextureUsage::SAMPLED,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            });
+            assert!(
+                matches!(made, Err(GpuError::Unsupported(_))),
+                "compressed texture accepted a drawn or stored use"
+            );
         }
     }
 

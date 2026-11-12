@@ -13,6 +13,19 @@ use zengpu_hal::{
 
 pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
     match format {
+        Format::R11G11B10Float => MTLPixelFormat::RG11B10Float,
+        Format::Rg16Float => MTLPixelFormat::RG16Float,
+        Format::Bc1RgbaUnorm => MTLPixelFormat::BC1_RGBA,
+        Format::Bc1RgbaUnormSrgb => MTLPixelFormat::BC1_RGBA_sRGB,
+        Format::Bc3RgbaUnorm => MTLPixelFormat::BC3_RGBA,
+        Format::Bc3RgbaUnormSrgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        Format::Bc4RUnorm => MTLPixelFormat::BC4_RUnorm,
+        Format::Bc5RgUnorm => MTLPixelFormat::BC5_RGUnorm,
+        Format::Bc6hRgbUfloat => MTLPixelFormat::BC6H_RGBUfloat,
+        Format::Bc7RgbaUnorm => MTLPixelFormat::BC7_RGBAUnorm,
+        Format::Bc7RgbaUnormSrgb => MTLPixelFormat::BC7_RGBAUnorm_sRGB,
+        Format::Astc4x4Unorm => MTLPixelFormat::ASTC_4x4_LDR,
+        Format::Astc4x4UnormSrgb => MTLPixelFormat::ASTC_4x4_sRGB,
         Format::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         Format::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
         Format::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
@@ -34,6 +47,13 @@ pub(crate) fn pixel_format(format: Format) -> MTLPixelFormat {
 ///
 /// f32 filters only where the device says so. sRGB and BGRA textures are not compute-writable.
 pub(crate) fn format_caps(format: Format, float32_filtering: bool) -> FormatCaps {
+    if format.is_compressed() {
+        return FormatCaps {
+            sampled: true,
+            filterable: true,
+            ..FormatCaps::default()
+        };
+    }
     let all = FormatCaps {
         sampled: true,
         filterable: true,
@@ -44,11 +64,16 @@ pub(crate) fn format_caps(format: Format, float32_filtering: bool) -> FormatCaps
     match format {
         Format::Rgba8Unorm
         | Format::Rgba16Float
+        | Format::Rg16Float
         | Format::Rgba16Unorm
         | Format::R8Unorm
         | Format::R16Float
         | Format::R16Unorm => all,
         Format::Rgba8UnormSrgb | Format::Bgra8Unorm | Format::Bgra8UnormSrgb => FormatCaps {
+            storage: false,
+            ..all
+        },
+        Format::R11G11B10Float => FormatCaps {
             storage: false,
             ..all
         },
