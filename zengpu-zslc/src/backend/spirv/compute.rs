@@ -1312,6 +1312,7 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         IrExpr::Input(_)
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
+        | IrExpr::SampleCompare { .. }
         | IrExpr::ArrayLit(_)
         | IrExpr::Index { .. }
         | IrExpr::Construct { .. } => {

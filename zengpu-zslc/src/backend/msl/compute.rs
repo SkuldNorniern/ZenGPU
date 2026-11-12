@@ -940,6 +940,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
         IrExpr::Input(_)
         | IrExpr::Swizzle { .. }
         | IrExpr::Sample { .. }
+        | IrExpr::SampleCompare { .. }
         | IrExpr::ArrayLit(_)
         | IrExpr::Index { .. } => {
             return Err(Diagnostic::new(

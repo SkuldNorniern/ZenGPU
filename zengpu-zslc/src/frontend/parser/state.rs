@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::node::IrStmt;
@@ -103,6 +104,8 @@ pub(super) struct GfxCtx {
     pub(super) locals_order: Vec<(String, TypeId)>,
     /// Array-literal locals, readable only as `name[i]`.
     pub(super) arrays: HashSet<String>,
+    /// Set when the body calls `.sample_compare`, so the table gets a depth image type.
+    pub(super) compares: Cell<bool>,
 }
 
 impl GfxCtx {

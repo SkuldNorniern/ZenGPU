@@ -85,6 +85,7 @@ pub(crate) mod op {
     pub const TYPE_SAMPLED_IMAGE: u32 = 27;
     pub const IMAGE_SAMPLE_IMPLICIT_LOD: u32 = 87;
     pub const IMAGE_SAMPLE_EXPLICIT_LOD: u32 = 88;
+    pub const IMAGE_SAMPLE_DREF_EXPLICIT_LOD: u32 = 90;
     pub const IMAGE_FETCH: u32 = 95;
     pub const IMAGE_READ: u32 = 98;
     pub const IMAGE_WRITE: u32 = 99;
@@ -894,11 +895,16 @@ impl SpvBuilder {
     }
 
     pub fn type_image_2d(&mut self, sampled: Id) -> Id {
+        self.type_image_2d_depth(sampled, 0)
+    }
+
+    /// `depth` is the OpTypeImage Depth operand: 0 for colour, 1 for a depth image.
+    pub fn type_image_2d_depth(&mut self, sampled: Id, depth: u32) -> Id {
         let id = self.fresh_id();
         emit(
             &mut self.types,
             op::TYPE_IMAGE,
-            &[id.0, sampled.0, 1, 0, 0, 0, 1, 0],
+            &[id.0, sampled.0, 1, depth, 0, 0, 1, 0],
         );
         id
     }
@@ -935,6 +941,24 @@ impl SpvBuilder {
             &mut self.functions,
             op::IMAGE_SAMPLE_EXPLICIT_LOD,
             &[ty.0, id.0, image.0, coord.0, 0x2, lod.0],
+        );
+        id
+    }
+
+    /// Comparison sample at an explicit level. `dref` is the reference depth.
+    pub fn op_image_sample_dref_explicit_lod(
+        &mut self,
+        ty: Id,
+        image: Id,
+        coord: Id,
+        dref: Id,
+        lod: Id,
+    ) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::IMAGE_SAMPLE_DREF_EXPLICIT_LOD,
+            &[ty.0, id.0, image.0, coord.0, dref.0, 0x2, lod.0],
         );
         id
     }

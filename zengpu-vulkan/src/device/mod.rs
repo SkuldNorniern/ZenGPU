@@ -2514,6 +2514,19 @@ mod tests {
             tex[p.slot].sample(uv)
         }
     );
+    const COMPARE_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+        push P { slot: u32, dref: f32 }
+        fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+            f32x4(tex[p.slot].sample_compare(uv, p.dref), 0.0, 0.0, 1.0)
+        }
+    );
+    const DEPTH_VS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+        push P { z: f32 }
+        vertex vs(vi: vertex_index, p: P) -> f32x4 {
+            let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+            f32x4(corner * 2.0 - 1.0, p.z, 1.0)
+        }
+    );
 
     #[derive(Clone, Copy)]
     enum Lane {
@@ -3449,6 +3462,176 @@ mod tests {
         device.destroy_texture(out);
         device.destroy_sampler(sampler);
         device.destroy_texture(plain);
+        device.destroy_texture(depth);
+    }
+
+    /// Depth-writing pipeline: the vertex stage sets z from a push scalar, and the fragment
+    /// writes a colour nobody reads.
+    fn depth_pipeline(device: &VulkanDevice) -> PipelineHandle {
+        let vs = device
+            .create_shader(DEPTH_VS.spirv_desc().unwrap())
+            .unwrap();
+        let fs = device
+            .create_shader(HALF_RED_FS.spirv_desc().unwrap())
+            .unwrap();
+        let pipeline = device
+            .create_graphics_pipeline(GraphicsPipelineDesc {
+                vertex_shader: vs,
+                fragment_shader: fs,
+                vertex_layouts: &[],
+                topology: PrimitiveTopology::TriangleList,
+                color_targets: &[ColorTargetState {
+                    format: Format::Rgba32Float,
+                    blend: None,
+                }],
+                depth_format: Some(Format::Depth32Float),
+                depth: DepthState {
+                    test: true,
+                    write: true,
+                    compare: zengpu_hal::CompareFn::Always,
+                },
+                stencil: None,
+                raster: RasterState::default(),
+                samples: 1,
+            })
+            .unwrap();
+        device.destroy_shader(vs);
+        device.destroy_shader(fs);
+        pipeline
+    }
+
+    /// Depths 0.2, 0.4, 0.6, 0.8 in a 2x2 map. Centres compare per texel, the middle blends the
+    /// four results. `LessEqual` passes where the reference is at most the stored depth.
+    #[test]
+    fn a_depth_texture_is_compared_with_linear_filtering() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        if !device.format_caps(Format::Rgba32Float).render_target {
+            return;
+        }
+        let depth = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format: Format::Depth32Float,
+                usage: TextureUsage::SAMPLED | TextureUsage::RENDER_TARGET,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let target = device.register_depth_texture(depth).unwrap();
+        let (dummy, dummy_target) = render_target(device, Format::Rgba32Float, 2, 2);
+        let pipeline = depth_pipeline(device);
+        let texels = [(0, 0, 0.2_f32), (1, 0, 0.4), (0, 1, 0.6), (1, 1, 0.8)];
+        for (i, &(x, y, z)) in texels.iter().enumerate() {
+            let load = if i == 0 {
+                LoadOp::clear_depth(1.0)
+            } else {
+                LoadOp::Load
+            };
+            let mut cmd = device.create_command_list().unwrap();
+            cmd.begin_render_pass(&RenderPassDesc {
+                color: &[ColorAttachment {
+                    target: dummy_target,
+                    load: LoadOp::Load,
+                    store: true,
+                    sample_after: false,
+                }],
+                depth: Some(zengpu_hal::DepthAttachment {
+                    target,
+                    load,
+                    store: true,
+                }),
+            });
+            cmd.set_pipeline(pipeline);
+            cmd.set_viewport_scissor(ViewportScissor {
+                viewport: Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 2.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: Some(zengpu_hal::Rect {
+                    x: x as f32,
+                    y: y as f32,
+                    width: 1.0,
+                    height: 1.0,
+                }),
+            });
+            cmd.bind(Bindings {
+                scalars: &[Scalar::F32(z)],
+                ..Default::default()
+            });
+            cmd.draw(0..6, 0..1);
+            cmd.end_render_pass();
+            device.submit_and_wait(cmd).unwrap();
+        }
+
+        let sampler = device
+            .create_sampler(SamplerDesc {
+                compare: Some(zengpu_hal::CompareFn::LessEqual),
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let slot = device.bind_texture(depth, sampler).unwrap();
+        let (centres, centre_target) = render_target(device, Format::Rgba32Float, 2, 2);
+        let (middle, middle_target) = render_target(device, Format::Rgba32Float, 1, 1);
+        let fs = quad_pipeline(device, &COMPARE_FS, Format::Rgba32Float, None);
+        let cases = [
+            (0.1_f32, [1.0_f32, 1.0, 1.0, 1.0], 1.0_f32),
+            (0.5, [0.0, 0.0, 1.0, 1.0], 0.5),
+            (0.9, [0.0; 4], 0.0),
+        ];
+        for (dref, want_centres, want_middle) in cases {
+            let scalars = [Scalar::U32(slot), Scalar::F32(dref)];
+            draw_quad(
+                device,
+                centre_target,
+                LoadOp::Clear([0.0; 4]),
+                fs,
+                &scalars,
+                (2, 2),
+            );
+            let got = read_texels(device, centres, Format::Rgba32Float, 2, 2);
+            for (texel, want) in got.iter().zip(want_centres) {
+                assert!(
+                    (texel[0] - want).abs() < 1e-3,
+                    "centre {texel:?} for ref {dref}, want {want}"
+                );
+            }
+            draw_quad(
+                device,
+                middle_target,
+                LoadOp::Clear([0.0; 4]),
+                fs,
+                &scalars,
+                (1, 1),
+            );
+            let got = read_texels(device, middle, Format::Rgba32Float, 1, 1);
+            assert!(
+                (got[0][0] - want_middle).abs() < 1e-3,
+                "middle {:?} for ref {dref}, want {want_middle}",
+                got[0]
+            );
+        }
+
+        device.destroy_pipeline(fs);
+        device.destroy_pipeline(pipeline);
+        device.unregister_render_target(centre_target);
+        device.unregister_render_target(middle_target);
+        device.unregister_render_target(dummy_target);
+        device.unregister_render_target(target);
+        device.destroy_texture(centres);
+        device.destroy_texture(middle);
+        device.destroy_texture(dummy);
+        device.destroy_sampler(sampler);
         device.destroy_texture(depth);
     }
 

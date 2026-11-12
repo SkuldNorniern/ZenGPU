@@ -21,6 +21,9 @@ pub const PUSH_BUFFER_INDEX: u32 = 16;
 
 pub const TEXTURE_BUFFER_INDEX: u32 = 17;
 
+/// The depth table, bound only when a shader calls `sample_compare`.
+pub const DEPTH_TEXTURE_BUFFER_INDEX: u32 = 19;
+
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
@@ -112,10 +115,16 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     if e.textures.is_some() {
         texture_abi(&mut s);
     }
+    if e.compare_textures {
+        depth_abi(&mut s);
+    }
     let texture_arg = e
         .textures
         .as_ref()
         .map(|_| format!("    ZSL_TEXTURE_ARGS({TEXTURE_BUFFER_INDEX})"));
+    let compare_arg = e
+        .compare_textures
+        .then(|| format!("    ZSL_DEPTH_ARGS({DEPTH_TEXTURE_BUFFER_INDEX})"));
 
     if e.is_fragment {
         let single = match &e.outputs[..] {
@@ -145,6 +154,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             args.push(format!("    {push_arg}"));
         }
         args.extend(texture_arg.iter().cloned());
+        args.extend(compare_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
@@ -182,6 +192,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             args.push(format!("    {push_arg}"));
         }
         args.extend(texture_arg.iter().cloned());
+        args.extend(compare_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
         s.push_str("\n) {\n");
         for st in &e.body {
@@ -203,6 +214,28 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         has_push,
         local_size: [1, 1, 1],
     })
+}
+
+/// Depth textures need their own table: Metal types a `depth2d` apart from a `texture2d`. It
+/// reuses the slot ids of [`texture_abi`].
+fn depth_abi(s: &mut String) {
+    s.push_str("#ifdef ZSL_METAL_TIER1\n");
+    s.push_str("struct ZslDepthTable {\n    array<depth2d<float>, 16> tex [[id(0)]];\n    array<sampler, 16> smp [[id(16)]];\n};\n");
+    s.push_str("inline float zsl_sample_compare(constant ZslDepthTable& t, constant uint* ids, uint slot, float2 uv, float dref) {\n");
+    for i in 0..16 {
+        let _ = writeln!(
+            s,
+            "    if (ids[{i}] == slot) return t.tex[{i}].sample_compare(t.smp[{i}], uv, dref);"
+        );
+    }
+    s.push_str("    return 0.0;\n}\n");
+    s.push_str(
+        "#define ZSL_DEPTH_ARGS(B) constant ZslDepthTable& zsl_depth_textures [[buffer(B)]]\n",
+    );
+    s.push_str("#define ZSL_SAMPLE_COMPARE(I, UV, D) zsl_sample_compare(zsl_depth_textures, zsl_texture_ids, (I), (UV), (D))\n");
+    s.push_str("#else\nstruct ZslDepthTexture {\n    depth2d<float> tex;\n    sampler smp;\n};\n");
+    s.push_str("#define ZSL_DEPTH_ARGS(B) const device ZslDepthTexture* zsl_depth_textures [[buffer(B)]]\n");
+    s.push_str("#define ZSL_SAMPLE_COMPARE(I, UV, D) zsl_depth_textures[I].tex.sample_compare(zsl_depth_textures[I].smp, (UV), (D))\n#endif\n\n");
 }
 
 /// Tier 1 cannot index an array of argument-buffer structs. Bind a small per-draw
@@ -372,6 +405,14 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 None if ctx.is_fragment => format!("ZSL_SAMPLE({index}, {uv})"),
                 None => format!("ZSL_SAMPLE_LOD({index}, {uv}, 0.0)"),
             }
+        }
+        IrExpr::SampleCompare { index, uv, depth } => {
+            let index = emit_expr(ctx, index)?;
+            let uv = emit_expr(ctx, uv)?;
+            format!(
+                "ZSL_SAMPLE_COMPARE({index}, {uv}, {})",
+                emit_expr(ctx, depth)?
+            )
         }
 
         IrExpr::Swizzle { base, lanes } => {
@@ -626,6 +667,27 @@ mod tests {
         assert!(m.source.contains("struct ZslTexture {"));
         assert!(m.source.contains("ZSL_TEXTURE_ARGS(17)"));
         assert!(m.source.contains("ZSL_SAMPLE(pc.slot, in.uv)"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn comparison_samples_go_through_a_depth_table() {
+        let m = graphics(
+            r#"
+            push P { slot: u32, dref: f32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                let lit = tex[p.slot].sample_compare(uv, p.dref)
+                f32x4(lit, lit, lit, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("struct ZslDepthTexture {"));
+        assert!(m.source.contains("depth2d<float> tex;"));
+        assert!(m.source.contains("ZSL_DEPTH_ARGS(19)"));
+        assert!(
+            m.source
+                .contains("ZSL_SAMPLE_COMPARE(pc.slot, in.uv, pc.dref)")
+        );
         let _ = metal_compiles(&m.source);
     }
 

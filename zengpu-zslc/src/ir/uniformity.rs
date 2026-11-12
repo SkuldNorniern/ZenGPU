@@ -29,7 +29,7 @@ fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
         IrExpr::Construct { args, .. } | IrExpr::Builtin { args, .. } => {
             args.iter().all(|arg| expr_is_uniform(arg, locals))
         }
-        IrExpr::Sample { .. } | IrExpr::Texel { .. } => false,
+        IrExpr::Sample { .. } | IrExpr::SampleCompare { .. } | IrExpr::Texel { .. } => false,
         IrExpr::TexSize { .. } => true,
         IrExpr::ArrayLit(elems) => elems.iter().all(|e| expr_is_uniform(e, locals)),
         IrExpr::Index { array, index } => {
@@ -81,6 +81,11 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
             args.iter().any(expr_contains_subgroup_collective)
         }
         IrExpr::Index { index, .. } => expr_contains_subgroup_collective(index),
+        IrExpr::SampleCompare { index, uv, depth } => {
+            expr_contains_subgroup_collective(index)
+                || expr_contains_subgroup_collective(uv)
+                || expr_contains_subgroup_collective(depth)
+        }
         IrExpr::Sample { index, uv, lod } => {
             expr_contains_subgroup_collective(index)
                 || expr_contains_subgroup_collective(uv)

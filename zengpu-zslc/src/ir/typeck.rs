@@ -326,6 +326,7 @@ pub fn type_of_graphics_expr(
         IrExpr::Input(n) => ctx.inputs.get(n).copied().unwrap_or(f32_id),
         IrExpr::FieldAccess { .. } => f32_id,
         IrExpr::Sample { .. } => vec4_id,
+        IrExpr::SampleCompare { .. } => f32_id,
         IrExpr::ArrayLit(elems) => {
             let element = elems
                 .first()

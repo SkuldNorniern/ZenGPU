@@ -184,6 +184,8 @@ pub struct GraphicsEntry {
     pub buf_params: Vec<String>,
     /// Name of the bindless texture table, sampled as `name[slot].sample(uv)`.
     pub textures: Option<String>,
+    /// The body calls `sample_compare`, so the texture table holds depth images.
+    pub compare_textures: bool,
     /// Vertex varying outputs. Empty for fragment shaders and for position-only vertex shaders.
     pub varyings: Vec<TypeId>,
     pub locals: Vec<(String, TypeId)>,

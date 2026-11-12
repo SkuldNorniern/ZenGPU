@@ -58,6 +58,11 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
             array: renamed(array),
             index: Box::new(rename_expr(index, map)),
         },
+        IrExpr::SampleCompare { index, uv, depth } => IrExpr::SampleCompare {
+            index: Box::new(rename_expr(index, map)),
+            uv: Box::new(rename_expr(uv, map)),
+            depth: Box::new(rename_expr(depth, map)),
+        },
         IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
             index: Box::new(rename_expr(index, map)),
             uv: Box::new(rename_expr(uv, map)),
@@ -219,6 +224,11 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
         IrExpr::Index { array, index } => IrExpr::Index {
             array: array.clone(),
             index: Box::new(resolve_construct_types_expr(index, types)),
+        },
+        IrExpr::SampleCompare { index, uv, depth } => IrExpr::SampleCompare {
+            index: Box::new(resolve_construct_types_expr(index, types)),
+            uv: Box::new(resolve_construct_types_expr(uv, types)),
+            depth: Box::new(resolve_construct_types_expr(depth, types)),
         },
         IrExpr::Sample { index, uv, lod } => IrExpr::Sample {
             index: Box::new(resolve_construct_types_expr(index, types)),

@@ -57,6 +57,13 @@ pub enum IrExpr {
         uv: Box<IrExpr>,
         lod: Option<Box<IrExpr>>,
     },
+    /// Hardware depth comparison at mip 0, filtered like `Sample`, giving `f32`. The slot's
+    /// sampler must be a comparison sampler. Graphics only.
+    SampleCompare {
+        index: Box<IrExpr>,
+        uv: Box<IrExpr>,
+        depth: Box<IrExpr>,
+    },
     /// `dim` is 2, 3 or 4. `ty` is `None` after parsing and is filled by
     /// `resolve_construct_types_expr` before any backend sees it.
     Construct {
@@ -487,6 +494,11 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
                 || expr_uses_subgroup_query(uv)
                 || lod.as_deref().is_some_and(expr_uses_subgroup_query)
         }
+        IrExpr::SampleCompare { index, uv, depth } => {
+            expr_uses_subgroup_query(index)
+                || expr_uses_subgroup_query(uv)
+                || expr_uses_subgroup_query(depth)
+        }
         IrExpr::Texel { args, .. } => args.iter().any(expr_uses_subgroup_query),
         IrExpr::FragLoad { offset, ld, .. } => {
             expr_uses_subgroup_query(offset) || expr_uses_subgroup_query(ld)
@@ -579,6 +591,11 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
             expr_uses_workgroup_reduce(index)
                 || expr_uses_workgroup_reduce(uv)
                 || lod.as_deref().is_some_and(expr_uses_workgroup_reduce)
+        }
+        IrExpr::SampleCompare { index, uv, depth } => {
+            expr_uses_workgroup_reduce(index)
+                || expr_uses_workgroup_reduce(uv)
+                || expr_uses_workgroup_reduce(depth)
         }
         IrExpr::Texel { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
         IrExpr::FragLoad { offset, ld, .. } => {
@@ -735,6 +752,13 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
             .fold((false, false, false, false, false), |acc, e| {
                 merge_subgroup_collective_uses(acc, expr_uses_subgroup_collectives(e))
             }),
+        IrExpr::SampleCompare { index, uv, depth } => {
+            let uses = merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(index),
+                expr_uses_subgroup_collectives(uv),
+            );
+            merge_subgroup_collective_uses(uses, expr_uses_subgroup_collectives(depth))
+        }
         IrExpr::Sample { index, uv, lod } => {
             let uses = merge_subgroup_collective_uses(
                 expr_uses_subgroup_collectives(index),

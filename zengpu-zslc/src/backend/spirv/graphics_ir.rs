@@ -330,7 +330,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
     let textures = e.textures.as_ref().map(|_| {
         spv.capability_non_uniform_sampled_images();
-        let t_image = spv.type_image_2d(t_f32);
+        let t_image = spv.type_image_2d_depth(t_f32, u32::from(e.compare_textures));
         let t_sampled = spv.type_sampled_image(t_image);
         let t_table = spv.type_runtime_array(t_sampled);
         let t_ptr_table = spv.type_pointer(sc::UNIFORM_CONSTANT, t_table);
@@ -933,6 +933,29 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
         | IrExpr::GroupId(_)
         | IrExpr::SharedLoad { .. } => {
             Err("workgroup expressions are only available in compute shaders".into())
+        }
+        IrExpr::SampleCompare { index, uv, depth } => {
+            let table = ctx.textures.ok_or("internal: no texture table")?;
+            let slot = lower_expr(ctx, index)?;
+            let slot = scalar_to_u32(ctx, slot);
+            let uv = lower_expr(ctx, uv)?;
+            if uv.ty != ctx.vec2_id {
+                return Err("texture coordinates must be f32x2".into());
+            }
+            let depth = lower_expr(ctx, depth)?;
+            let depth = scalar_to_f32(ctx, depth);
+            let ptr = ctx.spv.op_access_chain(table.t_ptr, table.var, &[slot]);
+            let image = ctx.spv.op_load(table.t_sampled, ptr);
+            ctx.spv.decorate(ptr, deco::NON_UNIFORM, &[]);
+            ctx.spv.decorate(image, deco::NON_UNIFORM, &[]);
+            let lod = ctx.spv.constant_f32(ctx.t_f32, 0.0);
+            let id = ctx
+                .spv
+                .op_image_sample_dref_explicit_lod(ctx.t_f32, image, uv.id, depth, lod);
+            Ok(GVal {
+                id,
+                ty: ctx.f32_id,
+            })
         }
         IrExpr::Texel { .. } | IrExpr::TexSize { .. } => {
             Err("texture and image params are only available in compute shaders; sample the `textures` table".into())
@@ -1646,6 +1669,45 @@ pub(crate) mod tests {
         assert!(capabilities.contains(&cap::SAMPLED_IMAGE_ARRAY_NON_UNIFORM_INDEXING));
         // the slot's pointer and the image loaded through it
         assert_eq!(decorated, 2);
+    }
+
+    #[test]
+    fn comparison_samples_use_a_depth_table() {
+        let words = lower(
+            r#"
+            push P { slot: u32, dref: f32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                let lit = tex[p.slot].sample_compare(uv, p.dref)
+                f32x4(lit, lit, lit, 1.0)
+            }
+            "#,
+        );
+        validate(&words);
+        // OpTypeImage: id, sampled type, dim (1 = 2D), depth (1 = depth image)
+        let (mut dref_samples, mut depth_images) = (0, 0);
+        let mut at = 5;
+        while at < words.len() {
+            let (count, opcode) = ((words[at] >> 16) as usize, words[at] & 0xffff);
+            if opcode == 90 {
+                dref_samples += 1;
+            }
+            if opcode == 25 && words[at + 3] == 1 && words[at + 4] == 1 {
+                depth_images += 1;
+            }
+            at += count.max(1);
+        }
+        assert_eq!(dref_samples, 1, "OpImageSampleDrefExplicitLod");
+        assert_eq!(depth_images, 1, "table image declared Depth=1");
+    }
+
+    #[test]
+    fn comparison_result_has_no_channels() {
+        assert!(
+            parse_zsl(
+                "fragment fs(@location(0) uv: f32x2, tex: textures) -> f32x4 { let a = tex[0].sample_compare(uv, 0.5).r\n f32x4(a) }"
+            )
+            .is_err()
+        );
     }
 
     /// Whether any struct member is decorated NonWritable.

@@ -108,6 +108,11 @@ fn check_expr(
             Ok(())
         }
         IrExpr::Index { index, .. } => check_expr(index, ctx, types, bool_id),
+        IrExpr::SampleCompare { index, uv, depth } => {
+            check_expr(index, ctx, types, bool_id)?;
+            check_expr(uv, ctx, types, bool_id)?;
+            check_expr(depth, ctx, types, bool_id)
+        }
         IrExpr::Sample { index, uv, lod } => {
             check_expr(index, ctx, types, bool_id)?;
             check_expr(uv, ctx, types, bool_id)?;

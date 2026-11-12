@@ -1,3 +1,5 @@
+use std::cell::Cell;
+
 use super::*;
 
 impl<'a> Parser<'a> {
@@ -15,6 +17,7 @@ impl<'a> Parser<'a> {
             locals: HashMap::new(),
             locals_order: Vec::new(),
             arrays: HashSet::new(),
+            compares: Cell::new(false),
         };
         let (inputs, scalar_params, buf_params) = self.parse_gfx_params(&mut ctx, is_fragment)?;
 
@@ -73,6 +76,7 @@ impl<'a> Parser<'a> {
                 scalar_params,
                 buf_params,
                 textures: ctx.textures.clone(),
+                compare_textures: ctx.compares.get(),
                 varyings,
                 locals,
                 body,

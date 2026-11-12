@@ -168,6 +168,9 @@ impl<'a> Parser<'a> {
                 }
                 if ctx.textures.as_deref() == Some(name.as_str()) {
                     let sample = self.parse_g_sample(ctx)?;
+                    if matches!(sample, IrExpr::SampleCompare { .. }) {
+                        return Ok(sample);
+                    }
                     return self.parse_g_postfix(ctx, sample);
                 }
                 if ctx.buffers.contains_key(&name) {
@@ -206,17 +209,30 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::RBracket, "`]`")?;
         self.expect(&Tok::Dot, "`.sample(uv)` on a texture")?;
         let method = self.ident()?;
-        let explicit = match method.as_str() {
-            "sample" => false,
-            "sample_level" => true,
+        let (explicit, compare) = match method.as_str() {
+            "sample" => (false, false),
+            "sample_level" => (true, false),
+            "sample_compare" => (false, true),
             other => {
                 return self.err(format!(
-                    "unknown texture method `.{other}()`; use `.sample` or `.sample_level`"
+                    "unknown texture method `.{other}()`; use `.sample`, `.sample_level` or `.sample_compare`"
                 ));
             }
         };
         self.expect(&Tok::LParen, "`(`")?;
         let uv = self.parse_g_expr(ctx)?;
+        if compare {
+            self.expect(&Tok::Comma, "`,` before the depth reference")?;
+            let depth = self.parse_g_expr(ctx)?;
+            self.eat(&Tok::Comma);
+            self.expect(&Tok::RParen, "`)`")?;
+            ctx.compares.set(true);
+            return Ok(IrExpr::SampleCompare {
+                index: Box::new(index),
+                uv: Box::new(uv),
+                depth: Box::new(depth),
+            });
+        }
         let lod = if explicit {
             self.expect(&Tok::Comma, "`,` before the level")?;
             Some(Box::new(self.parse_g_expr(ctx)?))
