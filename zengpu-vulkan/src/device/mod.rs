@@ -905,32 +905,26 @@ impl VulkanDevice {
             ..Default::default()
         };
 
-        let mut supported_desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures::default();
+        let mut supported_v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut supported_dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
         let mut supported_atomic_float = vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
         let mut supported_subgroup_size =
             vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT::default();
-        supported_desc_idx.p_next = &mut supported_dynamic_rendering as *mut _ as *mut c_void;
+        supported_v12.p_next = &mut supported_dynamic_rendering as *mut _ as *mut c_void;
         supported_dynamic_rendering.p_next = &mut supported_atomic_float as *mut _ as *mut c_void;
         supported_atomic_float.p_next = &mut supported_subgroup_size as *mut _ as *mut c_void;
         let mut supported_coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
         let mut supported_storage16 = vk::PhysicalDevice16BitStorageFeatures::default();
-        let mut supported_storage8 = vk::PhysicalDevice8BitStorageFeatures::default();
-        let mut supported_f16i8 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
         let mut supported_wg_explicit =
             vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR::default();
         let mut supported_pipe_exec =
             vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default();
-        let mut supported_memory_model = vk::PhysicalDeviceVulkanMemoryModelFeatures::default();
         supported_subgroup_size.p_next = &mut supported_coop as *mut _ as *mut c_void;
         supported_coop.p_next = &mut supported_storage16 as *mut _ as *mut c_void;
-        supported_storage16.p_next = &mut supported_storage8 as *mut _ as *mut c_void;
-        supported_storage8.p_next = &mut supported_f16i8 as *mut _ as *mut c_void;
-        supported_f16i8.p_next = &mut supported_wg_explicit as *mut _ as *mut c_void;
+        supported_storage16.p_next = &mut supported_wg_explicit as *mut _ as *mut c_void;
         supported_wg_explicit.p_next = &mut supported_pipe_exec as *mut _ as *mut c_void;
-        supported_pipe_exec.p_next = &mut supported_memory_model as *mut _ as *mut c_void;
         let mut supported_features2 = vk::PhysicalDeviceFeatures2 {
-            p_next: &mut supported_desc_idx as *mut _ as *mut c_void,
+            p_next: &mut supported_v12 as *mut _ as *mut c_void,
             ..Default::default()
         };
         unsafe {
@@ -939,14 +933,13 @@ impl VulkanDevice {
                 .get_physical_device_features2(physical, &mut supported_features2);
         }
 
-        let descriptor_indexing = supported_desc_idx
-            .shader_storage_buffer_array_non_uniform_indexing
+        let descriptor_indexing = supported_v12.shader_storage_buffer_array_non_uniform_indexing
             == vk::TRUE
-            && supported_desc_idx.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
-            && supported_desc_idx.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE
-            && supported_desc_idx.descriptor_binding_sampled_image_update_after_bind == vk::TRUE
-            && supported_desc_idx.descriptor_binding_partially_bound == vk::TRUE
-            && supported_desc_idx.runtime_descriptor_array == vk::TRUE;
+            && supported_v12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
+            && supported_v12.descriptor_binding_storage_buffer_update_after_bind == vk::TRUE
+            && supported_v12.descriptor_binding_sampled_image_update_after_bind == vk::TRUE
+            && supported_v12.descriptor_binding_partially_bound == vk::TRUE
+            && supported_v12.runtime_descriptor_array == vk::TRUE;
         if !descriptor_indexing {
             return Err(GpuError::UnsupportedFeatures(Features::DESCRIPTOR_INDEXING));
         }
@@ -969,6 +962,10 @@ impl VulkanDevice {
         // a gpu count above one is many draws in one call
         if indirect_count && multi_draw_indirect {
             available_features |= Features::DRAW_INDIRECT_COUNT;
+        }
+        let sampler_minmax = supported_v12.sampler_filter_minmax == vk::TRUE;
+        if sampler_minmax {
+            available_features |= Features::SAMPLER_MINMAX;
         }
         let missing_required = req.required.difference(available_features);
         if !missing_required.is_empty() {
@@ -1013,7 +1010,7 @@ impl VulkanDevice {
             == vk::TRUE
             && supported_features.shader_storage_image_write_without_format == vk::TRUE
             && supported_features.shader_storage_image_array_dynamic_indexing == vk::TRUE
-            && supported_desc_idx.descriptor_binding_storage_image_update_after_bind == vk::TRUE;
+            && supported_v12.descriptor_binding_storage_image_update_after_bind == vk::TRUE;
         let mut device_limits = device_limits;
         if !storage_images {
             device_limits.max_storage_textures = 0;
@@ -1034,16 +1031,15 @@ impl VulkanDevice {
         let texture_compression_bc = supported_features.texture_compression_bc == vk::TRUE;
         let texture_compression_astc = supported_features.texture_compression_astc_ldr == vk::TRUE;
 
-        let mut desc_idx = vk::PhysicalDeviceDescriptorIndexingFeatures {
-            shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
-            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
-            descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
-            descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
-            descriptor_binding_storage_image_update_after_bind: on(storage_images),
-            descriptor_binding_partially_bound: vk::TRUE,
-            runtime_descriptor_array: vk::TRUE,
-            ..Default::default()
-        };
+        let f16i8_supported = supported_storage16.storage_buffer16_bit_access == vk::TRUE
+            && supported_v12.storage_buffer8_bit_access == vk::TRUE
+            && supported_v12.shader_float16 == vk::TRUE
+            && supported_v12.shader_int8 == vk::TRUE;
+        // Cooperative matrix modules use the Vulkan memory model.
+        let coop_supported = supports_extension(khr::cooperative_matrix::NAME)
+            && supported_coop.cooperative_matrix == vk::TRUE
+            && supported_v12.vulkan_memory_model == vk::TRUE
+            && f16i8_supported;
         let mut dynamic_rendering_feat = vk::PhysicalDeviceDynamicRenderingFeatures {
             dynamic_rendering: vk::TRUE,
             ..Default::default()
@@ -1055,12 +1051,32 @@ impl VulkanDevice {
         if shader_atomic_float && needs_graphics {
             dynamic_rendering_feat.p_next = &mut atomic_float_feat as *mut _ as *mut c_void;
         }
-        desc_idx.p_next = if needs_graphics {
-            &mut dynamic_rendering_feat as *mut _ as *mut c_void
-        } else if shader_atomic_float {
-            &mut atomic_float_feat as *mut _ as *mut c_void
-        } else {
-            null_mut()
+        let mut vk12 = vk::PhysicalDeviceVulkan12Features {
+            shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
+            descriptor_binding_storage_buffer_update_after_bind: vk::TRUE,
+            descriptor_binding_sampled_image_update_after_bind: vk::TRUE,
+            descriptor_binding_storage_image_update_after_bind: on(storage_images),
+            descriptor_binding_partially_bound: vk::TRUE,
+            runtime_descriptor_array: vk::TRUE,
+            storage_buffer8_bit_access: on(f16i8_supported),
+            shader_float16: on(f16i8_supported),
+            shader_int8: on(f16i8_supported),
+            vulkan_memory_model: on(coop_supported),
+            vulkan_memory_model_device_scope: if coop_supported {
+                supported_v12.vulkan_memory_model_device_scope
+            } else {
+                vk::FALSE
+            },
+            sampler_filter_minmax: on(sampler_minmax),
+            p_next: if needs_graphics {
+                &mut dynamic_rendering_feat as *mut _ as *mut c_void
+            } else if shader_atomic_float {
+                &mut atomic_float_feat as *mut _ as *mut c_void
+            } else {
+                null_mut()
+            },
+            ..Default::default()
         };
         let mut features2 = vk::PhysicalDeviceFeatures2 {
             features: vk::PhysicalDeviceFeatures {
@@ -1087,7 +1103,7 @@ impl VulkanDevice {
             },
             ..Default::default()
         };
-        features2.p_next = &mut desc_idx as *mut _ as *mut c_void;
+        features2.p_next = &mut vk12 as *mut _ as *mut c_void;
         let mut subgroup_size_feat = vk::PhysicalDeviceSubgroupSizeControlFeaturesEXT {
             subgroup_size_control: vk::TRUE,
             compute_full_subgroups: supported_subgroup_size.compute_full_subgroups,
@@ -1097,44 +1113,18 @@ impl VulkanDevice {
             subgroup_size_feat.p_next = features2.p_next;
             features2.p_next = &mut subgroup_size_feat as *mut _ as *mut c_void;
         }
-        let f16i8_supported = supported_storage16.storage_buffer16_bit_access == vk::TRUE
-            && supported_storage8.storage_buffer8_bit_access == vk::TRUE
-            && supported_f16i8.shader_float16 == vk::TRUE
-            && supported_f16i8.shader_int8 == vk::TRUE;
-        // Cooperative matrix modules use the Vulkan memory model.
-        let coop_supported = supports_extension(khr::cooperative_matrix::NAME)
-            && supported_coop.cooperative_matrix == vk::TRUE
-            && supported_memory_model.vulkan_memory_model == vk::TRUE
-            && f16i8_supported;
-        let mut memory_model_feat = vk::PhysicalDeviceVulkanMemoryModelFeatures {
-            vulkan_memory_model: vk::TRUE,
-            vulkan_memory_model_device_scope: supported_memory_model
-                .vulkan_memory_model_device_scope,
-            ..Default::default()
-        };
-        let mut coop_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
-            cooperative_matrix: vk::TRUE,
-            ..Default::default()
-        };
         let mut storage16_feat = vk::PhysicalDevice16BitStorageFeatures {
             storage_buffer16_bit_access: vk::TRUE,
             ..Default::default()
         };
-        let mut storage8_feat = vk::PhysicalDevice8BitStorageFeatures {
-            storage_buffer8_bit_access: vk::TRUE,
-            ..Default::default()
-        };
-        let mut f16i8_feat = vk::PhysicalDeviceShaderFloat16Int8Features {
-            shader_float16: vk::TRUE,
-            shader_int8: vk::TRUE,
-            ..Default::default()
-        };
         if f16i8_supported {
-            f16i8_feat.p_next = features2.p_next;
-            storage8_feat.p_next = &mut f16i8_feat as *mut _ as *mut c_void;
-            storage16_feat.p_next = &mut storage8_feat as *mut _ as *mut c_void;
+            storage16_feat.p_next = features2.p_next;
             features2.p_next = &mut storage16_feat as *mut _ as *mut c_void;
         }
+        let mut coop_feat = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
+            cooperative_matrix: vk::TRUE,
+            ..Default::default()
+        };
         let wg_explicit_supported = supports_extension(khr::workgroup_memory_explicit_layout::NAME)
             && supported_wg_explicit.workgroup_memory_explicit_layout == vk::TRUE;
         let pipe_exec_supported = supports_extension(khr::pipeline_executable_properties::NAME)
@@ -1164,8 +1154,7 @@ impl VulkanDevice {
         if coop_supported {
             extensions.push(khr::cooperative_matrix::NAME.as_ptr());
             coop_feat.p_next = features2.p_next;
-            memory_model_feat.p_next = &mut coop_feat as *mut _ as *mut c_void;
-            features2.p_next = &mut memory_model_feat as *mut _ as *mut c_void;
+            features2.p_next = &mut coop_feat as *mut _ as *mut c_void;
         }
 
         let device_create_info = vk::DeviceCreateInfo {
@@ -3607,6 +3596,92 @@ mod tests {
         device.destroy_texture(tex);
     }
 
+    fn sample_centre(device: &VulkanDevice, src: TextureHandle, sampler: SamplerHandle) -> f32 {
+        let slot = device.bind_texture(src, sampler).unwrap();
+        let out_format = Format::Rgba32Float;
+        let (out, target) = render_target(device, out_format, 1, 1);
+        let pipeline = quad_pipeline(device, &SAMPLE_FS, out_format, None);
+        draw_quad(
+            device,
+            target,
+            LoadOp::Clear([0.0; 4]),
+            pipeline,
+            &[Scalar::U32(slot)],
+            (1, 1),
+        );
+        let got = read_texels(device, out, out_format, 1, 1)[0][0];
+        device.destroy_pipeline(pipeline);
+        device.destroy_texture(out);
+        got
+    }
+
+    #[test]
+    fn reduction_samplers_take_the_min_max_or_average_of_a_footprint() {
+        let Some(dev) = try_graphics_device() else {
+            return;
+        };
+        let device = vulkan(&dev);
+        let format = Format::R32Float;
+        if !device.format_caps(format).filterable
+            || !device.format_caps(Format::Rgba32Float).render_target
+        {
+            return;
+        }
+        let src = device
+            .create_texture(TextureDesc {
+                width: 2,
+                height: 2,
+                depth: 1,
+                format,
+                usage: TextureUsage::SAMPLED | TextureUsage::TRANSFER_DST,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            })
+            .unwrap();
+        let bytes: Vec<u8> = [0.1, 0.2, 0.3, 0.4]
+            .iter()
+            .flat_map(|&t| encode(format, [t, 0.0, 0.0, 1.0]))
+            .collect();
+        device.upload_texture_data(src, &bytes).unwrap();
+        let sampler = |reduction| SamplerDesc {
+            min_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Linear,
+            reduction,
+            ..SamplerDesc::default()
+        };
+
+        let average = device
+            .create_sampler(sampler(zengpu_hal::Reduction::Average))
+            .unwrap();
+        assert!((sample_centre(device, src, average) - 0.25).abs() < 1e-4);
+        device.destroy_sampler(average);
+
+        let minmax = device
+            .capabilities()
+            .features
+            .contains(zengpu_hal::Features::SAMPLER_MINMAX);
+        for (reduction, want) in [
+            (zengpu_hal::Reduction::Min, 0.1),
+            (zengpu_hal::Reduction::Max, 0.4),
+        ] {
+            match device.create_sampler(sampler(reduction)) {
+                Ok(sampler) => {
+                    assert!(minmax, "{reduction:?} sampler created without the feature");
+                    let got = sample_centre(device, src, sampler);
+                    assert!((got - want).abs() < 1e-4, "{reduction:?}: got {got}");
+                    device.destroy_sampler(sampler);
+                }
+                Err(err) => {
+                    assert!(!minmax, "{reduction:?} sampler refused: {err:?}");
+                    assert!(matches!(err, zengpu_hal::GpuError::UnsupportedFeatures(_)));
+                }
+            }
+        }
+        device.destroy_texture(src);
+    }
+
     #[test]
     fn compressed_formats_refuse_drawn_and_stored_use() {
         let Some(dev) = try_graphics_device() else {
@@ -3706,6 +3781,75 @@ mod tests {
         let timestamps = device.resolve_query_pool(pool).unwrap();
         assert_eq!(timestamps.len(), 1);
         assert_ne!(timestamps[0], 0);
+    }
+
+    #[test]
+    fn compute_batches_time_their_work_with_timestamps() {
+        const LOOP: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            @workgroup_size(64)
+            kernel spin(out: device mut buffer<f32>, id: global_id) {
+                let x = f32(id.x)
+                for i in 0..4096 {
+                    x = x * 0.999 + 0.001
+                }
+                out[id.x] = x
+            }
+        );
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+        const N: u32 = 1 << 14;
+        let shader = device.create_shader(LOOP.spirv_desc().unwrap()).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let out = device
+            .create_buffer(BufferDesc {
+                size: u64::from(N) * 4,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let pool = device.create_query_pool(2).unwrap();
+        let buffers = [out.index()];
+        let work = ComputeOp::Dispatch(DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &buffers,
+                ..Default::default()
+            },
+            grid: [N / 64, 1, 1],
+        });
+        let ops = [
+            ComputeOp::Timestamp { pool, index: 0 },
+            work,
+            ComputeOp::Timestamp { pool, index: 1 },
+        ];
+        device
+            .submit_compute_ops(1, &ops)
+            .unwrap()
+            .wait(Duration::from_secs(10))
+            .unwrap();
+        let times = device.read_timestamps(pool).unwrap().unwrap();
+        assert!(times[1] > times[0], "{times:?}");
+
+        let out_of_range = ComputeOp::Timestamp { pool, index: 2 };
+        assert!(device.submit_compute_ops(2, &[out_of_range]).is_err());
+
+        device.destroy_buffer(out);
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
     }
 
     #[test]

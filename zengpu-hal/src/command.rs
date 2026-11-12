@@ -1,6 +1,6 @@
 //! Command-recording value types, consumed by backends when recording a dispatch or draw.
 
-use crate::handle::{BufferHandle, PipelineHandle};
+use crate::handle::{BufferHandle, PipelineHandle, QueryPoolHandle};
 
 /// Scalar arguments, kept push-constant sized.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -56,4 +56,10 @@ pub enum ComputeOp<'a> {
     Dispatch(DispatchOp<'a>),
     /// Group counts from an earlier op in the same batch are seen.
     DispatchIndirect(IndirectDispatchOp<'a>),
+    /// Writes the timestamp at `index` of `pool` once the ops before it finish. Backends without
+    /// timestamps skip it, as they skip [`RenderCommands::write_timestamp`](crate::RenderCommands).
+    Timestamp {
+        pool: QueryPoolHandle,
+        index: u32,
+    },
 }

@@ -2813,6 +2813,7 @@ impl GpuDevice for CudaDevice {
             let (plan, resolve_error) = resolve_all(ops, |op| match op {
                 ComputeOp::CopyBuffer(copy) => self.resolve_copy(copy),
                 ComputeOp::Dispatch(op) => self.resolve_dispatch(op).map(Some),
+                ComputeOp::Timestamp { .. } => Ok(None),
                 ComputeOp::DispatchIndirect(_) => Err(zengpu_hal::GpuError::Unsupported(
                     "cuda: indirect dispatch".into(),
                 )),

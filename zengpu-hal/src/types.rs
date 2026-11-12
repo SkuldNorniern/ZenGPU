@@ -121,6 +121,8 @@ impl Features {
     /// Many draws from one indirect call, each with its own first instance. Without it a
     /// backend issues them one at a time.
     pub const MULTI_DRAW_INDIRECT: Self = Self(1 << 7);
+    /// [`Reduction::Min`](crate::Reduction::Min) and [`Reduction::Max`](crate::Reduction::Max) samplers.
+    pub const SAMPLER_MINMAX: Self = Self(1 << 8);
 
     pub const fn empty() -> Self {
         Self(0)

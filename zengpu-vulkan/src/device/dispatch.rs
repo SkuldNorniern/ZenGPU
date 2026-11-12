@@ -661,6 +661,10 @@ impl VulkanDevice {
                 /// Group counts read from here instead of `grid`.
                 indirect: Option<(vk::Buffer, u64)>,
             },
+            Timestamp {
+                pool: vk::QueryPool,
+                index: u32,
+            },
         }
 
         let buffers = self.buffers.lock().unwrap();
@@ -668,6 +672,7 @@ impl VulkanDevice {
         let bound_textures = self.bindless.bound_textures.lock().unwrap();
         let pipelines = self.pipelines.lock().unwrap();
         let samplers = self.samplers.lock().unwrap();
+        let query_pools = self.query_pools.lock().unwrap();
         let mut resolved = Vec::with_capacity(ops.len());
 
         for op in ops {
@@ -722,6 +727,21 @@ impl VulkanDevice {
                         len: copy.len,
                     });
                 }
+                ComputeOp::Timestamp { pool, index } => {
+                    let query_pool = query_pools
+                        .get(*pool)
+                        .ok_or_else(|| GpuError::Backend("stale query pool handle".to_string()))?;
+                    if *index >= query_pool.count {
+                        return Err(GpuError::Backend(format!(
+                            "timestamp index {index} is outside a pool of {}",
+                            query_pool.count
+                        )));
+                    }
+                    resolved.push(ResolvedOp::Timestamp {
+                        pool: query_pool.pool,
+                        index: *index,
+                    });
+                }
                 ComputeOp::Dispatch(_) | ComputeOp::DispatchIndirect(_) => {
                     let (pipeline_handle, bindings, grid, indirect) = match op {
                         ComputeOp::Dispatch(op) => (op.pipeline, op.bindings, op.grid, None),
@@ -755,7 +775,7 @@ impl VulkanDevice {
                                 Some((args.buffer, op.offset)),
                             )
                         }
-                        ComputeOp::CopyBuffer(_) => unreachable!(),
+                        ComputeOp::CopyBuffer(_) | ComputeOp::Timestamp { .. } => unreachable!(),
                     };
                     let op = DispatchOp {
                         pipeline: pipeline_handle,
@@ -817,6 +837,7 @@ impl VulkanDevice {
             }
         }
 
+        drop(query_pools);
         let uses = mixed_buffer_uses(ops);
         let bindless_set = self.bindless.set;
         let submission = self.one_shot_submit_async(cycle_id, &uses, move |dev, cmd| {
@@ -898,6 +919,15 @@ impl VulkanDevice {
                                 }
                                 None => dev.cmd_dispatch(cmd, grid[0], grid[1], grid[2]),
                             }
+                        }
+                        ResolvedOp::Timestamp { pool, index } => {
+                            dev.cmd_reset_query_pool(cmd, *pool, *index, 1);
+                            dev.cmd_write_timestamp(
+                                cmd,
+                                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                                *pool,
+                                *index,
+                            );
                         }
                     }
                 }
@@ -1147,6 +1177,7 @@ fn mixed_buffer_uses(ops: &[ComputeOp<'_>]) -> Vec<u32> {
                 uses.push(dispatch.args.index());
             }
             ComputeOp::CopyBuffer(copy) => uses.extend([copy.src.index(), copy.dst.index()]),
+            ComputeOp::Timestamp { .. } => {}
         }
     }
     uses

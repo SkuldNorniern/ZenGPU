@@ -1996,7 +1996,7 @@ impl GpuDevice for HipDevice {
                 }
             }
             ComputeOp::Dispatch(dispatch) => core.dispatch_touches(dispatch, out),
-            ComputeOp::DispatchIndirect(_) => {}
+            ComputeOp::DispatchIndirect(_) | ComputeOp::Timestamp { .. } => {}
         };
         self.core
             .submit(cycle_id, ops, touches, |core, op| match op {
@@ -2008,6 +2008,7 @@ impl GpuDevice for HipDevice {
                     copy.len,
                 ),
                 ComputeOp::Dispatch(dispatch) => core.launch(dispatch),
+                ComputeOp::Timestamp { .. } => Ok(()),
                 ComputeOp::DispatchIndirect(_) => Err(zengpu_hal::GpuError::Unsupported(
                     "hip: indirect dispatch".into(),
                 )),

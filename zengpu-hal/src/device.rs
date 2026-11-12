@@ -437,6 +437,7 @@ pub trait GpuDevice: Send + Sync {
                         "indirect dispatch on this backend".into(),
                     ));
                 }
+                ComputeOp::Timestamp { .. } => {}
             }
         }
         Ok(Box::new(CompletedSubmission::new(cycle_id)))

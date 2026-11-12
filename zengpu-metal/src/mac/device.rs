@@ -25,9 +25,9 @@ use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
     ComputeOp, ComputePipelineDesc, DType, DeviceLimits, DispatchOp, Features, Format, FormatCaps,
     GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, MmaShape, PipelineHandle,
-    Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap,
-    Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
-    TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
+    Reduction, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource,
+    SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle,
+    TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
@@ -829,12 +829,13 @@ impl MetalDevice {
     fn commit_ops(&self, ops: &[ComputeOp<'_>]) -> Result<CommandBuffer> {
         let resolved = ops
             .iter()
-            .map(|op| match op {
-                ComputeOp::Dispatch(d) => self.resolve_dispatch(d).map(Resolved::Dispatch),
-                ComputeOp::CopyBuffer(c) => self.resolve_copy(c).map(Resolved::Copy),
-                ComputeOp::DispatchIndirect(_) => {
-                    Err(GpuError::Unsupported("metal: indirect dispatch".into()))
-                }
+            .filter_map(|op| match op {
+                ComputeOp::Dispatch(d) => Some(self.resolve_dispatch(d).map(Resolved::Dispatch)),
+                ComputeOp::CopyBuffer(c) => Some(self.resolve_copy(c).map(Resolved::Copy)),
+                ComputeOp::DispatchIndirect(_) => Some(Err(GpuError::Unsupported(
+                    "metal: indirect dispatch".into(),
+                ))),
+                ComputeOp::Timestamp { .. } => None,
             })
             .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
@@ -1500,6 +1501,9 @@ impl GpuDevice for MetalDevice {
     }
 
     fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle> {
+        if desc.reduction != Reduction::Average {
+            return Err(GpuError::Unsupported("metal: reduction samplers".into()));
+        }
         let sd = SamplerDescriptor::new();
         sd.set_min_filter(convert::min_mag_filter(desc.min_filter));
         sd.set_mag_filter(convert::min_mag_filter(desc.mag_filter));
@@ -1649,6 +1653,7 @@ impl GpuDevice for MetalDevice {
                 ComputeOp::Dispatch(d) => d.bindings.buffers.to_vec(),
                 ComputeOp::DispatchIndirect(d) => d.bindings.buffers.to_vec(),
                 ComputeOp::CopyBuffer(c) => vec![c.src.index(), c.dst.index()],
+                ComputeOp::Timestamp { .. } => Vec::new(),
             })
             .collect();
         lock(&self.inner.in_flight)?.push((cmd.clone(), slots));

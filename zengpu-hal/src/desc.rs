@@ -148,6 +148,16 @@ pub enum BorderColor {
     OpaqueWhite,
 }
 
+/// How a sampler combines the texels of its footprint. `Min` and `Max` need
+/// [`Features::SAMPLER_MINMAX`](crate::Features::SAMPLER_MINMAX) and ignore `anisotropy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Reduction {
+    #[default]
+    Average,
+    Min,
+    Max,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplerDesc {
     pub min_filter: FilterMode,
@@ -163,6 +173,7 @@ pub struct SamplerDesc {
     pub compare: Option<CompareFn>,
     /// Used only by [`AddressMode::ClampToBorder`].
     pub border: BorderColor,
+    pub reduction: Reduction,
 }
 
 impl Default for SamplerDesc {
@@ -177,6 +188,7 @@ impl Default for SamplerDesc {
             lod_max: 1000.0,
             compare: None,
             border: BorderColor::TransparentBlack,
+            reduction: Reduction::Average,
         }
     }
 }

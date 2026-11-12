@@ -1,7 +1,7 @@
 use super::*;
 use zengpu_hal::{
     BackendPreference, ComputeCaps, DType, Format, FormatCaps, MmaShape, PipelineStats,
-    ReadSubmission, TextureRegion, TextureWrite, TransferCaps,
+    ReadSubmission, Reduction, TextureRegion, TextureWrite, TransferCaps,
 };
 
 impl GpuDevice for VulkanDevice {
@@ -873,6 +873,20 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_sampler(&self, desc: SamplerDesc) -> Result<SamplerHandle> {
+        let reduction = match desc.reduction {
+            Reduction::Average => None,
+            Reduction::Min | Reduction::Max
+                if !self.inner.features.contains(Features::SAMPLER_MINMAX) =>
+            {
+                return Err(GpuError::UnsupportedFeatures(Features::SAMPLER_MINMAX));
+            }
+            Reduction::Min => Some(vk::SamplerReductionMode::MIN),
+            Reduction::Max => Some(vk::SamplerReductionMode::MAX),
+        };
+        let mut reduction_info = vk::SamplerReductionModeCreateInfo {
+            reduction_mode: reduction.unwrap_or(vk::SamplerReductionMode::WEIGHTED_AVERAGE),
+            ..Default::default()
+        };
         let min = filter_to_vk(desc.min_filter);
         let mag = filter_to_vk(desc.mag_filter);
         let addr = address_to_vk(desc.address);
@@ -880,9 +894,14 @@ impl GpuDevice for VulkanDevice {
             FilterMode::Nearest => vk::SamplerMipmapMode::NEAREST,
             FilterMode::Linear => vk::SamplerMipmapMode::LINEAR,
         };
-        let anisotropy_enable = self.inner.sampler_anisotropy && desc.anisotropy > 1;
+        let anisotropy_enable =
+            self.inner.sampler_anisotropy && desc.anisotropy > 1 && reduction.is_none();
         let max_anisotropy = (desc.anisotropy as f32).min(self.inner.max_sampler_anisotropy);
         let info = vk::SamplerCreateInfo {
+            p_next: match reduction {
+                Some(_) => &mut reduction_info as *mut _ as *const c_void,
+                None => null(),
+            },
             mag_filter: mag,
             min_filter: min,
             mipmap_mode,
