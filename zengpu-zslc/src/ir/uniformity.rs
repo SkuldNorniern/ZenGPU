@@ -168,11 +168,19 @@ fn check_stmt(
             reject_if_divergent(ld, divergent)?;
             reject_if_divergent(value, divergent)
         }
-        IrStmt::AtomicAdd {
-            index, value, old, ..
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            old,
+            ..
         } => {
             reject_if_divergent(index, divergent)?;
             reject_if_divergent(value, divergent)?;
+            if let Some(compare) = compare {
+                reject_if_divergent(compare, divergent)?;
+            }
+
             // each invocation gets its own old value
             if let Some(old) = old {
                 locals.insert(old.clone(), false);

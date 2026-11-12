@@ -42,7 +42,7 @@ use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::arena::TypeArena;
 use crate::ir::binding::{IMAGE_BINDING, TEXTURE_BINDING, ssbo_binding_for};
 use crate::ir::node::{
-    BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_collectives,
+    AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_collectives,
     stmts_use_subgroup_query, stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::frag_parts;
@@ -763,10 +763,25 @@ fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), String> {
     Ok(())
 }
 
+fn atomic_opcode(op: AtomicOp, signed: bool) -> u32 {
+    match (op, signed) {
+        (AtomicOp::Add, _) => op::ATOMIC_I_ADD,
+        (AtomicOp::Min, true) => op::ATOMIC_S_MIN,
+        (AtomicOp::Min, false) => op::ATOMIC_U_MIN,
+        (AtomicOp::Max, true) => op::ATOMIC_S_MAX,
+        (AtomicOp::Max, false) => op::ATOMIC_U_MAX,
+        (AtomicOp::And, _) => op::ATOMIC_AND,
+        (AtomicOp::Or, _) => op::ATOMIC_OR,
+        (AtomicOp::Exchange, _) => op::ATOMIC_EXCHANGE,
+        (AtomicOp::CompareExchange, _) => op::ATOMIC_COMPARE_EXCHANGE,
+    }
+}
+
 fn collect_atomic_bufs<'a>(stmts: &'a [IrStmt], out: &mut Vec<&'a str>) {
     for s in stmts {
         match s {
-            IrStmt::AtomicAdd { buf, .. } => out.push(buf),
+            IrStmt::Atomic { buf, .. } => out.push(buf),
+
             IrStmt::If { then, else_, .. } => {
                 collect_atomic_bufs(then, out);
                 if let Some(e) = else_ {
@@ -878,10 +893,12 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             Ok(())
         }
 
-        IrStmt::AtomicAdd {
+        IrStmt::Atomic {
+            op: aop,
             buf,
             index,
             value,
+            compare,
             old,
         } => {
             let info = *ctx
@@ -914,13 +931,34 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
             let before = if elem == ctx.f32_id {
+                if *aop != AtomicOp::Add {
+                    return Err("ZSL: only atomic_add takes an f32 buffer".into());
+                }
                 ctx.spv
                     .op_atomic_fadd_ext(ctx.t_f32, ptr_elem, scope, semantics, rhs_id)
             } else {
                 let t = ctx.spv_ty(elem);
-                ctx.spv
-                    .op_atomic_int(op::ATOMIC_I_ADD, t, ptr_elem, scope, semantics, rhs_id)
+                match aop {
+                    AtomicOp::CompareExchange => {
+                        let Some(compare) = compare else {
+                            return Err(
+                                "ZSL: atomic_compare_exchange needs an expected value".into()
+                            );
+                        };
+                        let cmp = lower_expr(ctx, compare)?;
+                        let cmp_id = coerce(ctx, cmp, elem);
+                        ctx.spv.op_atomic_compare_exchange(
+                            t, ptr_elem, scope, semantics, rhs_id, cmp_id,
+                        )
+                    }
+                    _ => {
+                        let opcode = atomic_opcode(*aop, elem == ctx.i32_id);
+                        ctx.spv
+                            .op_atomic_int(opcode, t, ptr_elem, scope, semantics, rhs_id)
+                    }
+                }
             };
+
             if let Some(old) = old {
                 let ptr = ctx
                     .locals

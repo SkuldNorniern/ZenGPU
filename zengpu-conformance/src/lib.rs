@@ -1288,3 +1288,194 @@ mod half_buffer_tests {
         vk.destroy_shader(shader);
     }
 }
+
+#[cfg(test)]
+mod atomic_bitcast_tests {
+    //! ZSL integer atomics and bitcasts on Vulkan. Skips without Vulkan.
+
+    use zengpu_hal::{
+        AdapterRequest, Bindings, BufferDesc, BufferUsage, ComputePipelineDesc, DeviceRequest,
+        GpuDevice, GpuInstance, MemoryUsage, Scalar,
+    };
+    use zengpu_shader::{ZslShader, zsl};
+    use zengpu_vulkan::VulkanInstance;
+
+    const MINMAX_ZSL: ZslShader = zsl!(
+        push P { n: u32 }
+        @workgroup_size(64)
+        kernel minmax(vals: device buffer<u32>, svals: device buffer<i32>, out: device mut buffer<u32>, sout: device mut buffer<i32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.n {
+                atomic_min(out, 0u, vals[i])
+                atomic_max(out, 1u, vals[i])
+                atomic_min(sout, 0u, svals[i])
+                atomic_max(sout, 1u, svals[i])
+            }
+        }
+    );
+
+    const BITCAST_ZSL: ZslShader = zsl!(
+        push P { n: u32 }
+        @workgroup_size(64)
+        kernel bitcast_roundtrip(xs: device buffer<f32>, bits: device mut buffer<u32>, back: device mut buffer<f32>, p: P, id: global_id) {
+            let i = id.x
+            if i < p.n {
+                let b = bitcast_u32(xs[i])
+                bits[i] = b
+                back[i] = bitcast_f32(b)
+            }
+        }
+    );
+
+    fn vulkan() -> Option<Box<dyn GpuDevice>> {
+        let inst = VulkanInstance::new().ok()?;
+        inst.request_adapter(AdapterRequest::default())?
+            .open(DeviceRequest::default())
+            .ok()
+    }
+
+    fn words(bytes: &[u8]) -> Vec<u32> {
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect()
+    }
+
+    fn le<T: Copy, const N: usize>(items: &[T], to: impl Fn(T) -> [u8; N]) -> Vec<u8> {
+        items.iter().flat_map(|&v| to(v)).collect()
+    }
+
+    #[test]
+    fn vulkan_atomic_min_max_find_the_true_extremes() {
+        let Some(vk) = vulkan() else { return };
+        let (shader, entry) = MINMAX_ZSL.create(&*vk).unwrap();
+        let pipeline = vk
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let n = 4096u32;
+        let mut state = 0x2545_f491u32;
+        let vals: Vec<u32> = (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state
+            })
+            .collect();
+        let svals: Vec<i32> = vals.iter().map(|&v| v as i32).collect();
+        let buffer = |size: u64| {
+            vk.create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+        };
+        let bufs = [
+            buffer(u64::from(n) * 4),
+            buffer(u64::from(n) * 4),
+            buffer(8),
+            buffer(8),
+        ];
+        vk.write_buffer(bufs[0], 0, &le(&vals, u32::to_le_bytes))
+            .unwrap();
+        vk.write_buffer(bufs[1], 0, &le(&svals, i32::to_le_bytes))
+            .unwrap();
+        // min starts at the type's maximum, max at its minimum
+        vk.write_buffer(bufs[2], 0, &le(&[u32::MAX, 0], u32::to_le_bytes))
+            .unwrap();
+        vk.write_buffer(bufs[3], 0, &le(&[i32::MAX, i32::MIN], i32::to_le_bytes))
+            .unwrap();
+        let slots: Vec<u32> = bufs.iter().map(|b| b.index()).collect();
+        vk.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+        let unsigned = words(&vk.read_buffer(bufs[2], 0, 8).unwrap());
+        let signed: Vec<i32> = words(&vk.read_buffer(bufs[3], 0, 8).unwrap())
+            .into_iter()
+            .map(|w| w as i32)
+            .collect();
+        assert_eq!(unsigned[0], *vals.iter().min().unwrap(), "u32 min");
+        assert_eq!(unsigned[1], *vals.iter().max().unwrap(), "u32 max");
+        assert_eq!(signed[0], *svals.iter().min().unwrap(), "i32 min");
+        assert_eq!(signed[1], *svals.iter().max().unwrap(), "i32 max");
+        for b in bufs {
+            vk.destroy_buffer(b);
+        }
+        vk.destroy_pipeline(pipeline);
+        vk.destroy_shader(shader);
+    }
+
+    #[test]
+    fn vulkan_bitcast_round_trips_known_bit_patterns() {
+        let Some(vk) = vulkan() else { return };
+        let (shader, entry) = BITCAST_ZSL.create(&*vk).unwrap();
+        let pipeline = vk
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry,
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        // zero, -0, one, denormal, max, a quiet NaN with payload, and an all-ones NaN
+        let patterns = [
+            0x0000_0000u32,
+            0x8000_0000,
+            0x3f80_0000,
+            0x0000_0001,
+            0x7f7f_ffff,
+            0x7fc0_1234,
+            0xffff_ffff,
+            0xc2f6_e979,
+        ];
+        let inputs: Vec<f32> = patterns.iter().map(|&b| f32::from_bits(b)).collect();
+        let n = inputs.len() as u32;
+        let buffer = |size: u64| {
+            vk.create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap()
+        };
+        let bytes = u64::from(n) * 4;
+        let bufs = [buffer(bytes), buffer(bytes), buffer(bytes)];
+        vk.write_buffer(bufs[0], 0, &le(&inputs, f32::to_le_bytes))
+            .unwrap();
+        let slots: Vec<u32> = bufs.iter().map(|b| b.index()).collect();
+        vk.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+        let bits = words(&vk.read_buffer(bufs[1], 0, bytes).unwrap());
+        let back = words(&vk.read_buffer(bufs[2], 0, bytes).unwrap());
+        assert_eq!(bits, patterns, "bitcast_u32 keeps every bit");
+        assert_eq!(back, patterns, "bitcast_f32 restores every bit");
+        for b in bufs {
+            vk.destroy_buffer(b);
+        }
+        vk.destroy_pipeline(pipeline);
+        vk.destroy_shader(shader);
+    }
+}

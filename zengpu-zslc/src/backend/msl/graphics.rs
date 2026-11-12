@@ -313,10 +313,10 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "MSL graphics backend: workgroup operations are unavailable in graphics shaders",
             ));
         }
-        IrStmt::AtomicAdd { .. } => {
+        IrStmt::Atomic { .. } => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Internal,
-                "MSL graphics backend: atomic_add is unavailable in graphics shaders",
+                "MSL graphics backend: atomics are unavailable in graphics shaders",
             ));
         }
         IrStmt::ImageStore { .. } => {
@@ -394,6 +394,8 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", a[0], a[1]),
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::BitcastF32 => format!("as_type<float>({})", a[0]),
+                BuiltinFn::BitcastU32 => format!("as_type<uint>({})", a[0]),
                 BuiltinFn::FragZeroAcc
                 | BuiltinFn::Mma
                 | BuiltinFn::FragLen
@@ -593,6 +595,21 @@ mod tests {
         "#,
         );
         assert!(m.source.contains("discard_fragment();"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn bitcasts_reinterpret_the_word() {
+        let m = graphics(
+            r#"
+            fragment fs(@location(0) c: f32x4) -> f32x4 {
+                let bits = bitcast_u32(c.a)
+                f32x4(c.rgb, bitcast_f32(bits))
+            }
+        "#,
+        );
+        assert!(m.source.contains("as_type<uint>("));
+        assert!(m.source.contains("as_type<float>(bits)"));
         let _ = metal_compiles(&m.source);
     }
 

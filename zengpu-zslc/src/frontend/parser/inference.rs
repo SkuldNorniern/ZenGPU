@@ -145,6 +145,8 @@ pub(super) fn gfx_builtin_from_name(name: &str) -> Option<BuiltinFn> {
         "mix" => BuiltinFn::Mix,
         "normalize" => BuiltinFn::Normalize,
         "length" => BuiltinFn::Length,
+        "bitcast_f32" => BuiltinFn::BitcastF32,
+        "bitcast_u32" => BuiltinFn::BitcastU32,
         _ => return None,
     })
 }

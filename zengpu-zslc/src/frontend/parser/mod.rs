@@ -33,6 +33,18 @@ mod types;
 
 #[allow(unused_imports)]
 use compute::*;
+
+/// Atomic keywords and the operation each one stands for.
+const ATOMIC_KWS: [(&str, AtomicOp); 7] = [
+    ("atomic_add", AtomicOp::Add),
+    ("atomic_min", AtomicOp::Min),
+    ("atomic_max", AtomicOp::Max),
+    ("atomic_and", AtomicOp::And),
+    ("atomic_or", AtomicOp::Or),
+    ("atomic_exchange", AtomicOp::Exchange),
+    ("atomic_compare_exchange", AtomicOp::CompareExchange),
+];
+
 #[allow(unused_imports)]
 use expr::*;
 #[allow(unused_imports)]
@@ -50,7 +62,8 @@ use std::mem;
 
 use crate::frontend::lex::{Tok, Token, lex};
 use crate::ir::arena::TypeArena;
-use crate::ir::node::{BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
+use crate::ir::node::{AtomicOp, BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp};
+
 use crate::ir::typeck::{
     StorageElem, frag_parts, i8_type, storage_byte_size, storage_elem, storage_value_type,
     type_of_compute_expr, type_of_graphics_expr, u8_type, u32_vec_lanes,

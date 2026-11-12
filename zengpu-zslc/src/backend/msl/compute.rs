@@ -5,7 +5,7 @@ use crate::backend::msl::{ENTRY, MslShader};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
 use crate::ir::node::{
-    BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
+    AtomicOp, BuiltinFn, FragSrc, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_query,
     stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::{ComputeTypeCtx, frag_parts, type_of_compute_expr, u32_vec_lanes};
@@ -410,9 +410,10 @@ struct Ctx<'a> {
 fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
     for stmt in stmts {
         match stmt {
-            IrStmt::AtomicAdd { buf, .. } => {
+            IrStmt::Atomic { buf, .. } => {
                 buffers.insert(buf);
             }
+
             IrStmt::If { then, else_, .. } => {
                 collect_atomic_buffers(then, buffers);
                 if let Some(else_) = else_ {
@@ -490,10 +491,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             };
             let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
-        IrStmt::AtomicAdd {
+        IrStmt::Atomic {
+            op: aop,
             buf,
             index,
             value,
+            compare,
             old,
         } => {
             indent(s, depth);
@@ -503,17 +506,57 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .buffers
                 .get(buf.as_str())
                 .map_or("float", |&t| scalar_c_type(ctx, t));
+            let idx = emit_expr(ctx, index)?;
+            let val = emit_expr(ctx, value)?;
+            if *aop == AtomicOp::CompareExchange {
+                let cmp = emit_expr(
+                    ctx,
+                    compare.as_ref().ok_or_else(|| {
+                        Diagnostic::new(
+                            DiagnosticCode::Internal,
+                            "MSL backend: atomic_compare_exchange needs an expected value",
+                        )
+                    })?,
+                )?;
+                // A weak exchange can fail spuriously, leaving the expected value unchanged: retry.
+                let var = match old {
+                    Some(old) => {
+                        let _ = writeln!(s, "{cty} {old} = {cty}({cmp});");
+                        old.as_str()
+                    }
+                    None => {
+                        let _ = writeln!(s, "{{ {cty} zsl_exp = {cty}({cmp});");
+                        "zsl_exp"
+                    }
+                };
+                if old.is_some() {
+                    let _ = writeln!(s, "{{ const {cty} zsl_cmp = {var};");
+                } else {
+                    let _ = writeln!(s, "const {cty} zsl_cmp = {var};");
+                }
+                let _ = writeln!(
+                    s,
+                    "while (!atomic_compare_exchange_weak_explicit(&{buf}[uint({idx})], &{var}, {cty}({val}), memory_order_relaxed, memory_order_relaxed) && {var} == zsl_cmp) {{}}\n}}"
+                );
+                return Ok(());
+            }
+            let f = match aop {
+                AtomicOp::Add => "atomic_fetch_add_explicit",
+                AtomicOp::Min => "atomic_fetch_min_explicit",
+                AtomicOp::Max => "atomic_fetch_max_explicit",
+                AtomicOp::And => "atomic_fetch_and_explicit",
+                AtomicOp::Or => "atomic_fetch_or_explicit",
+                _ => "atomic_exchange_explicit",
+            };
             if let Some(old) = old {
                 let _ = write!(s, "{cty} {old} = ");
             }
             let _ = writeln!(
                 s,
-                "atomic_fetch_add_explicit(&{}[uint({})], {cty}({}), memory_order_relaxed);",
-                buf,
-                emit_expr(ctx, index)?,
-                emit_expr(ctx, value)?
+                "{f}(&{buf}[uint({idx})], {cty}({val}), memory_order_relaxed);"
             );
         }
+
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);
             let val = emit_expr(ctx, value)?;

@@ -101,14 +101,18 @@ pub enum IrStmt {
         index: IrExpr,
         value: IrExpr,
     },
-    /// Mutable device buffers only. `old`, when set, is a local pre-declared like a `Let`'s
-    /// that takes the element's value from before the add.
-    AtomicAdd {
+    /// Read-modify-write on a mutable device buffer element. `value` is the operand, or the
+    /// desired value for `CompareExchange`, which also takes `compare`. `old`, when set, is a
+    /// local pre-declared like a `Let`'s that takes the element's value from before the update.
+    Atomic {
+        op: AtomicOp,
         buf: String,
         index: IrExpr,
         value: IrExpr,
+        compare: Option<IrExpr>,
         old: Option<String>,
     },
+
     /// Six values: x, y, r, g, b and a. Compute only.
     ImageStore {
         image: String,
@@ -145,7 +149,20 @@ pub enum IrStmt {
     Discard,
 }
 
+/// Operations of [`IrStmt::Atomic`]. Add is also valid on f32 buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AtomicOp {
+    Add,
+    Min,
+    Max,
+    And,
+    Or,
+    Exchange,
+    CompareExchange,
+}
+
 /// A buffer param or shared array. Compute only.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FragSrc {
     Buffer(String),
@@ -404,11 +421,20 @@ fn stmt_uses_subgroup_query(stmt: &IrStmt) -> bool {
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             expr_uses_subgroup_query(init)
         }
-        IrStmt::AssignBuffer { index, value, .. }
-        | IrStmt::AssignShared { index, value, .. }
-        | IrStmt::AtomicAdd { index, value, .. } => {
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
             expr_uses_subgroup_query(index) || expr_uses_subgroup_query(value)
         }
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            ..
+        } => {
+            expr_uses_subgroup_query(index)
+                || expr_uses_subgroup_query(value)
+                || compare.as_ref().is_some_and(expr_uses_subgroup_query)
+        }
+
         IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_subgroup_query),
         IrStmt::FragStore {
             offset, ld, value, ..
@@ -493,11 +519,20 @@ fn stmt_uses_workgroup_reduce(stmt: &IrStmt) -> bool {
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             expr_uses_workgroup_reduce(init)
         }
-        IrStmt::AssignBuffer { index, value, .. }
-        | IrStmt::AssignShared { index, value, .. }
-        | IrStmt::AtomicAdd { index, value, .. } => {
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
             expr_uses_workgroup_reduce(index) || expr_uses_workgroup_reduce(value)
         }
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            ..
+        } => {
+            expr_uses_workgroup_reduce(index)
+                || expr_uses_workgroup_reduce(value)
+                || compare.as_ref().is_some_and(expr_uses_workgroup_reduce)
+        }
+
         IrStmt::ImageStore { args, .. } => args.iter().any(expr_uses_workgroup_reduce),
         IrStmt::FragStore {
             offset, ld, value, ..
@@ -587,12 +622,28 @@ fn stmt_uses_subgroup_collectives(stmt: &IrStmt) -> (bool, bool, bool, bool, boo
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             expr_uses_subgroup_collectives(init)
         }
-        IrStmt::AssignBuffer { index, value, .. }
-        | IrStmt::AssignShared { index, value, .. }
-        | IrStmt::AtomicAdd { index, value, .. } => merge_subgroup_collective_uses(
-            expr_uses_subgroup_collectives(index),
-            expr_uses_subgroup_collectives(value),
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
+            merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(index),
+                expr_uses_subgroup_collectives(value),
+            )
+        }
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            ..
+        } => merge_subgroup_collective_uses(
+            merge_subgroup_collective_uses(
+                expr_uses_subgroup_collectives(index),
+                expr_uses_subgroup_collectives(value),
+            ),
+            compare.as_ref().map_or(
+                (false, false, false, false, false),
+                expr_uses_subgroup_collectives,
+            ),
         ),
+
         IrStmt::ImageStore { args, .. } => args
             .iter()
             .fold((false, false, false, false, false), |acc, e| {

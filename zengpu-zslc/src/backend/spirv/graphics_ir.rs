@@ -143,7 +143,8 @@ impl Ctx<'_> {
 
 fn writes_buffer(stmts: &[IrStmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
-        IrStmt::AssignBuffer { .. } | IrStmt::AtomicAdd { .. } => true,
+        IrStmt::AssignBuffer { .. } | IrStmt::Atomic { .. } => true,
+
         IrStmt::FragStore { src, .. } => matches!(src, FragSrc::Buffer(_)),
         IrStmt::If { then, else_, .. } => {
             writes_buffer(then) || else_.as_deref().is_some_and(writes_buffer)
@@ -692,7 +693,8 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
         IrStmt::AssignShared { .. } | IrStmt::Barrier | IrStmt::SharedBarrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }
-        IrStmt::AtomicAdd { .. } => Err("atomic_add is only available in compute shaders".into()),
+        IrStmt::Atomic { .. } => Err("atomics are only available in compute shaders".into()),
+
         IrStmt::ImageStore { .. } => {
             Err("image stores are only available in compute shaders".into())
         }
@@ -969,8 +971,6 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::F16Lo
         | BuiltinFn::F16Hi
         | BuiltinFn::PackF16x2
-        | BuiltinFn::BitcastF32
-        | BuiltinFn::BitcastU32
         | BuiltinFn::BitcastI32
         | BuiltinFn::Byte
         | BuiltinFn::SByte
@@ -1001,6 +1001,25 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             "{}() is only available in compute shaders",
             func.name()
         )),
+        BuiltinFn::BitcastF32 | BuiltinFn::BitcastU32 => {
+            if args.len() != 1 {
+                return Err(format!("{name}() takes 1 arg"));
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let (target, ty) = if matches!(func, BuiltinFn::BitcastF32) {
+                (ctx.t_f32, ctx.f32_id)
+            } else {
+                (ctx.t_u32, ctx.u32_id)
+            };
+            if v.ty == ty {
+                return Ok(GVal { id: v.id, ty });
+            }
+            if v.ty != ctx.f32_id && v.ty != ctx.u32_id {
+                return Err(format!("{name}() takes an f32 or u32 value"));
+            }
+            let id = ctx.spv.op_bitcast(target, v.id);
+            Ok(GVal { id, ty })
+        }
         BuiltinFn::U32 | BuiltinFn::F32 => {
             if args.len() != 1 {
                 return Err(format!("{name}() takes 1 arg"));
@@ -1551,6 +1570,38 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn bitcasts_lower_to_op_bitcast() {
+        let words = lower(
+            r#"
+            fragment fs(@location(0) c: f32x4) -> f32x4 {
+                let bits = bitcast_u32(c.a)
+                f32x4(c.rgb, bitcast_f32(bits))
+            }
+            "#,
+        );
+        validate(&words);
+        let mut at = 5;
+        let mut ops = Vec::new();
+        while at < words.len() {
+            ops.push(words[at] & 0xffff);
+            at += (words[at] >> 16).max(1) as usize;
+        }
+        assert!(ops.contains(&124), "OpBitcast");
+    }
+
+    #[test]
+    fn bitcast_i32_is_compute_only_in_graphics() {
+        let src = r#"
+            fragment fs(@location(0) c: f32x4) -> f32x4 {
+                let bits = bitcast_i32(c.a)
+                c
+            }
+        "#;
+        let err = parse_zsl(src).err().map(|e| e.msg).unwrap_or_default();
+        assert!(err.contains("compute-only"), "{err}");
     }
 
     #[test]

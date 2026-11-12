@@ -327,6 +327,9 @@ impl<'a> Parser<'a> {
             }
         }
         match name {
+            "bitcast_i32" => {
+                self.err("bitcast_i32 is compute-only: graphics stages have no i32 type")
+            }
             "dot" => {
                 if args.len() != 2 {
                     return self.err("dot(a, b) takes exactly 2 args");

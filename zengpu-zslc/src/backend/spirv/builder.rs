@@ -42,7 +42,14 @@ pub(crate) mod op {
     pub const RETURN: u32 = 253;
     pub const CONTROL_BARRIER: u32 = 224;
     pub const ATOMIC_FADD_EXT: u32 = 6035;
+    pub const ATOMIC_EXCHANGE: u32 = 229;
+    pub const ATOMIC_COMPARE_EXCHANGE: u32 = 230;
     pub const ATOMIC_I_ADD: u32 = 234;
+    pub const ATOMIC_S_MIN: u32 = 236;
+    pub const ATOMIC_U_MIN: u32 = 237;
+    pub const ATOMIC_S_MAX: u32 = 238;
+    pub const ATOMIC_U_MAX: u32 = 239;
+
     pub const ATOMIC_AND: u32 = 240;
     pub const ATOMIC_OR: u32 = 241;
     pub const IADD: u32 = 128;
@@ -696,6 +703,35 @@ impl SpvBuilder {
             &mut self.functions,
             opcode,
             &[ty.0, id.0, ptr.0, scope.0, semantics.0, value.0],
+        );
+        id
+    }
+
+    /// `OpAtomicCompareExchange`: `equal` and `unequal` are the memory semantics.
+    pub fn op_atomic_compare_exchange(
+        &mut self,
+        ty: Id,
+        ptr: Id,
+        scope: Id,
+        semantics: Id,
+        value: Id,
+        comparator: Id,
+    ) -> Id {
+        self.atomics = true;
+        let id = self.fresh_id();
+        emit(
+            &mut self.functions,
+            op::ATOMIC_COMPARE_EXCHANGE,
+            &[
+                ty.0,
+                id.0,
+                ptr.0,
+                scope.0,
+                semantics.0,
+                semantics.0,
+                value.0,
+                comparator.0,
+            ],
         );
         id
     }

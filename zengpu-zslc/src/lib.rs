@@ -16,6 +16,7 @@ mod phase_z_tests {
     use std::process::{Command, id};
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use crate::backend::spirv::graphics_ir::tests::validate;
     use crate::backend::{cuda, hip, msl, spirv};
     use crate::frontend::parser::parse_compute;
 
@@ -1093,7 +1094,80 @@ int main() {{
         spirv::lower_compute(&module).expect("lower bitcast_pack to SPIR-V");
     }
 
+    /// Every integer atomic, as statements and as `let` values, on u32 and i32 buffers.
+    const INT_ATOMICS: &str = r#"
+        @workgroup_size(64)
+        kernel int_atomics(words: device mut buffer<u32>, signed: device mut buffer<i32>, out: device mut buffer<u32>, id: global_id) {
+            let i = id.x
+            atomic_min(words, 0u, i)
+            atomic_max(words, 1u, i)
+            atomic_and(words, 2u, i)
+            atomic_or(words, 3u, i)
+            let was = atomic_exchange(words, 4u, i)
+            let seen = atomic_compare_exchange(words, 5u, 0u, i)
+            atomic_min(signed, 0u, i32(i))
+            atomic_max(signed, 1u, i32(i))
+            let sw = atomic_compare_exchange(signed, 2u, i32(0u), i32(i))
+            out[i] = was + seen + u32(sw)
+        }
+    "#;
+
+    #[test]
+    fn integer_atomics_lower_on_all_compute_backends() {
+        let module = parse_compute(INT_ATOMICS).expect("parse int_atomics");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
+        for name in [
+            "atomicMin(&words[",
+            "atomicMax(&signed[",
+            "atomicAnd(&words[",
+            "atomicOr(&words[",
+            "atomicExch(&words[",
+            "atomicCAS(&words[",
+            "atomicCAS(&signed[",
+        ] {
+            assert!(hip_source.contains(name), "HIP missing {name}");
+            assert!(cuda_source.contains(name), "CUDA missing {name}");
+        }
+        for name in [
+            "atomic_fetch_min_explicit(&words[",
+            "atomic_fetch_max_explicit(&signed[",
+            "atomic_fetch_and_explicit(&words[",
+            "atomic_fetch_or_explicit(&words[",
+            "atomic_exchange_explicit(&words[",
+            "atomic_compare_exchange_weak_explicit(&words[",
+            "atomic_compare_exchange_weak_explicit(&signed[",
+        ] {
+            assert!(msl_source.contains(name), "MSL missing {name}");
+        }
+        assert!(
+            msl_source.contains("zsl_cmp"),
+            "MSL CAS retries spurious failures"
+        );
+
+        let words = spirv::lower_compute(&module).expect("lower to SPIR-V");
+        let ops = spirv_opcodes(&words);
+        // U/S min, U/S max, and, or, exchange, compare-exchange.
+        for opcode in [237, 236, 239, 238, 240, 241, 229, 230] {
+            assert!(ops.contains(&opcode), "SPIR-V missing opcode {opcode}");
+        }
+        validate(&words);
+    }
+
+    #[test]
+    fn atomic_min_rejects_f32_buffers_at_parse() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel bad(x: device mut buffer<f32>) {
+                atomic_min(x, 0u, 1.0)
+            }
+        "#;
+        assert!(parse_compute(src).is_err());
+    }
+
     /// `view` over an f16 shared array: u32x4 stores, f16 loads from the base after the barrier.
+
     const VIEW_MMA: &str = r#"
         @workgroup_size(32)
         kernel view_mma(a: device buffer<u32x4>, b: device buffer<u32x4>, c: device buffer<f32>, out: device mut buffer<f32>) {

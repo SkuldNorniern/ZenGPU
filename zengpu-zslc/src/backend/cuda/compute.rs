@@ -5,7 +5,7 @@ use std::fmt::Write;
 use crate::backend::cuda::{CudaShader, ENTRY};
 use crate::frontend::diagnostic::{Diagnostic, DiagnosticCode};
 use crate::ir::arena::TypeArena;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
+use crate::ir::node::{AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_workgroup_reduce};
 use crate::ir::typeck::{
     ComputeTypeCtx, StorageElem, storage_elem, type_of_compute_expr, u32_vec_lanes,
 };
@@ -611,10 +611,12 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             };
             let _ = writeln!(s, "{buf}[{idx}] = {val};");
         }
-        IrStmt::AtomicAdd {
+        IrStmt::Atomic {
+            op: aop,
             buf,
             index,
             value,
+            compare,
             old,
         } => {
             indent(s, depth);
@@ -630,13 +632,28 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             if let Some(old) = old {
                 let _ = write!(s, "{cty} {old} = ");
             }
-            let _ = writeln!(
-                s,
-                "atomicAdd(&{}[(unsigned int)({})], ({cty})({}));",
-                buf,
-                emit_expr(ctx, index)?,
-                emit_expr(ctx, value)?
-            );
+            let idx = emit_expr(ctx, index)?;
+            let val = emit_expr(ctx, value)?;
+            let call = if *aop == AtomicOp::CompareExchange {
+                let cmp = emit_expr(
+                    ctx,
+                    compare.as_ref().ok_or_else(|| {
+                        "ZSL: atomic_compare_exchange needs an expected value".to_string()
+                    })?,
+                )?;
+                format!("atomicCAS(&{buf}[(unsigned int)({idx})], ({cty})({cmp}), ({cty})({val}))")
+            } else {
+                let name = match aop {
+                    AtomicOp::Min => "atomicMin",
+                    AtomicOp::Max => "atomicMax",
+                    AtomicOp::And => "atomicAnd",
+                    AtomicOp::Or => "atomicOr",
+                    AtomicOp::Exchange => "atomicExch",
+                    _ => "atomicAdd",
+                };
+                format!("{name}(&{buf}[(unsigned int)({idx})], ({cty})({val}))")
+            };
+            let _ = writeln!(s, "{call};");
         }
         IrStmt::AssignShared { name, index, value } => {
             indent(s, depth);

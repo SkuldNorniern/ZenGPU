@@ -137,12 +137,24 @@ fn check_stmt(
         IrStmt::Let { init, .. } | IrStmt::AssignLocal { value: init, .. } | IrStmt::Eval(init) => {
             check_expr(init, ctx, types, bool_id)
         }
-        IrStmt::AssignBuffer { index, value, .. }
-        | IrStmt::AssignShared { index, value, .. }
-        | IrStmt::AtomicAdd { index, value, .. } => {
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
             check_expr(index, ctx, types, bool_id)?;
             check_expr(value, ctx, types, bool_id)
         }
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            ..
+        } => {
+            check_expr(index, ctx, types, bool_id)?;
+            check_expr(value, ctx, types, bool_id)?;
+            match compare {
+                Some(compare) => check_expr(compare, ctx, types, bool_id),
+                None => Ok(()),
+            }
+        }
+
         IrStmt::ImageStore { args, .. } => {
             for arg in args {
                 check_expr(arg, ctx, types, bool_id)?;

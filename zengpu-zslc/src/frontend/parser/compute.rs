@@ -446,15 +446,18 @@ impl<'a> Parser<'a> {
         if self.eat_kw("frag_store") {
             return Ok(vec![self.parse_frag_store(ctx)?]);
         }
-        if self.eat_kw("atomic_add") {
-            let (buf, index, value, _) = self.parse_atomic_add(ctx)?;
-            return Ok(vec![IrStmt::AtomicAdd {
+        if let Some((kw, op)) = self.eat_atomic_kw() {
+            let (buf, index, value, compare, _) = self.parse_atomic(ctx, kw, op)?;
+            return Ok(vec![IrStmt::Atomic {
+                op,
                 buf,
                 index,
                 value,
+                compare,
                 old: None,
             }]);
         }
+
         if let Some(Tok::Ident(name)) = self.peek()
             && let Some(&storage) = ctx.textures.get(name)
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Dot))
@@ -635,19 +638,33 @@ impl<'a> Parser<'a> {
         Ok(prelude)
     }
 
-    /// `atomic_add(buffer, index, value)` after its keyword: the buffer, index, value and the
-    /// buffer's element type.
-    fn parse_atomic_add(
+    fn eat_atomic_kw(&mut self) -> Option<(&'static str, AtomicOp)> {
+        ATOMIC_KWS.into_iter().find(|(kw, _)| self.eat_kw(kw))
+    }
+
+    /// `atomic_*(buffer, index, value)` after its keyword. `atomic_compare_exchange` takes
+    /// `(buffer, index, expected, desired)`. Returns the buffer, index, operand, expected value,
+    /// and the buffer's element type.
+    #[allow(clippy::type_complexity)]
+    fn parse_atomic(
         &mut self,
         ctx: &mut Ctx,
-    ) -> Result<(String, IrExpr, IrExpr, TypeId), ParseError> {
-        self.expect(&Tok::LParen, "`(` after atomic_add")?;
+        kw: &str,
+        op: AtomicOp,
+    ) -> Result<(String, IrExpr, IrExpr, Option<IrExpr>, TypeId), ParseError> {
+        self.expect(&Tok::LParen, "`(` after atomic")?;
         let buf = self.ident()?;
-        self.expect(&Tok::Comma, "`,` after atomic_add buffer")?;
+        self.expect(&Tok::Comma, "`,` after atomic buffer")?;
         let index = self.parse_expr(ctx)?;
-        self.expect(&Tok::Comma, "`,` after atomic_add index")?;
-        let value = self.parse_expr(ctx)?;
-        self.expect(&Tok::RParen, "`)` after atomic_add arguments")?;
+        self.expect(&Tok::Comma, "`,` after atomic index")?;
+        let first = self.parse_expr(ctx)?;
+        let (value, compare) = if op == AtomicOp::CompareExchange {
+            self.expect(&Tok::Comma, "`,` after the expected value")?;
+            (self.parse_expr(ctx)?, Some(first))
+        } else {
+            (first, None)
+        };
+        self.expect(&Tok::RParen, "`)` after atomic arguments")?;
         let Some(buffer) = ctx.buffers.get(&buf).copied() else {
             return self.err(format!("`{buf}` is not a device buffer"));
         };
@@ -659,26 +676,44 @@ impl<'a> Parser<'a> {
         let f32_id = self.types.f32_id();
         let u32_id = self.types.u32_id();
         let i32_id = self.types.i32_id();
-        if ![f32_id, u32_id, i32_id].contains(&buffer.elem) {
-            return self.err("atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>");
+        let elem_ok = if op == AtomicOp::Add {
+            [f32_id, u32_id, i32_id].contains(&buffer.elem)
+        } else {
+            buffer.elem == u32_id || buffer.elem == i32_id
+        };
+        if !elem_ok {
+            return self.err(if op == AtomicOp::Add {
+                "atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>"
+            } else {
+                "this atomic requires buffer<u32> or buffer<i32>"
+            });
         }
         let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
         if index_ty != u32_id && index_ty != f32_id {
-            return self.err("atomic_add index must be a u32- or f32-typed expression");
+            return self.err(format!("{kw} index must be a u32- or f32-typed expression"));
         }
-        // f32 buffers add f32 values; integer buffers add either integer type, converted.
-        let value_ty = type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types);
-        let fits = if buffer.elem == f32_id {
-            value_ty == f32_id
-        } else {
-            value_ty == u32_id || value_ty == i32_id
+        // f32 buffers take f32 values; integer buffers take either integer type, converted.
+        let elem = buffer.elem;
+        let fits = |ty: TypeId| {
+            if elem == f32_id {
+                ty == f32_id
+            } else {
+                ty == u32_id || ty == i32_id
+            }
         };
-        if !fits {
-            return self.err(
-                "atomic_add value must match the buffer: f32 for buffer<f32>, an integer otherwise",
-            );
+        let value_ty = type_of_compute_expr(&value, &ctx.type_ctx(), &mut self.types);
+        let mut ok = fits(value_ty);
+        if let Some(compare) = &compare {
+            let cmp_ty = type_of_compute_expr(compare, &ctx.type_ctx(), &mut self.types);
+            ok = ok && fits(cmp_ty);
         }
-        Ok((buf, index, value, buffer.elem))
+
+        if !ok {
+            return self.err(format!(
+                "{kw} value must match the buffer: f32 for buffer<f32>, an integer otherwise"
+            ));
+        }
+        Ok((buf, index, value, compare, buffer.elem))
     }
 
     pub(super) fn parse_let(&mut self, ctx: &mut Ctx) -> Result<IrStmt, ParseError> {
@@ -696,20 +731,23 @@ impl<'a> Parser<'a> {
             Some(self.parse_scalar_type()?)
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
-        if self.eat_kw("atomic_add") {
-            let (buf, index, value, elem) = self.parse_atomic_add(ctx)?;
+        if let Some((kw, op)) = self.eat_atomic_kw() {
+            let (buf, index, value, compare, elem) = self.parse_atomic(ctx, kw, op)?;
             if annot.is_some_and(|ty| ty != elem) {
-                return self.err("atomic_add hands back the buffer's element type");
+                return self.err(format!("{kw} hands back the buffer's element type"));
             }
             ctx.locals.insert(name.clone(), elem);
             ctx.locals_order.push((name.clone(), elem));
-            return Ok(IrStmt::AtomicAdd {
+            return Ok(IrStmt::Atomic {
+                op,
                 buf,
                 index,
                 value,
+                compare,
                 old: Some(name),
             });
         }
+
         let init = self.parse_expr(ctx)?;
         let init = match annot {
             Some(ty) => self.frag_load_for(ctx, init, ty),

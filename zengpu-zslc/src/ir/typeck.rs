@@ -355,8 +355,8 @@ pub fn type_of_graphics_expr(
         IrExpr::SharedLoad { .. } | IrExpr::Texel { .. } | IrExpr::FragLoad { .. } => f32_id,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::TexSize { .. } => u32_id,
         IrExpr::Builtin { func, args } => match func {
-            BuiltinFn::U32 => u32_id,
-            BuiltinFn::F32 | BuiltinFn::Length => f32_id,
+            BuiltinFn::U32 | BuiltinFn::BitcastU32 => u32_id,
+            BuiltinFn::F32 | BuiltinFn::BitcastF32 | BuiltinFn::Length => f32_id,
             BuiltinFn::Step | BuiltinFn::Smoothstep => args
                 .last()
                 .map(|a| type_of_graphics_expr(a, ctx, arena))
