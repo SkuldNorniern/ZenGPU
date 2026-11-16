@@ -159,10 +159,15 @@ impl<'a> Parser<'a> {
                     return self.err("expected `buffer`");
                 }
                 self.expect(&Tok::Lt, "`<`")?;
-                let elem = self.parse_any_type()?;
+                let elem = self.parse_scalar_type()?;
                 self.expect(&Tok::Gt, "`>`")?;
-                if elem != self.types.f32_id() && elem != self.types.u32_id() {
-                    return self.err("only buffer<f32> and buffer<u32> are supported");
+                let ok = [
+                    self.types.f32_id(),
+                    self.types.u32_id(),
+                    self.types.i32_id(),
+                ];
+                if !ok.contains(&elem) {
+                    return self.err("only buffer<f32>, buffer<u32> and buffer<i32> are supported");
                 }
                 ctx.buffers.insert(name.clone(), (writable, elem));
                 buf_params.push(name);
@@ -277,7 +282,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Some((kw, op)) = self.eat_atomic_kw() {
-                body.push(self.parse_gfx_atomic(ctx, kw, op, None)?);
+                body.push(self.parse_gfx_atomic(ctx, kw, op, None)?.0);
                 self.eat(&Tok::Semi);
                 continue;
             }
@@ -359,7 +364,7 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if let Some((kw, op)) = self.eat_atomic_kw() {
-                stmts.push(self.parse_gfx_atomic(ctx, kw, op, None)?);
+                stmts.push(self.parse_gfx_atomic(ctx, kw, op, None)?.0);
                 self.eat(&Tok::Semi);
                 continue;
             }
@@ -381,13 +386,12 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::Eq, "`=` in let binding")?;
         if let Some((kw, op)) = self.eat_atomic_kw() {
-            let u32_id = self.types.u32_id();
-            if annot.is_some_and(|ty| ty != u32_id) {
-                return self.err(format!("{kw} hands back a u32"));
+            let (atomic, elem) = self.parse_gfx_atomic(ctx, kw, op, Some(name.clone()))?;
+            if annot.is_some_and(|ty| ty != elem) {
+                return self.err(format!("{kw} hands back the buffer's element type"));
             }
-            let atomic = self.parse_gfx_atomic(ctx, kw, op, Some(name.clone()))?;
-            ctx.locals.insert(name.clone(), u32_id);
-            ctx.locals_order.push((name, u32_id));
+            ctx.locals.insert(name.clone(), elem);
+            ctx.locals_order.push((name, elem));
             return Ok(atomic);
         }
         let init = self.parse_g_expr(ctx)?;
@@ -406,16 +410,16 @@ impl<'a> Parser<'a> {
         Ok(IrStmt::Let { name, init })
     }
 
-    /// `atomic_*(buffer, index, value)` after its keyword, on a `device mut buffer<u32>`;
-    /// `atomic_compare_exchange` takes `(buffer, index, expected, desired)`. `old` takes the value
-    /// from before.
+    /// `atomic_*(buffer, index, value)` after its keyword, on a `device mut buffer<u32>` or
+    /// `buffer<i32>`; `atomic_compare_exchange` takes `(buffer, index, expected, desired)`. `old`
+    /// takes the value from before. Also returns the buffer's element type.
     fn parse_gfx_atomic(
         &mut self,
         ctx: &GfxCtx,
         kw: &str,
         op: AtomicOp,
         old: Option<String>,
-    ) -> Result<IrStmt, ParseError> {
+    ) -> Result<(IrStmt, TypeId), ParseError> {
         self.expect(&Tok::LParen, "`(` after atomic")?;
         let buf = self.ident()?;
         self.expect(&Tok::Comma, "`,` after atomic buffer")?;
@@ -430,31 +434,34 @@ impl<'a> Parser<'a> {
         };
         self.expect(&Tok::RParen, "`)` after atomic arguments")?;
         let u32_id = self.types.u32_id();
-        match ctx.buffers.get(&buf) {
-            Some((true, elem)) if *elem == u32_id => {}
+        let i32_id = self.types.i32_id();
+        let elem = match ctx.buffers.get(&buf) {
+            Some((true, elem)) if *elem == u32_id || *elem == i32_id => *elem,
             Some(_) => {
                 return self.err(format!(
-                    "{kw} in a vertex or fragment shader takes a `device mut buffer<u32>`"
+                    "{kw} in a vertex or fragment shader takes a `device mut buffer<u32>` or `buffer<i32>`"
                 ));
             }
             None => return self.err(format!("`{buf}` is not a device buffer")),
-        }
+        };
         let type_ctx = ctx.type_ctx();
         let mut operands = vec![&value];
         operands.extend(compare.as_ref());
         for operand in operands {
-            if type_of_graphics_expr(operand, &type_ctx, &mut self.types) != u32_id {
-                return self.err(format!("{kw} value must be a u32"));
+            if type_of_graphics_expr(operand, &type_ctx, &mut self.types) != elem {
+                let want = if elem == u32_id { "u32" } else { "i32" };
+                return self.err(format!("{kw} value must be a {want}"));
             }
         }
-        Ok(IrStmt::Atomic {
+        let stmt = IrStmt::Atomic {
             op,
             buf,
             index,
             value,
             compare,
             old,
-        })
+        };
+        Ok((stmt, elem))
     }
 
     fn gfx_discard(&mut self, ctx: &GfxCtx) -> Result<IrStmt, ParseError> {

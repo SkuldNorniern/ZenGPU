@@ -88,6 +88,7 @@ struct Ctx<'a> {
     spv: &'a mut SpvBuilder,
     t_f32: Id,
     t_u32: Id,
+    t_i32: Id,
     t_bool: Id,
     t_vec2: Id,
     t_vec3: Id,
@@ -96,6 +97,7 @@ struct Ctx<'a> {
     /// Canonical `TypeId`s for the six graphics value types, cached in `lower_graphics_inner`.
     f32_id: TypeId,
     u32_id: TypeId,
+    i32_id: TypeId,
     vec2_id: TypeId,
     vec3_id: TypeId,
     vec4_id: TypeId,
@@ -105,9 +107,10 @@ struct Ctx<'a> {
     scalar_params: HashMap<String, ScalarInfo>,
     /// Each buffer's push slot and element type.
     buf_params: HashMap<String, (u32, TypeId)>,
-    /// The buffer table seen as `f32` and as `u32` elements: one binding, two views.
+    /// The buffer table seen as `f32`, `u32` and `i32` elements: one binding, several views.
     bufs_f32: Option<BufView>,
     bufs_u32: Option<BufView>,
+    bufs_i32: Option<BufView>,
     textures: Option<TextureTable>,
     is_fragment: bool,
     pc_var: Option<Id>,
@@ -153,6 +156,8 @@ impl Ctx<'_> {
             .ok_or_else(|| format!("`{buf}` is not a buffer param"))?;
         let view = if elem == self.u32_id {
             self.bufs_u32
+        } else if elem == self.i32_id {
+            self.bufs_i32
         } else {
             self.bufs_f32
         }
@@ -221,6 +226,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut types = module.types.clone();
     let f32_id = types.f32_id();
     let u32_id = types.u32_id();
+    let i32_id = types.i32_id();
     let vec2_id = types.vec_id(2);
     let vec3_id = types.vec_id(3);
     let vec4_id = types.vec_id(4);
@@ -234,6 +240,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let t_void = spv.type_void();
     let t_f32 = spv.type_float(32);
     let t_u32 = spv.type_int(32, false);
+    let t_i32 = spv.type_int(32, true);
     let t_bool = spv.type_bool();
     let t_vec2 = spv.type_vector(t_f32, 2);
     let t_vec3 = spv.type_vector(t_f32, 3);
@@ -367,6 +374,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let wants = |elem: TypeId| e.buf_elems.contains(&elem);
     let bufs_f32 = wants(f32_id).then(|| buffer_view(&mut spv, t_f32, read_only));
     let bufs_u32 = wants(u32_id).then(|| buffer_view(&mut spv, t_u32, read_only));
+    let bufs_i32 = wants(i32_id).then(|| buffer_view(&mut spv, t_i32, read_only));
 
     let textures = e.textures.as_ref().map(|_| {
         spv.capability_non_uniform_sampled_images();
@@ -451,6 +459,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
     let mut t_ptr_func_f32 = Id(0);
     let mut t_ptr_func_u32 = Id(0);
+    let mut t_ptr_func_i32 = Id(0);
     let mut t_ptr_func_vec2 = Id(0);
     let mut t_ptr_func_vec3 = Id(0);
     let mut t_ptr_func_vec4 = Id(0);
@@ -491,6 +500,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             (t_f32, &mut t_ptr_func_f32)
         } else if gty == u32_id {
             (t_u32, &mut t_ptr_func_u32)
+        } else if gty == i32_id {
+            (t_i32, &mut t_ptr_func_i32)
         } else if gty == vec2_id {
             (t_vec2, &mut t_ptr_func_vec2)
         } else if gty == vec3_id {
@@ -520,6 +531,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         spv: &mut spv,
         t_f32,
         t_u32,
+        t_i32,
         t_bool,
         t_vec2,
         t_vec3,
@@ -527,6 +539,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         t_mat4,
         f32_id,
         u32_id,
+        i32_id,
         vec2_id,
         vec3_id,
         vec4_id,
@@ -537,6 +550,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         buf_params: buf_param_map,
         bufs_f32,
         bufs_u32,
+        bufs_i32,
         textures,
         is_fragment,
         pc_var,
@@ -610,7 +624,7 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
         }
         IrStmt::Let { name, init } => {
             let gty = ctx.locals.get(name).map(|l| l.ty).unwrap_or(ctx.f32_id);
-            let val = lower_expr(ctx, init)?;
+            let val = lower_value(ctx, init)?;
             let coerced = coerce(ctx, val, gty)?;
             let ptr = ctx
                 .locals
@@ -626,16 +640,21 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
                 .get(name)
                 .map(|l| (l.ptr, l.ty))
                 .ok_or_else(|| format!("undeclared local `{name}`"))?;
-            let val = lower_expr(ctx, value)?;
+            let val = lower_value(ctx, value)?;
             let coerced = coerce(ctx, val, gty)?;
             ctx.spv.op_store(ptr, coerced);
             Ok(())
         }
         IrStmt::AssignBuffer { buf, index, value } => {
             let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
-            let rhs = lower_expr(ctx, value)?;
+            let rhs = lower_value(ctx, value)?;
+            if rhs.ty == ctx.i32_id && elem != ctx.i32_id {
+                return Err("an i32 value can only be stored in a buffer<i32>".into());
+            }
             let rhs_id = if elem == ctx.u32_id {
                 scalar_to_u32(ctx, rhs)
+            } else if elem == ctx.i32_id {
+                scalar_to_i32(ctx, rhs)
             } else {
                 scalar_to_f32(ctx, rhs)
             };
@@ -732,18 +751,22 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             old,
         } => {
             let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
-            if elem != ctx.u32_id {
-                return Err("vertex and fragment atomics take a buffer<u32>".into());
+            if elem != ctx.u32_id && elem != ctx.i32_id {
+                return Err("vertex and fragment atomics take a buffer<u32> or buffer<i32>".into());
             }
-            let t = ctx.t_u32;
-            let rhs = lower_expr(ctx, value)?;
-            let rhs_id = scalar_to_u32(ctx, rhs);
-            let scope = ctx.spv.constant_u32(t, 1);
-            let semantics = ctx.spv.constant_u32(t, 0);
+            let signed = elem == ctx.i32_id;
+            let t = if signed { ctx.t_i32 } else { ctx.t_u32 };
+            let rhs = lower_value(ctx, value)?;
+            if rhs.ty == ctx.i32_id && !signed {
+                return Err("an i32 value cannot be an atomic on a buffer<u32>".into());
+            }
+            let rhs_id = scalar_to_int(ctx, rhs, signed);
+            let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
+            let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
             let before = match (aop, compare) {
                 (AtomicOp::CompareExchange, Some(compare)) => {
-                    let cmp = lower_expr(ctx, compare)?;
-                    let cmp_id = scalar_to_u32(ctx, cmp);
+                    let cmp = lower_value(ctx, compare)?;
+                    let cmp_id = scalar_to_int(ctx, cmp, signed);
                     ctx.spv
                         .op_atomic_compare_exchange(t, ptr_elem, scope, semantics, rhs_id, cmp_id)
                 }
@@ -751,7 +774,7 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
                     return Err("atomic_compare_exchange needs an expected value".into());
                 }
                 _ => {
-                    let opcode = atomic_opcode(*aop, false);
+                    let opcode = atomic_opcode(*aop, signed);
                     ctx.spv
                         .op_atomic_int(opcode, t, ptr_elem, scope, semantics, rhs_id)
                 }
@@ -821,7 +844,17 @@ fn lower_condition(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<Id> {
     Err("`if` condition must be a comparison (< > <= >= == !=) or logical (&& ||)".into())
 }
 
+/// Operands of arithmetic, conditions, builtins and outputs. An `i32` stops here.
 fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
+    let v = lower_value(ctx, expr)?;
+    if v.ty == ctx.i32_id {
+        return Err("i32 values only feed buffer elements and atomics in graphics stages".into());
+    }
+    Ok(v)
+}
+
+/// Values that buffers, atomics and locals take, which may be `i32`.
+fn lower_value(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
     match expr {
         IrExpr::FragLoad { .. } => Err("frag_load is only available in compute shaders".into()),
         IrExpr::LitU32(v) => {
@@ -866,6 +899,8 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
             let t = if elem == ctx.u32_id {
                 ctx.t_u32
+            } else if elem == ctx.i32_id {
+                ctx.t_i32
             } else {
                 ctx.t_f32
             };
@@ -1491,6 +1526,27 @@ fn scalar_to_u32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
     ctx.spv.op_convert_f_to_u(t, v.id)
 }
 
+fn scalar_to_i32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
+    if v.ty == ctx.i32_id {
+        return v.id;
+    }
+    let t = ctx.t_i32;
+    if v.ty == ctx.u32_id {
+        ctx.spv.op_bitcast(t, v.id)
+    } else {
+        ctx.spv.op_convert_f_to_s(t, v.id)
+    }
+}
+
+/// `scalar_to_u32` or `scalar_to_i32`, as the buffer's element type asks.
+fn scalar_to_int(ctx: &mut Ctx<'_>, v: GVal, signed: bool) -> Id {
+    if signed {
+        scalar_to_i32(ctx, v)
+    } else {
+        scalar_to_u32(ctx, v)
+    }
+}
+
 fn coerce(ctx: &mut Ctx<'_>, v: GVal, target: TypeId) -> R<Id> {
     if v.ty == target {
         return Ok(v.id);
@@ -1740,6 +1796,84 @@ pub(crate) mod tests {
             }
         "#);
         assert!(read_only.contains("device mut buffer<u32>"), "{read_only}");
+    }
+
+    #[test]
+    fn fragments_count_into_an_i32_buffer() {
+        validate(&lower(
+            r#"
+            push P { width: u32 }
+            fragment fs(pos: frag_coord, hits: device mut buffer<i32>, step: device buffer<i32>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                atomic_add(hits, at, step[0])
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn i32_atomics_keep_the_old_value_and_compare_exchange() {
+        validate(&lower(
+            r#"
+            fragment fs(pos: frag_coord, lo: device mut buffer<i32>, src: device buffer<i32>) -> f32x4 {
+                let before = atomic_min(lo, 0u, src[0])
+                let swapped = atomic_compare_exchange(lo, 1u, before, src[1])
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn vertex_and_fragment_stages_load_and_store_i32_buffers() {
+        validate(&lower(
+            r#"
+            vertex vs(vi: vertex_index, ids: device buffer<i32>, xs: device buffer<f32>) -> f32x4 {
+                let id = ids[vi]
+                f32x4(xs[vi], 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+        validate(&lower(
+            r#"
+            push P { width: u32 }
+            fragment fs(pos: frag_coord, out: device mut buffer<i32>, src: device buffer<i32>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                out[at] = src[at]
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn i32_stays_in_buffers_and_atomics_in_graphics() {
+        let arith = r#"
+            fragment fs(pos: frag_coord, src: device buffer<i32>) -> f32x4 {
+                let x = src[0] + 1u
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        "#;
+        let Shader::Graphics(m) = parse_zsl(arith).expect("parse") else {
+            panic!("expected graphics");
+        };
+        let err = lower_graphics(&m)
+            .err()
+            .map(|d| d.message)
+            .unwrap_or_default();
+        assert!(err.contains("only feed buffer elements"), "{err}");
+        let wrong_elem = r#"
+            fragment fs(hits: device mut buffer<u32>, src: device buffer<i32>) -> f32x4 {
+                atomic_add(hits, 0u, src[0])
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        "#;
+        let err = parse_zsl(wrong_elem)
+            .err()
+            .map(|e| e.msg)
+            .unwrap_or_default();
+        assert!(err.contains("value must be a u32"), "{err}");
     }
 
     #[test]

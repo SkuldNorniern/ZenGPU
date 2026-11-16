@@ -344,7 +344,7 @@ impl<'a> Parser<'a> {
         }
         match name {
             "bitcast_i32" => {
-                self.err("bitcast_i32 is compute-only: graphics stages have no i32 type")
+                self.err("bitcast_i32 is compute-only: graphics i32 values come from buffer<i32>")
             }
             "dot" => {
                 if args.len() != 2 {
