@@ -5,6 +5,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod adapter;
+mod barrier;
 pub(crate) mod command_list;
 pub mod depth_target;
 pub mod device;

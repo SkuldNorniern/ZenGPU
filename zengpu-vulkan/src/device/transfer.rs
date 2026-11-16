@@ -14,6 +14,7 @@ use zengpu_hal::{
 };
 
 use super::VulkanDevice;
+use crate::barrier;
 
 /// Ring starts at this size and doubles up to `RING_MAX`.
 const RING_START: u64 = 4 << 20;
@@ -257,8 +258,9 @@ impl VulkanDevice {
             at += size.next_multiple_of(RING_ALIGN);
         }
         let staging_vk = self.vk_buffer(staging)?;
+        let graphics = self.inner.graphics;
         self.one_shot_submit_tracked(0, &[staging.index()], |dev, cmd| {
-            record_buffer_to_images(dev, cmd, staging_vk, &placed);
+            record_buffer_to_images(dev, cmd, staging_vk, &placed, graphics);
             Ok(())
         })
     }
@@ -286,16 +288,28 @@ impl VulkanDevice {
             row_texels,
         }];
         let vk_buffer = self.vk_buffer(buffer)?;
+        let graphics = self.inner.graphics;
         let (submission, _) = self.one_shot_submit_tracked(0, &[buffer.index()], |dev, cmd| {
-            memory_barrier(
-                dev,
-                cmd,
-                (
-                    vk::AccessFlags::MEMORY_WRITE,
-                    vk::AccessFlags::TRANSFER_READ,
-                ),
+            let staged = barrier::buffer(
+                vk_buffer,
+                offset,
+                span,
+                vk::AccessFlags::MEMORY_WRITE,
+                vk::AccessFlags::TRANSFER_READ,
             );
-            record_buffer_to_images(dev, cmd, vk_buffer, &placed);
+            // Earlier writers of the source range are unknown here, so the source stage stays broad.
+            unsafe {
+                barrier::submit(
+                    dev,
+                    cmd,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    &[],
+                    &[staged],
+                    &[],
+                );
+            }
+            record_buffer_to_images(dev, cmd, vk_buffer, &placed, graphics);
             Ok(())
         })?;
         self.mark_ready(texture, region);
@@ -318,6 +332,7 @@ impl VulkanDevice {
         let (image, resting) = self.image_of(texture)?;
         let was_ready = self.is_ready(texture, region);
         let vk_buffer = self.vk_buffer(buffer)?;
+        let graphics = self.inner.graphics;
         let (submission, _) = self.one_shot_submit_tracked(0, &[buffer.index()], |dev, cmd| {
             let from = if was_ready {
                 resting
@@ -330,6 +345,14 @@ impl VulkanDevice {
                 image,
                 region,
                 (from, vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                (
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                ),
+                (
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::AccessFlags::TRANSFER_READ,
+                ),
             );
             unsafe {
                 dev.cmd_copy_image_to_buffer(
@@ -340,16 +363,34 @@ impl VulkanDevice {
                     &[buffer_image_copy(region, offset, row_texels)],
                 );
             }
-            let back = (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, resting);
-            image_barrier(dev, cmd, image, region, back);
-            memory_barrier(
-                dev,
-                cmd,
-                (
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ,
-                ),
+            // One call for the image back to its resting layout and the host read of the copy.
+            let (image_users, image_access) = barrier::image_users(graphics);
+            let (buffer_users, _) = barrier::buffer_users(graphics);
+            let back = barrier::image(
+                image,
+                subresource(region),
+                (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, resting),
+                vk::AccessFlags::TRANSFER_READ,
+                image_access,
             );
+            let host = barrier::buffer(
+                vk_buffer,
+                offset,
+                span,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ,
+            );
+            unsafe {
+                barrier::submit(
+                    dev,
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    image_users | buffer_users | vk::PipelineStageFlags::HOST,
+                    &[],
+                    &[host],
+                    &[back],
+                );
+            }
             Ok(())
         })?;
         self.mark_ready(texture, region);
@@ -672,57 +713,20 @@ fn buffer_image_copy(region: TextureRegion, offset: u64, row_texels: u32) -> vk:
     }
 }
 
+/// Layout change for `region`. `src_stage` and `src_access` cover the work before it. Its users
+/// after it come from the `barrier` scope.
 fn image_barrier(
     dev: &Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
     region: TextureRegion,
-    (from, to): (vk::ImageLayout, vk::ImageLayout),
+    layouts: (vk::ImageLayout, vk::ImageLayout),
+    (src_stage, src_access): (vk::PipelineStageFlags, vk::AccessFlags),
+    (dst_stage, dst_access): (vk::PipelineStageFlags, vk::AccessFlags),
 ) {
-    let barrier = vk::ImageMemoryBarrier {
-        old_layout: from,
-        new_layout: to,
-        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-        image,
-        subresource_range: subresource(region),
-        src_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        dst_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-        ..Default::default()
-    };
+    let change = barrier::image(image, subresource(region), layouts, src_access, dst_access);
     unsafe {
-        dev.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[barrier],
-        );
-    }
-}
-
-fn memory_barrier(
-    dev: &Device,
-    cmd: vk::CommandBuffer,
-    (src, dst): (vk::AccessFlags, vk::AccessFlags),
-) {
-    let barrier = vk::MemoryBarrier {
-        src_access_mask: src,
-        dst_access_mask: dst,
-        ..Default::default()
-    };
-    unsafe {
-        dev.cmd_pipeline_barrier(
-            cmd,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[barrier],
-            &[],
-            &[],
-        );
+        barrier::submit(dev, cmd, src_stage, dst_stage, &[], &[], &[change]);
     }
 }
 
@@ -733,6 +737,7 @@ fn record_buffer_to_images(
     cmd: vk::CommandBuffer,
     buffer: vk::Buffer,
     placed: &[Placed],
+    graphics: bool,
 ) {
     for p in placed {
         let from = if p.was_ready {
@@ -746,6 +751,14 @@ fn record_buffer_to_images(
             p.image,
             p.region,
             (from, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+            (
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+            ),
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
         );
         unsafe {
             dev.cmd_copy_buffer_to_image(
@@ -757,7 +770,19 @@ fn record_buffer_to_images(
             );
         }
         let back = (vk::ImageLayout::TRANSFER_DST_OPTIMAL, p.resting);
-        image_barrier(dev, cmd, p.image, p.region, back);
+        let (users, access) = barrier::image_users(graphics);
+        image_barrier(
+            dev,
+            cmd,
+            p.image,
+            p.region,
+            back,
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
+            ),
+            (users, access),
+        );
     }
 }
 

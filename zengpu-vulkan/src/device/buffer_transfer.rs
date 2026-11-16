@@ -1,6 +1,7 @@
 //! Submission-owned staging for asynchronous buffer readback.
 
 use super::*;
+use crate::barrier;
 use zengpu_hal::{CompletedReadback, GpuReadback, ReadSubmission};
 
 /// Removed from the resource table before submission; its raw allocation is
@@ -160,25 +161,33 @@ impl VulkanDevice {
             .ok_or_else(|| stale(target, &buffers))?
             .buffer;
         let input = storage.buffer.buffer;
+        let graphics = self.inner.graphics;
         let len = data.len() as u64;
         let (work, _) = self.one_shot_submit_tracked_inner(
             cycle,
             &[target.index()],
             Some(Arc::clone(&storage)),
             |device, cmd| {
+                let (users, access) = barrier::buffer_users(graphics);
+                // Earlier work on this range is done before it changes. Earlier readers are
+                // unknown here, so the source stage stays broad.
+                let before = barrier::buffer(
+                    output,
+                    offset,
+                    len,
+                    vk::AccessFlags::MEMORY_WRITE,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                let after =
+                    barrier::buffer(output, offset, len, vk::AccessFlags::TRANSFER_WRITE, access);
                 unsafe {
-                    // earlier work reading or writing the target is done before it changes
-                    device.cmd_pipeline_barrier(
+                    barrier::submit(
+                        device,
                         cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::MEMORY_WRITE,
-                            dst_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                            ..Default::default()
-                        }],
                         &[],
+                        &[before],
                         &[],
                     );
                     device.cmd_copy_buffer(
@@ -191,18 +200,13 @@ impl VulkanDevice {
                             size: len,
                         }],
                     );
-                    device.cmd_pipeline_barrier(
+                    barrier::submit(
+                        device,
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                            dst_access_mask: vk::AccessFlags::MEMORY_READ
-                                | vk::AccessFlags::MEMORY_WRITE,
-                            ..Default::default()
-                        }],
+                        users,
                         &[],
+                        &[after],
                         &[],
                     );
                 }
@@ -267,18 +271,29 @@ impl VulkanDevice {
             &[source.index()],
             Some(Arc::clone(&storage)),
             |device, cmd| {
+                // Earlier writers of the source range are unknown here, so the source stage stays broad.
+                let before = barrier::buffer(
+                    input,
+                    start,
+                    span,
+                    vk::AccessFlags::MEMORY_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                );
+                let after = barrier::buffer(
+                    output,
+                    0,
+                    span,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::HOST_READ,
+                );
                 unsafe {
-                    device.cmd_pipeline_barrier(
+                    barrier::submit(
+                        device,
                         cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::MEMORY_WRITE,
-                            dst_access_mask: vk::AccessFlags::TRANSFER_READ,
-                            ..Default::default()
-                        }],
                         &[],
+                        &[before],
                         &[],
                     );
                     device.cmd_copy_buffer(
@@ -291,17 +306,13 @@ impl VulkanDevice {
                             size: span,
                         }],
                     );
-                    device.cmd_pipeline_barrier(
+                    barrier::submit(
+                        device,
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::HOST,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                            dst_access_mask: vk::AccessFlags::HOST_READ,
-                            ..Default::default()
-                        }],
                         &[],
+                        &[after],
                         &[],
                     );
                 }

@@ -1,6 +1,7 @@
 use std::mem;
 
 use super::*;
+use crate::barrier;
 
 /// Largest device-local host-visible heap treated as the legacy BAR aperture, not Resizable BAR
 /// (which spans VRAM).
@@ -441,25 +442,29 @@ impl VulkanDevice {
     /// Writes to buffers the host cannot map (device-local VRAM) through a temporary
     /// host-visible buffer.
     pub(super) fn staged_write(&self, dst: vk::Buffer, offset: u64, data: &[u8]) -> Result<()> {
+        let graphics = self.inner.graphics;
         if data.len() as u64 <= INLINE_UPDATE_MAX
             && offset.is_multiple_of(4)
             && data.len().is_multiple_of(4)
         {
             return self.one_shot_submit(|dev, cmd| {
+                let (users, access) = barrier::buffer_users(graphics);
+                let range = barrier::buffer(
+                    dst,
+                    offset,
+                    data.len() as u64,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    access,
+                );
                 unsafe {
                     dev.cmd_update_buffer(cmd, dst, offset, data);
-                    dev.cmd_pipeline_barrier(
+                    barrier::submit(
+                        dev,
                         cmd,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::PipelineStageFlags::ALL_COMMANDS,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                            dst_access_mask: vk::AccessFlags::MEMORY_READ
-                                | vk::AccessFlags::MEMORY_WRITE,
-                            ..Default::default()
-                        }],
+                        users,
                         &[],
+                        &[range],
                         &[],
                     );
                 }
@@ -480,6 +485,14 @@ impl VulkanDevice {
                 let dst_offset = offset + (i as u64) * STAGING_CHUNK;
                 let len = chunk.len() as u64;
                 in_flight[i % 2] = Some(self.submit_raw(|dev, cmd| {
+                    let (users, access) = barrier::buffer_users(graphics);
+                    let range = barrier::buffer(
+                        dst,
+                        dst_offset,
+                        len,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        access,
+                    );
                     unsafe {
                         dev.cmd_copy_buffer(
                             cmd,
@@ -491,18 +504,13 @@ impl VulkanDevice {
                                 size: len,
                             }],
                         );
-                        dev.cmd_pipeline_barrier(
+                        barrier::submit(
+                            dev,
                             cmd,
                             vk::PipelineStageFlags::TRANSFER,
-                            vk::PipelineStageFlags::ALL_COMMANDS,
-                            vk::DependencyFlags::empty(),
-                            &[vk::MemoryBarrier {
-                                src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                                dst_access_mask: vk::AccessFlags::MEMORY_READ
-                                    | vk::AccessFlags::MEMORY_WRITE,
-                                ..Default::default()
-                            }],
+                            users,
                             &[],
+                            &[range],
                             &[],
                         );
                     }
@@ -533,18 +541,22 @@ impl VulkanDevice {
             let src_offset = offset + i as u64 * STAGING_CHUNK;
             let len = STAGING_CHUNK.min(total - i as u64 * STAGING_CHUNK);
             self.submit_raw(|dev, cmd| {
+                // Earlier writers of the source range are unknown here, so the source stage stays broad.
+                let range = barrier::buffer(
+                    src,
+                    src_offset,
+                    len,
+                    vk::AccessFlags::MEMORY_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                );
                 unsafe {
-                    dev.cmd_pipeline_barrier(
+                    barrier::submit(
+                        dev,
                         cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::TRANSFER,
-                        vk::DependencyFlags::empty(),
-                        &[vk::MemoryBarrier {
-                            src_access_mask: vk::AccessFlags::MEMORY_WRITE,
-                            dst_access_mask: vk::AccessFlags::TRANSFER_READ,
-                            ..Default::default()
-                        }],
                         &[],
+                        &[range],
                         &[],
                     );
                     dev.cmd_copy_buffer(
@@ -931,7 +943,7 @@ impl VulkanDevice {
                         }
                     }
                 }
-                hand_off(dev, cmd);
+                hand_off(dev, cmd, self.inner.graphics);
             }
             Ok(())
         });
@@ -1067,7 +1079,7 @@ impl VulkanDevice {
                         );
                     }
                 }
-                hand_off(dev, cmd);
+                hand_off(dev, cmd, self.inner.graphics);
             }
             Ok(())
         });
@@ -1188,8 +1200,11 @@ fn mixed_buffer_uses(ops: &[ComputeOp<'_>]) -> Vec<u32> {
 ///
 /// # Safety
 /// `cmd` must be recording on `dev`.
-pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
-    let barrier = vk::MemoryBarrier {
+pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer, graphics: bool) {
+    // Later users are buffers or images, so the stage set covers both. Access stays broad.
+    let (buffer_stages, _) = barrier::buffer_users(graphics);
+    let (image_stages, _) = barrier::image_users(graphics);
+    let memory = vk::MemoryBarrier {
         src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
         dst_access_mask: vk::AccessFlags::MEMORY_READ
             | vk::AccessFlags::MEMORY_WRITE
@@ -1197,12 +1212,12 @@ pub(super) unsafe fn hand_off(dev: &Device, cmd: vk::CommandBuffer) {
         ..Default::default()
     };
     unsafe {
-        dev.cmd_pipeline_barrier(
+        barrier::submit(
+            dev,
             cmd,
             vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-            vk::DependencyFlags::empty(),
-            &[barrier],
+            buffer_stages | image_stages | vk::PipelineStageFlags::HOST,
+            &[memory],
             &[],
             &[],
         );
