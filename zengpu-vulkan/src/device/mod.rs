@@ -3324,6 +3324,131 @@ mod tests {
         device.destroy_texture(tex);
     }
 
+    /// Draws a full 4x4 quad, then the top-left 2x2 quad again, with `fs` writing a counter per
+    /// pixel into slot 0 of `buffers`. Returns the 16 counters, row by row.
+    fn overdraw_counts(
+        dev: &VulkanDevice,
+        fs: &zengpu_shader::ZslShader,
+        inputs: &[BufferHandle],
+    ) -> Vec<u32> {
+        let format = Format::Rgba8Unorm;
+        let (tex, target) = render_target(dev, format, 4, 4);
+        let pipeline = quad_pipeline(dev, fs, format, None);
+        let counter = dev
+            .create_buffer(BufferDesc {
+                size: 64,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        dev.write_buffer(counter, 0, &[0; 64]).unwrap();
+        let mut slots = vec![counter.index()];
+        slots.extend(inputs.iter().map(|b| b.index()));
+        let mut cmd = dev.create_command_list().unwrap();
+        let color = [ColorAttachment {
+            target,
+            load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &color,
+            depth: None,
+        });
+        cmd.set_pipeline(pipeline);
+        for side in [4.0, 2.0] {
+            cmd.set_viewport_scissor(ViewportScissor {
+                viewport: Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: side,
+                    height: side,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: None,
+            });
+            cmd.bind(Bindings {
+                buffers: &slots,
+                scalars: &[Scalar::U32(4)],
+                ..Default::default()
+            });
+            cmd.draw(0..6, 0..1);
+        }
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).unwrap();
+        let raw = dev.read_buffer(counter, 0, 64).unwrap();
+        dev.destroy_buffer(counter);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_texture(tex);
+        raw.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|word| u32::from_ne_bytes(*word))
+            .collect()
+    }
+
+    /// The overdraw counts `overdraw_counts` should give: two in the top-left 2x2, one elsewhere.
+    fn overdraw_want() -> Vec<u32> {
+        (0..16)
+            .map(|i| if i % 4 < 2 && i / 4 < 2 { 2 } else { 1 })
+            .collect()
+    }
+
+    #[test]
+    fn fragment_atomics_count_overdraw_into_a_u32_buffer() {
+        const COUNT_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            push P { width: u32 }
+            fragment fs(pos: frag_coord, hits: device mut buffer<u32>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                atomic_add(hits, at, 1u)
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        );
+        let Some(device) = try_graphics_device() else {
+            return;
+        };
+        let dev = vulkan(&device);
+        assert!(
+            dev.capabilities()
+                .features
+                .contains(Features::GRAPHICS_STORES)
+        );
+        assert_eq!(overdraw_counts(dev, &COUNT_FS, &[]), overdraw_want());
+    }
+
+    #[test]
+    fn fragment_atomics_add_signed_steps_into_an_i32_buffer() {
+        const COUNT_FS: zengpu_shader::ZslShader = zengpu_shader::zsl!(
+            push P { width: u32 }
+            fragment fs(pos: frag_coord, hits: device mut buffer<i32>, step: device buffer<i32>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                atomic_add(hits, at, step[0])
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        );
+        let Some(device) = try_graphics_device() else {
+            return;
+        };
+        let dev = vulkan(&device);
+        let step = dev
+            .create_buffer(BufferDesc {
+                size: 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        dev.write_buffer(step, 0, &(-1i32).to_ne_bytes()).unwrap();
+        // each pixel gets -1 per fragment: -2 in the top-left 2x2, -1 elsewhere
+        let got = overdraw_counts(dev, &COUNT_FS, &[step]);
+        let want: Vec<u32> = overdraw_want()
+            .into_iter()
+            .map(|n| (-(n as i32)) as u32)
+            .collect();
+        assert_eq!(got, want);
+        dev.destroy_buffer(step);
+    }
+
     #[test]
     fn rendered_and_uploaded_texels_survive_readback_and_load() {
         let Some(dev) = try_graphics_device() else {
