@@ -123,6 +123,9 @@ impl Features {
     pub const MULTI_DRAW_INDIRECT: Self = Self(1 << 7);
     /// [`Reduction::Min`](crate::Reduction::Min) and [`Reduction::Max`](crate::Reduction::Max) samplers.
     pub const SAMPLER_MINMAX: Self = Self(1 << 8);
+    /// Vertex and fragment shaders write and run atomics on storage buffers, for overdraw counts
+    /// or a visibility buffer. Without it a graphics shader may only read buffers.
+    pub const GRAPHICS_STORES: Self = Self(1 << 9);
 
     pub const fn empty() -> Self {
         Self(0)

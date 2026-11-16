@@ -967,6 +967,15 @@ impl VulkanDevice {
         if sampler_minmax {
             available_features |= Features::SAMPLER_MINMAX;
         }
+        let graphics_stores = needs_graphics
+            && supported_features2.features.fragment_stores_and_atomics == vk::TRUE
+            && supported_features2
+                .features
+                .vertex_pipeline_stores_and_atomics
+                == vk::TRUE;
+        if graphics_stores {
+            available_features |= Features::GRAPHICS_STORES;
+        }
         let missing_required = req.required.difference(available_features);
         if !missing_required.is_empty() {
             return Err(GpuError::UnsupportedFeatures(missing_required));
@@ -1099,6 +1108,8 @@ impl VulkanDevice {
                 draw_indirect_first_instance: on(multi_draw_indirect),
                 texture_compression_bc: on(texture_compression_bc),
                 texture_compression_astc_ldr: on(texture_compression_astc),
+                fragment_stores_and_atomics: on(graphics_stores),
+                vertex_pipeline_stores_and_atomics: on(graphics_stores),
                 ..Default::default()
             },
             ..Default::default()
