@@ -638,7 +638,7 @@ impl<'a> Parser<'a> {
         Ok(prelude)
     }
 
-    fn eat_atomic_kw(&mut self) -> Option<(&'static str, AtomicOp)> {
+    pub(super) fn eat_atomic_kw(&mut self) -> Option<(&'static str, AtomicOp)> {
         ATOMIC_KWS.into_iter().find(|(kw, _)| self.eat_kw(kw))
     }
 

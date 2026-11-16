@@ -180,8 +180,10 @@ pub struct GraphicsEntry {
     /// `@location` inputs. The backend sorts them by location.
     pub inputs: Vec<GfxInput>,
     pub scalar_params: Vec<GfxScalar>,
-    /// Names of the `buffer<f32>` params. The parser checks writability.
+    /// Names of the `buffer<f32>` and `buffer<u32>` params. The parser checks writability.
     pub buf_params: Vec<String>,
+    /// Each buffer param's element type, in `buf_params`' order.
+    pub buf_elems: Vec<TypeId>,
     /// Name of the bindless texture table, sampled as `name[slot].sample(uv)`.
     pub textures: Option<String>,
     /// The body calls `sample_compare`, so the texture table holds depth images.

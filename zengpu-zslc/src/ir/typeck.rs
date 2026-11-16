@@ -304,6 +304,8 @@ pub struct GraphicsTypeCtx {
     pub inputs: HashMap<String, TypeId>,
     pub scalars: HashMap<String, TypeId>,
     pub locals: HashMap<String, TypeId>,
+    /// Each buffer param's element type.
+    pub buffers: HashMap<String, TypeId>,
 }
 
 pub fn type_of_graphics_expr(
@@ -351,7 +353,7 @@ pub fn type_of_graphics_expr(
             3 => vec3_id,
             _ => vec4_id,
         },
-        IrExpr::BufferLoad { .. } => f32_id,
+        IrExpr::BufferLoad { buf, .. } => ctx.buffers.get(buf).copied().unwrap_or(f32_id),
         IrExpr::GlobalId(_) => u32_id,
         IrExpr::SharedLoad { .. } | IrExpr::Texel { .. } | IrExpr::FragLoad { .. } => f32_id,
         IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::TexSize { .. } => u32_id,

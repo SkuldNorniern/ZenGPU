@@ -97,21 +97,19 @@ fn entry_layout(entry: &Entry) -> Vec<(String, LayoutInfo)> {
 /// Graphics layout: buffer slots, then scalars. `mat4x4<f32>` is 16-byte aligned, 64
 /// bytes, column-major.
 ///
-/// Graphics buffers are always `f32`, so `elem` is the f32 `TypeId`.
 pub fn graphics_layout(module: &GraphicsModule) -> Vec<(String, LayoutInfo)> {
     let e: &GraphicsEntry = &module.entry;
     let mut types = module.types.clone();
-    let f32_id = types.f32_id();
 
     let mut out = Vec::new();
     let mut offset = 0u32;
-    for name in &e.buf_params {
+    for (name, &elem) in e.buf_params.iter().zip(&e.buf_elems) {
         out.push((
             name.clone(),
             LayoutInfo {
                 offset,
                 size: 4,
-                kind: LayoutKind::BufferIndex { elem: f32_id },
+                kind: LayoutKind::BufferIndex { elem },
             },
         ));
         offset += 4;

@@ -37,10 +37,11 @@ mod glsl_op {
 use std::collections::HashMap;
 
 use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
+use crate::backend::spirv::compute::atomic_opcode;
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::GraphicsModule;
 use crate::ir::node::FragSrc;
-use crate::ir::node::{BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt};
 use crate::ir::types::{ArrayLen, Type, TypeId};
 
 type R<T> = Result<T, String>;
@@ -102,9 +103,11 @@ struct Ctx<'a> {
     glsl_ext: Id,
     inputs: HashMap<String, InputVar>,
     scalar_params: HashMap<String, ScalarInfo>,
-    buf_params: HashMap<String, u32>,
-    g_bufs_var: Option<Id>,
-    t_ptr_ssbo_f32: Id,
+    /// Each buffer's push slot and element type.
+    buf_params: HashMap<String, (u32, TypeId)>,
+    /// The buffer table seen as `f32` and as `u32` elements: one binding, two views.
+    bufs_f32: Option<BufView>,
+    bufs_u32: Option<BufView>,
     textures: Option<TextureTable>,
     is_fragment: bool,
     pc_var: Option<Id>,
@@ -114,7 +117,60 @@ struct Ctx<'a> {
     arrays: HashMap<String, ArrayInfo>,
 }
 
+#[derive(Clone, Copy)]
+struct BufView {
+    var: Id,
+    t_ptr_elem: Id,
+}
+
+/// The bindless buffer table at binding 0 with `elem` elements, aliasing the other views.
+fn buffer_view(spv: &mut SpvBuilder, elem: Id, read_only: bool) -> BufView {
+    let t_ra = spv.type_runtime_array(elem);
+    spv.decorate(t_ra, deco::ARRAY_STRIDE, &[4]);
+    let t_struct_buf = spv.type_struct(&[t_ra]);
+    spv.decorate(t_struct_buf, deco::BLOCK, &[]);
+    spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
+    // without the vertex and fragment store features a buffer must be marked read only
+    if read_only {
+        spv.member_decorate(t_struct_buf, 0, deco::NON_WRITABLE, &[]);
+    }
+    let t_ra_struct = spv.type_runtime_array(t_struct_buf);
+    let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
+    let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, elem);
+    let var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
+    spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
+    spv.decorate(var, deco::BINDING, &[0]);
+    spv.decorate(var, deco::ALIASED, &[]);
+    BufView { var, t_ptr_elem }
+}
+
 impl Ctx<'_> {
+    /// A pointer to `buf[index]` through the view of its element type, and that type.
+    fn buffer_element(&mut self, buf: &str, index: &IrExpr) -> R<(Id, TypeId)> {
+        let (pc_index, elem) = *self
+            .buf_params
+            .get(buf)
+            .ok_or_else(|| format!("`{buf}` is not a buffer param"))?;
+        let view = if elem == self.u32_id {
+            self.bufs_u32
+        } else {
+            self.bufs_f32
+        }
+        .ok_or("internal: no buffer table")?;
+        let pc_var = self.pc_var.ok_or("internal: no push-constant block")?;
+        let pc_field = self.spv.constant_u32(self.t_u32, pc_index);
+        let pc_ptr = self.pc_ptr(self.t_u32);
+        let pc_chain = self.spv.op_access_chain(pc_ptr, pc_var, &[pc_field]);
+        let buf_idx = self.spv.op_load(self.t_u32, pc_chain);
+        let idx = lower_expr(self, index)?;
+        let idx_id = scalar_to_u32(self, idx);
+        let c0 = self.const_0_u32;
+        let ptr = self
+            .spv
+            .op_access_chain(view.t_ptr_elem, view.var, &[buf_idx, c0, idx_id]);
+        Ok((ptr, elem))
+    }
+
     fn pc_ptr(&mut self, pointee: Id) -> Id {
         if let Some(&ptr) = self.pc_ptrs.get(&pointee.0) {
             return ptr;
@@ -307,26 +363,10 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         varying_out_vars.push((var, vty));
     }
 
-    let (g_bufs_var, t_ptr_ssbo_f32) = if !e.buf_params.is_empty() {
-        let t_ra_f32 = spv.type_runtime_array(t_f32);
-        spv.decorate(t_ra_f32, deco::ARRAY_STRIDE, &[4]);
-        let t_struct_buf = spv.type_struct(&[t_ra_f32]);
-        spv.decorate(t_struct_buf, deco::BLOCK, &[]);
-        spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
-        // without the vertex and fragment store features a buffer must be marked read only
-        if !writes_buffer(&e.body) {
-            spv.member_decorate(t_struct_buf, 0, deco::NON_WRITABLE, &[]);
-        }
-        let t_ra_struct = spv.type_runtime_array(t_struct_buf);
-        let t_ptr_ra_struct = spv.type_pointer(sc::STORAGE_BUFFER, t_ra_struct);
-        let t_ptr_elem = spv.type_pointer(sc::STORAGE_BUFFER, t_f32);
-        let var = spv.global_variable(t_ptr_ra_struct, sc::STORAGE_BUFFER);
-        spv.decorate(var, deco::DESCRIPTOR_SET, &[0]);
-        spv.decorate(var, deco::BINDING, &[0]);
-        (Some(var), t_ptr_elem)
-    } else {
-        (None, Id(0))
-    };
+    let read_only = !writes_buffer(&e.body);
+    let wants = |elem: TypeId| e.buf_elems.contains(&elem);
+    let bufs_f32 = wants(f32_id).then(|| buffer_view(&mut spv, t_f32, read_only));
+    let bufs_u32 = wants(u32_id).then(|| buffer_view(&mut spv, t_u32, read_only));
 
     let textures = e.textures.as_ref().map(|_| {
         spv.capability_non_uniform_sampled_images();
@@ -398,11 +438,12 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         })
         .collect();
 
-    let buf_param_map: HashMap<String, u32> = e
+    let buf_param_map: HashMap<String, (u32, TypeId)> = e
         .buf_params
         .iter()
+        .zip(&e.buf_elems)
         .enumerate()
-        .map(|(i, name)| (name.clone(), i as u32))
+        .map(|(i, (name, &elem))| (name.clone(), (i as u32, elem)))
         .collect();
 
     spv.begin_function(t_void, fn_id, t_fn);
@@ -494,8 +535,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         inputs: input_vars,
         scalar_params: scalar_param_map,
         buf_params: buf_param_map,
-        g_bufs_var,
-        t_ptr_ssbo_f32,
+        bufs_f32,
+        bufs_u32,
         textures,
         is_fragment,
         pc_var,
@@ -591,24 +632,13 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             Ok(())
         }
         IrStmt::AssignBuffer { buf, index, value } => {
-            let pc_index = *ctx
-                .buf_params
-                .get(buf)
-                .ok_or_else(|| format!("`{buf}` is not a buffer param"))?;
-            let g_bufs = ctx.g_bufs_var.ok_or("internal: no g_bufs")?;
-            let pc_var = ctx.pc_var.ok_or("internal: no push-constant block")?;
-            let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
-            let pc_ptr = ctx.pc_ptr(ctx.t_u32);
-            let pc_chain = ctx.spv.op_access_chain(pc_ptr, pc_var, &[pc_field]);
-            let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
-            let idx = lower_expr(ctx, index)?;
-            let idx_id = scalar_to_u32(ctx, idx);
-            let c0 = ctx.const_0_u32;
-            let ptr_elem =
-                ctx.spv
-                    .op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
+            let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
             let rhs = lower_expr(ctx, value)?;
-            let rhs_id = scalar_to_f32(ctx, rhs);
+            let rhs_id = if elem == ctx.u32_id {
+                scalar_to_u32(ctx, rhs)
+            } else {
+                scalar_to_f32(ctx, rhs)
+            };
             ctx.spv.op_store(ptr_elem, rhs_id);
             Ok(())
         }
@@ -693,7 +723,49 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
         IrStmt::AssignShared { .. } | IrStmt::Barrier | IrStmt::SharedBarrier => {
             Err("workgroup operations are only available in compute shaders".into())
         }
-        IrStmt::Atomic { .. } => Err("atomics are only available in compute shaders".into()),
+        IrStmt::Atomic {
+            op: aop,
+            buf,
+            index,
+            value,
+            compare,
+            old,
+        } => {
+            let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
+            if elem != ctx.u32_id {
+                return Err("vertex and fragment atomics take a buffer<u32>".into());
+            }
+            let t = ctx.t_u32;
+            let rhs = lower_expr(ctx, value)?;
+            let rhs_id = scalar_to_u32(ctx, rhs);
+            let scope = ctx.spv.constant_u32(t, 1);
+            let semantics = ctx.spv.constant_u32(t, 0);
+            let before = match (aop, compare) {
+                (AtomicOp::CompareExchange, Some(compare)) => {
+                    let cmp = lower_expr(ctx, compare)?;
+                    let cmp_id = scalar_to_u32(ctx, cmp);
+                    ctx.spv
+                        .op_atomic_compare_exchange(t, ptr_elem, scope, semantics, rhs_id, cmp_id)
+                }
+                (AtomicOp::CompareExchange, None) => {
+                    return Err("atomic_compare_exchange needs an expected value".into());
+                }
+                _ => {
+                    let opcode = atomic_opcode(*aop, false);
+                    ctx.spv
+                        .op_atomic_int(opcode, t, ptr_elem, scope, semantics, rhs_id)
+                }
+            };
+            if let Some(old) = old {
+                let ptr = ctx
+                    .locals
+                    .get(old)
+                    .ok_or_else(|| format!("undeclared local `{old}`"))?
+                    .ptr;
+                ctx.spv.op_store(ptr, before);
+            }
+            Ok(())
+        }
 
         IrStmt::ImageStore { .. } => {
             Err("image stores are only available in compute shaders".into())
@@ -791,24 +863,14 @@ fn lower_expr(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
             Ok(GVal { id, ty: info.gty })
         }
         IrExpr::BufferLoad { buf, index } => {
-            let pc_index = *ctx
-                .buf_params
-                .get(buf)
-                .ok_or_else(|| format!("`{buf}` is not a buffer param"))?;
-            let g_bufs = ctx.g_bufs_var.ok_or("internal: no g_bufs")?;
-            let pc_var = ctx.pc_var.ok_or("internal: no push-constant block")?;
-            let pc_field = ctx.spv.constant_u32(ctx.t_u32, pc_index);
-            let pc_ptr = ctx.pc_ptr(ctx.t_u32);
-            let pc_chain = ctx.spv.op_access_chain(pc_ptr, pc_var, &[pc_field]);
-            let buf_idx = ctx.spv.op_load(ctx.t_u32, pc_chain);
-            let idx = lower_expr(ctx, index)?;
-            let idx_id = scalar_to_u32(ctx, idx);
-            let c0 = ctx.const_0_u32;
-            let ptr_elem =
-                ctx.spv
-                    .op_access_chain(ctx.t_ptr_ssbo_f32, g_bufs, &[buf_idx, c0, idx_id]);
-            let id = ctx.spv.op_load(ctx.t_f32, ptr_elem);
-            Ok(GVal { id, ty: ctx.f32_id })
+            let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
+            let t = if elem == ctx.u32_id {
+                ctx.t_u32
+            } else {
+                ctx.t_f32
+            };
+            let id = ctx.spv.op_load(t, ptr_elem);
+            Ok(GVal { id, ty: elem })
         }
         IrExpr::FieldAccess { base, component } => {
             let composite = lower_expr(ctx, base)?;
@@ -1613,6 +1675,71 @@ pub(crate) mod tests {
             at += (words[at] >> 16).max(1) as usize;
         }
         assert!(ops.contains(&124), "OpBitcast");
+    }
+
+    #[test]
+    fn fragments_count_into_a_u32_buffer() {
+        validate(&lower(
+            r#"
+            push P { width: u32 }
+            fragment fs(pos: frag_coord, hits: device mut buffer<u32>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                atomic_add(hits, at, 1u)
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn the_nearest_wins_through_atomic_min_and_the_old_value_comes_back() {
+        validate(&lower(
+            r#"
+            fragment fs(pos: frag_coord, depth: device mut buffer<u32>, ids: device buffer<u32>)
+                -> f32x4
+            {
+                let before = atomic_min(depth, 0u, ids[0u])
+                let swapped = atomic_compare_exchange(depth, 1u, before, 7u)
+                if swapped == before {
+                    discard
+                }
+                f32x4(0.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_vertex_shader_reads_u32_and_f32_buffers_side_by_side() {
+        validate(&lower(
+            r#"
+            vertex vs(vi: vertex_index, packed: device buffer<u32>, xs: device buffer<f32>)
+                -> f32x4
+            {
+                let word = packed[vi]
+                f32x4(xs[word], 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn graphics_atomics_take_a_mutable_u32_buffer() {
+        let err = |src: &str| parse_zsl(src).err().map(|e| e.msg).unwrap_or_default();
+        let on_f32 = err(r#"
+            fragment fs(b: device mut buffer<f32>) -> f32x4 {
+                atomic_add(b, 0u, 1u)
+                f32x4(0.0, 0.0, 0.0, 1.0)
+            }
+        "#);
+        assert!(on_f32.contains("buffer<u32>"), "{on_f32}");
+        let read_only = err(r#"
+            fragment fs(b: device buffer<u32>) -> f32x4 {
+                atomic_add(b, 0u, 1u)
+                f32x4(0.0, 0.0, 0.0, 1.0)
+            }
+        "#);
+        assert!(read_only.contains("device mut buffer<u32>"), "{read_only}");
     }
 
     #[test]

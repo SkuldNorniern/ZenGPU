@@ -98,7 +98,8 @@ pub(super) struct GfxCtx {
     pub(super) inputs: HashMap<String, TypeId>,
     pub(super) scalars: HashMap<String, TypeId>,
     pub(super) push_param: Option<String>,
-    pub(super) buffers: HashMap<String, bool>,
+    /// Each buffer's writability and element type.
+    pub(super) buffers: HashMap<String, (bool, TypeId)>,
     pub(super) textures: Option<String>,
     pub(super) locals: HashMap<String, TypeId>,
     pub(super) locals_order: Vec<(String, TypeId)>,
@@ -114,6 +115,11 @@ impl GfxCtx {
             inputs: self.inputs.clone(),
             scalars: self.scalars.clone(),
             locals: self.locals.clone(),
+            buffers: self
+                .buffers
+                .iter()
+                .map(|(n, (_, e))| (n.clone(), *e))
+                .collect(),
         }
     }
 }

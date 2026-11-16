@@ -68,8 +68,7 @@ pub fn compute_bindings(module: &Module) -> Vec<(String, BindingInfo)> {
         .collect()
 }
 
-/// Graphics buffers are always `f32` (the parser rejects other element types). They use the f32
-/// table (`binding=0`).
+/// Graphics buffers of every element type share one table (`binding=0`).
 pub fn graphics_bindings(module: &GraphicsModule) -> Vec<(String, BindingInfo)> {
     let e: &GraphicsEntry = &module.entry;
     e.buf_params

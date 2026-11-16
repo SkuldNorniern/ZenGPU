@@ -763,7 +763,7 @@ fn lower_stmts(ctx: &mut LowerCtx<'_>, stmts: &[IrStmt]) -> Result<(), String> {
     Ok(())
 }
 
-fn atomic_opcode(op: AtomicOp, signed: bool) -> u32 {
+pub(super) fn atomic_opcode(op: AtomicOp, signed: bool) -> u32 {
     match (op, signed) {
         (AtomicOp::Add, _) => op::ATOMIC_I_ADD,
         (AtomicOp::Min, true) => op::ATOMIC_S_MIN,
