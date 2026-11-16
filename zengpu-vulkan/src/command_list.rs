@@ -352,7 +352,9 @@ impl VulkanCommandList {
             old_layout: old,
             new_layout: new,
             src_access_mask: vk::AccessFlags::empty(),
-            dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            // a LOAD op reads the target at color output
+            dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             image,
             subresource_range: COLOR_SUBRESOURCE,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -459,7 +461,9 @@ impl VulkanCommandList {
             old_layout: old,
             new_layout: new,
             src_access_mask: vk::AccessFlags::empty(),
-            dst_access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            // a LOAD op reads the target in the fragment tests
+            dst_access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
             image,
             subresource_range: DEPTH_SUBRESOURCE,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -470,7 +474,8 @@ impl VulkanCommandList {
             self.inner.device.cmd_pipeline_barrier(
                 self.cmd,
                 src_stage,
-                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+                vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
