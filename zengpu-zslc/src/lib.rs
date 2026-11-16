@@ -1167,7 +1167,6 @@ int main() {{
     }
 
     /// `view` over an f16 shared array: u32x4 stores, f16 loads from the base after the barrier.
-
     const VIEW_MMA: &str = r#"
         @workgroup_size(32)
         kernel view_mma(a: device buffer<u32x4>, b: device buffer<u32x4>, c: device buffer<f32>, out: device mut buffer<f32>) {
