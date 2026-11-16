@@ -880,10 +880,6 @@ impl VulkanDevice {
             }
             extensions.push(khr::dynamic_rendering::NAME.as_ptr());
         }
-        let indirect_count = needs_graphics && supports_extension(khr::draw_indirect_count::NAME);
-        if indirect_count {
-            extensions.push(khr::draw_indirect_count::NAME.as_ptr());
-        }
         let shader_atomic_float_extension = supports_extension(ext::shader_atomic_float::NAME);
 
         let queue_family =
@@ -933,6 +929,13 @@ impl VulkanDevice {
                 .get_physical_device_features2(physical, &mut supported_features2);
         }
 
+        // The extension requires the Vulkan 1.2 `drawIndirectCount` feature to be enabled too.
+        let indirect_count = needs_graphics
+            && supports_extension(khr::draw_indirect_count::NAME)
+            && supported_v12.draw_indirect_count == vk::TRUE;
+        if indirect_count {
+            extensions.push(khr::draw_indirect_count::NAME.as_ptr());
+        }
         let descriptor_indexing = supported_v12.shader_storage_buffer_array_non_uniform_indexing
             == vk::TRUE
             && supported_v12.shader_sampled_image_array_non_uniform_indexing == vk::TRUE
@@ -1078,6 +1081,7 @@ impl VulkanDevice {
                 vk::FALSE
             },
             sampler_filter_minmax: on(sampler_minmax),
+            draw_indirect_count: on(indirect_count),
             p_next: if needs_graphics {
                 &mut dynamic_rendering_feat as *mut _ as *mut c_void
             } else if shader_atomic_float {
@@ -1706,6 +1710,21 @@ impl Drop for VulkanDevice {
         }
         self.drain_in_flight();
         self.reap_orphans();
+        // destroyed while work ran: idle now, so free them before the device goes
+        let deferred = self
+            .lifetime
+            .lock()
+            .unwrap()
+            .take_ready(self.inner.serials.completed());
+        destroy_deferred_vulkan(
+            &self.inner,
+            &self.buffers,
+            &self.textures,
+            &self.samplers,
+            &self.pipelines,
+            &self.bindless.level_slots,
+            deferred,
+        );
         let _ = self.recover_raw_waits();
         if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {
             slots.destroy(&self.inner.device);
