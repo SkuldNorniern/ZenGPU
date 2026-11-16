@@ -559,7 +559,8 @@ impl VulkanDevice {
                         base_array_layer: 0,
                         layer_count: array_layers,
                     },
-                    src_access_mask: vk::AccessFlags::empty(),
+                    // the previous blit wrote this level
+                    src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
                     dst_access_mask: vk::AccessFlags::TRANSFER_READ,
                     ..Default::default()
                 };
@@ -583,7 +584,7 @@ impl VulkanDevice {
                 unsafe {
                     dev.cmd_pipeline_barrier(
                         cmd,
-                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
                         &[],
