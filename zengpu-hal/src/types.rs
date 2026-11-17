@@ -276,6 +276,11 @@ impl Format {
         matches!(self, Format::Depth32Float | Format::Depth24PlusStencil8)
     }
 
+    /// Depth and stencil packed in one texture. Such textures cannot be copied.
+    pub const fn is_packed_depth_stencil(self) -> bool {
+        matches!(self, Format::Depth24PlusStencil8)
+    }
+
     pub const fn is_compressed(self) -> bool {
         self.block_size().0 > 1
     }

@@ -1,5 +1,6 @@
 //! Plain descriptor data with no backend types.
 
+use crate::error::{GpuError, Result, UsageError};
 use crate::handle::{ShaderHandle, TextureHandle};
 use crate::types::{BufferUsage, Format, MemoryUsage, PresentMode, TextureUsage};
 
@@ -37,6 +38,20 @@ pub struct TextureDesc {
     pub mip_levels: u32,
     /// Array layer count. `1` means a single non-array texture. Must be `6` for [`TexDim::Cube`].
     pub array_layers: u32,
+}
+
+impl TextureDesc {
+    /// Packed depth/stencil textures cannot be copied. Checked at creation on every backend.
+    pub fn check_transfer(&self) -> Result<()> {
+        let copy = TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST;
+        if self.format.is_packed_depth_stencil() && self.usage.bits() & copy.bits() != 0 {
+            return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                "packed depth/stencil textures cannot be copied; read depth through a shader"
+                    .into(),
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -490,4 +505,63 @@ pub struct TextureWrite<'a> {
     pub data: &'a [u8],
     /// Bytes from one row to the next. Must be at least the region's width in bytes.
     pub bytes_per_row: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TexDim, TextureDesc};
+    use crate::error::{GpuError, UsageError};
+    use crate::types::{Format, TextureUsage};
+
+    fn desc(format: Format, usage: TextureUsage) -> TextureDesc {
+        TextureDesc {
+            width: 4,
+            height: 4,
+            depth: 1,
+            format,
+            usage,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        }
+    }
+
+    #[test]
+    fn packed_depth_stencil_rejects_transfer() {
+        for usage in [
+            TextureUsage::TRANSFER_SRC,
+            TextureUsage::TRANSFER_DST,
+            TextureUsage::DEPTH_STENCIL | TextureUsage::TRANSFER_SRC,
+        ] {
+            let err = desc(Format::Depth24PlusStencil8, usage)
+                .check_transfer()
+                .unwrap_err();
+            assert!(
+                matches!(err, GpuError::InvalidUsage(UsageError::BindingMismatch(_))),
+                "{usage:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_depth_stencil_without_transfer_is_ok() {
+        let usage = TextureUsage::DEPTH_STENCIL | TextureUsage::SAMPLED;
+        assert!(
+            desc(Format::Depth24PlusStencil8, usage)
+                .check_transfer()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn depth32_float_allows_transfer() {
+        for usage in [
+            TextureUsage::TRANSFER_SRC,
+            TextureUsage::TRANSFER_DST,
+            TextureUsage::TRANSFER_SRC | TextureUsage::TRANSFER_DST,
+        ] {
+            assert!(desc(Format::Depth32Float, usage).check_transfer().is_ok());
+        }
+    }
 }
