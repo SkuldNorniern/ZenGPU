@@ -126,6 +126,9 @@ impl Features {
     /// Vertex and fragment shaders write and run atomics on storage buffers, for overdraw counts
     /// or a visibility buffer. Without it a graphics shader may only read buffers.
     pub const GRAPHICS_STORES: Self = Self(1 << 9);
+    /// `u64` values, storage buffers and atomics. Vulkan needs `shaderInt64` and
+    /// `shaderBufferInt64Atomics`. Graphics atomics also need [`Features::GRAPHICS_STORES`].
+    pub const ATOMIC_U64: Self = Self(1 << 10);
 
     pub const fn empty() -> Self {
         Self(0)

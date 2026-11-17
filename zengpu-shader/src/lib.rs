@@ -45,6 +45,8 @@ pub enum ScalarKind {
     F32,
     U32,
     I32,
+    /// A `buffer<u64>` element, 8 bytes; needs `Features::ATOMIC_U64`.
+    U64,
     /// A `buffer<f16>` element (buffers only; packed two per word on Vulkan).
     F16,
     /// A `buffer<bf16>` element (buffers only; packed two per word on Vulkan).
