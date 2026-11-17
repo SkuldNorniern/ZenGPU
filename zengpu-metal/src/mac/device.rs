@@ -579,7 +579,7 @@ impl MetalDevice {
         region: TextureRegion,
         data: &[u8],
     ) -> Result<CommandBuffer> {
-        let staging = self.stage_rows(layout, region, data)?;
+        let staging = self.stage_rows(layout, data)?;
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
             let blit = cmd.new_blit_command_encoder();
@@ -593,7 +593,6 @@ impl MetalDevice {
     fn stage_rows(
         &self,
         layout: &transfer::Layout,
-        region: TextureRegion,
         data: &[u8],
     ) -> Result<Buffer> {
         let row = layout.packed;
@@ -1249,7 +1248,7 @@ impl GpuDevice for MetalDevice {
             .map(|layer| {
                 let start = layer as usize * layer_bytes;
                 let region = TextureRegion { layer, ..region };
-                self.stage_rows(&layout, region, &data[start..start + layer_bytes])
+                self.stage_rows(&layout, &data[start..start + layer_bytes])
                     .map(|staging| (staging, region))
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1309,7 +1308,7 @@ impl GpuDevice for MetalDevice {
         }
         let staging = uploads
             .iter()
-            .map(|(_, layout, w)| self.stage_rows(layout, w.region, w.data))
+            .map(|(_, layout, w)| self.stage_rows(layout, w.data))
             .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
         autoreleasepool(|| {
