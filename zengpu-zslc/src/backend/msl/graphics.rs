@@ -2,7 +2,9 @@
 //! - vertex `@location(N)` inputs arrive via `[[stage_in]]` with `[[attribute(N)]]`;
 //! - fragment `@location(N)` inputs arrive via `[[stage_in]]` with `[[user(locnN)]]` (matching the
 //!   vertex output varyings);
-//! - the push block, if any, binds at `[[buffer(0)]]`; storage buffers follow at `[[buffer(1..)]]`;
+//! - the push block, if any, binds at [`PUSH_BUFFER_INDEX`], scalars only;
+//! - storage buffers bind one each from [`GRAPHICS_BUFFER_INDEX`], in declaration order, at most
+//!   [`MAX_GRAPHICS_BUFFERS`];
 //! - the texture table binds at [`TEXTURE_BUFFER_INDEX`] as an argument buffer of `{ tex, smp }`
 //!   texture and sampler pairs, one per bindless slot.
 
@@ -23,6 +25,12 @@ pub const TEXTURE_BUFFER_INDEX: u32 = 17;
 
 /// The depth table, bound only when a shader calls `sample_compare`.
 pub const DEPTH_TEXTURE_BUFFER_INDEX: u32 = 19;
+
+/// First storage buffer of a graphics shader. Above vertex buffers, push and the texture tables.
+pub const GRAPHICS_BUFFER_INDEX: u32 = 20;
+
+/// Storage buffers a graphics shader takes: Metal has 31 buffer slots per stage.
+pub const MAX_GRAPHICS_BUFFERS: u32 = 31 - GRAPHICS_BUFFER_INDEX;
 
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
     let e = &module.entry;
@@ -112,6 +120,20 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
     }
 
     let push_arg = format!("constant Push& pc [[buffer({PUSH_BUFFER_INDEX})]]");
+    if e.buf_params.len() > MAX_GRAPHICS_BUFFERS as usize {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Internal,
+            format!(
+                "MSL graphics backend: {} buffers, Metal takes {MAX_GRAPHICS_BUFFERS} per stage",
+                e.buf_params.len()
+            ),
+        ));
+    }
+    let mut buffer_args = Vec::new();
+    for (slot, (name, elem)) in (GRAPHICS_BUFFER_INDEX..).zip(e.buf_params.iter().zip(&e.buf_elems)) {
+        let elem = super::compute::msl_buffer_elem(module.types.get(*elem))?;
+        buffer_args.push(format!("    device {elem}* {name} [[buffer({slot})]]"));
+    }
     if e.textures.is_some() {
         texture_abi(&mut s);
     }
@@ -153,6 +175,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         if has_push {
             args.push(format!("    {push_arg}"));
         }
+        args.extend(buffer_args.iter().cloned());
         args.extend(texture_arg.iter().cloned());
         args.extend(compare_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
@@ -191,6 +214,7 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         if has_push {
             args.push(format!("    {push_arg}"));
         }
+        args.extend(buffer_args.iter().cloned());
         args.extend(texture_arg.iter().cloned());
         args.extend(compare_arg.iter().cloned());
         s.push_str(&args.join(",\n"));
@@ -592,6 +616,57 @@ mod tests {
             ),
             Err(_) => None,
         }
+    }
+
+    #[test]
+    fn vertex_reads_its_positions_from_a_buffer() {
+        let m = graphics(
+            r#"
+            vertex vs(vi: vertex_index, xy: device buffer<f32>) -> f32x4 {
+                f32x4(xy[vi * 2u], xy[vi * 2u + 1u], 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("device float* xy [[buffer(20)]]"));
+        assert!(!m.source.contains("struct Push"));
+        assert_eq!(m.buffer_count, 1);
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn fragment_stores_into_buffers_after_the_push_block() {
+        let m = graphics(
+            r#"
+            push P { slot: u32 }
+            fragment fs(seen: device mut buffer<u32>, gain: device buffer<f32>, p: P) -> f32x4 {
+                seen[p.slot] = 1u;
+                f32x4(gain[0u], 0.0, 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("constant Push& pc [[buffer(16)]]"));
+        assert!(m.source.contains("device uint* seen [[buffer(20)]]"));
+        assert!(m.source.contains("device float* gain [[buffer(21)]]"));
+        assert!(m.source.contains("seen[pc.slot] = 1u;"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn more_buffers_than_metal_slots_is_an_error() {
+        let params: Vec<String> = (0..=MAX_GRAPHICS_BUFFERS)
+            .map(|i| format!("b{i}: device buffer<f32>"))
+            .collect();
+        let src = format!(
+            "fragment fs({}) -> f32x4 {{ f32x4(b0[0u], 0.0, 0.0, 1.0) }}",
+            params.join(", ")
+        );
+        let Shader::Graphics(m) = parse_zsl(&src).expect("parse") else {
+            panic!("expected graphics");
+        };
+        let Err(err) = lower_graphics(&m) else {
+            panic!("too many buffers lowered");
+        };
+        assert!(err.to_string().contains("per stage"), "{err}");
     }
 
     #[test]

@@ -1468,7 +1468,7 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
 
 /// MSL spelling of a buffer element [`Type`]. `bf16` is `ushort`, bit-exact with the HIP/CUDA
 /// backends: round-to-nearest-even on store, zero-extend on load.
-fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
+pub(super) fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
     match t {
         Type::Int {
             width: IntWidth::W8,
