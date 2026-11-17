@@ -1230,6 +1230,7 @@ impl GpuDevice for MetalDevice {
     }
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+        desc.check_transfer()?;
         if desc.width == 0 || desc.height == 0 {
             return Err(GpuError::Backend("metal: zero-sized texture".into()));
         }

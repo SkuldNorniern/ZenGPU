@@ -2081,4 +2081,42 @@ mod graphics_tests {
             }
         }
     }
+
+    #[test]
+    fn packed_depth_stencil_rejects_transfer_usage() {
+        let Some(dev) = open() else { return };
+        for usage in [TextureUsage::TRANSFER_SRC, TextureUsage::TRANSFER_DST] {
+            let desc = TextureDesc {
+                width: 4,
+                height: 4,
+                depth: 1,
+                format: Format::Depth24PlusStencil8,
+                usage: TextureUsage::DEPTH_STENCIL | usage,
+                samples: 1,
+                dimension: TexDim::D2,
+                mip_levels: 1,
+                array_layers: 1,
+            };
+            assert!(
+                matches!(
+                    dev.create_texture(desc),
+                    Err(zengpu_hal::GpuError::InvalidUsage(_))
+                ),
+                "{usage:?}"
+            );
+        }
+        let ok = TextureDesc {
+            width: 4,
+            height: 4,
+            depth: 1,
+            format: Format::Depth24PlusStencil8,
+            usage: TextureUsage::DEPTH_STENCIL,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: 1,
+            array_layers: 1,
+        };
+        let tex = dev.create_texture(ok).unwrap();
+        dev.destroy_texture(tex);
+    }
 }

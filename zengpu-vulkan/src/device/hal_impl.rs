@@ -503,6 +503,7 @@ impl GpuDevice for VulkanDevice {
     }
 
     fn create_texture(&self, desc: TextureDesc) -> Result<TextureHandle> {
+        desc.check_transfer()?;
         self.collect_garbage();
         if desc.format.is_compressed() {
             let caps = self.format_caps(desc.format);
