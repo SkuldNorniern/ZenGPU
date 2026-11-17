@@ -5197,6 +5197,244 @@ mod tests {
         dev.destroy_shader(shader);
     }
 
+    /// Median ms of `f` over `reps` timed runs after `warm` untimed ones.
+    fn median_ms(warm: usize, reps: usize, mut f: impl FnMut()) -> f64 {
+        use std::time::Instant;
+        for _ in 0..warm {
+            f();
+        }
+        let mut ms: Vec<f64> = (0..reps)
+            .map(|_| {
+                let start = Instant::now();
+                f();
+                start.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        ms[reps / 2]
+    }
+
+    /// Ms per case for one device: buffer copy, compute, sampled draw, image copy, image upload.
+    fn sharing_cases(device: &VulkanDevice) -> Vec<(String, f64)> {
+        use std::time::Duration;
+        use zengpu_hal::BufferCopyOp;
+        use zengpu_shader::{ZslShader, zsl};
+
+        const SCALE: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel scale(inp: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len { out[i] = inp[i] * 3.0 + 1.0 }
+            }
+        );
+        const WAIT: Duration = Duration::from_secs(60);
+        const WARM: usize = 3;
+        const REPS: usize = 31;
+        let mut out = Vec::new();
+        let mut cycle = 0u64;
+
+        let bytes = 64u64 << 20;
+        let src = device
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let dst = device
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let ms = median_ms(WARM, REPS, || {
+            cycle += 1;
+            let op = ComputeOp::CopyBuffer(BufferCopyOp {
+                src,
+                src_offset: 0,
+                dst,
+                dst_offset: 0,
+                len: bytes,
+            });
+            device
+                .submit_compute_ops(cycle, &[op])
+                .unwrap()
+                .wait(WAIT)
+                .unwrap();
+        });
+        out.push(("buffer copy 64 MiB".to_string(), ms));
+        device.destroy_buffer(src);
+        device.destroy_buffer(dst);
+
+        let n: u32 = 32 << 20;
+        let big = |usage| BufferDesc {
+            size: n as u64 * 4,
+            usage,
+            memory: MemoryUsage::GpuOnly,
+        };
+        let input = device.create_buffer(big(BufferUsage::STORAGE)).unwrap();
+        let output = device.create_buffer(big(BufferUsage::STORAGE)).unwrap();
+        let shader = device.create_shader(SCALE.spirv_desc().unwrap()).unwrap();
+        let pipeline = device
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let buffers = [input.index(), output.index()];
+        let scalars = [Scalar::U32(n)];
+        let ms = median_ms(WARM, REPS, || {
+            cycle += 1;
+            let ops: Vec<ComputeOp> = (0..4)
+                .map(|_| {
+                    ComputeOp::Dispatch(DispatchOp {
+                        pipeline,
+                        bindings: Bindings {
+                            buffers: &buffers,
+                            textures: &[],
+                            images: &[],
+                            scalars: &scalars,
+                        },
+                        grid: [n / 64, 1, 1],
+                    })
+                })
+                .collect();
+            device
+                .submit_compute_ops(cycle, &ops)
+                .unwrap()
+                .wait(WAIT)
+                .unwrap();
+        });
+        out.push(("compute 4x scale, 128 MiB in/out".to_string(), ms));
+        device.destroy_pipeline(pipeline);
+        device.destroy_shader(shader);
+        device.destroy_buffer(input);
+        device.destroy_buffer(output);
+
+        let (w, h) = (2048u32, 2048u32);
+        let tex = |width, height| TextureDesc {
+            width,
+            height,
+            ..tex_desc(TexDim::D2)
+        };
+        let src_tex = device.create_texture(tex(w, h)).unwrap();
+        let data = vec![0x7fu8; (w * h * 4) as usize];
+        device.upload_texture_data(src_tex, &data).unwrap();
+        let sampler = device
+            .create_sampler(SamplerDesc {
+                min_filter: FilterMode::Linear,
+                mag_filter: FilterMode::Linear,
+                ..SamplerDesc::default()
+            })
+            .unwrap();
+        let slot = device.bind_texture(src_tex, sampler).unwrap();
+        let (target_tex, target) = render_target(device, Format::Rgba8Unorm, w, h);
+        let pipeline = quad_pipeline(device, &SAMPLE_FS, Format::Rgba8Unorm, None);
+        let ms = median_ms(WARM, REPS, || {
+            let mut cmd = device.create_command_list().unwrap();
+            let color = [ColorAttachment {
+                target,
+                load: LoadOp::Clear([0.0; 4]),
+                store: true,
+                sample_after: true,
+            }];
+            cmd.begin_render_pass(&RenderPassDesc {
+                color: &color,
+                depth: None,
+            });
+            cmd.set_pipeline(pipeline);
+            cmd.set_viewport_scissor(ViewportScissor {
+                viewport: Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: w as f32,
+                    height: h as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: None,
+            });
+            for _ in 0..16 {
+                cmd.bind(Bindings {
+                    scalars: &[Scalar::U32(slot)],
+                    ..Default::default()
+                });
+                cmd.draw(0..6, 0..1);
+            }
+            cmd.end_render_pass();
+            device.submit_and_wait(cmd).unwrap();
+        });
+        out.push(("sampled draw 16x 2048^2 rgba8".to_string(), ms));
+        device.destroy_pipeline(pipeline);
+
+        let readback = device
+            .create_buffer(BufferDesc {
+                size: (w * h * 4) as u64,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let ms = median_ms(WARM, REPS, || {
+            device.copy_texture_to_buffer(src_tex, readback).unwrap();
+        });
+        out.push(("image copy to buffer 2048^2 rgba8".to_string(), ms));
+        device.destroy_buffer(readback);
+        device.destroy_texture(target_tex);
+        device.destroy_texture(src_tex);
+        device.destroy_sampler(sampler);
+
+        for side in [512u32, 2048, 4096] {
+            let texture = device.create_texture(tex(side, side)).unwrap();
+            let data = vec![0x3cu8; (side * side * 4) as usize];
+            let ms = median_ms(2, 7, || {
+                device.upload_texture_data(texture, &data).unwrap();
+            });
+            out.push((format!("image upload {side}^2 rgba8"), ms));
+            device.destroy_texture(texture);
+        }
+        out
+    }
+
+    /// CONCURRENT against EXCLUSIVE on the same adapter, alternating twice.
+    ///
+    /// Run with `cargo test --release -p zengpu-vulkan concurrent_vs_exclusive -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "sharing benchmark: CONCURRENT vs EXCLUSIVE"]
+    fn concurrent_vs_exclusive_sharing() {
+        let mut runs: Vec<(bool, Vec<(String, f64)>)> = Vec::new();
+        for exclusive in [false, true, false, true] {
+            let Some((dev, _guard)) = try_async_device(exclusive) else {
+                return;
+            };
+            let concurrent = dev.inner.sharing().0 == vk::SharingMode::CONCURRENT;
+            if concurrent == exclusive {
+                eprintln!("no dedicated async family here; nothing to compare");
+                return;
+            }
+            runs.push((exclusive, sharing_cases(&dev)));
+        }
+        let mean = |exclusive: bool, case: usize| {
+            let v: Vec<f64> = runs
+                .iter()
+                .filter(|(e, _)| *e == exclusive)
+                .map(|(_, c)| c[case].1)
+                .collect();
+            v.iter().sum::<f64>() / v.len() as f64
+        };
+        eprintln!("| case | EXCLUSIVE ms | CONCURRENT ms | CONCURRENT vs EXCLUSIVE |");
+        eprintln!("|---|---|---|---|");
+        for (i, (name, _)) in runs[0].1.iter().enumerate() {
+            let (ex, co) = (mean(true, i), mean(false, i));
+            eprintln!(
+                "| {name} | {ex:.3} | {co:.3} | {:+.1}% |",
+                (co / ex - 1.0) * 100.0
+            );
+        }
+    }
+
     /// Host cost of one trivial one-workgroup dispatch.
     ///
     /// Run with `cargo test --release -p zengpu-vulkan dispatch_overhead -- --ignored --nocapture`.
