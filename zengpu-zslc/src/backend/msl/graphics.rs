@@ -55,8 +55,13 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         .filter(|i| matches!(i.slot, GfxSlot::Builtin(_)))
         .map(|i| i.name.as_str())
         .collect();
+    let mut buffers = HashMap::new();
+    for (name, elem) in e.buf_params.iter().zip(&e.buf_elems) {
+        buffers.insert(name.as_str(), super::compute::msl_buffer_elem(module.types.get(*elem))?);
+    }
     let ctx = Ctx {
         locals,
+        buffers,
         arrays,
         builtins,
         is_fragment: e.is_fragment,
@@ -129,9 +134,21 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             ),
         ));
     }
+    let mut atomic = HashSet::new();
+    super::compute::collect_atomic_buffers(&e.body, &mut atomic);
     let mut buffer_args = Vec::new();
-    for (slot, (name, elem)) in (GRAPHICS_BUFFER_INDEX..).zip(e.buf_params.iter().zip(&e.buf_elems)) {
-        let elem = super::compute::msl_buffer_elem(module.types.get(*elem))?;
+    for (slot, name) in (GRAPHICS_BUFFER_INDEX..).zip(&e.buf_params) {
+        let elem = ctx.buffers[name.as_str()];
+        let elem = if atomic.contains(name.as_str()) {
+            match elem {
+                "uint" => "atomic_uint",
+                "int" => "atomic_int",
+                "ulong" => "atomic_ulong",
+                _ => "atomic_float",
+            }
+        } else {
+            elem
+        };
         buffer_args.push(format!("    device {elem}* {name} [[buffer({slot})]]"));
     }
     if e.textures.is_some() {
@@ -294,6 +311,8 @@ fn texture_abi(s: &mut String) {
 
 struct Ctx<'a> {
     locals: HashMap<&'a str, &'static str>,
+    /// Element type of each storage buffer, as MSL spells it.
+    buffers: HashMap<&'a str, &'static str>,
     arrays: HashMap<&'a str, (&'static str, u32)>,
     builtins: HashSet<&'a str>,
     is_fragment: bool,
@@ -370,11 +389,20 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 "MSL graphics backend: workgroup operations are unavailable in graphics shaders",
             ));
         }
-        IrStmt::Atomic { .. } => {
-            return Err(Diagnostic::new(
-                DiagnosticCode::Internal,
-                "MSL graphics backend: atomics are unavailable in graphics shaders",
-            ));
+        IrStmt::Atomic {
+            op,
+            buf,
+            index,
+            value,
+            compare,
+            old,
+        } => {
+            let cty = ctx.buffers.get(buf.as_str()).copied().unwrap_or("uint");
+            let idx = emit_expr(ctx, index)?;
+            let val = emit_expr(ctx, value)?;
+            let cmp = compare.as_ref().map(|c| emit_expr(ctx, c)).transpose()?;
+            indent(s, depth);
+            super::compute::atomic_stmt(s, *op, buf, cty, &idx, &val, cmp.as_deref(), old.as_deref())?;
         }
         IrStmt::ImageStore { .. } => {
             return Err(Diagnostic::new(
@@ -648,6 +676,24 @@ mod tests {
         assert!(m.source.contains("device uint* seen [[buffer(20)]]"));
         assert!(m.source.contains("device float* gain [[buffer(21)]]"));
         assert!(m.source.contains("seen[pc.slot] = 1u;"));
+        let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn fragments_count_into_an_atomic_buffer() {
+        let m = graphics(
+            r#"
+            fragment fs(hits: device mut buffer<u32>, coord: frag_coord) -> f32x4 {
+                atomic_add(hits, 0u, 1u)
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("device atomic_uint* hits [[buffer(20)]]"));
+        assert!(
+            m.source
+                .contains("atomic_fetch_add_explicit(&hits[uint(0u)], uint(1u), memory_order_relaxed);")
+        );
         let _ = metal_compiles(&m.source);
     }
 

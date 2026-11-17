@@ -408,7 +408,7 @@ struct Ctx<'a> {
     has_images: bool,
 }
 
-fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
+pub(super) fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str>) {
     for stmt in stmts {
         match stmt {
             IrStmt::Atomic { buf, .. } => {
@@ -425,6 +425,73 @@ fn collect_atomic_buffers<'a>(stmts: &'a [IrStmt], buffers: &mut HashSet<&'a str
             _ => {}
         }
     }
+}
+
+/// One atomic on `buf[idx]` of element type `cty`, the operands already in MSL. Writes after the
+/// caller's indent. Shared by compute and graphics.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn atomic_stmt(
+    s: &mut String,
+    aop: AtomicOp,
+    buf: &str,
+    cty: &str,
+    idx: &str,
+    val: &str,
+    cmp: Option<&str>,
+    old: Option<&str>,
+) -> Result<(), Diagnostic> {
+    // Metal has 64-bit min and max only.
+    if cty == "ulong" && !matches!(aop, AtomicOp::Min | AtomicOp::Max) {
+        return Err(Diagnostic::new(
+            DiagnosticCode::Unsupported,
+            "MSL backend: u64 atomics support only atomic_max and atomic_min",
+        ));
+    }
+    if aop == AtomicOp::CompareExchange {
+        let cmp = cmp.ok_or_else(|| {
+            Diagnostic::new(
+                DiagnosticCode::Internal,
+                "MSL backend: atomic_compare_exchange needs an expected value",
+            )
+        })?;
+        // A weak exchange can fail spuriously, leaving the expected value unchanged: retry.
+        let var = match old {
+            Some(old) => {
+                let _ = writeln!(s, "{cty} {old} = {cty}({cmp});");
+                old
+            }
+            None => {
+                let _ = writeln!(s, "{{ {cty} zsl_exp = {cty}({cmp});");
+                "zsl_exp"
+            }
+        };
+        if old.is_some() {
+            let _ = writeln!(s, "{{ const {cty} zsl_cmp = {var};");
+        } else {
+            let _ = writeln!(s, "const {cty} zsl_cmp = {var};");
+        }
+        let _ = writeln!(
+            s,
+            "while (!atomic_compare_exchange_weak_explicit(&{buf}[uint({idx})], &{var}, {cty}({val}), memory_order_relaxed, memory_order_relaxed) && {var} == zsl_cmp) {{}}\n}}"
+        );
+        return Ok(());
+    }
+    let f = match aop {
+        AtomicOp::Add => "atomic_fetch_add_explicit",
+        AtomicOp::Min => "atomic_fetch_min_explicit",
+        AtomicOp::Max => "atomic_fetch_max_explicit",
+        AtomicOp::And => "atomic_fetch_and_explicit",
+        AtomicOp::Or => "atomic_fetch_or_explicit",
+        _ => "atomic_exchange_explicit",
+    };
+    if let Some(old) = old {
+        let _ = write!(s, "{cty} {old} = ");
+    }
+    let _ = writeln!(
+        s,
+        "{f}(&{buf}[uint({idx})], {cty}({val}), memory_order_relaxed);"
+    );
+    Ok(())
 }
 
 /// Longest constant-trip loop that is fully unrolled.
@@ -507,62 +574,10 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .buffers
                 .get(buf.as_str())
                 .map_or("float", |&t| scalar_c_type(ctx, t));
-            // Metal has 64-bit min and max only.
-            if cty == "ulong" && !matches!(aop, AtomicOp::Min | AtomicOp::Max) {
-                return Err(Diagnostic::new(
-                    DiagnosticCode::Unsupported,
-                    "MSL backend: u64 atomics support only atomic_max and atomic_min",
-                ));
-            }
             let idx = emit_expr(ctx, index)?;
             let val = emit_expr(ctx, value)?;
-            if *aop == AtomicOp::CompareExchange {
-                let cmp = emit_expr(
-                    ctx,
-                    compare.as_ref().ok_or_else(|| {
-                        Diagnostic::new(
-                            DiagnosticCode::Internal,
-                            "MSL backend: atomic_compare_exchange needs an expected value",
-                        )
-                    })?,
-                )?;
-                // A weak exchange can fail spuriously, leaving the expected value unchanged: retry.
-                let var = match old {
-                    Some(old) => {
-                        let _ = writeln!(s, "{cty} {old} = {cty}({cmp});");
-                        old.as_str()
-                    }
-                    None => {
-                        let _ = writeln!(s, "{{ {cty} zsl_exp = {cty}({cmp});");
-                        "zsl_exp"
-                    }
-                };
-                if old.is_some() {
-                    let _ = writeln!(s, "{{ const {cty} zsl_cmp = {var};");
-                } else {
-                    let _ = writeln!(s, "const {cty} zsl_cmp = {var};");
-                }
-                let _ = writeln!(
-                    s,
-                    "while (!atomic_compare_exchange_weak_explicit(&{buf}[uint({idx})], &{var}, {cty}({val}), memory_order_relaxed, memory_order_relaxed) && {var} == zsl_cmp) {{}}\n}}"
-                );
-                return Ok(());
-            }
-            let f = match aop {
-                AtomicOp::Add => "atomic_fetch_add_explicit",
-                AtomicOp::Min => "atomic_fetch_min_explicit",
-                AtomicOp::Max => "atomic_fetch_max_explicit",
-                AtomicOp::And => "atomic_fetch_and_explicit",
-                AtomicOp::Or => "atomic_fetch_or_explicit",
-                _ => "atomic_exchange_explicit",
-            };
-            if let Some(old) = old {
-                let _ = write!(s, "{cty} {old} = ");
-            }
-            let _ = writeln!(
-                s,
-                "{f}(&{buf}[uint({idx})], {cty}({val}), memory_order_relaxed);"
-            );
+            let cmp = compare.as_ref().map(|c| emit_expr(ctx, c)).transpose()?;
+            atomic_stmt(s, *aop, buf, cty, &idx, &val, cmp.as_deref(), old.as_deref())?;
         }
 
         IrStmt::AssignShared { name, index, value } => {
