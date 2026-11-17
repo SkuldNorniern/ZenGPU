@@ -476,6 +476,25 @@ pub(super) fn atomic_stmt(
         );
         return Ok(());
     }
+    // 64-bit min and max return nothing: atomic_max_explicit, not the fetch form.
+    if cty == "ulong" {
+        if let Some(old) = old {
+            return Err(Diagnostic::new(
+                DiagnosticCode::Unsupported,
+                format!("MSL backend: u64 atomics return no old value, `{old}` cannot be read"),
+            ));
+        }
+        let f = if aop == AtomicOp::Min {
+            "atomic_min_explicit"
+        } else {
+            "atomic_max_explicit"
+        };
+        let _ = writeln!(
+            s,
+            "{f}(&{buf}[uint({idx})], {cty}({val}), memory_order_relaxed);"
+        );
+        return Ok(());
+    }
     let f = match aop {
         AtomicOp::Add => "atomic_fetch_add_explicit",
         AtomicOp::Min => "atomic_fetch_min_explicit",
