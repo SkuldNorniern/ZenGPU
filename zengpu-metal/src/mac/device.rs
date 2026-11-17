@@ -1028,6 +1028,10 @@ impl GpuDevice for MetalDevice {
         if !shared_memory(&self.inner.device) {
             caps.features = Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING;
         }
+        // atomic_ulong min and max need Apple8 (A15, M2) or later
+        if self.inner.device.supports_family(MTLGPUFamily::Apple8) {
+            caps.features |= Features::ATOMIC_U64;
+        }
         caps
     }
 
