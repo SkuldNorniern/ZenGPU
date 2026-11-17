@@ -151,6 +151,7 @@ struct Placed {
     image: vk::Image,
     resting: vk::ImageLayout,
     region: TextureRegion,
+    format: Format,
     was_ready: bool,
     offset: u64,
     row_texels: u32,
@@ -206,6 +207,9 @@ impl VulkanDevice {
                 "write_textures needs at least one write".into(),
             )));
         }
+        for write in writes {
+            reject_packed(self.texture_format(write.texture)?)?;
+        }
         let mut sizes = Vec::with_capacity(writes.len());
         for write in writes {
             sizes.push(self.check_write(write)?);
@@ -246,6 +250,7 @@ impl VulkanDevice {
                 image,
                 resting,
                 region: write.region,
+                format,
                 was_ready: batch_write_ready(
                     &mut initialized,
                     image,
@@ -274,6 +279,7 @@ impl VulkanDevice {
         region: TextureRegion,
     ) -> Result<Submission> {
         let format = self.texture_format(texture)?;
+        reject_packed(format)?;
         self.check_region(texture, region, vk::ImageUsageFlags::TRANSFER_DST)?;
         let row_texels = rows_in_texels(format, bytes_per_row, region.width)?;
         let span = span_bytes(format, region, bytes_per_row);
@@ -283,6 +289,7 @@ impl VulkanDevice {
             image,
             resting,
             region,
+            format,
             was_ready: self.is_ready(texture, region),
             offset,
             row_texels,
@@ -325,6 +332,7 @@ impl VulkanDevice {
         bytes_per_row: u32,
     ) -> Result<Submission> {
         let format = self.texture_format(texture)?;
+        reject_packed(format)?;
         self.check_region(texture, region, vk::ImageUsageFlags::TRANSFER_SRC)?;
         let row_texels = rows_in_texels(format, bytes_per_row, region.width)?;
         let span = span_bytes(format, region, bytes_per_row);
@@ -343,7 +351,7 @@ impl VulkanDevice {
                 dev,
                 cmd,
                 image,
-                region,
+                subresource(region, format),
                 (from, vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
                 (
                     vk::PipelineStageFlags::ALL_COMMANDS,
@@ -360,7 +368,7 @@ impl VulkanDevice {
                     image,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk_buffer,
-                    &[buffer_image_copy(region, offset, row_texels)],
+                    &[buffer_image_copy(region, format, offset, row_texels)],
                 );
             }
             // One call for the image back to its resting layout and the host read of the copy.
@@ -368,7 +376,7 @@ impl VulkanDevice {
             let (buffer_users, _) = barrier::buffer_users(graphics);
             let back = barrier::image(
                 image,
-                subresource(region),
+                subresource(region, format),
                 (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, resting),
                 vk::AccessFlags::TRANSFER_READ,
                 image_access,
@@ -679,9 +687,28 @@ fn span_bytes(format: Format, region: TextureRegion, bytes_per_row: u32) -> u64 
         + format.row_bytes(region.width)
 }
 
-fn subresource(region: TextureRegion) -> vk::ImageSubresourceRange {
+/// Packed depth/stencil can't be copied yet. Same limit as metal.
+fn reject_packed(format: Format) -> Result<()> {
+    if format == Format::Depth24PlusStencil8 {
+        return Err(GpuError::Unsupported(
+            "vulkan: packed depth/stencil transfers".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Aspect a copy of `format` touches. Packed formats never get here.
+fn copy_aspect(format: Format) -> vk::ImageAspectFlags {
+    if format == Format::Depth32Float {
+        vk::ImageAspectFlags::DEPTH
+    } else {
+        vk::ImageAspectFlags::COLOR
+    }
+}
+
+fn subresource(region: TextureRegion, format: Format) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
+        aspect_mask: copy_aspect(format),
         base_mip_level: region.mip_level,
         level_count: 1,
         base_array_layer: region.layer,
@@ -689,13 +716,18 @@ fn subresource(region: TextureRegion) -> vk::ImageSubresourceRange {
     }
 }
 
-fn buffer_image_copy(region: TextureRegion, offset: u64, row_texels: u32) -> vk::BufferImageCopy {
+fn buffer_image_copy(
+    region: TextureRegion,
+    format: Format,
+    offset: u64,
+    row_texels: u32,
+) -> vk::BufferImageCopy {
     vk::BufferImageCopy {
         buffer_offset: offset,
         buffer_row_length: row_texels,
         buffer_image_height: 0,
         image_subresource: vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
+            aspect_mask: copy_aspect(format),
             mip_level: region.mip_level,
             base_array_layer: region.layer,
             layer_count: 1,
@@ -713,18 +745,18 @@ fn buffer_image_copy(region: TextureRegion, offset: u64, row_texels: u32) -> vk:
     }
 }
 
-/// Layout change for `region`. `src_stage` and `src_access` cover the work before it. Its users
+/// Layout change for `range`. `src_stage` and `src_access` cover the work before it. Its users
 /// after it come from the `barrier` scope.
 fn image_barrier(
     dev: &Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
-    region: TextureRegion,
+    range: vk::ImageSubresourceRange,
     layouts: (vk::ImageLayout, vk::ImageLayout),
     (src_stage, src_access): (vk::PipelineStageFlags, vk::AccessFlags),
     (dst_stage, dst_access): (vk::PipelineStageFlags, vk::AccessFlags),
 ) {
-    let change = barrier::image(image, subresource(region), layouts, src_access, dst_access);
+    let change = barrier::image(image, range, layouts, src_access, dst_access);
     unsafe {
         barrier::submit(dev, cmd, src_stage, dst_stage, &[], &[], &[change]);
     }
@@ -749,7 +781,7 @@ fn record_buffer_to_images(
             dev,
             cmd,
             p.image,
-            p.region,
+            subresource(p.region, p.format),
             (from, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
             (
                 vk::PipelineStageFlags::ALL_COMMANDS,
@@ -766,7 +798,12 @@ fn record_buffer_to_images(
                 buffer,
                 p.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[buffer_image_copy(p.region, p.offset, p.row_texels)],
+                &[buffer_image_copy(
+                    p.region,
+                    p.format,
+                    p.offset,
+                    p.row_texels,
+                )],
             );
         }
         let back = (vk::ImageLayout::TRANSFER_DST_OPTIMAL, p.resting);
@@ -775,7 +812,7 @@ fn record_buffer_to_images(
             dev,
             cmd,
             p.image,
-            p.region,
+            subresource(p.region, p.format),
             back,
             (
                 vk::PipelineStageFlags::TRANSFER,
@@ -789,6 +826,23 @@ fn record_buffer_to_images(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_aspect_follows_the_format() {
+        assert_eq!(
+            copy_aspect(Format::Depth32Float),
+            vk::ImageAspectFlags::DEPTH
+        );
+        assert_eq!(copy_aspect(Format::Rgba8Unorm), vk::ImageAspectFlags::COLOR);
+        assert_eq!(copy_aspect(Format::R32Float), vk::ImageAspectFlags::COLOR);
+    }
+
+    #[test]
+    fn packed_depth_stencil_is_refused_before_any_copy() {
+        assert!(reject_packed(Format::Depth24PlusStencil8).is_err());
+        assert!(reject_packed(Format::Depth32Float).is_ok());
+        assert!(reject_packed(Format::Rgba8Unorm).is_ok());
+    }
 
     #[test]
     fn only_the_first_write_to_a_fresh_subresource_discards_contents() {
