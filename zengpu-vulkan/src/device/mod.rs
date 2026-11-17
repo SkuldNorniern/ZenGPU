@@ -72,13 +72,19 @@ const SSBO_BINDING_U32: u32 = 2;
 /// Bindless SSBO table for `buffer<i32>`, same slot indices as the f32 table.
 const SSBO_BINDING_I32: u32 = 3;
 
+/// Bindless SSBO table for `buffer<u64>`, same slot indices as the f32 table. Only in the layout
+/// when `ATOMIC_U64` is on.
+const SSBO_BINDING_U64: u32 = 5;
+
 /// Storage-image table: each `STORAGE` texture's mip 0, in `GENERAL` layout, at its own slot.
 /// Level views take slots above the texture-index range.
 const STORAGE_IMAGE_BINDING: u32 = 4;
 
-/// SSBO tables sharing the storage-buffer budget (`f32`/`u32`/`i32`). Append-only: new tables take
-/// new binding numbers, no renumbering.
-const SSBO_TYPED_TABLE_COUNT: u32 = 3;
+/// SSBO tables sharing the storage-buffer budget: `f32`/`u32`/`i32`, plus `u64` when
+/// `ATOMIC_U64` is on. Append-only: new tables take new binding numbers, no renumbering.
+fn typed_table_count(atomic_u64: bool) -> u32 {
+    3 + u32::from(atomic_u64)
+}
 
 /// Keep compute's push-constant ABI at the 128-byte Vulkan minimum, so conforming devices are
 /// not rejected.
@@ -94,6 +100,8 @@ struct BindlessState {
     storage_capacity: u32,
     /// Slots past `storage_capacity` for level views; 0 if there is no storage table.
     level_view_capacity: u32,
+    /// Whether the `u64` SSBO table at `SSBO_BINDING_U64` exists in the layout.
+    u64_table: bool,
     level_slots: Arc<Mutex<LevelSlots>>,
     bound_textures: Mutex<Vec<bool>>,
 }
@@ -1110,6 +1118,11 @@ impl VulkanDevice {
         if graphics_stores {
             available_features |= Features::GRAPHICS_STORES;
         }
+        let atomic_u64 = supported_features2.features.shader_int64 == vk::TRUE
+            && supported_v12.shader_buffer_int64_atomics == vk::TRUE;
+        if atomic_u64 {
+            available_features |= Features::ATOMIC_U64;
+        }
         let missing_required = req.required.difference(available_features);
         if !missing_required.is_empty() {
             return Err(GpuError::UnsupportedFeatures(missing_required));
@@ -1246,6 +1259,7 @@ impl VulkanDevice {
                 vk::FALSE
             },
             sampler_filter_minmax: on(sampler_minmax),
+            shader_buffer_int64_atomics: on(atomic_u64),
             timeline_semaphore: on(timeline_enabled),
             draw_indirect_count: on(indirect_count),
             p_next: if needs_graphics {
@@ -1280,6 +1294,7 @@ impl VulkanDevice {
                 texture_compression_astc_ldr: on(texture_compression_astc),
                 fragment_stores_and_atomics: on(graphics_stores),
                 vertex_pipeline_stores_and_atomics: on(graphics_stores),
+                shader_int64: on(atomic_u64),
                 ..Default::default()
             },
             ..Default::default()
@@ -1439,7 +1454,11 @@ impl VulkanDevice {
             debug_utils,
         });
 
-        let bindless = create_bindless(&inner.device, inner.limits)?;
+        let bindless = create_bindless(
+            &inner.device,
+            inner.limits,
+            inner.features.contains(Features::ATOMIC_U64),
+        )?;
         let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner), queue_family)?);
         let async_family = inner
             .async_lane
@@ -1590,14 +1609,14 @@ impl VulkanDevice {
     }
 }
 
-fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32, u32)> {
+fn bindless_capacities(limits: DeviceLimits, tables: u32) -> Result<(u32, u32, u32)> {
     let total = limits.max_update_after_bind_descriptors;
     let buffer_capacity = MAX_BINDLESS_BUFFERS
-        .min(limits.max_storage_buffers / SSBO_TYPED_TABLE_COUNT)
-        .min(total.saturating_sub(1) / SSBO_TYPED_TABLE_COUNT);
+        .min(limits.max_storage_buffers / tables)
+        .min(total.saturating_sub(1) / tables);
     let texture_capacity = MAX_BINDLESS_TEXTURES
         .min(limits.max_sampled_textures)
-        .min(total.saturating_sub(buffer_capacity * SSBO_TYPED_TABLE_COUNT));
+        .min(total.saturating_sub(buffer_capacity * tables));
     if buffer_capacity == 0 || texture_capacity == 0 {
         return Err(GpuError::Unsupported(format!(
             "bindless descriptor limits are too small: storage={}, textures={}, total={total}",
@@ -1606,7 +1625,7 @@ fn bindless_capacities(limits: DeviceLimits) -> Result<(u32, u32, u32)> {
     }
     let storage_capacity = MAX_BINDLESS_TEXTURES
         .min(limits.max_storage_textures)
-        .min(total - buffer_capacity * SSBO_TYPED_TABLE_COUNT - texture_capacity);
+        .min(total - buffer_capacity * tables - texture_capacity);
     Ok((buffer_capacity, texture_capacity, storage_capacity))
 }
 
@@ -1626,6 +1645,7 @@ fn create_bindless_layout(
     texture_capacity: u32,
     storage_capacity: u32,
     lv_cap: u32,
+    u64_table: bool,
 ) -> Result<vk::DescriptorSetLayout> {
     let storage_table = storage_capacity + lv_cap;
     let mut bindings = vec![
@@ -1658,6 +1678,15 @@ fn create_bindless_layout(
             ..Default::default()
         },
     ];
+    if u64_table {
+        bindings.push(vk::DescriptorSetLayoutBinding {
+            binding: SSBO_BINDING_U64,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: buffer_capacity,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            ..Default::default()
+        });
+    }
     if storage_capacity != 0 {
         bindings.push(vk::DescriptorSetLayoutBinding {
             binding: STORAGE_IMAGE_BINDING,
@@ -1692,16 +1721,20 @@ fn create_bindless_layout(
     }
 }
 
-fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessState> {
-    let (mut buf_cap, mut tex_cap, mut stor_cap) = bindless_capacities(limits)?;
+fn create_bindless(
+    dev: &ash::Device,
+    limits: DeviceLimits,
+    atomic_u64: bool,
+) -> Result<BindlessState> {
+    let tables = typed_table_count(atomic_u64);
+    let (mut buf_cap, mut tex_cap, mut stor_cap) = bindless_capacities(limits, tables)?;
 
     // Some drivers (e.g. Qualcomm Adreno X1-45) report enormous descriptor limits but return
     // VK_ERROR_OUT_OF_HOST_MEMORY when vkCreatePipelineLayout references a layout that actually
     // uses them.  Probe with a throw-away pipeline layout and halve capacities on each failure.
     let layout = loop {
-        let lv_cap =
-            level_view_capacity(limits, buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap, stor_cap);
-        let layout = create_bindless_layout(dev, buf_cap, tex_cap, stor_cap, lv_cap)?;
+        let lv_cap = level_view_capacity(limits, buf_cap * tables + tex_cap, stor_cap);
+        let layout = create_bindless_layout(dev, buf_cap, tex_cap, stor_cap, lv_cap, atomic_u64)?;
 
         let push_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::ALL,
@@ -1753,13 +1786,13 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         }
     };
 
-    let lv_cap = level_view_capacity(limits, buf_cap * SSBO_TYPED_TABLE_COUNT + tex_cap, stor_cap);
+    let lv_cap = level_view_capacity(limits, buf_cap * tables + tex_cap, stor_cap);
     let storage_table = stor_cap + lv_cap;
 
     let mut pool_sizes = vec![
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::STORAGE_BUFFER,
-            descriptor_count: buf_cap * SSBO_TYPED_TABLE_COUNT,
+            descriptor_count: buf_cap * tables,
         },
         vk::DescriptorPoolSize {
             ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -1811,6 +1844,7 @@ fn create_bindless(dev: &ash::Device, limits: DeviceLimits) -> Result<BindlessSt
         texture_capacity: tex_cap,
         storage_capacity: stor_cap,
         level_view_capacity: lv_cap,
+        u64_table: atomic_u64,
         level_slots: Arc::new(Mutex::new(LevelSlots::new(stor_cap, lv_cap))),
         bound_textures: Mutex::new(vec![false; tex_cap as usize]),
     })
@@ -3680,6 +3714,171 @@ mod tests {
         dev.destroy_buffer(step);
     }
 
+    /// Draws `(side, depth, id)` quads over a 4x4 target. `side` is the viewport edge from the
+    /// corner. Each fragment does `atomic_max` of `(depth << 32) | id` into its pixel's u64 slot,
+    /// and this returns the 16 slots, row by row.
+    fn visibility_winners(
+        dev: &VulkanDevice,
+        fs: &zengpu_shader::ZslShader,
+        draws: &[(f32, u32, u32)],
+    ) -> Vec<u64> {
+        let format = Format::Rgba8Unorm;
+        let (tex, target) = render_target(dev, format, 4, 4);
+        let pipeline = quad_pipeline(dev, fs, format, None);
+        let vis = dev
+            .create_buffer(BufferDesc {
+                size: 16 * 8,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        dev.write_buffer(vis, 0, &[0; 16 * 8]).unwrap();
+        let mut cmd = dev.create_command_list().unwrap();
+        let color = [ColorAttachment {
+            target,
+            load: LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &color,
+            depth: None,
+        });
+        cmd.set_pipeline(pipeline);
+        for &(side, depth, id) in draws {
+            cmd.set_viewport_scissor(ViewportScissor {
+                viewport: Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: side,
+                    height: side,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                scissor: None,
+            });
+            cmd.bind(Bindings {
+                buffers: &[vis.index()],
+                scalars: &[Scalar::U32(4), Scalar::U32(depth), Scalar::U32(id)],
+                ..Default::default()
+            });
+            cmd.draw(0..6, 0..1);
+        }
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).unwrap();
+        let raw = dev.read_buffer(vis, 0, 16 * 8).unwrap();
+        dev.destroy_buffer(vis);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_texture(tex);
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_ne_bytes(*word))
+            .collect()
+    }
+
+    #[test]
+    fn fragment_u64_atomic_max_keeps_the_deepest_then_highest_id_per_pixel() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const VIS_FS: ZslShader = zsl!(
+            push P { width: u32, depth: u32, id: u32 }
+            fragment fs(pos: frag_coord, vis: device mut buffer<u64>, p: P) -> f32x4 {
+                let at = u32(pos.y) * p.width + u32(pos.x)
+                atomic_max(vis, at, (u64(p.depth) << 32) | u64(p.id))
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        );
+        let Some(device) = try_graphics_device() else {
+            return;
+        };
+        let dev = vulkan(&device);
+        assert!(dev.capabilities().features.contains(Features::ATOMIC_U64));
+        // Full quad at depth 5 with id 4, top-left 2x2 at depth 9 with id 2, full quad at depth 5
+        // with id 1. The 2x2 wins where it covers, since depth sits above id in the packed value.
+        let got = visibility_winners(dev, &VIS_FS, &[(4.0, 5, 4), (2.0, 9, 2), (4.0, 5, 1)]);
+        let deep = (9u64 << 32) | 2;
+        let near = (5u64 << 32) | 4;
+        let want: Vec<u64> = (0..16)
+            .map(|i| if i % 4 < 2 && i / 4 < 2 { deep } else { near })
+            .collect();
+        assert_eq!(got, want);
+        println!("u64 visibility winners on the GPU: {got:x?}");
+    }
+
+    #[test]
+    fn compute_u64_atomic_max_reads_back_the_packed_winner() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const PACK: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel pack(best: device mut buffer<u64>, depth: device buffer<u32>, id: global_id) {
+                let packed = (u64(depth[id.x]) << 32) | u64(id.x)
+                atomic_max(best, 0, packed)
+                atomic_add(best, 1, 1u64)
+            }
+        );
+        let Some(dev) = try_device() else {
+            return;
+        };
+        assert!(dev.capabilities().features.contains(Features::ATOMIC_U64));
+        let n: u32 = 256;
+        let depth: Vec<u32> = (0..n).map(|i| (i * 73 + 11) % 251).collect();
+        let depth_bytes: Vec<u8> = depth.iter().flat_map(|d| d.to_ne_bytes()).collect();
+        let best = dev
+            .create_buffer(BufferDesc {
+                size: 16,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Readback,
+            })
+            .unwrap();
+        dev.write_buffer(best, 0, &[0; 16]).unwrap();
+        let input = dev
+            .create_buffer(BufferDesc {
+                size: u64::from(n) * 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        dev.write_buffer(input, 0, &depth_bytes).unwrap();
+        let shader = dev.create_shader(PACK.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[best.index(), input.index()],
+                ..Default::default()
+            },
+            [n / 64, 1, 1],
+        )
+        .unwrap();
+        let raw = dev.read_buffer(best, 0, 16).unwrap();
+        let words: Vec<u64> = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|word| u64::from_ne_bytes(*word))
+            .collect();
+        let want = depth
+            .iter()
+            .zip(0u64..)
+            .map(|(&d, i)| (u64::from(d) << 32) | i)
+            .max()
+            .unwrap();
+        assert_eq!(words, vec![want, u64::from(n)]);
+        println!("u64 compute winner on the GPU: {:#x}", words[0]);
+        dev.destroy_buffer(best);
+        dev.destroy_buffer(input);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+    }
+
     #[test]
     fn rendered_and_uploaded_texels_survive_readback_and_load() {
         let Some(dev) = try_graphics_device() else {
@@ -4292,20 +4491,27 @@ mod tests {
             max_update_after_bind_descriptors: 12,
             ..Default::default()
         };
-        assert_eq!(bindless_capacities(limits).unwrap(), (3, 3, 0));
+        // Without ATOMIC_U64: three typed tables, as before u64.
+        assert_eq!(bindless_capacities(limits, 3).unwrap(), (3, 3, 0));
         let roomy = DeviceLimits {
             max_storage_textures: 64,
             max_update_after_bind_descriptors: 1000,
             ..limits
         };
-        assert_eq!(bindless_capacities(roomy).unwrap(), (5, 8, 64));
+        assert_eq!(bindless_capacities(roomy, 3).unwrap(), (5, 8, 64));
+        // With ATOMIC_U64: four typed tables share the same storage-buffer budget.
+        assert_eq!(bindless_capacities(limits, 4).unwrap(), (2, 4, 0));
+        assert_eq!(bindless_capacities(roomy, 4).unwrap(), (4, 8, 64));
         assert!(
-            bindless_capacities(DeviceLimits {
-                max_storage_buffers: 1,
-                max_sampled_textures: 1,
-                max_update_after_bind_descriptors: 1,
-                ..Default::default()
-            })
+            bindless_capacities(
+                DeviceLimits {
+                    max_storage_buffers: 1,
+                    max_sampled_textures: 1,
+                    max_update_after_bind_descriptors: 1,
+                    ..Default::default()
+                },
+                3
+            )
             .is_err()
         );
     }

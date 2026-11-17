@@ -261,11 +261,14 @@ impl VulkanDevice {
             p_buffer_info: &info,
             ..Default::default()
         };
-        let writes = [
+        let mut writes = vec![
             write_for(SSBO_BINDING_F32),
             write_for(SSBO_BINDING_U32),
             write_for(SSBO_BINDING_I32),
         ];
+        if self.bindless.u64_table {
+            writes.push(write_for(SSBO_BINDING_U64));
+        }
         unsafe {
             self.inner.device.update_descriptor_sets(&writes, &[]);
         }

@@ -995,6 +995,14 @@ impl GpuDevice for VulkanDevice {
             zengpu_spv::disassemble(words)
         );
 
+        // u64 values, buffers and atomics need `shaderInt64`, which `ATOMIC_U64` reports.
+        const INT64: u32 = 11;
+        const INT64_ATOMICS: u32 = 12;
+        if (declares_capability(words, INT64) || declares_capability(words, INT64_ATOMICS))
+            && !self.inner.features.contains(Features::ATOMIC_U64)
+        {
+            return Err(GpuError::UnsupportedFeatures(Features::ATOMIC_U64));
+        }
         let coop = uses_cooperative_matrix(words);
         if coop {
             if !self.inner.coop_matrix {
@@ -1436,15 +1444,20 @@ impl GpuDevice for VulkanDevice {
 }
 
 fn uses_cooperative_matrix(words: &[u32]) -> bool {
-    const OP_CAPABILITY: u32 = 17;
     const COOPERATIVE_MATRIX_KHR: u32 = 6022;
+    declares_capability(words, COOPERATIVE_MATRIX_KHR)
+}
+
+/// True if the SPIR-V header's `OpCapability` block declares `capability`.
+fn declares_capability(words: &[u32], capability: u32) -> bool {
+    const OP_CAPABILITY: u32 = 17;
     let mut i = 5;
     while i < words.len() {
         let count = (words[i] >> 16) as usize;
         if words[i] & 0xffff != OP_CAPABILITY || count < 2 {
             return false;
         }
-        if words.get(i + 1) == Some(&COOPERATIVE_MATRIX_KHR) {
+        if words.get(i + 1) == Some(&capability) {
             return true;
         }
         i += count;
