@@ -419,10 +419,20 @@ impl MetalDevice {
         self.inner.table.lock().map(|t| t.used()).unwrap_or(0)
     }
 
-    /// A depth texture drawn as a depth target and sampled after. Not on metal yet, always
-    /// `None`: callers keep a path without it.
-    pub fn register_depth_texture(&self, _texture: TextureHandle) -> Option<TargetHandle> {
-        None
+    /// A depth texture drawn as a depth target and sampled after. Needs a depth format and
+    /// `RENDER_TARGET | SAMPLED`. `None` for a stale handle or a texture that is not that.
+    /// metal draws into it, but `sample_compare` has no depth table bound yet.
+    pub fn register_depth_texture(&self, texture: TextureHandle) -> Option<TargetHandle> {
+        let (tex, format) = {
+            let textures = self.inner.textures.lock().ok()?;
+            let t = textures.get(texture)?;
+            let usage = TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED;
+            if !t.desc.format.is_depth_stencil() || !t.desc.usage.contains(usage) {
+                return None;
+            }
+            (t.tex.clone(), t.desc.format)
+        };
+        self.insert_target(tex, format)
     }
 
     /// Returns the render target for `ColorAttachment::target` or `DepthAttachment::target`, or
@@ -433,6 +443,10 @@ impl MetalDevice {
             let t = textures.get(texture)?;
             (t.tex.clone(), t.desc.format)
         };
+        self.insert_target(tex, format)
+    }
+
+    fn insert_target(&self, tex: Texture, format: Format) -> Option<TargetHandle> {
         Some(
             self.inner
                 .targets

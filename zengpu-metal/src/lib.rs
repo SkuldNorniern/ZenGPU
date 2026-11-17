@@ -1946,6 +1946,32 @@ mod graphics_tests {
         );
     }
 
+    #[test]
+    fn depth_texture_registers_only_when_drawable_and_sampled() {
+        let Some(dev) = open() else { return };
+        let both = TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED;
+        let depth = texture(&dev, Format::Depth32Float, 2, 2, both);
+        let target = dev.register_depth_texture(depth).expect("depth target");
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &[],
+            depth: Some(DepthAttachment {
+                target,
+                load: LoadOp::clear_depth(0.5),
+                store: true,
+            }),
+        });
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        let color = texture(&dev, Format::Rgba8Unorm, 2, 2, both);
+        assert!(dev.register_depth_texture(color).is_none());
+        let drawn = TextureUsage::RENDER_TARGET;
+        let unsampled = texture(&dev, Format::Depth32Float, 2, 2, drawn);
+        assert!(dev.register_depth_texture(unsampled).is_none());
+        dev.destroy_texture(depth);
+        assert!(dev.register_depth_texture(depth).is_none());
+    }
+
     /// Metal twin of zengpu-vulkan's `compute_chains_texture_passes_in_one_submission`.
     #[test]
     fn compute_chains_texture_passes() {
