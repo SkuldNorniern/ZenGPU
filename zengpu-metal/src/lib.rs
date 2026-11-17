@@ -1266,6 +1266,56 @@ mod graphics_tests {
 
     /// ZSL clip space has +y down, as on Vulkan: y in -1..0 is the top half.
     #[test]
+    fn each_fragment_counts_once_through_an_atomic() {
+        const FULL_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index, hits: device mut buffer<u32>) -> f32x4 {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                f32x4(corner.x * 4.0 - 1.0, corner.y * 4.0 - 1.0, 0.0, 1.0)
+            }
+        );
+        const COUNT_FS: ZslShader = zsl!(
+            fragment fs(hits: device mut buffer<u32>) -> f32x4 {
+                atomic_add(hits, 0u, 1u)
+                f32x4(1.0, 0.0, 0.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let (_tex, target) = color_target(&dev, 4, 4);
+        let p = pipeline(&dev, &FULL_VS, &COUNT_FS, &[], None, None);
+        let hits = buffer(
+            &dev,
+            bytes(&[0u32]),
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 4));
+        cmd.bind(Bindings {
+            buffers: &[hits.index()],
+            textures: &[],
+            images: &[],
+            scalars: &[],
+        });
+        cmd.draw(0..3, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        let raw = dev.read_buffer(hits, 0, 4).expect("read hits");
+        assert_eq!(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]), 16);
+    }
+
+    #[test]
     fn graphics_shaders_read_and_store_buffers() {
         const FROM_BUFFER_VS: ZslShader = zsl!(
             vertex vs(vi: vertex_index, xy: device buffer<f32>, tint: device buffer<f32>, hits: device mut buffer<u32>) -> f32x4 {
