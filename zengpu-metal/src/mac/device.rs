@@ -24,7 +24,8 @@ use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
     ComputeOp, ComputePipelineDesc, DType, DeviceLimits, DispatchOp, Features, Format, FormatCaps,
-    GpuDevice, GpuError, GpuSubmission, HalCapabilities, MemoryBudget, MmaShape, PipelineHandle,
+    GpuDevice, GpuError, GpuSubmission, HalCapabilities, IndirectDispatchOp, MemoryBudget, MmaShape,
+    PipelineHandle,
     Reduction, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource,
     SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle,
     TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
@@ -802,7 +803,40 @@ impl MetalDevice {
             sampled,
             images,
             push: pack_scalars(op.bindings.scalars),
+            indirect: None,
         })
+    }
+
+    /// A dispatch whose group counts are three `u32` at `op.offset` in `op.args`.
+    fn resolve_indirect(&self, op: &IndirectDispatchOp<'_>) -> Result<ResolvedDispatch> {
+        let args = {
+            let buffers = lock(&self.inner.buffers)?;
+            let args = buffers
+                .get(op.args)
+                .ok_or_else(|| GpuError::Backend("metal: invalid indirect buffer handle".into()))?;
+            if !args.usage.contains(BufferUsage::INDIRECT) {
+                return Err(GpuError::InvalidUsage(UsageError::MissingUsage {
+                    resource: "indirect dispatch arguments",
+                    needed: "INDIRECT",
+                }));
+            }
+            let fits = op.offset.is_multiple_of(4)
+                && op.offset.checked_add(12).is_some_and(|end| end <= args.size);
+            if !fits {
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
+                    "indirect dispatch arguments at {} do not fit {} bytes, 4 aligned",
+                    op.offset, args.size
+                ))));
+            }
+            args.buf.clone()
+        };
+        let mut resolved = self.resolve_dispatch(&DispatchOp {
+            pipeline: op.pipeline,
+            bindings: op.bindings,
+            grid: [1, 1, 1],
+        })?;
+        resolved.indirect = Some((args, op.offset));
+        Ok(resolved)
     }
 
     fn resolve_copy(&self, copy: &BufferCopyOp) -> Result<ResolvedCopy> {
@@ -831,9 +865,9 @@ impl MetalDevice {
             .filter_map(|op| match op {
                 ComputeOp::Dispatch(d) => Some(self.resolve_dispatch(d).map(Resolved::Dispatch)),
                 ComputeOp::CopyBuffer(c) => Some(self.resolve_copy(c).map(Resolved::Copy)),
-                ComputeOp::DispatchIndirect(_) => Some(Err(GpuError::Unsupported(
-                    "metal: indirect dispatch".into(),
-                ))),
+                ComputeOp::DispatchIndirect(d) => {
+                    Some(self.resolve_indirect(d).map(Resolved::Dispatch))
+                }
                 ComputeOp::Timestamp { .. } => None,
             })
             .collect::<Result<Vec<_>>>()?;
@@ -899,12 +933,14 @@ struct ResolvedDispatch {
     sampled: Vec<(Texture, SamplerState)>,
     images: Vec<Texture>,
     push: Vec<u8>,
+    /// The group counts the GPU wrote, and where, in place of `grid`.
+    indirect: Option<(Buffer, u64)>,
 }
 
 impl ResolvedDispatch {
     fn encode(&self, enc: &ComputeCommandEncoderRef) {
         // Metal rejects an empty grid; it runs nothing anyway.
-        if self.grid.contains(&0) {
+        if self.indirect.is_none() && self.grid.contains(&0) {
             return;
         }
         enc.set_compute_pipeline_state(&self.state);
@@ -925,8 +961,12 @@ impl ResolvedDispatch {
                 self.push.as_ptr() as *const c_void,
             );
         }
-        let [gx, gy, gz] = self.grid.map(u64::from);
         let [bx, by, bz] = self.block.map(u64::from);
+        if let Some((args, offset)) = &self.indirect {
+            enc.dispatch_thread_groups_indirect(args, *offset, MTLSize::new(bx, by, bz));
+            return;
+        }
+        let [gx, gy, gz] = self.grid.map(u64::from);
         enc.dispatch_thread_groups(MTLSize::new(gx, gy, gz), MTLSize::new(bx, by, bz));
     }
 }
@@ -1650,7 +1690,11 @@ impl GpuDevice for MetalDevice {
             .iter()
             .flat_map(|op| match op {
                 ComputeOp::Dispatch(d) => d.bindings.buffers.to_vec(),
-                ComputeOp::DispatchIndirect(d) => d.bindings.buffers.to_vec(),
+                ComputeOp::DispatchIndirect(d) => {
+                    let mut slots = d.bindings.buffers.to_vec();
+                    slots.push(d.args.index());
+                    slots
+                }
                 ComputeOp::CopyBuffer(c) => vec![c.src.index(), c.dst.index()],
                 ComputeOp::Timestamp { .. } => Vec::new(),
             })

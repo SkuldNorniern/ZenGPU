@@ -120,6 +120,107 @@ mod tests {
         assert_eq!(out, expect);
     }
 
+    /// A dispatch whose group counts an earlier dispatch wrote runs that many groups; arguments
+    /// past the end, unaligned, or in a buffer without `INDIRECT` are refused.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn indirect_dispatch_runs_the_counts_the_gpu_wrote() {
+        use std::time::Duration;
+        use zengpu_hal::{
+            Bindings, BufferCopyOp, BufferUsage, ComputeOp, ComputePipelineDesc, DispatchOp,
+            IndirectDispatchOp, MemoryUsage,
+        };
+        use zengpu_shader::{ZslShader, zsl};
+
+        const WRITE_ARGS: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel write_args(a: device mut buffer<u32>, id: global_id) {
+                if id.x == 0 {
+                    a[0] = 3
+                    a[1] = 1
+                    a[2] = 1
+                }
+            }
+        );
+        const COUNT: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel count(n: device mut buffer<u32>, id: global_id) {
+                let before = atomic_add(n, 0, 1)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let pipeline = |zsl: &ZslShader| {
+            let shader = dev.create_shader(ShaderDesc::msl(zsl.msl.unwrap())).unwrap();
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [64, 1, 1],
+            })
+            .unwrap()
+        };
+        let (write, count) = (pipeline(&WRITE_ARGS), pipeline(&COUNT));
+        let buffer = |usage| {
+            let b = dev
+                .create_buffer(BufferDesc {
+                    size: 16,
+                    usage,
+                    memory: MemoryUsage::Upload,
+                })
+                .unwrap();
+            dev.write_buffer(b, 0, &[0; 16]).unwrap();
+            b
+        };
+        let args = buffer(BufferUsage::STORAGE | BufferUsage::INDIRECT);
+        let counter = buffer(BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC);
+        let readback = buffer(BufferUsage::TRANSFER_DST | BufferUsage::READBACK);
+        dev.submit_compute_ops(
+            7,
+            &[
+                ComputeOp::Dispatch(DispatchOp {
+                    pipeline: write,
+                    bindings: Bindings {
+                        buffers: &[args.index()],
+                        ..Default::default()
+                    },
+                    grid: [1, 1, 1],
+                }),
+                ComputeOp::DispatchIndirect(IndirectDispatchOp {
+                    pipeline: count,
+                    bindings: Bindings {
+                        buffers: &[counter.index()],
+                        ..Default::default()
+                    },
+                    args,
+                    offset: 0,
+                }),
+                ComputeOp::CopyBuffer(BufferCopyOp {
+                    src: counter,
+                    src_offset: 0,
+                    dst: readback,
+                    dst_offset: 0,
+                    len: 4,
+                }),
+            ],
+        )
+        .unwrap()
+        .wait(Duration::from_secs(5))
+        .unwrap();
+        let counted = dev.read_buffer(readback, 0, 4).unwrap();
+        assert_eq!(u32::from_le_bytes(counted.try_into().unwrap()), 3 * 64);
+        for (from, offset) in [(args, 8), (args, 2), (counter, 0)] {
+            let op = ComputeOp::DispatchIndirect(IndirectDispatchOp {
+                pipeline: count,
+                bindings: Bindings {
+                    buffers: &[counter.index()],
+                    ..Default::default()
+                },
+                args: from,
+                offset,
+            });
+            assert!(dev.submit_compute_ops(8, &[op]).is_err(), "{offset}");
+        }
+    }
+
     /// Metal has 31 buffer slots and the push block takes the one after the buffers: binding
     /// past that is an error, not an out-of-range `setBuffer`.
     #[test]
