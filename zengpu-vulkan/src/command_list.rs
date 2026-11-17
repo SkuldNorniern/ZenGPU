@@ -42,14 +42,17 @@ const DEPTH_SUBRESOURCE: vk::ImageSubresourceRange = vk::ImageSubresourceRange {
 /// recording is externally synchronized per pool.
 pub(crate) struct CmdListPool {
     inner: Arc<VulkanDeviceInner>,
+    /// Queue family the command pools are created for.
+    family: u32,
     free: Mutex<Vec<vk::CommandBuffer>>,
     pools: Mutex<Vec<vk::CommandPool>>,
 }
 
 impl CmdListPool {
-    pub(crate) fn new(inner: Arc<VulkanDeviceInner>) -> Result<Self> {
+    pub(crate) fn new(inner: Arc<VulkanDeviceInner>, family: u32) -> Result<Self> {
         Ok(Self {
             inner,
+            family,
             free: Mutex::new(Vec::new()),
             pools: Mutex::new(Vec::new()),
         })
@@ -63,7 +66,7 @@ impl CmdListPool {
                     self.inner.device.create_command_pool(
                         &vk::CommandPoolCreateInfo {
                             flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-                            queue_family_index: self.inner.queue_family,
+                            queue_family_index: self.family,
                             ..Default::default()
                         },
                         None,

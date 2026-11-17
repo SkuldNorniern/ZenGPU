@@ -184,12 +184,12 @@ impl GpuDevice for VulkanDevice {
             )));
         }
         let vk_usage = buffer_usage_to_vk(desc.usage);
-        let buffer_info = vk::BufferCreateInfo {
-            size: alloc_size,
-            usage: vk_usage,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            ..Default::default()
-        };
+        let (sharing_mode, families) = self.inner.sharing();
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(alloc_size)
+            .usage(vk_usage)
+            .sharing_mode(sharing_mode)
+            .queue_family_indices(families);
 
         let buffer = unsafe {
             self.inner
@@ -606,6 +606,7 @@ impl GpuDevice for VulkanDevice {
             vk::ImageCreateFlags::empty()
         };
 
+        let (sharing_mode, families) = self.inner.sharing();
         let image_info = vk::ImageCreateInfo {
             flags,
             image_type,
@@ -621,7 +622,9 @@ impl GpuDevice for VulkanDevice {
             tiling: vk::ImageTiling::OPTIMAL,
             usage,
             initial_layout: vk::ImageLayout::UNDEFINED,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            sharing_mode,
+            queue_family_index_count: families.len() as u32,
+            p_queue_family_indices: families.as_ptr(),
             ..Default::default()
         };
         let image = unsafe {
@@ -1372,6 +1375,63 @@ impl GpuDevice for VulkanDevice {
 
     fn submit_compute_ops(&self, cycle_id: u64, ops: &[ComputeOp<'_>]) -> Result<Submission> {
         self.submit_mixed_compute_async(cycle_id, ops)
+    }
+
+    fn submit_compute_async(
+        &self,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+        waits: &[QueueTicket],
+    ) -> Result<(Submission, QueueTicket)> {
+        if self.inner.async_lane.is_none() {
+            let submission = self.submit_compute_ops_after(cycle_id, ops, waits)?;
+            return Ok((submission, QueueTicket::COMPLETE));
+        }
+        self.submit_mixed_compute_on(Lane::Async, cycle_id, ops, waits)
+    }
+
+    fn submit_compute_ops_after(
+        &self,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+        waits: &[QueueTicket],
+    ) -> Result<Submission> {
+        self.submit_mixed_compute_on(Lane::Main, cycle_id, ops, waits)
+            .map(|(submission, _)| submission)
+    }
+
+    fn poll_ticket(&self, ticket: QueueTicket) -> Result<SubmissionStatus> {
+        let Some(async_lane) = &self.inner.async_lane else {
+            return Ok(SubmissionStatus::Complete);
+        };
+        let reached = unsafe {
+            self.inner
+                .device
+                .get_semaphore_counter_value(async_lane.timeline)
+        }
+        .map_err(|e| map_vk_err("vkGetSemaphoreCounterValue", e))?;
+        Ok(if reached >= ticket.value() {
+            SubmissionStatus::Complete
+        } else {
+            SubmissionStatus::Pending
+        })
+    }
+
+    fn wait_ticket(&self, ticket: QueueTicket, timeout: Duration) -> Result<()> {
+        let Some(async_lane) = &self.inner.async_lane else {
+            return Ok(());
+        };
+        let semaphores = [async_lane.timeline];
+        let values = [ticket.value()];
+        let wait_info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&semaphores)
+            .values(&values);
+        let timeout_ns = VulkanSubmission::timeout_ns(timeout);
+        match unsafe { self.inner.device.wait_semaphores(&wait_info, timeout_ns) } {
+            Ok(()) => Ok(()),
+            Err(vk::Result::TIMEOUT) => Err(GpuError::Timeout),
+            Err(e) => Err(map_vk_err("vkWaitSemaphores", e)),
+        }
     }
 }
 

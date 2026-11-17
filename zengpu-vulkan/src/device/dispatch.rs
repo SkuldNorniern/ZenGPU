@@ -24,7 +24,9 @@ impl VulkanDevice {
                     .device_wait_idle()
                     .map_err(|e| GpuError::Backend(format!("device_wait_idle: {e}")))?;
             }
-            self.inner.serials.complete(self.inner.serials.submitted());
+            self.inner
+                .serials
+                .complete_all(self.inner.serials.submitted());
         }
         self.drain_in_flight();
         self.recover_raw_waits()?;
@@ -358,7 +360,41 @@ impl VulkanDevice {
     where
         F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
     {
-        let cmd = self.cmd_list_pool.acquire()?;
+        let (submission, serial, _) =
+            self.submit_on(Lane::Main, cycle_id, uses, retained, &[], record)?;
+        Ok((submission, serial))
+    }
+
+    /// Records `record` into a command buffer for `lane`, submits it after `waits`, and returns
+    /// the submission with its ticket. The ticket is `COMPLETE` on the main lane.
+    pub(super) fn submit_on<F>(
+        &self,
+        lane: Lane,
+        cycle_id: u64,
+        uses: &[u32],
+        retained: Option<Arc<buffer_transfer::AsyncBuffer>>,
+        waits: &[QueueTicket],
+        record: F,
+    ) -> Result<(Submission, u64, QueueTicket)>
+    where
+        F: FnOnce(&Device, vk::CommandBuffer) -> Result<()>,
+    {
+        let (queue, _, queue_lock) = self.inner.lane_queue(lane)?;
+        let pool = match lane {
+            Lane::Main => Arc::clone(&self.cmd_list_pool),
+            Lane::Async => Arc::clone(&self.async_cmd_pool),
+        };
+        let timeline = match &self.inner.async_lane {
+            Some(async_lane) => async_lane.timeline,
+            None if waits.iter().all(|ticket| ticket.value() == 0) => vk::Semaphore::null(),
+            None => {
+                return Err(GpuError::Unsupported(
+                    "timeline tickets need timeline semaphores".into(),
+                ));
+            }
+        };
+
+        let cmd = pool.acquire()?;
         let record_result = record(&self.inner.device, cmd);
         let end_result = unsafe {
             self.inner
@@ -367,37 +403,64 @@ impl VulkanDevice {
                 .map_err(|e| GpuError::Backend(format!("vkEndCommandBuffer: {e}")))
         };
         if let Err(e) = record_result.and(end_result) {
-            self.cmd_list_pool.release(cmd);
+            pool.release(cmd);
             return Err(e);
         }
 
         let fence = match self.fence_pool.acquire() {
             Ok(fence) => fence,
             Err(error) => {
-                self.cmd_list_pool.release(cmd);
+                pool.release(cmd);
                 return Err(error);
             }
         };
-        let submit_info = vk::SubmitInfo {
-            command_buffer_count: 1,
-            p_command_buffers: &cmd,
-            ..Default::default()
-        };
-        let submit_result = {
-            let _queue = self.inner.queue_lock.lock().unwrap();
+        let command_buffers = [cmd];
+        let wait_values: Vec<u64> = waits.iter().map(|ticket| ticket.value()).collect();
+        let wait_semaphores = vec![timeline; waits.len()];
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
+        let submitted = {
+            let _queue = queue_lock.lock().unwrap();
+            let signal_value = match (lane, &self.inner.async_lane) {
+                (Lane::Async, Some(async_lane)) => {
+                    let value = async_lane.signalled.load(Ordering::Acquire) + 1;
+                    async_lane.signalled.store(value, Ordering::Release);
+                    Some(value)
+                }
+                _ => None,
+            };
+            let signal_values: Vec<u64> = signal_value.into_iter().collect();
+            let signal_semaphores: Vec<vk::Semaphore> =
+                signal_value.map(|_| timeline).into_iter().collect();
+            let mut timeline_info = vk::TimelineSemaphoreSubmitInfo::default()
+                .wait_semaphore_values(&wait_values)
+                .signal_semaphore_values(&signal_values);
+            let submit_info = vk::SubmitInfo::default()
+                .command_buffers(&command_buffers)
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .signal_semaphores(&signal_semaphores);
+            let submit_info = if wait_values.is_empty() && signal_values.is_empty() {
+                submit_info
+            } else {
+                submit_info.push_next(&mut timeline_info)
+            };
             unsafe {
                 self.inner
                     .device
-                    .queue_submit(self.inner.queue, &[submit_info], fence)
+                    .queue_submit(queue, &[submit_info], fence)
                     .map_err(|e| map_vk_err("vkQueueSubmit", e))
             }
-            .map(|()| self.inner.serials.next())
+            .map(|()| match lane {
+                Lane::Main => self.inner.serials.next(),
+                Lane::Async => self.inner.serials.next_async(),
+            })
+            .map(|serial| (serial, signal_value))
         };
-        let serial = match submit_result {
-            Ok(serial) => serial,
+        let (serial, signal_value) = match submitted {
+            Ok(done) => done,
             Err(e) => {
                 self.fence_pool.release(fence);
-                self.cmd_list_pool.release(cmd);
+                pool.release(cmd);
                 return Err(e);
             }
         };
@@ -406,9 +469,10 @@ impl VulkanDevice {
         let submission: Submission = Box::new(VulkanSubmission {
             cycle_id,
             serial,
+            lane,
             inner: Arc::clone(&self.inner),
             fence_pool: Arc::clone(&self.fence_pool),
-            cmd_pool: Arc::clone(&self.cmd_list_pool),
+            cmd_pool: Arc::clone(&pool),
             buffers: Arc::clone(&self.buffers),
             textures: Arc::clone(&self.textures),
             samplers: Arc::clone(&self.samplers),
@@ -422,7 +486,8 @@ impl VulkanDevice {
                 retained,
             }),
         });
-        Ok((submission, serial))
+        let ticket = signal_value.map_or(QueueTicket::COMPLETE, QueueTicket::new);
+        Ok((submission, serial, ticket))
     }
 
     pub(super) fn find_memory_type(
@@ -651,10 +716,25 @@ impl VulkanDevice {
         cycle_id: u64,
         ops: &[ComputeOp<'_>],
     ) -> Result<Submission> {
+        self.submit_mixed_compute_on(Lane::Main, cycle_id, ops, &[])
+            .map(|(submission, _)| submission)
+    }
+
+    pub(super) fn submit_mixed_compute_on(
+        &self,
+        lane: Lane,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+        waits: &[QueueTicket],
+    ) -> Result<(Submission, QueueTicket)> {
         self.reap_orphans();
-        if ops.is_empty() {
-            return Ok(Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)));
+        if ops.is_empty() && lane == Lane::Main && waits.is_empty() {
+            return Ok((
+                Box::new(zengpu_hal::CompletedSubmission::new(cycle_id)),
+                QueueTicket::COMPLETE,
+            ));
         }
+        let graphics = lane == Lane::Main && self.inner.graphics;
 
         enum ResolvedOp {
             Copy {
@@ -852,7 +932,7 @@ impl VulkanDevice {
         drop(query_pools);
         let uses = mixed_buffer_uses(ops);
         let bindless_set = self.bindless.set;
-        let submission = self.one_shot_submit_async(cycle_id, &uses, move |dev, cmd| {
+        let submission = self.submit_on(lane, cycle_id, &uses, None, waits, move |dev, cmd| {
             let barrier = vk::MemoryBarrier {
                 src_access_mask: vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE,
                 dst_access_mask: vk::AccessFlags::SHADER_READ
@@ -943,12 +1023,12 @@ impl VulkanDevice {
                         }
                     }
                 }
-                hand_off(dev, cmd, self.inner.graphics);
+                hand_off(dev, cmd, graphics);
             }
             Ok(())
         });
         drop(samplers);
-        submission
+        submission.map(|(submission, _, ticket)| (submission, ticket))
     }
 
     pub(super) fn submit_compute_batch_async(

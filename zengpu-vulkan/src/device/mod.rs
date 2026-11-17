@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::{CStr, CString, c_char, c_void},
     fs,
     io::ErrorKind,
@@ -20,10 +20,10 @@ use zengpu_hal::{
     Bindings, BufferDesc, BufferHandle, BufferUsage, CompareFn, ComputeOp, ComputePipelineDesc,
     DeviceLimits, DeviceRequest, DispatchOp, Features, FilterMode, Format, GpuDevice, GpuError,
     GpuSubmission, GraphicsDevice, GraphicsPipelineDesc, HalCapabilities, MemoryBudget,
-    MemoryUsage, PipelineHandle, PolygonMode, QueryPoolHandle, Result, SamplerDesc, SamplerHandle,
-    Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission, SubmissionStatus,
-    SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureUsage, UsageError,
-    WindowHandles, marker,
+    MemoryUsage, PipelineHandle, PolygonMode, QueryPoolHandle, QueueTicket, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
+    SubmissionStatus, SurfaceConfig, TargetHandle, TexDim, TextureDesc, TextureHandle,
+    TextureUsage, UsageError, WindowHandles, marker,
 };
 
 mod buffer_transfer;
@@ -176,25 +176,99 @@ enum DeferredVulkanResource {
     Pipeline(u32, VulkanPipeline),
 }
 
-/// Queue work, numbered in submission order. Once `n` is finished, everything before it is too.
+/// Which queue work goes to. `Async` is the compute family when the GPU has one, else the main
+/// queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    Main,
+    Async,
+}
+
+/// Compute queue behind `submit_compute_async`, with the timeline its tickets name.
+pub(crate) struct AsyncLane {
+    pub family: u32,
+    pub queue: vk::Queue,
+    /// Own lock when `dedicated`. Otherwise the main queue's lock is used.
+    pub lock: Mutex<()>,
+    pub dedicated: bool,
+    pub timeline: vk::Semaphore,
+    /// Last value signalled. Advanced under the lane's lock, so values follow queue order.
+    pub signalled: AtomicU64,
+}
+
+/// Queue work, numbered in submission order. Serial `n` is finished once every serial up to `n`
+/// is.
 ///
-/// Every submission takes a number, so a resource is freed only after the work that could
-/// still use it.
+/// Main-queue work finishes in order, so observing one serial finished covers the earlier main
+/// serials. Async work can finish out of order, so an open async serial holds back the count.
 #[derive(Default)]
 pub(crate) struct QueueSerials {
     submitted: AtomicU64,
     completed: AtomicU64,
+    open: Mutex<OpenSerials>,
+}
+
+#[derive(Default)]
+struct OpenSerials {
+    main: BTreeSet<u64>,
+    asynchronous: BTreeSet<u64>,
 }
 
 impl QueueSerials {
-    /// Numbers a submission that reached the queue. Call with the queue lock held, right after the
-    /// submit, so numbers follow queue order.
+    /// Numbers a main-queue submission that reached the queue. Call with the queue lock held,
+    /// right after the submit, so numbers follow queue order.
     pub(crate) fn next(&self) -> u64 {
-        self.submitted.fetch_add(1, Ordering::AcqRel) + 1
+        self.number(Lane::Main)
     }
 
+    /// Numbers an async submission that reached its queue.
+    pub(crate) fn next_async(&self) -> u64 {
+        self.number(Lane::Async)
+    }
+
+    fn number(&self, lane: Lane) -> u64 {
+        let mut open = self.open.lock().unwrap();
+        let serial = self.submitted.load(Ordering::Acquire) + 1;
+        self.submitted.store(serial, Ordering::Release);
+        match lane {
+            Lane::Main => open.main.insert(serial),
+            Lane::Async => open.asynchronous.insert(serial),
+        };
+        serial
+    }
+
+    /// A main-queue serial finished. Everything earlier on the main queue did too.
     pub(crate) fn complete(&self, serial: u64) {
-        self.completed.fetch_max(serial, Ordering::AcqRel);
+        let mut open = self.open.lock().unwrap();
+        open.main = open.main.split_off(&(serial + 1));
+        self.publish(&open);
+    }
+
+    /// An async serial finished. Only it is cleared: async work can finish out of order.
+    pub(crate) fn complete_async(&self, serial: u64) {
+        let mut open = self.open.lock().unwrap();
+        open.asynchronous.remove(&serial);
+        self.publish(&open);
+    }
+
+    /// Everything numbered up to `serial` is finished. Only for after a full device idle.
+    pub(crate) fn complete_all(&self, serial: u64) {
+        let mut open = self.open.lock().unwrap();
+        open.main = open.main.split_off(&(serial + 1));
+        open.asynchronous = open.asynchronous.split_off(&(serial + 1));
+        self.publish(&open);
+    }
+
+    fn publish(&self, open: &OpenSerials) {
+        let first_open = [open.main.first(), open.asynchronous.first()]
+            .into_iter()
+            .flatten()
+            .min();
+        let done = match first_open {
+            Some(&first) => first - 1,
+            None => self.submitted.load(Ordering::Acquire),
+        };
+        self.completed.fetch_max(done, Ordering::AcqRel);
     }
 
     pub(crate) fn submitted(&self) -> u64 {
@@ -246,6 +320,7 @@ impl VulkanLifetimeState {
 struct VulkanSubmission {
     cycle_id: u64,
     serial: u64,
+    lane: Lane,
     inner: Arc<VulkanDeviceInner>,
     fence_pool: Arc<FencePool>,
     cmd_pool: Arc<CmdListPool>,
@@ -283,7 +358,10 @@ impl VulkanSubmission {
     }
 
     fn release_in_flight(&self) {
-        self.inner.serials.complete(self.serial);
+        match self.lane {
+            Lane::Main => self.inner.serials.complete(self.serial),
+            Lane::Async => self.inner.serials.complete_async(self.serial),
+        }
         let deferred = self
             .lifetime
             .lock()
@@ -384,6 +462,7 @@ impl VulkanSubmission {
         Self {
             cycle_id: self.cycle_id,
             serial: self.serial,
+            lane: self.lane,
             inner: Arc::clone(&self.inner),
             fence_pool: Arc::clone(&self.fence_pool),
             cmd_pool: Arc::clone(&self.cmd_pool),
@@ -499,6 +578,10 @@ pub(crate) struct VulkanDeviceInner {
     pub queue: vk::Queue,
     /// Queue needs external sync: every submit or present on `queue` holds this mutex.
     pub queue_lock: Mutex<()>,
+    /// Async compute queue, or `None` when timeline semaphores are unavailable.
+    pub async_lane: Option<AsyncLane>,
+    /// Families that use shared resources. Two or more means CONCURRENT sharing.
+    pub shared_families: Vec<u32>,
     /// Numbers submissions to `queue` for deferred frees.
     pub serials: QueueSerials,
     /// Set once the device is seen lost; it never comes back.
@@ -539,6 +622,60 @@ pub(crate) struct VulkanDeviceInner {
 
 unsafe impl Send for VulkanDeviceInner {}
 unsafe impl Sync for VulkanDeviceInner {}
+
+impl VulkanDeviceInner {
+    /// Queue, family and lock that `lane` submits under.
+    pub(crate) fn lane_queue(&self, lane: Lane) -> Result<(vk::Queue, u32, &Mutex<()>)> {
+        match lane {
+            Lane::Main => Ok((self.queue, self.queue_family, &self.queue_lock)),
+            Lane::Async => {
+                let async_lane = self.async_lane.as_ref().ok_or_else(|| {
+                    GpuError::Unsupported("async compute needs timeline semaphores".into())
+                })?;
+                let lock = if async_lane.dedicated {
+                    &async_lane.lock
+                } else {
+                    &self.queue_lock
+                };
+                Ok((async_lane.queue, async_lane.family, lock))
+            }
+        }
+    }
+
+    /// Sharing mode for buffers and images. CONCURRENT once more than one family uses them.
+    pub(crate) fn sharing(&self) -> (vk::SharingMode, &[u32]) {
+        if self.shared_families.len() > 1 {
+            (vk::SharingMode::CONCURRENT, &self.shared_families)
+        } else {
+            (vk::SharingMode::EXCLUSIVE, &[])
+        }
+    }
+}
+
+/// Dedicated compute-without-graphics and transfer-only families, other than `main`.
+pub(crate) fn dedicated_families(
+    families: &[vk::QueueFamilyProperties],
+    main: u32,
+) -> (Option<u32>, Option<u32>) {
+    let find = |wanted: &dyn Fn(vk::QueueFlags) -> bool| {
+        families
+            .iter()
+            .enumerate()
+            .find(|(i, f)| *i as u32 != main && wanted(f.queue_flags))
+            .map(|(i, _)| i as u32)
+    };
+    let compute = find(&|flags| {
+        flags.contains(vk::QueueFlags::COMPUTE) && !flags.intersects(vk::QueueFlags::GRAPHICS)
+    });
+    let transfer = find(&|flags| {
+        flags.contains(vk::QueueFlags::TRANSFER)
+            && !flags.intersects(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+    });
+    (compute, transfer)
+}
+
+#[cfg(test)]
+static SHARED_QUEUES_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Depth-stencil format for `Format::Depth24PlusStencil8`: first of D24S8, D32S8 usable as an
 /// optimal-tiling depth attachment.
@@ -773,6 +910,8 @@ pub struct VulkanDevice {
     pipeline_cache: vk::PipelineCache,
     pipeline_cache_path: Option<PathBuf>,
     pub(crate) cmd_list_pool: Arc<CmdListPool>,
+    /// Command buffers for the async queue's family.
+    pub(crate) async_cmd_pool: Arc<CmdListPool>,
     fence_pool: Arc<FencePool>,
     lifetime: Arc<Mutex<VulkanLifetimeState>>,
     /// Reused for host-visible uploads.
@@ -892,14 +1031,6 @@ impl VulkanDevice {
                 GpuError::Backend(format!("no {kind} queue family"))
             })?;
         let device_limits = physical_device_limits(&shared.instance, physical, queue_family);
-
-        let queue_priorities = [1.0_f32];
-        let queue_info = vk::DeviceQueueCreateInfo {
-            queue_family_index: queue_family,
-            queue_count: 1,
-            p_queue_priorities: queue_priorities.as_ptr(),
-            ..Default::default()
-        };
 
         let mut supported_v12 = vk::PhysicalDeviceVulkan12Features::default();
         let mut supported_dynamic_rendering = vk::PhysicalDeviceDynamicRenderingFeatures::default();
@@ -1052,6 +1183,40 @@ impl VulkanDevice {
             && supported_coop.cooperative_matrix == vk::TRUE
             && supported_v12.vulkan_memory_model == vk::TRUE
             && f16i8_supported;
+        let timeline_enabled = supported_v12.timeline_semaphore == vk::TRUE;
+        #[cfg(test)]
+        let shared_only = SHARED_QUEUES_ONLY.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let shared_only = false;
+        let families = unsafe {
+            shared
+                .instance
+                .get_physical_device_queue_family_properties(physical)
+        };
+        let (dedicated_async, dedicated_transfer) = if shared_only {
+            (None, None)
+        } else {
+            dedicated_families(&families, queue_family)
+        };
+        let async_family = dedicated_async.filter(|_| timeline_enabled);
+        let mut queue_families = vec![queue_family];
+        queue_families.extend(async_family);
+        queue_families.extend(dedicated_transfer);
+        let shared_families: Vec<u32> = [Some(queue_family), async_family]
+            .into_iter()
+            .flatten()
+            .collect();
+        let queue_priorities = [1.0_f32; 3];
+        let queue_infos: Vec<vk::DeviceQueueCreateInfo> = queue_families
+            .iter()
+            .map(|&family| vk::DeviceQueueCreateInfo {
+                queue_family_index: family,
+                queue_count: 1,
+                p_queue_priorities: queue_priorities.as_ptr(),
+                ..Default::default()
+            })
+            .collect();
+
         let mut dynamic_rendering_feat = vk::PhysicalDeviceDynamicRenderingFeatures {
             dynamic_rendering: vk::TRUE,
             ..Default::default()
@@ -1081,6 +1246,7 @@ impl VulkanDevice {
                 vk::FALSE
             },
             sampler_filter_minmax: on(sampler_minmax),
+            timeline_semaphore: on(timeline_enabled),
             draw_indirect_count: on(indirect_count),
             p_next: if needs_graphics {
                 &mut dynamic_rendering_feat as *mut _ as *mut c_void
@@ -1174,8 +1340,8 @@ impl VulkanDevice {
 
         let device_create_info = vk::DeviceCreateInfo {
             p_next: &features2 as *const _ as *const c_void,
-            queue_create_info_count: 1,
-            p_queue_create_infos: &queue_info,
+            queue_create_info_count: queue_infos.len() as u32,
+            p_queue_create_infos: queue_infos.as_ptr(),
             enabled_extension_count: extensions.len() as u32,
             pp_enabled_extension_names: if extensions.is_empty() {
                 null()
@@ -1194,6 +1360,32 @@ impl VulkanDevice {
         };
 
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        let async_lane = if timeline_enabled {
+            let (lane_queue, lane_family, dedicated) = match async_family {
+                Some(family) => (unsafe { device.get_device_queue(family, 0) }, family, true),
+                None => (queue, queue_family, false),
+            };
+            let mut timeline_type = vk::SemaphoreTypeCreateInfo::default()
+                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                .initial_value(0);
+            let timeline = unsafe {
+                device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(&mut timeline_type),
+                    None,
+                )
+            }
+            .map_err(|e| map_vk_err("vkCreateSemaphore", e))?;
+            Some(AsyncLane {
+                family: lane_family,
+                queue: lane_queue,
+                lock: Mutex::new(()),
+                dedicated,
+                timeline,
+                signalled: AtomicU64::new(0),
+            })
+        } else {
+            None
+        };
         let dynamic_rendering = khr::dynamic_rendering::Device::new(&shared.instance, &device);
         let draw_indirect_count = indirect_count
             .then(|| khr::draw_indirect_count::Device::new(&shared.instance, &device));
@@ -1221,6 +1413,8 @@ impl VulkanDevice {
             queue_family,
             queue,
             queue_lock: Mutex::new(()),
+            async_lane,
+            shared_families,
             serials: QueueSerials::default(),
             lost: AtomicBool::new(false),
             probe,
@@ -1246,7 +1440,12 @@ impl VulkanDevice {
         });
 
         let bindless = create_bindless(&inner.device, inner.limits)?;
-        let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner))?);
+        let cmd_list_pool = Arc::new(CmdListPool::new(Arc::clone(&inner), queue_family)?);
+        let async_family = inner
+            .async_lane
+            .as_ref()
+            .map_or(queue_family, |lane| lane.family);
+        let async_cmd_pool = Arc::new(CmdListPool::new(Arc::clone(&inner), async_family)?);
         let fence_pool = Arc::new(FencePool::new(Arc::clone(&inner)));
         let initial_cache_data =
             pipeline_cache_path
@@ -1298,6 +1497,7 @@ impl VulkanDevice {
             pipeline_cache,
             pipeline_cache_path,
             cmd_list_pool,
+            async_cmd_pool,
             fence_pool,
             lifetime: Arc::new(Mutex::new(VulkanLifetimeState::default())),
             staging: Mutex::new(transfer::StagingRing::default()),
@@ -1705,7 +1905,9 @@ impl Drop for VulkanDevice {
     fn drop(&mut self) {
         unsafe {
             if self.inner.device.device_wait_idle().is_ok() {
-                self.inner.serials.complete(self.inner.serials.submitted());
+                self.inner
+                    .serials
+                    .complete_all(self.inner.serials.submitted());
             }
         }
         self.drain_in_flight();
@@ -1729,10 +1931,17 @@ impl Drop for VulkanDevice {
         if let Some(slots) = self.transfer_slots.get_mut().ok().and_then(Option::take) {
             slots.destroy(&self.inner.device);
         }
+        if let Some(async_lane) = &self.inner.async_lane {
+            unsafe {
+                self.inner
+                    .device
+                    .destroy_semaphore(async_lane.timeline, None)
+            };
+        }
         #[cfg(debug_assertions)]
         {
             let mut outstanding = Vec::new();
-            if Arc::strong_count(&self.inner) > 3 {
+            if Arc::strong_count(&self.inner) > 4 {
                 outstanding.push("inner");
             }
             if Arc::strong_count(&self.buffers) > 1 {
@@ -1755,6 +1964,9 @@ impl Drop for VulkanDevice {
             }
             if Arc::strong_count(&self.cmd_list_pool) > 1 {
                 outstanding.push("cmd_list_pool");
+            }
+            if Arc::strong_count(&self.async_cmd_pool) > 1 {
+                outstanding.push("async_cmd_pool");
             }
             if Arc::strong_count(&self.fence_pool) > 1 {
                 outstanding.push("fence_pool");
@@ -5783,6 +5995,121 @@ mod tests {
         dev.destroy_buffer(allocated_after_first);
         dev.destroy_buffer(allocated_after_completion);
         dev.destroy_buffer(second_out);
+    }
+
+    /// Graphics device, which has a compute-only family to use as the async queue. `shared_only`
+    /// hides that family, to exercise the fallback to the main queue.
+    fn try_async_device(shared_only: bool) -> Option<(VulkanDevice, MutexGuard<'static, ()>)> {
+        let guard = crate::test_gpu_lock();
+        let inst = VulkanInstance::new().ok()?;
+        let adapter = inst.request_vulkan_adapter()?;
+        SHARED_QUEUES_ONLY.store(shared_only, Ordering::Release);
+        let dev = adapter.open_headless(DeviceRequest::default());
+        SHARED_QUEUES_ONLY.store(false, Ordering::Release);
+        Some((dev.ok()?, guard))
+    }
+
+    /// Dispatches on the async lane, copies after its ticket on the main lane, and checks the
+    /// copied words.
+    fn async_fill_then_copy(dev: &dyn GpuDevice) {
+        use zengpu_hal::BufferCopyOp;
+        use zengpu_shader::{ZslShader, zsl};
+        const FILL_ZSL: ZslShader = zsl!(
+            push P { base: u32, len: u32 }
+            @workgroup_size(64)
+            kernel fill(out: device mut buffer<u32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len { out[i] = p.base + i }
+            }
+        );
+
+        let shader = dev.create_shader(FILL_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let n: u32 = 64;
+        let bytes = n as u64 * 4;
+        let out = dev
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: BufferUsage::STORAGE | BufferUsage::TRANSFER_SRC,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        let dst = dev
+            .create_buffer(BufferDesc {
+                size: bytes,
+                usage: BufferUsage::TRANSFER_DST | BufferUsage::READBACK,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+
+        let fill = ComputeOp::Dispatch(DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &[out.index()],
+                textures: &[],
+                images: &[],
+                scalars: &[Scalar::U32(7), Scalar::U32(n)],
+            },
+            grid: [1, 1, 1],
+        });
+        let (fill_submission, ticket) = dev.submit_compute_async(1, &[fill], &[]).unwrap();
+        let copy = ComputeOp::CopyBuffer(BufferCopyOp {
+            src: out,
+            src_offset: 0,
+            dst,
+            dst_offset: 0,
+            len: bytes,
+        });
+        let copy_submission = dev.submit_compute_ops_after(2, &[copy], &[ticket]).unwrap();
+        copy_submission.wait(Duration::from_secs(5)).unwrap();
+        dev.wait_ticket(ticket, Duration::from_secs(5)).unwrap();
+        assert_eq!(dev.poll_ticket(ticket).unwrap(), SubmissionStatus::Complete);
+        fill_submission.wait(Duration::from_secs(5)).unwrap();
+
+        let read = dev.read_buffer(dst, 0, bytes).unwrap();
+        let words: Vec<u32> = read
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        let expected: Vec<u32> = (0..n).map(|i| 7 + i).collect();
+        assert_eq!(words, expected);
+
+        dev.destroy_buffer(out);
+        dev.destroy_buffer(dst);
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+    }
+
+    #[test]
+    fn async_compute_ticket_orders_copy_on_dedicated_queue() {
+        let Some((dev, _guard)) = try_async_device(false) else {
+            return;
+        };
+        let async_lane = dev.inner.async_lane.as_ref().expect("timeline semaphores");
+        eprintln!(
+            "async lane family {} (main {}), dedicated {}",
+            async_lane.family, dev.inner.queue_family, async_lane.dedicated
+        );
+        async_fill_then_copy(&dev);
+    }
+
+    #[test]
+    fn async_compute_falls_back_to_shared_queue() {
+        let Some((dev, _guard)) = try_async_device(true) else {
+            return;
+        };
+        let async_lane = dev.inner.async_lane.as_ref().expect("timeline semaphores");
+        assert!(!async_lane.dedicated);
+        assert_eq!(async_lane.family, dev.inner.queue_family);
+        async_fill_then_copy(&dev);
     }
 
     #[test]

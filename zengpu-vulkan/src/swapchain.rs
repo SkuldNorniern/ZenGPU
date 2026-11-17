@@ -388,7 +388,9 @@ impl Swapchain {
                 .device_wait_idle()
                 .map_err(|e| map_vk_err("device_wait_idle", e))?;
         }
-        self.inner.serials.complete(self.inner.serials.submitted());
+        self.inner
+            .serials
+            .complete_all(self.inner.serials.submitted());
         Ok(())
     }
 
@@ -612,7 +614,9 @@ impl DeviceContext {
         }
         unsafe {
             if dev.device_wait_idle().is_ok() {
-                self.inner.serials.complete(self.inner.serials.submitted());
+                self.inner
+                    .serials
+                    .complete_all(self.inner.serials.submitted());
             }
             dev.destroy_command_pool(pool, None);
         }
