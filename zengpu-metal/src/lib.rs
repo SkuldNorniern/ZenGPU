@@ -1946,6 +1946,81 @@ mod graphics_tests {
         );
     }
 
+    /// A depth texture drawn in one pass is read with `sample_compare` in the next, through the
+    /// depth table. Cleared to 0.5 and compared `LessEqual`: 0.1 passes, 0.9 fails.
+    #[test]
+    fn depth_drawn_in_one_pass_compares_in_the_next() {
+        const QUAD_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index) -> (f32x4, f32x2) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), corner)
+            }
+        );
+        const COMPARE_FS: ZslShader = zsl!(
+            push P { slot: u32, dref: f32 }
+            fragment fs(@location(0) uv: f32x2, tex: textures, p: P) -> f32x4 {
+                f32x4(tex[p.slot].sample_compare(uv, p.dref), 0.0, 0.0, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let depth = texture(
+            &dev,
+            Format::Depth32Float,
+            4,
+            4,
+            TextureUsage::RENDER_TARGET | TextureUsage::SAMPLED,
+        );
+        let depth_target = dev.register_depth_texture(depth).expect("depth target");
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.begin_render_pass(&RenderPassDesc {
+            color: &[],
+            depth: Some(DepthAttachment {
+                target: depth_target,
+                load: LoadOp::clear_depth(0.5),
+                store: true,
+            }),
+        });
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("depth pass");
+
+        let sampler = dev
+            .create_sampler(SamplerDesc {
+                compare: Some(CompareFn::LessEqual),
+                ..SamplerDesc::default()
+            })
+            .expect("sampler");
+        let slot = dev.bind_texture(depth, sampler).expect("depth slot");
+        let (tex, target) = color_target(&dev, 4, 4);
+        let p = pipeline(&dev, &QUAD_VS, &COMPARE_FS, &[], None, None);
+        for (dref, want) in [(0.1_f32, RED), (0.9, BLACK)] {
+            let mut cmd = dev.create_command_list().expect("list");
+            let mut color = [ColorAttachment {
+                target,
+                load: LoadOp::DontCare,
+                store: true,
+                sample_after: false,
+            }];
+            cmd.begin_render_pass(&pass(
+                target,
+                LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                None,
+                &mut color,
+            ));
+            cmd.set_pipeline(p);
+            cmd.set_viewport_scissor(viewport(4, 4));
+            cmd.bind(Bindings {
+                scalars: &[Scalar::U32(slot), Scalar::F32(dref)],
+                ..Default::default()
+            });
+            cmd.draw(0..6, 0..1);
+            cmd.end_render_pass();
+            dev.submit_and_wait(cmd).expect("compare pass");
+            for (i, px) in pixels(&dev, tex, 4, 4).iter().enumerate() {
+                assert_eq!(*px, want, "pixel {i} for ref {dref}");
+            }
+        }
+    }
+
     #[test]
     fn depth_texture_registers_only_when_drawable_and_sampled() {
         let Some(dev) = open() else { return };
