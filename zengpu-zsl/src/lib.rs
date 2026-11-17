@@ -416,6 +416,10 @@ fn scalar_kind_name(ty: TypeId, types: &TypeArena) -> &'static str {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => "I32",
+        Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => "U64",
         Type::Matrix {
             rows: 4,
             columns: 4,

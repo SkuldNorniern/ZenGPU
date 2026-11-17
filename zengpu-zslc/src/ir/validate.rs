@@ -74,6 +74,7 @@ fn check_expr(
     use IrExpr;
     match expr {
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::Local(_)
         | IrExpr::ScalarParam(_)

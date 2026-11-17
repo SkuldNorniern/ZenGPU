@@ -43,7 +43,7 @@ use crate::ir::arena::TypeArena;
 use crate::ir::binding::{IMAGE_BINDING, TEXTURE_BINDING, ssbo_binding_for};
 use crate::ir::node::{
     AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt, TexelOp, stmts_use_subgroup_collectives,
-    stmts_use_subgroup_query, stmts_use_workgroup_reduce,
+    stmts_use_subgroup_query, stmts_use_u64, stmts_use_workgroup_reduce,
 };
 use crate::ir::typeck::frag_parts;
 use crate::ir::typeck::{
@@ -122,11 +122,24 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
     let f32_id = types.f32_id();
     let bool_id = types.bool_id();
     let u32x4_id = types.u32_vec_id(4);
+    let u64_id = types.u64_id();
 
     let t_void = spv.type_void();
     let t_bool = spv.type_bool();
     let t_u32 = spv.type_int(32, false);
     let t_i32 = spv.type_int(32, true);
+    // Declared only when used: `OpTypeInt 64` needs the Int64 capability.
+    let uses_u64 = stmts_use_u64(&entry.body)
+        || entry.locals.iter().any(|(_, ty)| *ty == u64_id)
+        || entry
+            .params
+            .iter()
+            .any(|p| matches!(p.kind, ParamKind::Buffer { elem, .. } if elem == u64_id));
+    let t_u64 = if uses_u64 {
+        spv.type_int(64, false)
+    } else {
+        Id(0)
+    };
     let t_f32 = spv.type_float(32);
     let t_uvec2 = spv.type_vector(t_u32, 2);
     let t_uvec3 = spv.type_vector(t_u32, 3);
@@ -206,6 +219,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             t_u32
         } else if elem_ty == i32_id {
             t_i32
+        } else if elem_ty == u64_id {
+            t_u64
         } else {
             return Err(format!(
                 "ZSL: SPIR-V backend does not support buffer<{:?}>",
@@ -215,7 +230,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         let binding = ssbo_binding_for(elem_ty, &mut types);
 
         let t_ra = spv.type_runtime_array(t_elem);
-        spv.decorate(t_ra, deco::ARRAY_STRIDE, &[4]);
+        let stride = if elem_ty == u64_id { 8 } else { 4 };
+        spv.decorate(t_ra, deco::ARRAY_STRIDE, &[stride]);
         let t_struct_buf = spv.type_struct(&[t_ra]);
         spv.decorate(t_struct_buf, deco::BLOCK, &[]);
         spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
@@ -348,6 +364,9 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             }
             Some(StorageElem::I32) => t_i32,
             Some(StorageElem::U32 | StorageElem::Bf16) => t_u32,
+            Some(StorageElem::U64) => {
+                return Err(format!("ZSL: shared `{}` cannot hold u64", decl.name));
+            }
             None => match u32_vec_lanes(&types, decl.elem) {
                 Some(lanes) => spv.type_vector(t_u32, u32::from(lanes)),
                 None => return Err(format!("ZSL: unsupported shared element `{}`", decl.name)),
@@ -492,6 +511,7 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
 
     let mut ptr_func_u32 = Id(0);
     let mut ptr_func_i32 = Id(0);
+    let mut ptr_func_u64 = Id(0);
     let mut ptr_func_f32 = Id(0);
     let mut ptr_func_bool = Id(0);
     let mut ptr_func_uvec2 = Id(0);
@@ -519,6 +539,8 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
             (&mut ptr_func_u32, t_u32)
         } else if sty == i32_id {
             (&mut ptr_func_i32, t_i32)
+        } else if sty == u64_id {
+            (&mut ptr_func_u64, t_u64)
         } else if sty == f32_id {
             (&mut ptr_func_f32, t_f32)
         } else if sty == u32x4_id || u32_vec_lanes(&types, sty) == Some(4) {
@@ -567,9 +589,11 @@ fn lower_compute_inner(module: &Module) -> Result<Vec<u32>, String> {
         f32_id,
         bool_id,
         u32x4_id,
+        u64_id,
         t_bool,
         t_u32,
         t_i32,
+        t_u64,
         t_f32,
         t_uvec2,
         t_uvec3,
@@ -695,9 +719,12 @@ struct LowerCtx<'a> {
     f32_id: TypeId,
     bool_id: TypeId,
     u32x4_id: TypeId,
+    u64_id: TypeId,
     t_bool: Id,
     t_u32: Id,
     t_i32: Id,
+    /// `Id(0)` unless the kernel uses u64.
+    t_u64: Id,
     t_f32: Id,
     t_uvec2: Id,
     t_uvec3: Id,
@@ -742,6 +769,8 @@ impl LowerCtx<'_> {
             self.t_u32
         } else if tid == self.i32_id {
             self.t_i32
+        } else if tid == self.u64_id {
+            self.t_u64
         } else if tid == self.f32_id {
             self.t_f32
         } else if tid == self.u32x4_id {
@@ -930,6 +959,9 @@ fn lower_stmt(ctx: &mut LowerCtx<'_>, stmt: &IrStmt) -> Result<(), String> {
             let rhs_id = coerce(ctx, rhs, elem);
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
+            if elem == ctx.u64_id {
+                ctx.spv.capability(cap::INT64_ATOMICS);
+            }
             let before = if elem == ctx.f32_id {
                 if *aop != AtomicOp::Add {
                     return Err("ZSL: only atomic_add takes an f32 buffer".into());
@@ -1114,6 +1146,11 @@ fn lower_expr(ctx: &mut LowerCtx<'_>, expr: &IrExpr) -> Result<Val, String> {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
             Ok(Val { id, ty: ctx.u32_id })
+        }
+
+        IrExpr::LitU64(v) => {
+            let id = ctx.spv.constant_u64(ctx.t_u64, *v);
+            Ok(Val { id, ty: ctx.u64_id })
         }
 
         IrExpr::LitF32(v) => {
@@ -1440,7 +1477,7 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 ctx.spv.op_fdiv(ty, lhs.id, rhs.id)
             } else if lhs.ty == ctx.i32_id {
                 ctx.spv.op_sdiv(ty, lhs.id, rhs.id)
-            } else if lhs.ty == ctx.u32_id {
+            } else if lhs.ty == ctx.u32_id || lhs.ty == ctx.u64_id {
                 ctx.spv.op_udiv(ty, lhs.id, rhs.id)
             } else {
                 return Err("ZSL: division is not supported on bool".into());
@@ -1470,7 +1507,7 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 let minus_rem = ctx.spv.op_isub(ctx.t_u32, zero_u, rem);
                 let signed = ctx.spv.op_select(ctx.t_u32, left_neg, minus_rem, rem);
                 ctx.spv.op_bitcast(ctx.t_i32, signed)
-            } else if lhs.ty == ctx.u32_id {
+            } else if lhs.ty == ctx.u32_id || lhs.ty == ctx.u64_id {
                 ctx.spv.op_umod(ty, lhs.id, rhs.id)
             } else {
                 return Err("ZSL: remainder is not supported on bool".into());
@@ -1490,7 +1527,7 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                     IrBinOp::Ne => ctx.spv.op_ford_ne(bool_ty, lhs.id, rhs.id),
                     _ => unreachable!(),
                 }
-            } else if lhs.ty == ctx.u32_id {
+            } else if lhs.ty == ctx.u32_id || lhs.ty == ctx.u64_id {
                 match op {
                     IrBinOp::Lt => ctx.spv.op_ult(bool_ty, lhs.id, rhs.id),
                     IrBinOp::Le => ctx.spv.op_ule(bool_ty, lhs.id, rhs.id),
@@ -1534,9 +1571,9 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
             })
         }
         IrBinOp::BitAnd | IrBinOp::BitOr | IrBinOp::BitXor | IrBinOp::Shl | IrBinOp::Shr => {
-            let ints = [ctx.u32_id, ctx.i32_id];
+            let ints = [ctx.u32_id, ctx.i32_id, ctx.u64_id];
             if !ints.contains(&lhs.ty) || !ints.contains(&rhs.ty) {
-                return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` require u32 or i32 operands".into());
+                return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` require u32, i32 or u64 operands".into());
             }
             if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
                 // A shift keeps its left operand's type; `>>` sign-fills an i32.
@@ -1604,6 +1641,14 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let v = lower_expr(ctx, &args[0])?;
             let id = coerce(ctx, v, ctx.u32_id);
             Ok(Val { id, ty: ctx.u32_id })
+        }
+        BuiltinFn::U64 => {
+            if args.len() != 1 {
+                return Err("ZSL: u64() takes 1 arg".into());
+            }
+            let v = lower_expr(ctx, &args[0])?;
+            let id = coerce(ctx, v, ctx.u64_id);
+            Ok(Val { id, ty: ctx.u64_id })
         }
         BuiltinFn::F32 => {
             if args.len() != 1 {
@@ -2814,6 +2859,12 @@ fn coerce(ctx: &mut LowerCtx<'_>, val: Val, target: TypeId) -> Id {
         ctx.spv.op_bitcast(ctx.t_i32, val.id)
     } else if val.ty == ctx.i32_id && target == ctx.u32_id {
         ctx.spv.op_bitcast(ctx.t_u32, val.id)
+    } else if val.ty == ctx.u32_id && target == ctx.u64_id {
+        ctx.spv.op_uconvert(ctx.t_u64, val.id)
+    } else if val.ty == ctx.i32_id && target == ctx.u64_id {
+        ctx.spv.op_sconvert(ctx.t_u64, val.id)
+    } else if val.ty == ctx.u64_id && target == ctx.u32_id {
+        ctx.spv.op_uconvert(ctx.t_u32, val.id)
     } else {
         val.id
     }
@@ -2825,6 +2876,8 @@ fn unify(ctx: &mut LowerCtx<'_>, lhs: Val, rhs: Val) -> (Val, Val) {
     }
     let target = if lhs.ty == ctx.f32_id || rhs.ty == ctx.f32_id {
         ctx.f32_id
+    } else if lhs.ty == ctx.u64_id || rhs.ty == ctx.u64_id {
+        ctx.u64_id
     } else if lhs.ty == ctx.i32_id || rhs.ty == ctx.i32_id {
         ctx.i32_id
     } else {

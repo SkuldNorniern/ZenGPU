@@ -331,6 +331,9 @@ impl<'a> Parser<'a> {
         }
         self.expect(&Tok::Lt, "`<` in array<T, N>")?;
         let elem = self.parse_buffer_elem_type()?;
+        if elem == self.types.u64_id() {
+            return self.err("shared arrays of u64 are not supported");
+        }
         self.expect(&Tok::Comma, "`,` in array<T, N>")?;
         let len = match self.peek() {
             Some(Tok::Int(v)) if *v > 0 && *v <= u32::MAX as u64 => {
@@ -493,8 +496,18 @@ impl<'a> Parser<'a> {
                         None => rhs,
                     };
                     self.check_frag_assign(ctx, &name, &rhs)?;
+                    let u64_id = self.types.u64_id();
+                    let rhs = if ctx.locals.get(&name) == Some(&u64_id) {
+                        widen_u64_literal(rhs)
+                    } else {
+                        rhs
+                    };
                     if let Some(&local_ty) = ctx.locals.get(&name) {
                         let rhs_ty = type_of_compute_expr(&rhs, &ctx.type_ctx(), &mut self.types);
+                        if (local_ty == u64_id || rhs_ty == u64_id) && rhs_ty != local_ty {
+                            return self
+                                .err(format!("assignment to `{name}` must keep its u64 type"));
+                        }
                         if (u32_vec_lanes(&self.types, local_ty).is_some()
                             || u32_vec_lanes(&self.types, rhs_ty).is_some())
                             && rhs_ty != local_ty
@@ -520,6 +533,12 @@ impl<'a> Parser<'a> {
                     let f32_id = self.types.f32_id();
                     let i8_id = self.types.intern(i8_type());
                     let u8_id = self.types.intern(u8_type());
+                    let u64_id = self.types.u64_id();
+                    let rhs = if buffer.elem == u64_id {
+                        widen_u64_literal(rhs)
+                    } else {
+                        rhs
+                    };
                     let expected = if buffer.elem == bf16_id || buffer.elem == f16_id {
                         f32_id
                     } else if buffer.elem == i8_id {
@@ -676,18 +695,24 @@ impl<'a> Parser<'a> {
         let f32_id = self.types.f32_id();
         let u32_id = self.types.u32_id();
         let i32_id = self.types.i32_id();
+        let u64_id = self.types.u64_id();
         let elem_ok = if op == AtomicOp::Add {
-            [f32_id, u32_id, i32_id].contains(&buffer.elem)
+            [f32_id, u32_id, i32_id, u64_id].contains(&buffer.elem)
         } else {
-            buffer.elem == u32_id || buffer.elem == i32_id
+            [u32_id, i32_id, u64_id].contains(&buffer.elem)
         };
         if !elem_ok {
             return self.err(if op == AtomicOp::Add {
-                "atomic_add requires buffer<f32>, buffer<u32> or buffer<i32>"
+                "atomic_add requires buffer<f32>, buffer<u32>, buffer<i32> or buffer<u64>"
             } else {
-                "this atomic requires buffer<u32> or buffer<i32>"
+                "this atomic requires buffer<u32>, buffer<i32> or buffer<u64>"
             });
         }
+        let (value, compare) = if buffer.elem == u64_id {
+            (widen_u64_literal(value), compare.map(widen_u64_literal))
+        } else {
+            (value, compare)
+        };
         let index_ty = type_of_compute_expr(&index, &ctx.type_ctx(), &mut self.types);
         if index_ty != u32_id && index_ty != f32_id {
             return self.err(format!("{kw} index must be a u32- or f32-typed expression"));
@@ -697,6 +722,8 @@ impl<'a> Parser<'a> {
         let fits = |ty: TypeId| {
             if elem == f32_id {
                 ty == f32_id
+            } else if elem == u64_id {
+                ty == u64_id
             } else {
                 ty == u32_id || ty == i32_id
             }
@@ -710,7 +737,7 @@ impl<'a> Parser<'a> {
 
         if !ok {
             return self.err(format!(
-                "{kw} value must match the buffer: f32 for buffer<f32>, an integer otherwise"
+                "{kw} value must match the buffer: f32 for buffer<f32>, u64 for buffer<u64>, an integer otherwise"
             ));
         }
         Ok((buf, index, value, compare, buffer.elem))
@@ -749,6 +776,12 @@ impl<'a> Parser<'a> {
         }
 
         let init = self.parse_expr(ctx)?;
+        let u64_id = self.types.u64_id();
+        let init = if annot == Some(u64_id) {
+            widen_u64_literal(init)
+        } else {
+            init
+        };
         let init = match annot {
             Some(ty) => self.frag_load_for(ctx, init, ty),
             None => init,
@@ -769,6 +802,9 @@ impl<'a> Parser<'a> {
                 }
                 if u32_vec_lanes(&self.types, ty).is_some() && init_ty != ty {
                     return self.err("let initializer does not match the vector annotation");
+                }
+                if ty == u64_id && init_ty != u64_id {
+                    return self.err("let initializer must be u64 for a u64 annotation");
                 }
                 ty
             }

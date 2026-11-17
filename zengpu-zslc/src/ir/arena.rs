@@ -35,6 +35,13 @@ impl TypeArena {
         })
     }
 
+    pub fn u64_id(&mut self) -> TypeId {
+        self.intern(Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        })
+    }
+
     pub fn i32_id(&mut self) -> TypeId {
         self.intern(Type::Int {
             width: IntWidth::W32,

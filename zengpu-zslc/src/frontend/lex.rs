@@ -13,6 +13,8 @@ pub struct Span {
 pub enum Tok {
     Ident(String),
     Int(u64),
+    /// Integer literal with the `u64` suffix.
+    U64(u64),
     /// Float literal value (narrowed to `f32` later).
     Float(f64),
 
@@ -33,6 +35,7 @@ pub enum Tok {
     Amp,
     Pipe,
     Caret,
+    Tilde,
     Shl,
     Shr,
     Arrow,
@@ -80,7 +83,8 @@ fn radix_prefix(bytes: &[u8], i: usize) -> Option<u32> {
 ///
 /// Only the `u...` and `i...` suffixes apply. Hex digits include `b`, `e` and `f`, so `0x1f32` is
 /// one number.
-fn lex_radix_int(src: &str, start: usize, radix: u32) -> Result<(u64, usize), LexError> {
+/// Returns the value, its end, and whether it has the `u64` suffix.
+fn lex_radix_int(src: &str, start: usize, radix: u32) -> Result<(u64, usize, bool), LexError> {
     let bytes = src.as_bytes();
     let n = bytes.len();
     let mut i = start + 2;
@@ -94,11 +98,14 @@ fn lex_radix_int(src: &str, start: usize, radix: u32) -> Result<(u64, usize), Le
             at: start,
         });
     }
+    let mut wide = false;
     if i < n && (bytes[i] == b'u' || bytes[i] == b'i') {
+        let suffix_start = i;
         i += 1;
         while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
             i += 1;
         }
+        wide = &src[suffix_start..i] == "u64";
     }
     if i < n && bytes[i].is_ascii_alphanumeric() {
         return Err(LexError {
@@ -108,17 +115,18 @@ fn lex_radix_int(src: &str, start: usize, radix: u32) -> Result<(u64, usize), Le
     }
     let v = u64::from_str_radix(&digits, radix).map_err(|_| LexError {
         msg: format!(
-            "integer literal `{}` does not fit in 32 bits",
-            &src[start..i]
+            "integer literal `{}` does not fit in {}",
+            &src[start..i],
+            if wide { "64 bits" } else { "32 bits" }
         ),
         at: start,
     })?;
-    Ok((checked_u32(v, start)?, i))
+    Ok((checked_width(v, wide, start)?, i, wide))
 }
 
-/// Values are 32-bit. Wider literals truncate silently.
-fn checked_u32(v: u64, at: usize) -> Result<u64, LexError> {
-    if v > u64::from(u32::MAX) {
+/// Values are 32-bit unless suffixed `u64`. Wider literals truncate silently.
+fn checked_width(v: u64, wide: bool, at: usize) -> Result<u64, LexError> {
+    if !wide && v > u64::from(u32::MAX) {
         return Err(LexError {
             msg: format!("integer literal {v} does not fit in 32 bits"),
             at,
@@ -185,9 +193,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
 
         if c.is_ascii_digit() {
             if let Some(radix) = radix_prefix(bytes, i) {
-                let (v, end) = lex_radix_int(src, i, radix)?;
+                let (v, end, wide) = lex_radix_int(src, i, radix)?;
                 out.push(Token {
-                    tok: Tok::Int(v),
+                    tok: if wide { Tok::U64(v) } else { Tok::Int(v) },
                     span: Span { start: i, end },
                 });
                 i = end;
@@ -225,6 +233,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 is_float = true;
             }
             let num_end = i;
+            let mut wide = false;
             if i < n && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
                 let suffix_start = i;
                 i += 1;
@@ -234,6 +243,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                 if src[suffix_start..i].starts_with('f') {
                     is_float = true;
                 }
+                wide = &src[suffix_start..i] == "u64";
             }
             let text = &src[start..num_end];
             let tok = if is_float {
@@ -246,7 +256,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
                     msg: format!("invalid integer literal `{text}`"),
                     at: start,
                 })?;
-                Tok::Int(checked_u32(v, start)?)
+                let v = checked_width(v, wide, start)?;
+                if wide { Tok::U64(v) } else { Tok::Int(v) }
             };
             out.push(Token {
                 tok,
@@ -281,6 +292,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, LexError> {
             (b'&', _) => (Tok::Amp, 1),
             (b'|', _) => (Tok::Pipe, 1),
             (b'^', _) => (Tok::Caret, 1),
+            (b'~', _) => (Tok::Tilde, 1),
             (b'=', _) => (Tok::Eq, 1),
             (b'.', _) => (Tok::Dot, 1),
             (b',', _) => (Tok::Comma, 1),
@@ -344,6 +356,15 @@ mod tests {
         assert!(lex("0b102").is_err());
         assert!(lex("4294967296").is_err());
         assert!(lex("0x1_0000_0000").is_err());
+    }
+
+    #[test]
+    fn u64_literals_take_the_wide_suffix() {
+        assert_eq!(kinds("1u64"), vec![Tok::U64(1)]);
+        assert_eq!(kinds("4294967296u64"), vec![Tok::U64(1 << 32)]);
+        assert_eq!(kinds("0xFFFF_FFFF_FFFF_FFFFu64"), vec![Tok::U64(u64::MAX)]);
+        assert!(lex("18446744073709551616u64").is_err());
+        assert!(lex("0x1_0000_0000_0000_0000u64").is_err());
     }
 
     #[test]

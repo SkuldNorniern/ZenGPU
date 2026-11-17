@@ -7,6 +7,8 @@ use crate::ir::types::TypeId;
 pub enum IrExpr {
     /// Typed as `u32`.
     LitU32(u32),
+    /// Typed as `u64`. Written with the `u64` suffix.
+    LitU64(u64),
     /// Typed as `f32`.
     LitF32(f32),
     Local(String),
@@ -190,6 +192,8 @@ pub enum TexelOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinFn {
     U32,
+    /// Zero-extends `u32`, sign-extends `i32`, and is the identity on `u64`.
+    U64,
     /// f32 to i32 truncates, maps NaN to 0 and saturates. u32 to i32 reinterprets the bits.
     I32,
     /// Rounds to the nearest f16, ties to even. The result stays f32: overflow gives inf, and NaN
@@ -328,6 +332,7 @@ impl BuiltinFn {
     pub fn name(self) -> &'static str {
         match self {
             BuiltinFn::U32 => "u32",
+            BuiltinFn::U64 => "u64",
             BuiltinFn::F32 => "f32",
             BuiltinFn::Step => "step",
             BuiltinFn::Smoothstep => "smoothstep",
@@ -508,6 +513,7 @@ fn expr_uses_subgroup_query(expr: &IrExpr) -> bool {
             expr_uses_subgroup_query(lhs) || expr_uses_subgroup_query(rhs)
         }
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::Local(_)
         | IrExpr::ScalarParam(_)
@@ -606,6 +612,7 @@ fn expr_uses_workgroup_reduce(expr: &IrExpr) -> bool {
             expr_uses_workgroup_reduce(lhs) || expr_uses_workgroup_reduce(rhs)
         }
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::Local(_)
         | IrExpr::ScalarParam(_)
@@ -780,6 +787,7 @@ fn expr_uses_subgroup_collectives(expr: &IrExpr) -> (bool, bool, bool, bool, boo
             expr_uses_subgroup_collectives(rhs),
         ),
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::Local(_)
         | IrExpr::ScalarParam(_)
@@ -813,4 +821,95 @@ pub enum IrBinOp {
     BitXor,
     Shl,
     Shr,
+}
+
+/// True if `pred` holds for any expression in `stmts`, nested ones included.
+pub fn stmts_any_expr(stmts: &[IrStmt], pred: &impl Fn(&IrExpr) -> bool) -> bool {
+    stmts.iter().any(|stmt| stmt_any_expr(stmt, pred))
+}
+
+fn stmt_any_expr(stmt: &IrStmt, pred: &impl Fn(&IrExpr) -> bool) -> bool {
+    match stmt {
+        IrStmt::Let { init: e, .. } | IrStmt::AssignLocal { value: e, .. } | IrStmt::Eval(e) => {
+            expr_any(e, pred)
+        }
+        IrStmt::AssignBuffer { index, value, .. } | IrStmt::AssignShared { index, value, .. } => {
+            expr_any(index, pred) || expr_any(value, pred)
+        }
+        IrStmt::Atomic {
+            index,
+            value,
+            compare,
+            ..
+        } => {
+            expr_any(index, pred)
+                || expr_any(value, pred)
+                || compare.as_ref().is_some_and(|c| expr_any(c, pred))
+        }
+        IrStmt::ImageStore { args, .. } => args.iter().any(|a| expr_any(a, pred)),
+        IrStmt::FragStore {
+            offset, ld, value, ..
+        } => expr_any(offset, pred) || expr_any(ld, pred) || expr_any(value, pred),
+        IrStmt::Barrier | IrStmt::SharedBarrier | IrStmt::Discard => false,
+        IrStmt::If { cond, then, else_ } => {
+            expr_any(cond, pred)
+                || stmts_any_expr(then, pred)
+                || else_.as_deref().is_some_and(|s| stmts_any_expr(s, pred))
+        }
+        IrStmt::For { lo, hi, body, .. } => {
+            expr_any(lo, pred) || expr_any(hi, pred) || stmts_any_expr(body, pred)
+        }
+    }
+}
+
+fn expr_any(expr: &IrExpr, pred: &impl Fn(&IrExpr) -> bool) -> bool {
+    if pred(expr) {
+        return true;
+    }
+    match expr {
+        IrExpr::BufferLoad { index, .. }
+        | IrExpr::SharedLoad { index, .. }
+        | IrExpr::Index { index, .. } => expr_any(index, pred),
+        IrExpr::FieldAccess { base, .. } | IrExpr::Swizzle { base, .. } => expr_any(base, pred),
+        IrExpr::Construct { args, .. }
+        | IrExpr::ArrayLit(args)
+        | IrExpr::Builtin { args, .. }
+        | IrExpr::Texel { args, .. } => args.iter().any(|a| expr_any(a, pred)),
+        IrExpr::Sample { index, uv, lod } => {
+            expr_any(index, pred)
+                || expr_any(uv, pred)
+                || lod.as_deref().is_some_and(|l| expr_any(l, pred))
+        }
+        IrExpr::SampleCompare { index, uv, depth } => {
+            expr_any(index, pred) || expr_any(uv, pred) || expr_any(depth, pred)
+        }
+        IrExpr::FragLoad { offset, ld, .. } => expr_any(offset, pred) || expr_any(ld, pred),
+        IrExpr::Neg(inner) => expr_any(inner, pred),
+        IrExpr::Binary { lhs, rhs, .. } => expr_any(lhs, pred) || expr_any(rhs, pred),
+        IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
+        | IrExpr::LitF32(_)
+        | IrExpr::Local(_)
+        | IrExpr::ScalarParam(_)
+        | IrExpr::GlobalId(_)
+        | IrExpr::LocalId(_)
+        | IrExpr::GroupId(_)
+        | IrExpr::Input(_)
+        | IrExpr::TexSize { .. } => false,
+    }
+}
+
+/// True if the body uses `u64`: a literal or a `u64(…)` conversion. Locals and buffers are
+/// checked by their types.
+pub fn stmts_use_u64(stmts: &[IrStmt]) -> bool {
+    stmts_any_expr(stmts, &|e| {
+        matches!(
+            e,
+            IrExpr::LitU64(_)
+                | IrExpr::Builtin {
+                    func: BuiltinFn::U64,
+                    ..
+                }
+        )
+    })
 }

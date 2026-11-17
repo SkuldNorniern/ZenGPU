@@ -24,6 +24,32 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Integer operands of `op`. An untyped literal takes the other side's `u64`. Any other mix of
+    /// `u64` and 32-bit values is an error: convert with `u64(…)` or `u32(…)`.
+    fn int_bin(
+        &mut self,
+        ctx: &Ctx,
+        op: IrBinOp,
+        lhs: IrExpr,
+        rhs: IrExpr,
+    ) -> Result<IrExpr, ParseError> {
+        let tc = ctx.type_ctx();
+        let u64_id = self.types.u64_id();
+        let lhs_ty = type_of_compute_expr(&lhs, &tc, &mut self.types);
+        let rhs_ty = type_of_compute_expr(&rhs, &tc, &mut self.types);
+        if lhs_ty != u64_id && rhs_ty != u64_id {
+            return Ok(bin(op, lhs, rhs));
+        }
+        let (lhs, rhs) = (widen_u64_literal(lhs), widen_u64_literal(rhs));
+        let lhs_ty = type_of_compute_expr(&lhs, &tc, &mut self.types);
+        let rhs_ty = type_of_compute_expr(&rhs, &tc, &mut self.types);
+        if lhs_ty != u64_id || rhs_ty != u64_id {
+            return self
+                .err("u64 operands must both be u64: write `1u64` or convert with `u64(x)`");
+        }
+        Ok(bin(op, lhs, rhs))
+    }
+
     fn vector_component(&self, field: &str, lanes: u8) -> Result<u32, ParseError> {
         let comp = match field {
             "x" => 0,
@@ -72,14 +98,14 @@ impl<'a> Parser<'a> {
         self.pos += 1;
         let rhs = self.parse_bitor(ctx)?;
         self.reject_vector_operands(ctx, [&lhs, &rhs])?;
-        Ok(bin(op, lhs, rhs))
+        self.int_bin(ctx, op, lhs, rhs)
     }
 
     pub(super) fn parse_bitor(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
         let mut lhs = self.parse_bitxor(ctx)?;
         while self.eat(&Tok::Pipe) {
             let rhs = self.parse_bitxor(ctx)?;
-            lhs = bin(IrBinOp::BitOr, lhs, rhs);
+            lhs = self.int_bin(ctx, IrBinOp::BitOr, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -88,7 +114,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_bitand(ctx)?;
         while self.eat(&Tok::Caret) {
             let rhs = self.parse_bitand(ctx)?;
-            lhs = bin(IrBinOp::BitXor, lhs, rhs);
+            lhs = self.int_bin(ctx, IrBinOp::BitXor, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -97,7 +123,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_shift(ctx)?;
         while self.eat(&Tok::Amp) {
             let rhs = self.parse_shift(ctx)?;
-            lhs = bin(IrBinOp::BitAnd, lhs, rhs);
+            lhs = self.int_bin(ctx, IrBinOp::BitAnd, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -128,7 +154,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let rhs = self.parse_mul(ctx)?;
             self.reject_vector_operands(ctx, [&lhs, &rhs])?;
-            lhs = bin(op, lhs, rhs);
+            lhs = self.int_bin(ctx, op, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -145,7 +171,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let rhs = self.parse_unary(ctx)?;
             self.reject_vector_operands(ctx, [&lhs, &rhs])?;
-            lhs = bin(op, lhs, rhs);
+            lhs = self.int_bin(ctx, op, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -155,7 +181,24 @@ impl<'a> Parser<'a> {
             let inner = self.parse_unary(ctx)?;
             return Ok(IrExpr::Neg(Box::new(inner)));
         }
+        if self.eat(&Tok::Tilde) {
+            let inner = self.parse_unary(ctx)?;
+            let ty = type_of_compute_expr(&inner, &ctx.type_ctx(), &mut self.types);
+            let ones = self.all_ones(ty)?;
+            return Ok(bin(IrBinOp::BitXor, inner, ones));
+        }
         self.parse_primary(ctx)
+    }
+
+    /// The all-ones literal of an integer type, for `~x` as `x ^ ones`.
+    pub(super) fn all_ones(&mut self, ty: TypeId) -> Result<IrExpr, ParseError> {
+        if ty == self.types.u64_id() {
+            Ok(IrExpr::LitU64(u64::MAX))
+        } else if ty == self.types.u32_id() || ty == self.types.i32_id() {
+            Ok(IrExpr::LitU32(u32::MAX))
+        } else {
+            self.err("`~` takes a u32, i32 or u64 value")
+        }
     }
 
     pub(super) fn parse_primary(&mut self, ctx: &Ctx) -> Result<IrExpr, ParseError> {
@@ -164,6 +207,11 @@ impl<'a> Parser<'a> {
                 let v = *v as u32;
                 self.pos += 1;
                 Ok(IrExpr::LitU32(v))
+            }
+            Some(Tok::U64(v)) => {
+                let v = *v;
+                self.pos += 1;
+                Ok(IrExpr::LitU64(v))
             }
             Some(Tok::Float(v)) => {
                 let v = *v as f32;
@@ -432,8 +480,8 @@ impl<'a> Parser<'a> {
             msg: format!("unknown function `{name}`"),
             at: self.span(),
         })?;
-        if func == BuiltinFn::U32 && args.len() != 1 {
-            return self.err("u32() takes 1 arg");
+        if matches!(func, BuiltinFn::U32 | BuiltinFn::U64) && args.len() != 1 {
+            return self.err(format!("{}() takes 1 arg", func.name()));
         }
         if func == BuiltinFn::F32 && args.len() != 1 {
             return self.err("f32() takes 1 arg");
@@ -488,6 +536,18 @@ impl<'a> Parser<'a> {
                         func.name()
                     ));
                 }
+            }
+        }
+        if func == BuiltinFn::U64 {
+            let tc = ctx.type_ctx();
+            let arg = type_of_compute_expr(&args[0], &tc, &mut self.types);
+            let ok = [
+                self.types.u32_id(),
+                self.types.i32_id(),
+                self.types.u64_id(),
+            ];
+            if !ok.contains(&arg) {
+                return self.err("u64(x) takes a u32, i32 or u64 value");
             }
         }
         if func == BuiltinFn::I32 {

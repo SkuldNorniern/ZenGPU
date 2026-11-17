@@ -550,7 +550,10 @@ mod tests {
         "#;
         let module = parse_compute(src).expect("parse");
         let err = lower_compute(&module).unwrap_err();
-        assert!(err.message.contains("u32 or i32 operands"), "got: {err}");
+        assert!(
+            err.message.contains("u32, i32 or u64 operands"),
+            "got: {err:?}"
+        );
     }
 
     #[test]
@@ -608,5 +611,83 @@ mod tests {
         "#;
         let words = lower(src);
         assert_eq!(words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    #[test]
+    fn u64_literals_and_conversions_type_check() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel k(wide: device mut buffer<u64>, out: device mut buffer<u32>, id: global_id) {
+                let mask: u64 = 0
+                let packed = (u64(id.x) << 32) | u64(id.y) | 1u64
+                let bits = ~mask & packed
+                let low = u32(bits)
+                wide[id.x] = bits + 1
+                out[id.x] = low
+            }
+        "#;
+        assert!(parse_compute(src).is_ok());
+    }
+
+    #[test]
+    fn u64_and_32_bit_operands_need_an_explicit_conversion() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel k(out: device mut buffer<u32>, id: global_id) {
+                let a: u32 = 1
+                let b = u64(a) + a
+                out[id.x] = u32(b)
+            }
+        "#;
+        let err = parse_compute(src).unwrap_err();
+        assert!(
+            err.msg.contains("u64 operands must both be u64"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn u64_atomics_need_u64_values_and_u64_buffers() {
+        let ok = r#"
+            @workgroup_size(1)
+            kernel k(depth: device mut buffer<u64>, id: global_id) {
+                let old = atomic_max(depth, id.x, (u64(3) << 32) | u64(id.x))
+                let c = atomic_compare_exchange(depth, 0, 0u64, old)
+                atomic_add(depth, 0, 1)
+            }
+        "#;
+        assert!(parse_compute(ok).is_ok());
+
+        let wrong_width = r#"
+            @workgroup_size(1)
+            kernel k(depth: device mut buffer<u64>, id: global_id) {
+                atomic_add(depth, 0, id.x)
+            }
+        "#;
+        let err = parse_compute(wrong_width).unwrap_err();
+        assert!(
+            err.msg.contains("value must match the buffer"),
+            "got: {err:?}"
+        );
+
+        let bad = r#"
+            @workgroup_size(1)
+            kernel k(words: device mut buffer<u32>, id: global_id) {
+                let old = atomic_max(words, id.x, u64(id.x))
+            }
+        "#;
+        assert!(parse_compute(bad).is_err());
+    }
+
+    #[test]
+    fn u64_shared_arrays_are_refused_at_parse() {
+        let src = r#"
+            @workgroup_size(1)
+            kernel k(id: global_id) {
+                shared s: array<u64, 4>
+            }
+        "#;
+        let err = parse_compute(src).unwrap_err();
+        assert!(err.msg.contains("shared arrays of u64"), "got: {err:?}");
     }
 }

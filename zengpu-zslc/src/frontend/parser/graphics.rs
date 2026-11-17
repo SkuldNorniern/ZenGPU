@@ -165,9 +165,12 @@ impl<'a> Parser<'a> {
                     self.types.f32_id(),
                     self.types.u32_id(),
                     self.types.i32_id(),
+                    self.types.u64_id(),
                 ];
                 if !ok.contains(&elem) {
-                    return self.err("only buffer<f32>, buffer<u32> and buffer<i32> are supported");
+                    return self.err(
+                        "only buffer<f32>, buffer<u32>, buffer<i32> and buffer<u64> are supported",
+                    );
                 }
                 ctx.buffers.insert(name.clone(), (writable, elem));
                 buf_params.push(name);
@@ -435,21 +438,33 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::RParen, "`)` after atomic arguments")?;
         let u32_id = self.types.u32_id();
         let i32_id = self.types.i32_id();
+        let u64_id = self.types.u64_id();
         let elem = match ctx.buffers.get(&buf) {
-            Some((true, elem)) if *elem == u32_id || *elem == i32_id => *elem,
+            Some((true, elem)) if [u32_id, i32_id, u64_id].contains(elem) => *elem,
             Some(_) => {
                 return self.err(format!(
-                    "{kw} in a vertex or fragment shader takes a `device mut buffer<u32>` or `buffer<i32>`"
+                    "{kw} in a vertex or fragment shader takes a `device mut buffer<u32>`, `buffer<i32>` or `buffer<u64>`"
                 ));
             }
             None => return self.err(format!("`{buf}` is not a device buffer")),
+        };
+        let (value, compare) = if elem == u64_id {
+            (widen_u64_literal(value), compare.map(widen_u64_literal))
+        } else {
+            (value, compare)
         };
         let type_ctx = ctx.type_ctx();
         let mut operands = vec![&value];
         operands.extend(compare.as_ref());
         for operand in operands {
             if type_of_graphics_expr(operand, &type_ctx, &mut self.types) != elem {
-                let want = if elem == u32_id { "u32" } else { "i32" };
+                let want = if elem == u32_id {
+                    "u32"
+                } else if elem == u64_id {
+                    "u64"
+                } else {
+                    "i32"
+                };
                 return self.err(format!("{kw} value must be a {want}"));
             }
         }

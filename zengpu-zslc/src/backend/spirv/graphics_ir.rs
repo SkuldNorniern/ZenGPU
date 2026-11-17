@@ -36,12 +36,12 @@ mod glsl_op {
 
 use std::collections::HashMap;
 
-use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, deco, sc};
+use crate::backend::spirv::builder::{Id, SpvBuilder, builtin, cap, deco, sc};
 use crate::backend::spirv::compute::atomic_opcode;
 use crate::frontend::diagnostic::Diagnostic;
 use crate::ir::GraphicsModule;
 use crate::ir::node::FragSrc;
-use crate::ir::node::{AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt};
+use crate::ir::node::{AtomicOp, BuiltinFn, IrBinOp, IrExpr, IrStmt, stmts_use_u64};
 use crate::ir::types::{ArrayLen, Type, TypeId};
 
 type R<T> = Result<T, String>;
@@ -89,6 +89,8 @@ struct Ctx<'a> {
     t_f32: Id,
     t_u32: Id,
     t_i32: Id,
+    /// `Id(0)` unless the shader uses u64.
+    t_u64: Id,
     t_bool: Id,
     t_vec2: Id,
     t_vec3: Id,
@@ -98,6 +100,7 @@ struct Ctx<'a> {
     f32_id: TypeId,
     u32_id: TypeId,
     i32_id: TypeId,
+    u64_id: TypeId,
     vec2_id: TypeId,
     vec3_id: TypeId,
     vec4_id: TypeId,
@@ -107,10 +110,11 @@ struct Ctx<'a> {
     scalar_params: HashMap<String, ScalarInfo>,
     /// Each buffer's push slot and element type.
     buf_params: HashMap<String, (u32, TypeId)>,
-    /// The buffer table seen as `f32`, `u32` and `i32` elements: one binding, several views.
+    /// The buffer table seen as `f32`, `u32`, `i32` and `u64` elements: one binding, several views.
     bufs_f32: Option<BufView>,
     bufs_u32: Option<BufView>,
     bufs_i32: Option<BufView>,
+    bufs_u64: Option<BufView>,
     textures: Option<TextureTable>,
     is_fragment: bool,
     pc_var: Option<Id>,
@@ -126,10 +130,11 @@ struct BufView {
     t_ptr_elem: Id,
 }
 
-/// The bindless buffer table at binding 0 with `elem` elements, aliasing the other views.
-fn buffer_view(spv: &mut SpvBuilder, elem: Id, read_only: bool) -> BufView {
+/// The bindless buffer table at binding 0 with `elem` elements of `stride` bytes, aliasing the
+/// other views.
+fn buffer_view(spv: &mut SpvBuilder, elem: Id, stride: u32, read_only: bool) -> BufView {
     let t_ra = spv.type_runtime_array(elem);
-    spv.decorate(t_ra, deco::ARRAY_STRIDE, &[4]);
+    spv.decorate(t_ra, deco::ARRAY_STRIDE, &[stride]);
     let t_struct_buf = spv.type_struct(&[t_ra]);
     spv.decorate(t_struct_buf, deco::BLOCK, &[]);
     spv.member_decorate(t_struct_buf, 0, deco::OFFSET, &[0]);
@@ -158,6 +163,8 @@ impl Ctx<'_> {
             self.bufs_u32
         } else if elem == self.i32_id {
             self.bufs_i32
+        } else if elem == self.u64_id {
+            self.bufs_u64
         } else {
             self.bufs_f32
         }
@@ -227,6 +234,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let f32_id = types.f32_id();
     let u32_id = types.u32_id();
     let i32_id = types.i32_id();
+    let u64_id = types.u64_id();
     let vec2_id = types.vec_id(2);
     let vec3_id = types.vec_id(3);
     let vec4_id = types.vec_id(4);
@@ -241,6 +249,15 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let t_f32 = spv.type_float(32);
     let t_u32 = spv.type_int(32, false);
     let t_i32 = spv.type_int(32, true);
+    // Declared only when used: `OpTypeInt 64` needs the Int64 capability.
+    let uses_u64 = stmts_use_u64(&e.body)
+        || e.locals.iter().any(|(_, ty)| *ty == u64_id)
+        || e.buf_elems.contains(&u64_id);
+    let t_u64 = if uses_u64 {
+        spv.type_int(64, false)
+    } else {
+        Id(0)
+    };
     let t_bool = spv.type_bool();
     let t_vec2 = spv.type_vector(t_f32, 2);
     let t_vec3 = spv.type_vector(t_f32, 3);
@@ -372,9 +389,10 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
 
     let read_only = !writes_buffer(&e.body);
     let wants = |elem: TypeId| e.buf_elems.contains(&elem);
-    let bufs_f32 = wants(f32_id).then(|| buffer_view(&mut spv, t_f32, read_only));
-    let bufs_u32 = wants(u32_id).then(|| buffer_view(&mut spv, t_u32, read_only));
-    let bufs_i32 = wants(i32_id).then(|| buffer_view(&mut spv, t_i32, read_only));
+    let bufs_f32 = wants(f32_id).then(|| buffer_view(&mut spv, t_f32, 4, read_only));
+    let bufs_u32 = wants(u32_id).then(|| buffer_view(&mut spv, t_u32, 4, read_only));
+    let bufs_i32 = wants(i32_id).then(|| buffer_view(&mut spv, t_i32, 4, read_only));
+    let bufs_u64 = wants(u64_id).then(|| buffer_view(&mut spv, t_u64, 8, read_only));
 
     let textures = e.textures.as_ref().map(|_| {
         spv.capability_non_uniform_sampled_images();
@@ -460,6 +478,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     let mut t_ptr_func_f32 = Id(0);
     let mut t_ptr_func_u32 = Id(0);
     let mut t_ptr_func_i32 = Id(0);
+    let mut t_ptr_func_u64 = Id(0);
     let mut t_ptr_func_vec2 = Id(0);
     let mut t_ptr_func_vec3 = Id(0);
     let mut t_ptr_func_vec4 = Id(0);
@@ -502,6 +521,8 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             (t_u32, &mut t_ptr_func_u32)
         } else if gty == i32_id {
             (t_i32, &mut t_ptr_func_i32)
+        } else if gty == u64_id {
+            (t_u64, &mut t_ptr_func_u64)
         } else if gty == vec2_id {
             (t_vec2, &mut t_ptr_func_vec2)
         } else if gty == vec3_id {
@@ -532,6 +553,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         t_f32,
         t_u32,
         t_i32,
+        t_u64,
         t_bool,
         t_vec2,
         t_vec3,
@@ -540,6 +562,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         f32_id,
         u32_id,
         i32_id,
+        u64_id,
         vec2_id,
         vec3_id,
         vec4_id,
@@ -551,6 +574,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         bufs_f32,
         bufs_u32,
         bufs_i32,
+        bufs_u64,
         textures,
         is_fragment,
         pc_var,
@@ -655,6 +679,8 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
                 scalar_to_u32(ctx, rhs)
             } else if elem == ctx.i32_id {
                 scalar_to_i32(ctx, rhs)
+            } else if elem == ctx.u64_id {
+                scalar_to_u64(ctx, rhs)
             } else {
                 scalar_to_f32(ctx, rhs)
             };
@@ -751,22 +777,51 @@ fn lower_stmt(ctx: &mut Ctx<'_>, stmt: &IrStmt) -> R<()> {
             old,
         } => {
             let (ptr_elem, elem) = ctx.buffer_element(buf, index)?;
-            if elem != ctx.u32_id && elem != ctx.i32_id {
-                return Err("vertex and fragment atomics take a buffer<u32> or buffer<i32>".into());
+            if elem != ctx.u32_id && elem != ctx.i32_id && elem != ctx.u64_id {
+                return Err(
+                    "vertex and fragment atomics take a buffer<u32>, buffer<i32> or buffer<u64>"
+                        .into(),
+                );
+            }
+            let wide = elem == ctx.u64_id;
+            if wide {
+                ctx.spv.capability(cap::INT64_ATOMICS);
             }
             let signed = elem == ctx.i32_id;
-            let t = if signed { ctx.t_i32 } else { ctx.t_u32 };
+            let t = if signed {
+                ctx.t_i32
+            } else if wide {
+                ctx.t_u64
+            } else {
+                ctx.t_u32
+            };
             let rhs = lower_value(ctx, value)?;
             if rhs.ty == ctx.i32_id && !signed {
-                return Err("an i32 value cannot be an atomic on a buffer<u32>".into());
+                return Err(
+                    "an i32 value cannot be an atomic on a buffer<u32> or buffer<u64>".into(),
+                );
             }
-            let rhs_id = scalar_to_int(ctx, rhs, signed);
+            if wide && rhs.ty != ctx.u64_id {
+                return Err("an atomic on a buffer<u64> takes a u64 value".into());
+            }
+            let rhs_id = if wide {
+                rhs.id
+            } else {
+                scalar_to_int(ctx, rhs, signed)
+            };
             let scope = ctx.spv.constant_u32(ctx.t_u32, 1);
             let semantics = ctx.spv.constant_u32(ctx.t_u32, 0);
             let before = match (aop, compare) {
                 (AtomicOp::CompareExchange, Some(compare)) => {
                     let cmp = lower_value(ctx, compare)?;
-                    let cmp_id = scalar_to_int(ctx, cmp, signed);
+                    let cmp_id = if wide {
+                        if cmp.ty != ctx.u64_id {
+                            return Err("an atomic on a buffer<u64> takes a u64 value".into());
+                        }
+                        cmp.id
+                    } else {
+                        scalar_to_int(ctx, cmp, signed)
+                    };
                     ctx.spv
                         .op_atomic_compare_exchange(t, ptr_elem, scope, semantics, rhs_id, cmp_id)
                 }
@@ -825,7 +880,7 @@ fn lower_condition(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<Id> {
                     IrBinOp::Ne => ctx.spv.op_ford_ne(b, lhs.id, rhs.id),
                     _ => unreachable!(),
                 }
-            } else if lhs.ty == ctx.u32_id {
+            } else if lhs.ty == ctx.u32_id || lhs.ty == ctx.u64_id {
                 match op {
                     IrBinOp::Lt => ctx.spv.op_ult(b, lhs.id, rhs.id),
                     IrBinOp::Le => ctx.spv.op_ule(b, lhs.id, rhs.id),
@@ -860,6 +915,10 @@ fn lower_value(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
         IrExpr::LitU32(v) => {
             let id = ctx.spv.constant_u32(ctx.t_u32, *v);
             Ok(GVal { id, ty: ctx.u32_id })
+        }
+        IrExpr::LitU64(v) => {
+            let id = ctx.spv.constant_u64(ctx.t_u64, *v);
+            Ok(GVal { id, ty: ctx.u64_id })
         }
         IrExpr::LitF32(v) => {
             let id = ctx.spv.constant_f32(ctx.t_f32, *v);
@@ -901,6 +960,8 @@ fn lower_value(ctx: &mut Ctx<'_>, expr: &IrExpr) -> R<GVal> {
                 ctx.t_u32
             } else if elem == ctx.i32_id {
                 ctx.t_i32
+            } else if elem == ctx.u64_id {
+                ctx.t_u64
             } else {
                 ctx.t_f32
             };
@@ -1140,6 +1201,14 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let id = ctx.spv.op_bitcast(target, v.id);
             Ok(GVal { id, ty })
         }
+        BuiltinFn::U64 => {
+            if args.len() != 1 {
+                return Err(format!("{name}() takes 1 arg"));
+            }
+            let v = lower_value(ctx, &args[0])?;
+            let id = scalar_to_u64(ctx, v);
+            Ok(GVal { id, ty: ctx.u64_id })
+        }
         BuiltinFn::U32 | BuiltinFn::F32 => {
             if args.len() != 1 {
                 return Err(format!("{name}() takes 1 arg"));
@@ -1363,6 +1432,46 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
     }
 }
 
+/// `u64` scalars. Both operands are `u64`, except a shift count, which may be `u32` or `u64`.
+fn lower_u64_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> {
+    if lhs.ty != ctx.u64_id {
+        return Err("u64 operands must both be u64".into());
+    }
+    let t = ctx.t_u64;
+    let id = match op {
+        IrBinOp::Shl | IrBinOp::Shr => {
+            let amount = if rhs.ty == ctx.u64_id {
+                rhs.id
+            } else if rhs.ty == ctx.u32_id {
+                ctx.spv.op_uconvert(t, rhs.id)
+            } else {
+                return Err("a shift count of u64 must be u32 or u64".into());
+            };
+            if matches!(op, IrBinOp::Shl) {
+                ctx.spv.op_shift_left_logical(t, lhs.id, amount)
+            } else {
+                ctx.spv.op_shift_right_logical(t, lhs.id, amount)
+            }
+        }
+        _ => {
+            if rhs.ty != ctx.u64_id {
+                return Err("u64 operands must both be u64".into());
+            }
+            match op {
+                IrBinOp::Add => ctx.spv.op_iadd(t, lhs.id, rhs.id),
+                IrBinOp::Sub => ctx.spv.op_isub(t, lhs.id, rhs.id),
+                IrBinOp::Mul => ctx.spv.op_imul(t, lhs.id, rhs.id),
+                IrBinOp::Div => ctx.spv.op_udiv(t, lhs.id, rhs.id),
+                IrBinOp::BitAnd => ctx.spv.op_bitwise_and(t, lhs.id, rhs.id),
+                IrBinOp::BitOr => ctx.spv.op_bitwise_or(t, lhs.id, rhs.id),
+                IrBinOp::BitXor => ctx.spv.op_bitwise_xor(t, lhs.id, rhs.id),
+                _ => return Err("u64 supports + - * / & | ^ << >>".into()),
+            }
+        }
+    };
+    Ok(GVal { id, ty: ctx.u64_id })
+}
+
 fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> {
     if lhs.ty == ctx.mat4_id {
         if !matches!(op, IrBinOp::Mul) {
@@ -1411,6 +1520,9 @@ fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> 
             let id = ctx.spv.op_vector_times_scalar(ty, vec_val.id, scalar_f32);
             return Ok(GVal { id, ty: vec_val.ty });
         }
+    }
+    if lhs.ty == ctx.u64_id || rhs.ty == ctx.u64_id {
+        return lower_u64_arith(ctx, op, lhs, rhs);
     }
     if !(lhs.ty == ctx.f32_id || lhs.ty == ctx.u32_id) {
         return Err("binary arithmetic only on scalar or vector types".into());
@@ -1523,7 +1635,25 @@ fn scalar_to_u32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
         return v.id;
     }
     let t = ctx.t_u32;
+    if v.ty == ctx.u64_id {
+        return ctx.spv.op_uconvert(t, v.id);
+    }
     ctx.spv.op_convert_f_to_u(t, v.id)
+}
+
+/// u32 zero-extends, i32 sign-extends, and f32 converts to an integer.
+fn scalar_to_u64(ctx: &mut Ctx<'_>, v: GVal) -> Id {
+    if v.ty == ctx.u64_id {
+        return v.id;
+    }
+    let t = ctx.t_u64;
+    if v.ty == ctx.u32_id {
+        ctx.spv.op_uconvert(t, v.id)
+    } else if v.ty == ctx.i32_id {
+        ctx.spv.op_sconvert(t, v.id)
+    } else {
+        ctx.spv.op_convert_f_to_u(t, v.id)
+    }
 }
 
 fn scalar_to_i32(ctx: &mut Ctx<'_>, v: GVal) -> Id {
@@ -1777,6 +1907,48 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn fragment_u64_atomic_max_packs_depth_and_id() {
+        validate(&lower(
+            r#"
+            fragment fs(pos: frag_coord, vis: device mut buffer<u64>) -> f32x4 {
+                let depth = bitcast_u32(pos.z)
+                let id = u32(pos.x)
+                atomic_max(vis, u32(pos.y), (u64(depth) << 32) | u64(id))
+                f32x4(0.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn vertex_reads_u64_buffers_and_converts_them() {
+        validate(&lower(
+            r#"
+            vertex vs(vi: vertex_index, ids: device buffer<u64>) -> f32x4 {
+                let id = ids[vi] & ~0u64
+                f32x4(f32(u32(id)), 0.0, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
+    fn graphics_u64_atomics_need_u64_values() {
+        let err = parse_zsl(
+            r#"
+            fragment fs(pos: frag_coord, vis: device mut buffer<u64>) -> f32x4 {
+                atomic_max(vis, u32(pos.y), u32(pos.x))
+                f32x4(0.0, 0.0, 0.0, 1.0)
+            }
+            "#,
+        )
+        .err()
+        .map(|e| e.msg)
+        .unwrap_or_default();
+        assert!(err.contains("value must be a u64"), "{err}");
     }
 
     #[test]

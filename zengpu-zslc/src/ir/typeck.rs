@@ -26,6 +26,7 @@ pub enum StorageElem {
     U8,
     I32,
     U32,
+    U64,
 }
 
 /// bytes per element of a shared or buffer type, `None` without a storage layout.
@@ -37,6 +38,7 @@ pub fn storage_byte_size(arena: &TypeArena, elem: TypeId) -> Option<u32> {
         StorageElem::F16 | StorageElem::Bf16 => 2,
         StorageElem::I8 | StorageElem::U8 => 1,
         StorageElem::F32 | StorageElem::I32 | StorageElem::U32 => 4,
+        StorageElem::U64 => 8,
     })
 }
 
@@ -67,6 +69,10 @@ pub fn storage_elem(arena: &TypeArena, elem: TypeId) -> Option<StorageElem> {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
         } => StorageElem::U32,
+        Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => StorageElem::U64,
         _ => return None,
     })
 }
@@ -134,11 +140,13 @@ pub fn frag16_id(arena: &mut TypeArena, element: TypeId, usage: FragUse) -> Type
 
 pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut TypeArena) -> TypeId {
     let u32_id = arena.u32_id();
+    let u64_id = arena.u64_id();
     let i32_id = arena.i32_id();
     let f32_id = arena.f32_id();
     let bool_id = arena.bool_id();
     match expr {
         IrExpr::LitU32(_) => u32_id,
+        IrExpr::LitU64(_) => u64_id,
         IrExpr::LitF32(_) => f32_id,
         IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(u32_id),
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
@@ -165,6 +173,7 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
         IrExpr::Construct { ty, .. } => ty.unwrap_or(u32_id),
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::I32 => i32_id,
+            BuiltinFn::U64 => u64_id,
             BuiltinFn::F16Round => f32_id,
             BuiltinFn::Select => args
                 .get(1)
@@ -236,6 +245,8 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
                     .collect();
                 if tys.is_empty() || tys.contains(&f32_id) {
                     f32_id
+                } else if tys.contains(&u64_id) {
+                    u64_id
                 } else if tys.contains(&i32_id) {
                     i32_id
                 } else if tys.iter().all(|&t| t == u32_id) {
@@ -287,6 +298,8 @@ pub fn type_of_compute_expr(expr: &IrExpr, ctx: &ComputeTypeCtx, arena: &mut Typ
                 let r = type_of_compute_expr(rhs, ctx, arena);
                 if l == f32_id || r == f32_id {
                     f32_id
+                } else if l == u64_id || r == u64_id {
+                    u64_id
                 } else if l == i32_id || r == i32_id {
                     i32_id
                 } else {
@@ -314,6 +327,7 @@ pub fn type_of_graphics_expr(
     arena: &mut TypeArena,
 ) -> TypeId {
     let u32_id = arena.u32_id();
+    let u64_id = arena.u64_id();
     let f32_id = arena.f32_id();
     let vec2_id = arena.vec_id(2);
     let vec3_id = arena.vec_id(3);
@@ -322,6 +336,7 @@ pub fn type_of_graphics_expr(
 
     match expr {
         IrExpr::LitU32(_) => u32_id,
+        IrExpr::LitU64(_) => u64_id,
         IrExpr::LitF32(_) => f32_id,
         IrExpr::Local(n) => ctx.locals.get(n).copied().unwrap_or(f32_id),
         IrExpr::ScalarParam(n) => ctx.scalars.get(n).copied().unwrap_or(f32_id),
@@ -359,6 +374,7 @@ pub fn type_of_graphics_expr(
         IrExpr::LocalId(_) | IrExpr::GroupId(_) | IrExpr::TexSize { .. } => u32_id,
         IrExpr::Builtin { func, args } => match func {
             BuiltinFn::U32 | BuiltinFn::BitcastU32 => u32_id,
+            BuiltinFn::U64 => u64_id,
             BuiltinFn::F32 | BuiltinFn::BitcastF32 | BuiltinFn::Length => f32_id,
             BuiltinFn::Step | BuiltinFn::Smoothstep => args
                 .last()
@@ -403,6 +419,8 @@ pub fn type_of_graphics_expr(
                     l
                 } else if l == f32_id || r == f32_id {
                     f32_id
+                } else if l == u64_id || r == u64_id {
+                    u64_id
                 } else {
                     u32_id
                 }
@@ -455,6 +473,36 @@ mod tests {
         };
         let ty = type_of_compute_expr(&load, &ctx, &mut arena);
         assert_eq!(ty, arena.f32_id());
+    }
+
+    #[test]
+    fn u64_literals_shifts_and_conversions_type_as_expected() {
+        let mut arena = TypeArena::new();
+        let ctx = ComputeTypeCtx::default();
+        let u64_id = arena.u64_id();
+        let u32_id = arena.u32_id();
+        let lit = IrExpr::LitU64(1);
+        assert_eq!(type_of_compute_expr(&lit, &ctx, &mut arena), u64_id);
+        let shifted = IrExpr::Binary {
+            op: IrBinOp::Shl,
+            lhs: Box::new(lit),
+            rhs: Box::new(IrExpr::LitU32(32)),
+        };
+        assert_eq!(type_of_compute_expr(&shifted, &ctx, &mut arena), u64_id);
+        let packed = IrExpr::Binary {
+            op: IrBinOp::BitOr,
+            lhs: Box::new(shifted),
+            rhs: Box::new(IrExpr::Builtin {
+                func: BuiltinFn::U64,
+                args: vec![IrExpr::LitU32(7)],
+            }),
+        };
+        assert_eq!(type_of_compute_expr(&packed, &ctx, &mut arena), u64_id);
+        let low = IrExpr::Builtin {
+            func: BuiltinFn::U32,
+            args: vec![packed],
+        };
+        assert_eq!(type_of_compute_expr(&low, &ctx, &mut arena), u32_id);
     }
 
     #[test]

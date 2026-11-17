@@ -249,6 +249,7 @@ inline uint zsl_byte_perm(uint a, uint b, uint sel) {
             match msl_buffer_elem(module.types.get(*buffer_elem))? {
                 "uint" => "atomic_uint",
                 "int" => "atomic_int",
+                "ulong" => "atomic_ulong",
                 _ => "atomic_float",
             }
         } else {
@@ -506,6 +507,13 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 .buffers
                 .get(buf.as_str())
                 .map_or("float", |&t| scalar_c_type(ctx, t));
+            // Metal has 64-bit min and max only.
+            if cty == "ulong" && !matches!(aop, AtomicOp::Min | AtomicOp::Max) {
+                return Err(Diagnostic::new(
+                    DiagnosticCode::Unsupported,
+                    "MSL backend: u64 atomics support only atomic_max and atomic_min",
+                ));
+            }
             let idx = emit_expr(ctx, index)?;
             let val = emit_expr(ctx, value)?;
             if *aop == AtomicOp::CompareExchange {
@@ -665,6 +673,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
             ));
         }
         IrExpr::LitU32(v) => format!("{v}u"),
+        IrExpr::LitU64(v) => format!("{v}ul"),
         IrExpr::LitF32(v) => msl_float(*v),
         IrExpr::Local(n) => n.clone(),
         IrExpr::ScalarParam(n) => format!("pc.{n}"),
@@ -789,6 +798,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::PackF16x2 => format!("zsl_pack_f16x2({}, {})", a[0], a[1]),
                 BuiltinFn::BitcastF32 => format!("zsl_bitcast_f32({})", a[0]),
                 BuiltinFn::BitcastU32 => format!("zsl_bitcast_u32({})", a[0]),
+                BuiltinFn::U64 => format!("ulong({})", a[0]),
                 BuiltinFn::BitcastI32 => format!("zsl_bitcast_i32({})", a[0]),
                 BuiltinFn::Byte => format!("zsl_byte({}, {})", a[0], a[1]),
                 BuiltinFn::SByte => format!("zsl_sbyte({}, {})", a[0], a[1]),
@@ -967,6 +977,8 @@ fn scalar_c_type(ctx: &Ctx<'_>, ty: TypeId) -> &'static str {
         "int"
     } else if ty == types.u32_id() {
         "uint"
+    } else if ty == types.u64_id() {
+        "ulong"
     } else {
         "float"
     }
@@ -1433,6 +1445,10 @@ fn msl_scalar(t: &Type) -> Result<&'static str, Diagnostic> {
             signedness: Signedness::Unsigned,
         } => Ok("uint"),
         Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => Ok("ulong"),
+        Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => Ok("int"),
@@ -1481,6 +1497,10 @@ fn msl_buffer_elem(t: &Type) -> Result<&'static str, Diagnostic> {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => Ok("int"),
+        Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => Ok("ulong"),
         other => Err(Diagnostic::new(
             DiagnosticCode::Unsupported,
             format!("MSL backend: unsupported compute buffer element {other:?}"),

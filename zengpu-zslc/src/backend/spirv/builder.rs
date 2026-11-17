@@ -186,6 +186,8 @@ pub(crate) mod cap {
     pub const SHADER: u32 = 1;
     pub const FLOAT16: u32 = 9;
     pub const INT8: u32 = 39;
+    pub const INT64: u32 = 11;
+    pub const INT64_ATOMICS: u32 = 12;
     pub const STORAGE_BUFFER_16BIT_ACCESS: u32 = 4433;
     pub const STORAGE_BUFFER_8BIT_ACCESS: u32 = 4448;
     pub const COOPERATIVE_MATRIX_KHR: u32 = 6022;
@@ -463,6 +465,9 @@ impl SpvBuilder {
     }
 
     pub fn type_int(&mut self, width: u32, signed: bool) -> Id {
+        if width == 64 {
+            self.capability(cap::INT64);
+        }
         if let Some(&id) = self.scalar_type_cache.get(&(op::TYPE_INT, width, signed)) {
             return id;
         }
@@ -604,6 +609,17 @@ impl SpvBuilder {
 
     pub fn constant_u32(&mut self, ty: Id, value: u32) -> Id {
         self.constant_bits(ty, value)
+    }
+
+    /// Not deduplicated. Words are low, then high.
+    pub fn constant_u64(&mut self, ty: Id, value: u64) -> Id {
+        let id = self.fresh_id();
+        emit(
+            &mut self.constants_globals,
+            op::CONSTANT,
+            &[ty.0, id.0, value as u32, (value >> 32) as u32],
+        );
+        id
     }
 
     pub fn constant_f32(&mut self, ty: Id, value: f32) -> Id {

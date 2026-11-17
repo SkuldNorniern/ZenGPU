@@ -8,7 +8,7 @@ use crate::ir::{GraphicsEntry, GraphicsModule, Module, ParamKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BindingInfo {
-    /// `set=0` binding in `zengpu-vulkan`'s bindless layout: f32=0, u32=2, i32=3.
+    /// `set=0` binding in `zengpu-vulkan`'s bindless layout: f32=0, u32=2, i32=3, u64=5.
     pub binding: u32,
 }
 
@@ -27,6 +27,8 @@ pub fn ssbo_binding_for(elem: TypeId, types: &mut TypeArena) -> u32 {
         2
     } else if elem == types.i32_id() {
         3
+    } else if elem == types.u64_id() {
+        5
     } else if u32_vec_lanes(types, elem).is_some() {
         2
     } else {

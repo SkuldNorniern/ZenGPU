@@ -5,6 +5,32 @@ impl<'a> Parser<'a> {
         self.parse_g_or(ctx)
     }
 
+    /// Like `int_bin` in compute: an untyped literal takes the other side's `u64`, and other
+    /// `u64` mixes are errors.
+    fn g_int_bin(
+        &mut self,
+        ctx: &GfxCtx,
+        op: IrBinOp,
+        lhs: IrExpr,
+        rhs: IrExpr,
+    ) -> Result<IrExpr, ParseError> {
+        let tc = ctx.type_ctx();
+        let u64_id = self.types.u64_id();
+        let lhs_ty = type_of_graphics_expr(&lhs, &tc, &mut self.types);
+        let rhs_ty = type_of_graphics_expr(&rhs, &tc, &mut self.types);
+        if lhs_ty != u64_id && rhs_ty != u64_id {
+            return Ok(bin(op, lhs, rhs));
+        }
+        let (lhs, rhs) = (widen_u64_literal(lhs), widen_u64_literal(rhs));
+        let lhs_ty = type_of_graphics_expr(&lhs, &tc, &mut self.types);
+        let rhs_ty = type_of_graphics_expr(&rhs, &tc, &mut self.types);
+        if lhs_ty != u64_id || rhs_ty != u64_id {
+            return self
+                .err("u64 operands must both be u64: write `1u64` or convert with `u64(x)`");
+        }
+        Ok(bin(op, lhs, rhs))
+    }
+
     pub(super) fn parse_g_or(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
         let mut lhs = self.parse_g_and(ctx)?;
         while self.eat(&Tok::OrOr) {
@@ -36,14 +62,14 @@ impl<'a> Parser<'a> {
         };
         self.pos += 1;
         let rhs = self.parse_g_bitor(ctx)?;
-        Ok(bin(op, lhs, rhs))
+        self.g_int_bin(ctx, op, lhs, rhs)
     }
 
     pub(super) fn parse_g_bitor(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
         let mut lhs = self.parse_g_bitxor(ctx)?;
         while self.eat(&Tok::Pipe) {
             let rhs = self.parse_g_bitxor(ctx)?;
-            lhs = bin(IrBinOp::BitOr, lhs, rhs);
+            lhs = self.g_int_bin(ctx, IrBinOp::BitOr, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -52,7 +78,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_g_bitand(ctx)?;
         while self.eat(&Tok::Caret) {
             let rhs = self.parse_g_bitand(ctx)?;
-            lhs = bin(IrBinOp::BitXor, lhs, rhs);
+            lhs = self.g_int_bin(ctx, IrBinOp::BitXor, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -61,7 +87,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.parse_g_shift(ctx)?;
         while self.eat(&Tok::Amp) {
             let rhs = self.parse_g_shift(ctx)?;
-            lhs = bin(IrBinOp::BitAnd, lhs, rhs);
+            lhs = self.g_int_bin(ctx, IrBinOp::BitAnd, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -91,7 +117,7 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_g_mul(ctx)?;
-            lhs = bin(op, lhs, rhs);
+            lhs = self.g_int_bin(ctx, op, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -106,7 +132,7 @@ impl<'a> Parser<'a> {
             };
             self.pos += 1;
             let rhs = self.parse_g_unary(ctx)?;
-            lhs = bin(op, lhs, rhs);
+            lhs = self.g_int_bin(ctx, op, lhs, rhs)?;
         }
         Ok(lhs)
     }
@@ -114,6 +140,12 @@ impl<'a> Parser<'a> {
     pub(super) fn parse_g_unary(&mut self, ctx: &GfxCtx) -> Result<IrExpr, ParseError> {
         if self.eat(&Tok::Minus) {
             return Ok(IrExpr::Neg(Box::new(self.parse_g_unary(ctx)?)));
+        }
+        if self.eat(&Tok::Tilde) {
+            let inner = self.parse_g_unary(ctx)?;
+            let ty = type_of_graphics_expr(&inner, &ctx.type_ctx(), &mut self.types);
+            let ones = self.all_ones(ty)?;
+            return Ok(bin(IrBinOp::BitXor, inner, ones));
         }
         self.parse_g_primary(ctx)
     }
@@ -124,6 +156,11 @@ impl<'a> Parser<'a> {
                 let v = *v as u32;
                 self.pos += 1;
                 self.parse_g_postfix(ctx, IrExpr::LitU32(v))
+            }
+            Some(Tok::U64(v)) => {
+                let v = *v;
+                self.pos += 1;
+                self.parse_g_postfix(ctx, IrExpr::LitU64(v))
             }
             Some(Tok::Float(v)) => {
                 let v = *v as f32;
@@ -372,6 +409,21 @@ impl<'a> Parser<'a> {
                     msg: format!("unknown function `{name}`"),
                     at: self.span(),
                 })?;
+                if func == BuiltinFn::U64 {
+                    if args.len() != 1 {
+                        return self.err("u64() takes 1 arg");
+                    }
+                    let tcx = ctx.type_ctx();
+                    let arg = type_of_graphics_expr(&args[0], &tcx, &mut self.types);
+                    let ok = [
+                        self.types.u32_id(),
+                        self.types.i32_id(),
+                        self.types.u64_id(),
+                    ];
+                    if !ok.contains(&arg) {
+                        return self.err("u64(x) takes a u32, i32 or u64 value");
+                    }
+                }
                 let args = self.spread_scalar_args(ctx, func, args);
                 Ok(IrExpr::Builtin { func, args })
             }

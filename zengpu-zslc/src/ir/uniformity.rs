@@ -10,6 +10,7 @@ use crate::ir::node::{BuiltinFn, IrExpr, IrStmt};
 fn expr_is_uniform(expr: &IrExpr, locals: &HashMap<String, bool>) -> bool {
     match expr {
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::ScalarParam(_)
         | IrExpr::GroupId(_)
@@ -100,6 +101,7 @@ fn expr_contains_subgroup_collective(expr: &IrExpr) -> bool {
             expr_contains_subgroup_collective(lhs) || expr_contains_subgroup_collective(rhs)
         }
         IrExpr::LitU32(_)
+        | IrExpr::LitU64(_)
         | IrExpr::LitF32(_)
         | IrExpr::Local(_)
         | IrExpr::ScalarParam(_)

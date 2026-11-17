@@ -8,6 +8,14 @@ pub(super) fn bin(op: IrBinOp, lhs: IrExpr, rhs: IrExpr) -> IrExpr {
     }
 }
 
+/// An untyped integer literal becomes `u64`. Other expressions are unchanged.
+pub(super) fn widen_u64_literal(expr: IrExpr) -> IrExpr {
+    match expr {
+        IrExpr::LitU32(v) => IrExpr::LitU64(u64::from(v)),
+        other => other,
+    }
+}
+
 /// Renames `Local`s per `map`. Names absent from `map` stay as they are.
 ///
 /// Also inlines `fn` bodies at call sites.
@@ -15,6 +23,7 @@ pub(super) fn rename_expr(expr: &IrExpr, map: &HashMap<String, String>) -> IrExp
     let renamed = |name: &String| map.get(name).cloned().unwrap_or_else(|| name.clone());
     match expr {
         IrExpr::LitU32(v) => IrExpr::LitU32(*v),
+        IrExpr::LitU64(v) => IrExpr::LitU64(*v),
         IrExpr::LitF32(v) => IrExpr::LitF32(*v),
         IrExpr::Local(name) => IrExpr::Local(renamed(name)),
         IrExpr::ScalarParam(name) => IrExpr::ScalarParam(name.clone()),
@@ -192,6 +201,7 @@ pub(super) fn resolve_construct_types_expr(expr: &IrExpr, types: &mut TypeArena)
             trans: *trans,
         },
         IrExpr::LitU32(v) => IrExpr::LitU32(*v),
+        IrExpr::LitU64(v) => IrExpr::LitU64(*v),
         IrExpr::LitF32(v) => IrExpr::LitF32(*v),
         IrExpr::Local(name) => IrExpr::Local(name.clone()),
         IrExpr::ScalarParam(name) => IrExpr::ScalarParam(name.clone()),

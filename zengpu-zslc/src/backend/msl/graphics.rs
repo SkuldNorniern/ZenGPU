@@ -370,10 +370,18 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
     Ok(())
 }
 
+fn u64_graphics_unsupported() -> Diagnostic {
+    Diagnostic::new(
+        DiagnosticCode::Unsupported,
+        "MSL backend: u64 values are not supported in vertex and fragment shaders",
+    )
+}
+
 fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match expr {
         IrExpr::FragLoad { .. } => return Err(super::compute::frag_unsupported("frag_load")),
         IrExpr::LitU32(v) => format!("{v}u"),
+        IrExpr::LitU64(_) => return Err(u64_graphics_unsupported()),
         IrExpr::LitF32(v) => super::compute::msl_float(*v),
         IrExpr::Local(n) => n.clone(),
         IrExpr::Input(n) if ctx.builtins.contains(n.as_str()) => n.clone(),
@@ -435,6 +443,7 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot => format!("dot({}, {})", a[0], a[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", a[0], a[1]),
                 BuiltinFn::U32 => format!("uint({})", a[0]),
+                BuiltinFn::U64 => return Err(u64_graphics_unsupported()),
                 BuiltinFn::BitcastF32 => format!("as_type<float>({})", a[0]),
                 BuiltinFn::BitcastU32 => format!("as_type<uint>({})", a[0]),
                 BuiltinFn::FragZeroAcc

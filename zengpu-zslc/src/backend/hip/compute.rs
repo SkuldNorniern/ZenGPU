@@ -390,6 +390,7 @@ fn shared_c_type(types: &TypeArena, elem: TypeId) -> Result<&'static str, Diagno
         Some(StorageElem::U8) => "unsigned char",
         Some(StorageElem::I32) => "int",
         Some(StorageElem::U32) => "unsigned int",
+        Some(StorageElem::U64) => "unsigned long long",
         None => {
             return Err(Diagnostic::new(
                 DiagnosticCode::Unsupported,
@@ -500,6 +501,10 @@ fn hip_scalar(ty: &Type) -> Result<&'static str, Diagnostic> {
             signedness: Signedness::Unsigned,
         } => Ok("unsigned int"),
         Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => Ok("unsigned long long"),
+        Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => Ok("int"),
@@ -543,6 +548,10 @@ fn hip_buffer_elem(ty: &Type) -> Result<&'static str, Diagnostic> {
             width: IntWidth::W32,
             signedness: Signedness::Unsigned,
         } => Ok("unsigned int"),
+        Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => Ok("unsigned long long"),
         Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
@@ -619,6 +628,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
                 match ctx.type_ctx.buffers.get(buf.as_str()) {
                     Some(&t) if t == types.u32_id() => "unsigned int",
                     Some(&t) if t == types.i32_id() => "int",
+                    Some(&t) if t == types.u64_id() => "unsigned long long",
                     _ => "float",
                 }
             };
@@ -715,6 +725,7 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
 fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
     Ok(match e {
         IrExpr::LitU32(v) => format!("{v}u"),
+        IrExpr::LitU64(v) => format!("{v}ull"),
         IrExpr::LitF32(v) => {
             if v.is_nan() {
                 "__builtin_nanf(\"\")".to_string()
@@ -828,6 +839,7 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Dot => format!("dot({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::Extend => format!("float4({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::U32 => format!("((unsigned int)({}))", args_s[0]),
+                BuiltinFn::U64 => format!("((unsigned long long)({}))", args_s[0]),
                 BuiltinFn::F32 => format!("((float)({}))", args_s[0]),
                 BuiltinFn::Step | BuiltinFn::Smoothstep => {
                     return Err(Diagnostic::new(

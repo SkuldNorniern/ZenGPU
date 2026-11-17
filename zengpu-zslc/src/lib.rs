@@ -1155,6 +1155,88 @@ int main() {{
         validate(&words);
     }
 
+    /// Packed visibility-style values and every u64 atomic.
+    const U64_ATOMICS: &str = r#"
+        @workgroup_size(64)
+        kernel u64_atomics(vis: device mut buffer<u64>, out: device mut buffer<u64>, id: global_id) {
+            let packed = (u64(id.y) << 32) | u64(id.x)
+            let was = atomic_max(vis, id.x, packed)
+            let lo = atomic_min(vis, 1, packed)
+            let sum = atomic_add(vis, 2, 1u64)
+            let ored = atomic_or(vis, 3, 1u64 << 40)
+            let anded = atomic_and(vis, 4, ~0u64)
+            let swapped = atomic_exchange(vis, 5, 0u64)
+            let cas = atomic_compare_exchange(vis, 6, 0u64, packed)
+            out[id.x] = was + lo + sum + ored + anded + swapped + cas
+        }
+    "#;
+
+    #[test]
+    fn u64_atomics_lower_on_all_compute_backends() {
+        let module = parse_compute(U64_ATOMICS).expect("parse u64_atomics");
+        let hip_source = hip::lower_compute(&module).expect("lower to HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("lower to CUDA").source;
+        for name in [
+            "atomicMax(&vis[",
+            "atomicMin(&vis[",
+            "atomicAdd(&vis[",
+            "atomicOr(&vis[",
+            "atomicAnd(&vis[",
+            "atomicExch(&vis[",
+            "atomicCAS(&vis[",
+        ] {
+            assert!(hip_source.contains(name), "HIP missing {name}");
+            assert!(cuda_source.contains(name), "CUDA missing {name}");
+        }
+        assert!(
+            cuda_source.contains("unsigned long long* __restrict__ vis"),
+            "{cuda_source}"
+        );
+        assert!(
+            hip_source.contains("unsigned long long* __restrict__ vis"),
+            "{hip_source}"
+        );
+        assert!(cuda_source.contains("18446744073709551615ull"));
+        let words = spirv::lower_compute(&module).expect("lower to SPIR-V");
+        validate(&words);
+    }
+
+    #[test]
+    fn u64_max_and_min_lower_on_msl() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel u64_max(vis: device mut buffer<u64>, id: global_id) {
+                atomic_max(vis, id.x, (u64(id.y) << 32) | u64(id.x))
+                atomic_min(vis, 0, 3u64)
+            }
+        "#;
+        let module = parse_compute(src).expect("parse u64_max");
+        let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
+        assert!(
+            msl_source.contains("device atomic_ulong* vis"),
+            "{msl_source}"
+        );
+        assert!(msl_source.contains("atomic_fetch_max_explicit(&vis["));
+        assert!(msl_source.contains("atomic_fetch_min_explicit(&vis["));
+    }
+
+    /// Metal has no 64-bit and, or, add, exchange or compare-exchange, so MSL refuses them.
+    #[test]
+    fn u64_and_is_refused_on_msl() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel u64_and(vis: device mut buffer<u64>, id: global_id) {
+                atomic_and(vis, id.x, 1u64)
+            }
+        "#;
+        let module = parse_compute(src).expect("parse u64_and");
+        let err = msl::lower_compute(&module).err().expect("MSL must refuse");
+        assert!(
+            err.message.contains("atomic_max and atomic_min"),
+            "got: {err}"
+        );
+    }
+
     #[test]
     fn atomic_min_rejects_f32_buffers_at_parse() {
         let src = r#"

@@ -5,11 +5,12 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         match name.as_str() {
             "u32" => Ok(self.types.u32_id()),
+            "u64" => Ok(self.types.u64_id()),
             "i32" => Ok(self.types.i32_id()),
             "f32" => Ok(self.types.f32_id()),
             "bool" => Ok(self.types.bool_id()),
             other => self.err(format!(
-                "unsupported scalar type `{other}`; use u32, i32, f32, or bool"
+                "unsupported scalar type `{other}`; use u32, u64, i32, f32, or bool"
             )),
         }
     }
@@ -23,6 +24,7 @@ impl<'a> Parser<'a> {
         let name = self.ident()?;
         match name.as_str() {
             "u32" => Ok(self.types.u32_id()),
+            "u64" => Ok(self.types.u64_id()),
             "i32" => Ok(self.types.i32_id()),
             "f32" => Ok(self.types.f32_id()),
             "bf16" => Ok(self.types.bf16_id()),
@@ -32,7 +34,7 @@ impl<'a> Parser<'a> {
             "u32x2" => Ok(self.types.u32_vec_id(2)),
             "u32x4" => Ok(self.types.u32_vec_id(4)),
             other => self.err(format!(
-                "unsupported buffer element type `{other}`; use u32, i32, f32, bf16, f16, i8, u8, u32x2, or u32x4"
+                "unsupported buffer element type `{other}`; use u32, u64, i32, f32, bf16, f16, i8, u8, u32x2, or u32x4"
             )),
         }
     }

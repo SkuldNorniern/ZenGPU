@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "u32" => BuiltinFn::U32,
+        "u64" => BuiltinFn::U64,
         "i32" => BuiltinFn::I32,
         "f16_round" => BuiltinFn::F16Round,
         "f32" => BuiltinFn::F32,
@@ -94,6 +95,10 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str 
             signedness: Signedness::Unsigned,
         } => "u32",
         Type::Int {
+            width: IntWidth::W64,
+            signedness: Signedness::Unsigned,
+        } => "u64",
+        Type::Int {
             width: IntWidth::W32,
             signedness: Signedness::Signed,
         } => "i32",
@@ -120,6 +125,7 @@ pub(super) fn buffer_elem_name(elem: TypeId, arena: &TypeArena) -> &'static str 
 pub(super) fn gfx_builtin_from_name(name: &str) -> Option<BuiltinFn> {
     Some(match name {
         "u32" => BuiltinFn::U32,
+        "u64" => BuiltinFn::U64,
         "f32" => BuiltinFn::F32,
         "step" => BuiltinFn::Step,
         "smoothstep" => BuiltinFn::Smoothstep,
