@@ -1,5 +1,5 @@
-//! Bindless table: an argument buffer of `{ texture, sampler }` pairs, read by ZSL's MSL as
-//! `zsl_textures [[buffer(17)]]`.
+//! Bindless tables: argument buffers of `{ texture, sampler }` pairs, read by ZSL's MSL as
+//! `zsl_textures [[buffer(17)]]`, and for depth textures `zsl_depth_textures [[buffer(19)]]`.
 
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -23,6 +23,22 @@ pub(crate) const GRAPHICS_BUFFER_INDEX: u64 = 20;
 /// Storage buffers a draw binds, up to the last of Metal's 31 slots.
 pub(crate) const MAX_GRAPHICS_BUFFERS: usize = 31 - GRAPHICS_BUFFER_INDEX as usize;
 
+/// Depth table slot (ZSL `DEPTH_TEXTURE_BUFFER_INDEX`). Metal types a `depth2d` apart from a
+/// `texture2d`, so depth textures sit in a table of their own, at the same slot numbers.
+pub(crate) const DEPTH_TEXTURE_BUFFER_INDEX: u64 = 19;
+
+/// Depth table probe, the layout of ZSL's `ZslDepthTexture`. Never run.
+const DEPTH_PROBE_MSL: &str = "#include <metal_stdlib>
+using namespace metal;
+struct ZslDepthTexture {
+    depth2d<float> tex;
+    sampler smp;
+};
+fragment float4 zengpu_table_probe(const device ZslDepthTexture* zsl_depth_textures [[buffer(19)]]) {
+    return float4(zsl_depth_textures[0].tex.sample_compare(zsl_depth_textures[0].smp, float2(0.0), 0.5));
+}
+";
+
 /// Dummy shader with the table's layout, compiled so Metal hands out an encoder. Never run.
 const PROBE_MSL: &str = "#include <metal_stdlib>
 using namespace metal;
@@ -37,6 +53,8 @@ fragment float4 zengpu_table_probe(const device ZslTexture* zsl_textures [[buffe
 
 pub(crate) struct TextureTable {
     pub(crate) tier1: bool,
+    /// Holds `depth2d` textures, for `sample_compare`.
+    pub(crate) depth: bool,
     encoder: ArgumentEncoder,
     buffer: Buffer,
     stride: u64,
@@ -52,6 +70,26 @@ impl TextureTable {
         )
     }
 
+    /// The depth table. Tier 1 has none: its per-draw snapshot holds `texture2d` only.
+    pub(crate) fn depth(device: &DeviceRef) -> Result<Option<Self>> {
+        if device.argument_buffers_support() == metal::MTLArgumentBuffersTier::Tier1 {
+            return Ok(None);
+        }
+        let library = device
+            .new_library_with_source(DEPTH_PROBE_MSL, &CompileOptions::new())
+            .map_err(|e| GpuError::Backend(format!("metal: depth table probe: {e}")))?;
+        let function = library
+            .get_function("zengpu_table_probe", None)
+            .map_err(|e| GpuError::Backend(format!("metal: depth table probe: {e}")))?;
+        let mut table = Self::from_encoder(
+            device,
+            function.new_argument_encoder(DEPTH_TEXTURE_BUFFER_INDEX),
+            false,
+        );
+        table.depth = true;
+        Ok(Some(table))
+    }
+
     pub(crate) fn with_tier(device: &DeviceRef, tier1: bool) -> Result<Self> {
         let tier1_probe = "#include <metal_stdlib>\nusing namespace metal;\nstruct Table { array<texture2d<float>,16> tex [[id(0)]]; array<sampler,16> smp [[id(16)]]; };\nfragment float4 zengpu_table_probe(constant Table& t [[buffer(17)]]) { return t.tex[0].sample(t.smp[0], float2(0.0)); }";
         let library = device
@@ -63,7 +101,14 @@ impl TextureTable {
         let function = library
             .get_function("zengpu_table_probe", None)
             .map_err(|e| GpuError::Backend(format!("metal: texture table probe: {e}")))?;
-        let encoder = function.new_argument_encoder(TEXTURE_BUFFER_INDEX);
+        Ok(Self::from_encoder(
+            device,
+            function.new_argument_encoder(TEXTURE_BUFFER_INDEX),
+            tier1,
+        ))
+    }
+
+    fn from_encoder(device: &DeviceRef, encoder: ArgumentEncoder, tier1: bool) -> Self {
         let align = encoder.alignment().max(1);
         let stride = encoder.encoded_length().div_ceil(align) * align;
         let buffer = device.new_buffer(
@@ -74,13 +119,14 @@ impl TextureTable {
             },
             MTLResourceOptions::StorageModeShared,
         );
-        Ok(Self {
+        Self {
             tier1,
+            depth: false,
             encoder,
             buffer,
             stride,
             bound: vec![None; TABLE_CAPACITY as usize],
-        })
+        }
     }
 
     /// The slot must not be read by in-flight work, as with Vulkan's update-after-bind.

@@ -125,6 +125,8 @@ pub(crate) struct Inner {
     pub(crate) samplers: Mutex<SlotMap<marker::Sampler, SamplerState>>,
     pub(crate) targets: Mutex<SlotMap<marker::RenderTarget, MetalTarget>>,
     pub(crate) table: Mutex<TextureTable>,
+    /// Depth textures for `sample_compare`, at their slot numbers. `None` on tier 1.
+    pub(crate) depth_table: Mutex<Option<TextureTable>>,
     pub(crate) level_views: Mutex<LevelViews>,
     /// Last committed buffer. Earlier ones finish first, so waiting on it waits for the device.
     pub(crate) last_submit: Mutex<Option<CommandBuffer>>,
@@ -347,6 +349,7 @@ impl MetalDevice {
     pub(crate) fn new(device: Device) -> Result<Self> {
         let queue = device.new_command_queue();
         let table = TextureTable::new(&device)?;
+        let depth_table = TextureTable::depth(&device)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 device,
@@ -358,6 +361,7 @@ impl MetalDevice {
                 samplers: Mutex::new(SlotMap::default()),
                 targets: Mutex::new(SlotMap::default()),
                 table: Mutex::new(table),
+                depth_table: Mutex::new(depth_table),
                 level_views: Mutex::new(LevelViews::default()),
                 last_submit: Mutex::new(None),
                 lost: AtomicBool::new(false),
@@ -403,8 +407,20 @@ impl MetalDevice {
         if texture.index() >= TABLE_CAPACITY {
             return None;
         }
-        let tex = self.inner.textures.lock().ok()?.get(texture)?.tex.clone();
+        let (tex, depth) = {
+            let textures = self.inner.textures.lock().ok()?;
+            let t = textures.get(texture)?;
+            (t.tex.clone(), t.desc.format.is_depth_stencil())
+        };
         let smp = self.inner.samplers.lock().ok()?.get(sampler)?.clone();
+        if depth {
+            // sample_compare reads depth2d from its own table, same slot
+            let mut table = self.inner.depth_table.lock().ok()?;
+            return table
+                .as_mut()?
+                .bind(texture.index(), &tex, &smp)
+                .then_some(texture.index());
+        }
         let mut table = self.inner.table.lock().ok()?;
         table
             .bind(texture.index(), &tex, &smp)
@@ -421,7 +437,7 @@ impl MetalDevice {
 
     /// A depth texture drawn as a depth target and sampled after. Needs a depth format and
     /// `RENDER_TARGET | SAMPLED`. `None` for a stale handle or a texture that is not that.
-    /// metal draws into it, but `sample_compare` has no depth table bound yet.
+    /// Bound with `bind_texture`, it reads through `sample_compare`; tier 1 refuses those shaders.
     pub fn register_depth_texture(&self, texture: TextureHandle) -> Option<TargetHandle> {
         let (tex, format) = {
             let textures = self.inner.textures.lock().ok()?;
@@ -1553,8 +1569,15 @@ impl GpuDevice for MetalDevice {
                 views.release(slot);
             }
         }
-        if let (Some(t), Ok(mut table)) = (removed, self.inner.table.lock()) {
-            table.unbind(texture.index(), &t.tex);
+        if let Some(t) = removed {
+            if let Ok(mut table) = self.inner.table.lock() {
+                table.unbind(texture.index(), &t.tex);
+            }
+            if let Ok(mut depth) = self.inner.depth_table.lock()
+                && let Some(depth) = depth.as_mut()
+            {
+                depth.unbind(texture.index(), &t.tex);
+            }
         }
     }
 
@@ -1626,6 +1649,11 @@ impl GpuDevice for MetalDevice {
             .map_err(|_| GpuError::ShaderCompile("metal: MSL source is not valid UTF-8".into()))?;
         let tier1_source;
         let source = if lock(&self.inner.table)?.tier1 {
+            if source.contains("ZSL_DEPTH_ARGS(") {
+                return Err(GpuError::Unsupported(
+                    "metal tier 1: sample_compare needs argument buffer tier 2".into(),
+                ));
+            }
             tier1_source = format!("#define ZSL_METAL_TIER1 1\n{source}");
             tier1_source.as_str()
         } else {

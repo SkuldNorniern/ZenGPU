@@ -21,7 +21,7 @@ use zengpu_hal::{
 use super::convert;
 use super::device::{Inner, MetalPipeline, RenderPipeline};
 use super::table::{
-    GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX,
+    DEPTH_TEXTURE_BUFFER_INDEX, GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX,
     TEXTURE_IDS_BUFFER_INDEX,
 };
 
@@ -240,10 +240,23 @@ impl RenderCommands for MetalCommandList {
             .lock()
             .ok()
             .and_then(|t| (!t.tier1).then(|| t.buffer().clone()));
+        let (depth_table, depth_resident) = self
+            .inner
+            .depth_table
+            .lock()
+            .ok()
+            .and_then(|t| t.as_ref().map(|t| (t.buffer().clone(), t.resident())))
+            .unzip();
+        let mut resident = resident;
+        resident.extend(depth_resident.into_iter().flatten());
         let enc = autoreleasepool(|| cmd.new_render_command_encoder(rpd).to_owned());
         if let Some(table) = &table {
             enc.set_vertex_buffer(TEXTURE_BUFFER_INDEX, Some(table), 0);
             enc.set_fragment_buffer(TEXTURE_BUFFER_INDEX, Some(table), 0);
+        }
+        if let Some(depth) = &depth_table {
+            enc.set_vertex_buffer(DEPTH_TEXTURE_BUFFER_INDEX, Some(depth), 0);
+            enc.set_fragment_buffer(DEPTH_TEXTURE_BUFFER_INDEX, Some(depth), 0);
         }
         if !resident.is_empty() {
             let refs: Vec<&ResourceRef> = resident
