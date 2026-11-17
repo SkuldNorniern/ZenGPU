@@ -1266,6 +1266,68 @@ mod graphics_tests {
 
     /// ZSL clip space has +y down, as on Vulkan: y in -1..0 is the top half.
     #[test]
+    fn graphics_shaders_read_and_store_buffers() {
+        const FROM_BUFFER_VS: ZslShader = zsl!(
+            vertex vs(vi: vertex_index, xy: device buffer<f32>, tint: device buffer<f32>, hits: device mut buffer<u32>) -> f32x4 {
+                f32x4(xy[vi * 2u], xy[vi * 2u + 1u], 0.0, 1.0)
+            }
+        );
+        const TINT_FS: ZslShader = zsl!(
+            push P { slot: u32 }
+            fragment fs(xy: device buffer<f32>, tint: device buffer<f32>, hits: device mut buffer<u32>, p: P) -> f32x4 {
+                hits[p.slot] = 7u;
+                f32x4(tint[0u], tint[1u], tint[2u], 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let (tex, target) = color_target(&dev, 4, 4);
+        let p = pipeline(&dev, &FROM_BUFFER_VS, &TINT_FS, &[], None, None);
+        let corners: [f32; 12] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0];
+        let xy = buffer(&dev, bytes(&corners), BufferUsage::STORAGE);
+        let tint = buffer(&dev, bytes(&[0.0f32, 1.0, 0.0]), BufferUsage::STORAGE);
+        let hits = buffer(
+            &dev,
+            bytes(&[0u32; 4]),
+            BufferUsage::STORAGE | BufferUsage::READBACK,
+        );
+        let mut cmd = dev.create_command_list().expect("list");
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 4));
+        cmd.bind(Bindings {
+            buffers: &[xy.index(), tint.index(), hits.index()],
+            textures: &[],
+            images: &[],
+            scalars: &[Scalar::U32(2)],
+        });
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        for (i, px) in pixels(&dev, tex, 4, 4).iter().enumerate() {
+            assert_eq!(*px, [0, 255, 0, 255], "pixel {i}");
+        }
+        let raw = dev.read_buffer(hits, 0, 16).expect("read hits");
+        let got: Vec<u32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(got, [0, 0, 7, 0]);
+    }
+
+    #[test]
     fn clip_space_y_points_down() {
         const TOP_HALF: ZslShader = zsl!(
             vertex vs(vi: vertex_index) -> f32x4 {

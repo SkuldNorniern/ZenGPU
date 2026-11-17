@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use metal::{
     Buffer, CommandBuffer, MTLClearColor, MTLIndexType, MTLLoadAction, MTLResourceUsage,
-    MTLScissorRect, MTLStoreAction, MTLViewport, RenderCommandEncoder, RenderPassDescriptor,
+    MTLScissorRect, MTLStoreAction, MTLViewport, RenderCommandEncoder, RenderCommandEncoderRef,
+    RenderPassDescriptor,
     ResourceRef, Texture,
 };
 use objc::rc::autoreleasepool;
@@ -19,7 +20,10 @@ use zengpu_hal::{
 
 use super::convert;
 use super::device::{Inner, MetalPipeline, RenderPipeline};
-use super::table::{PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX, TEXTURE_IDS_BUFFER_INDEX};
+use super::table::{
+    GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX,
+    TEXTURE_IDS_BUFFER_INDEX,
+};
 
 /// The push block's size limit, as on Vulkan: 64 four-byte words.
 const PUSH_BYTES: usize = 256;
@@ -85,6 +89,33 @@ impl MetalCommandList {
             log::error!("[zengpu-metal] {what} outside a render pass; skipped");
         }
         self.encoder.as_ref()
+    }
+
+    /// Storage buffers of a draw, one slot each from `GRAPHICS_BUFFER_INDEX` for both stages.
+    /// False when a draw has more than Metal takes or names a buffer that is gone.
+    fn bind_buffers(&self, enc: &RenderCommandEncoderRef, slots: &[u32]) -> bool {
+        if slots.is_empty() {
+            return true;
+        }
+        if slots.len() > MAX_GRAPHICS_BUFFERS {
+            log::error!(
+                "[zengpu-metal] {} storage buffers, a draw takes {MAX_GRAPHICS_BUFFERS}; draw skipped",
+                slots.len()
+            );
+            return false;
+        }
+        let Ok(table) = self.inner.buffers.lock() else {
+            return false;
+        };
+        for (at, &slot) in (GRAPHICS_BUFFER_INDEX..).zip(slots) {
+            let Some(buffer) = table.get_by_slot_index(slot) else {
+                log::error!("[zengpu-metal] stale storage buffer {slot}; draw skipped");
+                return false;
+            };
+            enc.set_vertex_buffer(at, Some(&buffer.buf), 0);
+            enc.set_fragment_buffer(at, Some(&buffer.buf), 0);
+        }
+        true
     }
 
     fn full_scissor(&self) -> MTLScissorRect {
@@ -319,6 +350,10 @@ impl RenderCommands for MetalCommandList {
                 }
             }
         }
+        if !self.bind_buffers(enc, bindings.buffers) {
+            self.binding_valid = false;
+            return;
+        }
         let mut pc = [0u8; PUSH_BYTES];
         let mut len = 0usize;
         let words = bindings
@@ -329,8 +364,7 @@ impl RenderCommands for MetalCommandList {
                 Scalar::I32(v) => v.to_le_bytes(),
                 Scalar::F32(v) => v.to_le_bytes(),
             })
-            .chain(bindings.textures.iter().map(|i| i.to_le_bytes()))
-            .chain(bindings.buffers.iter().map(|i| i.to_le_bytes()));
+            .chain(bindings.textures.iter().map(|i| i.to_le_bytes()));
         for w in words {
             if let Some(dst) = pc.get_mut(len..len + 4) {
                 dst.copy_from_slice(&w);

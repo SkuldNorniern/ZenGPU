@@ -18,6 +18,10 @@ pub(crate) const MAX_VERTEX_BUFFERS: u32 = PUSH_BUFFER_INDEX as u32;
 pub(crate) const TABLE_CAPACITY: u32 = 4096;
 pub(crate) const TIER1_CAPACITY: usize = 16;
 pub(crate) const TEXTURE_IDS_BUFFER_INDEX: u64 = 18;
+/// First storage buffer of a graphics pipeline (ZSL `GRAPHICS_BUFFER_INDEX`), one slot each.
+pub(crate) const GRAPHICS_BUFFER_INDEX: u64 = 20;
+/// Storage buffers a draw binds, up to the last of Metal's 31 slots.
+pub(crate) const MAX_GRAPHICS_BUFFERS: usize = 31 - GRAPHICS_BUFFER_INDEX as usize;
 
 /// Dummy shader with the table's layout, compiled so Metal hands out an encoder. Never run.
 const PROBE_MSL: &str = "#include <metal_stdlib>
