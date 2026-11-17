@@ -32,6 +32,23 @@ pub trait GpuSubmission: Send + Sync {
 
 pub type Submission = Box<dyn GpuSubmission>;
 
+/// Point on an async queue's timeline, from `GpuDevice::submit_compute_async`. Copy. Only valid on
+/// the device that issued it. `COMPLETE` is reached from the start.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub struct QueueTicket(u64);
+
+impl QueueTicket {
+    pub const COMPLETE: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 /// Bytes are taken once the read has completed.
 pub trait GpuReadback: GpuSubmission {
     /// Waits for completion if needed.

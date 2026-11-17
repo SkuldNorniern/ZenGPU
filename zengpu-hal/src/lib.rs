@@ -33,8 +33,8 @@ pub use request::{
     TransferCaps,
 };
 pub use submission::{
-    CompletedReadback, CompletedSubmission, GpuReadback, GpuSubmission, ReadSubmission, Submission,
-    SubmissionStatus,
+    CompletedReadback, CompletedSubmission, GpuReadback, GpuSubmission, QueueTicket,
+    ReadSubmission, Submission, SubmissionStatus,
 };
 pub use surface::WindowHandles;
 pub use zen_window_handle as window_handle;

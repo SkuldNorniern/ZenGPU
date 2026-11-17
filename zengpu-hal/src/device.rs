@@ -2,6 +2,7 @@
 //! select at runtime.
 
 use core::any::Any;
+use core::time::Duration;
 
 use crate::caps::ComputeCaps;
 use crate::codec::{ImageCodec, ImageCodecCaps, ImageDecodeRequest, ImageEncodeRequest};
@@ -13,7 +14,10 @@ use crate::desc::{
 use crate::error::{GpuError, Result};
 use crate::handle::{BufferHandle, PipelineHandle, SamplerHandle, ShaderHandle, TextureHandle};
 use crate::request::{DeviceLimits, FormatCaps, HalCapabilities, MemoryBudget};
-use crate::submission::{CompletedReadback, CompletedSubmission, ReadSubmission, Submission};
+use crate::submission::{
+    CompletedReadback, CompletedSubmission, QueueTicket, ReadSubmission, Submission,
+    SubmissionStatus,
+};
 use crate::types::{BackendPreference, Features, Format};
 
 /// `Send + Sync`, so worker threads can allocate and upload concurrently.
@@ -441,5 +445,44 @@ pub trait GpuDevice: Send + Sync {
             }
         }
         Ok(Box::new(CompletedSubmission::new(cycle_id)))
+    }
+
+    /// Runs `ops` on the async compute queue once each `waits` ticket completes. Returns the
+    /// submission and a ticket for its completion point, which later calls can wait on.
+    ///
+    /// The default runs synchronously, so the ticket is already complete.
+    fn submit_compute_async(
+        &self,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+        waits: &[QueueTicket],
+    ) -> Result<(Submission, QueueTicket)> {
+        let submission = self.submit_compute_ops_after(cycle_id, ops, waits)?;
+        Ok((submission, QueueTicket::COMPLETE))
+    }
+
+    /// Like `submit_compute_ops`, but starts after each `waits` ticket completes.
+    ///
+    /// The default blocks on the host for each ticket first.
+    fn submit_compute_ops_after(
+        &self,
+        cycle_id: u64,
+        ops: &[ComputeOp<'_>],
+        waits: &[QueueTicket],
+    ) -> Result<Submission> {
+        for &ticket in waits {
+            self.wait_ticket(ticket, Duration::MAX)?;
+        }
+        self.submit_compute_ops(cycle_id, ops)
+    }
+
+    /// Checks a ticket without blocking. The default reports complete.
+    fn poll_ticket(&self, _ticket: QueueTicket) -> Result<SubmissionStatus> {
+        Ok(SubmissionStatus::Complete)
+    }
+
+    /// Blocks until the ticket completes, or returns `GpuError::Timeout` when `timeout` expires.
+    fn wait_ticket(&self, _ticket: QueueTicket, _timeout: Duration) -> Result<()> {
+        Ok(())
     }
 }
