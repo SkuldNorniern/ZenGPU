@@ -120,6 +120,75 @@ mod tests {
         assert_eq!(out, expect);
     }
 
+    /// `atomic_max` of packed `(depth << 32) | id` keeps the deepest, then the highest id. Metal
+    /// has 64-bit atomics from Apple8 on; before that the pipeline is refused, and nothing runs.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn u64_atomic_max_reads_back_the_packed_winner_or_is_refused() {
+        use zengpu_hal::{Bindings, BufferUsage, ComputePipelineDesc, Features, MemoryUsage};
+        use zengpu_shader::{ZslShader, zsl};
+
+        const PACK: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel pack(best: device mut buffer<u64>, depth: device buffer<u32>, id: global_id) {
+                let packed = (u64(depth[id.x]) << 32) | u64(id.x)
+                atomic_max(best, 0, packed)
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let has = dev.capabilities().features.contains(Features::ATOMIC_U64);
+        let shader = dev.create_shader(ShaderDesc::msl(PACK.msl.unwrap()));
+        let pipeline = shader.and_then(|shader| {
+            dev.create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [64, 1, 1],
+            })
+        });
+        println!("ATOMIC_U64 {has}, pipeline {:?}", pipeline.as_ref().map(|_| ()));
+        let Ok(pipeline) = pipeline else {
+            assert!(!has, "the device says it has u64 atomics but the pipeline failed");
+            return;
+        };
+        let n: u32 = 256;
+        let depth: Vec<u32> = (0..n).map(|i| (i * 73 + 11) % 251).collect();
+        let depth_bytes: Vec<u8> = depth.iter().flat_map(|d| d.to_le_bytes()).collect();
+        let best = dev
+            .create_buffer(BufferDesc {
+                size: 8,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        dev.write_buffer(best, 0, &[0; 8]).unwrap();
+        let input = dev
+            .create_buffer(BufferDesc {
+                size: u64::from(n) * 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap();
+        dev.write_buffer(input, 0, &depth_bytes).unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[best.index(), input.index()],
+                ..Default::default()
+            },
+            [n / 64, 1, 1],
+        )
+        .unwrap();
+        let raw = dev.read_buffer(best, 0, 8).unwrap();
+        let got = u64::from_le_bytes(raw.try_into().unwrap());
+        let want = depth
+            .iter()
+            .zip(0u64..)
+            .map(|(&d, i)| (u64::from(d) << 32) | i)
+            .max()
+            .unwrap();
+        assert_eq!(got, want, "winner {got:x}, want {want:x}");
+    }
+
     /// A dispatch whose group counts an earlier dispatch wrote runs that many groups; arguments
     /// past the end, unaligned, or in a buffer without `INDIRECT` are refused.
     #[test]
