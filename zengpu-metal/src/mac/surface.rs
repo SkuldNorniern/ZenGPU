@@ -14,6 +14,7 @@ use zengpu_hal::{
     PresentMode, QueryPoolHandle, Result, Surface, SurfaceConfig, TargetHandle, WindowHandles,
 };
 
+use super::timestamps;
 use super::command::MetalCommandList;
 use super::convert;
 use super::device::{Inner, MetalDevice, MetalTarget, lock};
@@ -263,12 +264,32 @@ impl GraphicsDevice for MetalDevice {
         Ok(MetalCommandList::new(Arc::clone(&self.inner)))
     }
 
-    fn create_query_pool(&self, _count: u32) -> Result<QueryPoolHandle> {
-        Err(GpuError::Unsupported("metal: timestamp query pools".into()))
+    fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle> {
+        if count == 0 {
+            return Err(GpuError::Backend(
+                "timestamp query pool count must be non-zero".into(),
+            ));
+        }
+        let pool = timestamps::new_pool(&self.inner.device, count)
+            .map_err(|e| GpuError::Unsupported(format!("metal: timestamps: {e}")))?;
+        Ok(self
+            .inner
+            .query_pools
+            .lock()
+            .map_err(|_| GpuError::Backend("metal: query pools poisoned".into()))?
+            .insert(pool))
     }
 
-    fn read_timestamps(&self, _pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
-        Err(GpuError::Unsupported("metal: timestamp query pools".into()))
+    fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
+        let pools = self
+            .inner
+            .query_pools
+            .lock()
+            .map_err(|_| GpuError::Backend("metal: query pools poisoned".into()))?;
+        let pool = pools
+            .get(pool)
+            .ok_or_else(|| GpuError::Backend("metal: stale query pool handle".into()))?;
+        Ok(timestamps::read(pool))
     }
 
     fn supports_dual_source_blending(&self) -> bool {

@@ -9,6 +9,7 @@ mod offscreen;
 mod pipeline;
 mod surface;
 mod table;
+mod timestamps;
 
 pub use command::MetalCommandList;
 pub use device::{DepthTarget, MetalDevice};

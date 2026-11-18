@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::take;
+use std::mem::{discriminant, take};
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 use block::ConcreteBlock;
 use metal::{
     BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
-    ComputeCommandEncoderRef, ComputePipelineState, DepthStencilState, Device, Library,
+    ComputeCommandEncoderRef, ComputePipelineState, CounterSampleBuffer, DepthStencilState, Device,
+    Library,
     MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType,
     MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
@@ -25,13 +26,14 @@ use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
     ComputeOp, ComputePipelineDesc, DType, DeviceLimits, DispatchOp, Features, Format, FormatCaps,
     GpuDevice, GpuError, GpuSubmission, HalCapabilities, IndirectDispatchOp, MemoryBudget, MmaShape,
-    PipelineHandle,
+    PipelineHandle, QueryPoolHandle,
     Reduction, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource,
     SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle,
     TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
+use super::timestamps::{self, MetalQueryPool};
 use super::table::{TABLE_CAPACITY, TextureTable};
 use crate::transfer;
 
@@ -137,6 +139,9 @@ pub(crate) struct Inner {
     pub(crate) in_flight: Mutex<Vec<(CommandBuffer, Vec<u32>)>>,
     /// The kernel count driven draws clamp their arguments with, built on first use.
     pub(crate) count_clamp: OnceLock<Option<ComputePipelineState>>,
+    pub(crate) query_pools: Mutex<SlotMap<marker::QueryPool, MetalQueryPool>>,
+    /// Nanoseconds a GPU timestamp tick lasts, measured on first use.
+    pub(crate) tick_ns: OnceLock<f32>,
 }
 
 /// Completed-buffer count. Waiters block on the condvar instead of polling.
@@ -370,6 +375,8 @@ impl MetalDevice {
                 completions: Arc::default(),
                 in_flight: Mutex::new(Vec::new()),
                 count_clamp: OnceLock::new(),
+                query_pools: Mutex::new(SlotMap::default()),
+                tick_ns: OnceLock::new(),
             }),
         })
     }
@@ -895,13 +902,13 @@ impl MetalDevice {
     fn commit_ops(&self, ops: &[ComputeOp<'_>]) -> Result<CommandBuffer> {
         let resolved = ops
             .iter()
-            .filter_map(|op| match op {
-                ComputeOp::Dispatch(d) => Some(self.resolve_dispatch(d).map(Resolved::Dispatch)),
-                ComputeOp::CopyBuffer(c) => Some(self.resolve_copy(c).map(Resolved::Copy)),
-                ComputeOp::DispatchIndirect(d) => {
-                    Some(self.resolve_indirect(d).map(Resolved::Dispatch))
+            .map(|op| match op {
+                ComputeOp::Dispatch(d) => self.resolve_dispatch(d).map(Resolved::Dispatch),
+                ComputeOp::CopyBuffer(c) => self.resolve_copy(c).map(Resolved::Copy),
+                ComputeOp::DispatchIndirect(d) => self.resolve_indirect(d).map(Resolved::Dispatch),
+                ComputeOp::Timestamp { pool, index } => {
+                    self.resolve_timestamp(*pool, *index).map(Resolved::Timestamp)
                 }
-                ComputeOp::Timestamp { .. } => None,
             })
             .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
@@ -910,13 +917,17 @@ impl MetalDevice {
             while let Some(first) = rest.first() {
                 let run = rest
                     .iter()
-                    .position(|r| {
-                        matches!(r, Resolved::Dispatch(_)) != matches!(first, Resolved::Dispatch(_))
-                    })
+                    .position(|r| discriminant(r) != discriminant(first))
                     .unwrap_or(rest.len());
                 let (group, tail) = rest.split_at(run);
                 rest = tail;
-                if matches!(first, Resolved::Dispatch(_)) {
+                if matches!(first, Resolved::Timestamp(_)) {
+                    for r in group {
+                        if let Resolved::Timestamp((samples, index, _)) = r {
+                            timestamps::sample(&self.inner.device, &cmd, samples, *index);
+                        }
+                    }
+                } else if matches!(first, Resolved::Dispatch(_)) {
                     let enc = cmd.new_compute_command_encoder();
                     for r in group {
                         if let Resolved::Dispatch(d) = r {
@@ -942,7 +953,35 @@ impl MetalDevice {
             }
         });
         self.inner.commit(&cmd);
+        if let Ok(mut pools) = self.inner.query_pools.lock() {
+            for r in &resolved {
+                if let Resolved::Timestamp((_, index, pool)) = r
+                    && let Some(p) = pools.get_mut(*pool)
+                {
+                    p.writers[*index as usize] = Some(cmd.clone());
+                }
+            }
+        }
         Ok(cmd)
+    }
+
+    /// A timestamp op's samples, after checking the pool and index.
+    fn resolve_timestamp(
+        &self,
+        pool: QueryPoolHandle,
+        index: u32,
+    ) -> Result<(CounterSampleBuffer, u32, QueryPoolHandle)> {
+        let pools = lock(&self.inner.query_pools)?;
+        let p = pools
+            .get(pool)
+            .ok_or_else(|| GpuError::Backend("metal: stale query pool handle".into()))?;
+        if index as usize >= p.writers.len() {
+            return Err(GpuError::Backend(format!(
+                "metal: timestamp {index} past a pool of {}",
+                p.writers.len()
+            )));
+        }
+        Ok((p.samples.clone(), index, pool))
     }
 }
 
@@ -1015,6 +1054,7 @@ struct ResolvedCopy {
 enum Resolved {
     Dispatch(ResolvedDispatch),
     Copy(ResolvedCopy),
+    Timestamp((CounterSampleBuffer, u32, QueryPoolHandle)),
 }
 
 /// Four bytes per scalar, in the field order of ZSL's MSL `struct Push`.
@@ -1124,6 +1164,15 @@ impl GpuDevice for MetalDevice {
     fn limits(&self) -> DeviceLimits {
         let max = self.inner.device.max_threads_per_threadgroup();
         let cap = |v: u64| u32::try_from(v).unwrap_or(u32::MAX);
+        let timestamp_supported = timestamps::timestamp_set(&self.inner.device).is_some();
+        let timestamp_period_ns = if timestamp_supported {
+            *self
+                .inner
+                .tick_ns
+                .get_or_init(|| timestamps::period_ns(&self.inner.device))
+        } else {
+            0.0
+        };
         DeviceLimits {
             max_workgroup_size: [cap(max.width), cap(max.height), cap(max.depth)],
             max_workgroup_invocations: 1024,
@@ -1131,6 +1180,8 @@ impl GpuDevice for MetalDevice {
             max_push_constant_size: 4096,
             max_sampled_textures: TABLE_CAPACITY,
             max_storage_textures: TABLE_CAPACITY,
+            timestamp_supported,
+            timestamp_period_ns,
             ..DeviceLimits::default()
         }
     }

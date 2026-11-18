@@ -1,7 +1,7 @@
 //! Render command recording straight into an `MTLCommandBuffer`.
 
 use std::ffi::c_void;
-use std::mem::size_of_val;
+use std::mem::{size_of_val, take};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -19,6 +19,7 @@ use zengpu_hal::{
 };
 
 use super::convert;
+use super::timestamps;
 use super::count::{self, Clamp, DRAW_WORDS, INDEXED_WORDS};
 use super::device::{Inner, MetalPipeline, RenderPipeline};
 use super::table::{
@@ -48,6 +49,8 @@ pub struct MetalCommandList {
     extent: (u32, u32),
     /// Work the GPU must do before this list: count driven draws clamping their arguments.
     pre: Option<CommandBuffer>,
+    /// Timestamps written inside the open pass, taken when it ends.
+    pass_samples: Vec<(QueryPoolHandle, u32)>,
 }
 
 // SAFETY: used only through `&mut self`, so one thread encodes at a time.
@@ -65,6 +68,7 @@ impl MetalCommandList {
             binding_valid: true,
             extent: (0, 0),
             pre: None,
+            pass_samples: Vec::new(),
         }
     }
 
@@ -83,6 +87,9 @@ impl MetalCommandList {
     fn end_encoder(&mut self) {
         if let Some(enc) = self.encoder.take() {
             enc.end_encoding();
+        }
+        for (pool, index) in take(&mut self.pass_samples) {
+            self.sample(pool, index);
         }
         self.pipeline = None;
     }
@@ -164,6 +171,26 @@ impl MetalCommandList {
         Some(clamp.encode(&inner.device, &pipeline, pre, &args, &count))
     }
 
+    /// Takes timestamp `index` of `pool` here, between encoders, and marks this list its writer.
+    fn sample(&mut self, pool: QueryPoolHandle, index: u32) {
+        let Some(cmd) = self.cmd.as_ref() else {
+            return;
+        };
+        let Ok(mut pools) = self.inner.query_pools.lock() else {
+            return;
+        };
+        let Some(p) = pools.get_mut(pool) else {
+            log::error!("[zengpu-metal] write_timestamp: stale query pool; skipped");
+            return;
+        };
+        let Some(writer) = p.writers.get_mut(index as usize) else {
+            log::error!("[zengpu-metal] write_timestamp: {index} past the pool; skipped");
+            return;
+        };
+        *writer = Some(cmd.clone());
+        timestamps::sample(&self.inner.device, cmd, &p.samples, index);
+    }
+
     fn full_scissor(&self) -> MTLScissorRect {
         MTLScissorRect {
             x: 0,
@@ -219,9 +246,26 @@ impl RenderCommands for MetalCommandList {
         }
     }
 
-    fn write_timestamp(&mut self, _pool: QueryPoolHandle, _index: u32) {}
+    /// Apple GPUs sample only where encoders start or end: inside a pass the timestamp is taken
+    /// when the pass ends.
+    fn write_timestamp(&mut self, pool: QueryPoolHandle, index: u32) {
+        if self.encoder.is_some() {
+            self.pass_samples.push((pool, index));
+        } else {
+            self.sample(pool, index);
+        }
+    }
 
-    fn reset_queries(&mut self, _pool: QueryPoolHandle, _first: u32, _count: u32) {}
+    fn reset_queries(&mut self, pool: QueryPoolHandle, first: u32, count: u32) {
+        if let Ok(mut pools) = self.inner.query_pools.lock()
+            && let Some(p) = pools.get_mut(pool)
+        {
+            let end = first.saturating_add(count) as usize;
+            for writer in p.writers.iter_mut().take(end).skip(first as usize) {
+                *writer = None;
+            }
+        }
+    }
 
     fn begin_render_pass(&mut self, desc: &RenderPassDesc<'_>) {
         self.end_encoder();
