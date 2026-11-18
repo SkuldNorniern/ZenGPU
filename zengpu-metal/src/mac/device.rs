@@ -14,8 +14,7 @@ use block::ConcreteBlock;
 use metal::{
     BlitCommandEncoderRef, Buffer, CommandBuffer, CommandBufferRef, CommandQueue,
     ComputeCommandEncoderRef, ComputePipelineState, CounterSampleBuffer, DepthStencilState, Device,
-    Library,
-    MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType,
+    Library, MTLBlitOption, MTLCommandBufferStatus, MTLGPUFamily, MTLOrigin, MTLPrimitiveType,
     MTLResourceOptions, MTLSize, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
     RenderPipelineState, SamplerDescriptor, SamplerState, Texture, TextureDescriptor,
 };
@@ -25,16 +24,16 @@ use objc::{msg_send, sel, sel_impl};
 use zengpu_hal::{
     BackendPreference, Bindings, BufferCopyOp, BufferDesc, BufferHandle, BufferUsage, ComputeCaps,
     ComputeOp, ComputePipelineDesc, DType, DeviceLimits, DispatchOp, Features, Format, FormatCaps,
-    GpuDevice, GpuError, GpuSubmission, HalCapabilities, IndirectDispatchOp, MemoryBudget, MmaShape,
-    PipelineHandle, QueryPoolHandle,
-    Reduction, Result, SamplerDesc, SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource,
-    SlotMap, Submission, SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle,
-    TextureRegion, TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
+    GpuDevice, GpuError, GpuSubmission, HalCapabilities, IndirectDispatchOp, MathMode,
+    MemoryBudget, MmaShape, PipelineHandle, QueryPoolHandle, Reduction, Result, SamplerDesc,
+    SamplerHandle, Scalar, ShaderDesc, ShaderHandle, ShaderSource, SlotMap, Submission,
+    SubmissionStatus, TargetHandle, TexDim, TextureDesc, TextureHandle, TextureRegion,
+    TextureUsage, TextureWrite, TransferCaps, UsageError, marker,
 };
 
 use super::convert;
-use super::timestamps::{self, MetalQueryPool};
 use super::table::{TABLE_CAPACITY, TextureTable};
+use super::timestamps::{self, MetalQueryPool};
 use crate::transfer;
 
 pub(crate) struct MetalBuffer {
@@ -346,6 +345,14 @@ pub struct MetalDevice {
     pub(crate) inner: Arc<Inner>,
 }
 
+/// Compile options for a shader's math mode. Precise turns fast math off, so inf, NaN and the
+/// sign of zero hold and division rounds correctly.
+fn compile_options(math: MathMode) -> metal::CompileOptions {
+    let options = metal::CompileOptions::new();
+    options.set_fast_math_enabled(math == MathMode::Fast);
+    options
+}
+
 impl MetalDevice {
     #[cfg(test)]
     pub(crate) fn force_tier1(&self) {
@@ -631,11 +638,7 @@ impl MetalDevice {
         Ok(cmd)
     }
 
-    fn stage_rows(
-        &self,
-        layout: &transfer::Layout,
-        data: &[u8],
-    ) -> Result<Buffer> {
+    fn stage_rows(&self, layout: &transfer::Layout, data: &[u8]) -> Result<Buffer> {
         let row = layout.packed;
         let image_bytes = u64::from(row) * u64::from(layout.rows);
         if image_bytes > self.inner.device.max_buffer_length() {
@@ -861,12 +864,17 @@ impl MetalDevice {
                 }));
             }
             let fits = op.offset.is_multiple_of(4)
-                && op.offset.checked_add(12).is_some_and(|end| end <= args.size);
+                && op
+                    .offset
+                    .checked_add(12)
+                    .is_some_and(|end| end <= args.size);
             if !fits {
-                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(format!(
-                    "indirect dispatch arguments at {} do not fit {} bytes, 4 aligned",
-                    op.offset, args.size
-                ))));
+                return Err(GpuError::InvalidUsage(UsageError::BindingMismatch(
+                    format!(
+                        "indirect dispatch arguments at {} do not fit {} bytes, 4 aligned",
+                        op.offset, args.size
+                    ),
+                )));
             }
             args.buf.clone()
         };
@@ -906,9 +914,9 @@ impl MetalDevice {
                 ComputeOp::Dispatch(d) => self.resolve_dispatch(d).map(Resolved::Dispatch),
                 ComputeOp::CopyBuffer(c) => self.resolve_copy(c).map(Resolved::Copy),
                 ComputeOp::DispatchIndirect(d) => self.resolve_indirect(d).map(Resolved::Dispatch),
-                ComputeOp::Timestamp { pool, index } => {
-                    self.resolve_timestamp(*pool, *index).map(Resolved::Timestamp)
-                }
+                ComputeOp::Timestamp { pool, index } => self
+                    .resolve_timestamp(*pool, *index)
+                    .map(Resolved::Timestamp),
             })
             .collect::<Result<Vec<_>>>()?;
         let cmd = self.inner.command_buffer();
@@ -1720,7 +1728,7 @@ impl GpuDevice for MetalDevice {
         let library = self
             .inner
             .device
-            .new_library_with_source(source, &metal::CompileOptions::new())
+            .new_library_with_source(source, &compile_options(desc.math))
             .map_err(|e| GpuError::ShaderCompile(format!("metal: MSL compile failed: {e}")))?;
         Ok(lock(&self.inner.shaders)?.insert(MetalShader {
             library,

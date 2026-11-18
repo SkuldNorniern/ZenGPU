@@ -120,6 +120,67 @@ mod tests {
         assert_eq!(out, expect);
     }
 
+    /// Precise math keeps what fast math may drop: a NaN seen as one, the sign of a zero sum, the
+    /// order of additions, and a correctly rounded division, as the CPU gives them.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn precise_math_keeps_nan_signed_zeros_and_division() {
+        use std::hint::black_box;
+        use zengpu_hal::{Bindings, ComputePipelineDesc, MathMode};
+        use zengpu_shader::{ZslShader, zsl};
+
+        const EDGES: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel edges(x: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+                out[0] = 0.0
+                if isnan(x[0]) { out[0] = 1.0 }
+                out[1] = x[1] + x[2]
+                out[2] = x[3] / x[4]
+                out[3] = (x[5] + x[6]) - x[5]
+                out[4] = x[7] / x[8]
+            }
+        );
+        let Some(dev) = open_metal() else { return };
+        let run = |math: MathMode| {
+            let x = make_f32(
+                &*dev,
+                &[f32::NAN, -0.0, -0.0, 1.0, 3.0, 1e8, 1.0, 1e38, 3e38],
+                false,
+            );
+            let out = make_f32(&*dev, &[9.0; 5], true);
+            let (shader, entry) = EDGES.create_with_math(&*dev, math).unwrap();
+            let pipeline = dev
+                .create_compute_pipeline(ComputePipelineDesc {
+                    shader,
+                    entry,
+                    block: [1, 1, 1],
+                })
+                .unwrap();
+            dev.dispatch(
+                pipeline,
+                Bindings {
+                    buffers: &[x.index(), out.index()],
+                    ..Default::default()
+                },
+                [1, 1, 1],
+            )
+            .unwrap();
+            read_f32(&*dev, out, 5)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<u32>>()
+        };
+        let precise = run(MathMode::Precise);
+        // the CPU's own IEEE results; fast math folds the fourth to 1 and flushes the fifth to 0
+        let x = black_box([1.0f32, 3.0, 1e8, 1.0, 1e38, 3e38]);
+        let want = [1.0, -0.0, x[0] / x[1], (x[2] + x[3]) - x[2], x[4] / x[5]];
+        assert_eq!(
+            precise,
+            want.map(f32::to_bits).to_vec(),
+            "nan, -0 + -0, 1 / 3, (1e8 + 1) - 1e8, 1e38 / 3e38"
+        );
+    }
+
     /// `atomic_max` of packed `(depth << 32) | id` keeps the deepest, then the highest id. Metal
     /// has 64-bit atomics from Apple8 on; before that the pipeline is refused, and nothing runs.
     #[test]
@@ -145,9 +206,15 @@ mod tests {
                 block: [64, 1, 1],
             })
         });
-        println!("ATOMIC_U64 {has}, pipeline {:?}", pipeline.as_ref().map(|_| ()));
+        println!(
+            "ATOMIC_U64 {has}, pipeline {:?}",
+            pipeline.as_ref().map(|_| ())
+        );
         let Ok(pipeline) = pipeline else {
-            assert!(!has, "the device says it has u64 atomics but the pipeline failed");
+            assert!(
+                !has,
+                "the device says it has u64 atomics but the pipeline failed"
+            );
             return;
         };
         let n: u32 = 256;
@@ -218,10 +285,15 @@ mod tests {
             return;
         };
         let limits = dev.limits();
-        assert!(limits.timestamp_supported, "the m1 samples timestamps at encoder edges");
+        assert!(
+            limits.timestamp_supported,
+            "the m1 samples timestamps at encoder edges"
+        );
         assert!(limits.timestamp_period_ns > 0.0);
         const N: u32 = 1 << 14;
-        let shader = dev.create_shader(ShaderDesc::msl(SPIN.msl.unwrap())).unwrap();
+        let shader = dev
+            .create_shader(ShaderDesc::msl(SPIN.msl.unwrap()))
+            .unwrap();
         let pipeline = dev
             .create_compute_pipeline(ComputePipelineDesc {
                 shader,
@@ -237,7 +309,11 @@ mod tests {
             })
             .unwrap();
         let pool = dev.create_query_pool(2).unwrap();
-        assert_eq!(dev.read_timestamps(pool).unwrap(), None, "nothing written yet");
+        assert_eq!(
+            dev.read_timestamps(pool).unwrap(),
+            None,
+            "nothing written yet"
+        );
         let buffers = [out.index()];
         let ops = [
             ComputeOp::Timestamp { pool, index: 0 },
@@ -292,7 +368,9 @@ mod tests {
         );
         let Some(dev) = open_metal() else { return };
         let pipeline = |zsl: &ZslShader| {
-            let shader = dev.create_shader(ShaderDesc::msl(zsl.msl.unwrap())).unwrap();
+            let shader = dev
+                .create_shader(ShaderDesc::msl(zsl.msl.unwrap()))
+                .unwrap();
             dev.create_compute_pipeline(ComputePipelineDesc {
                 shader,
                 entry: "zsl_main",
@@ -1545,7 +1623,10 @@ mod graphics_tests {
         cmd.write_timestamp(pool, 1);
         cmd.end_render_pass();
         dev.submit_and_wait(cmd).expect("submit");
-        let times = dev.read_timestamps(pool).expect("read").expect("both written");
+        let times = dev
+            .read_timestamps(pool)
+            .expect("read")
+            .expect("both written");
         assert!(times[0] != 0 && times[1] >= times[0], "{times:?}");
         let mut cmd = dev.create_command_list().expect("list");
         cmd.reset_queries(pool, 0, 2);
@@ -1578,8 +1659,16 @@ mod graphics_tests {
         let half = |x0: f32, x1: f32| [x0, -1.0, x1, -1.0, x1, 1.0, x0, -1.0, x1, 1.0, x0, 1.0];
         let quads: Vec<f32> = half(-1.0, 0.0).into_iter().chain(half(0.0, 1.0)).collect();
         let vertices = buffer(&dev, bytes(&quads), BufferUsage::VERTEX);
-        let indices = buffer(&dev, bytes(&(0u32..12).collect::<Vec<_>>()), BufferUsage::INDEX);
-        let draws = buffer(&dev, bytes(&[6u32, 1, 0, 0, 6, 1, 6, 0]), BufferUsage::INDIRECT);
+        let indices = buffer(
+            &dev,
+            bytes(&(0u32..12).collect::<Vec<_>>()),
+            BufferUsage::INDEX,
+        );
+        let draws = buffer(
+            &dev,
+            bytes(&[6u32, 1, 0, 0, 6, 1, 6, 0]),
+            BufferUsage::INDIRECT,
+        );
         let indexed = buffer(
             &dev,
             bytes(&[6u32, 1, 0, 0, 0, 6, 1, 6, 0, 0]),
@@ -1587,7 +1676,12 @@ mod graphics_tests {
         );
         let (tex, target) = color_target(&dev, 4, 4);
         for indexed_draw in [false, true] {
-            for (count, left, right) in [(0u32, false, false), (1, true, false), (2, true, true), (9, true, true)] {
+            for (count, left, right) in [
+                (0u32, false, false),
+                (1, true, false),
+                (2, true, true),
+                (9, true, true),
+            ] {
                 let counts = buffer(&dev, bytes(&[count]), BufferUsage::INDIRECT);
                 let mut cmd = dev.create_command_list().expect("list");
                 let mut color = [ColorAttachment {
@@ -1616,7 +1710,10 @@ mod graphics_tests {
                 for (i, px) in pixels(&dev, tex, 4, 4).iter().enumerate() {
                     let lit = if i % 4 < 2 { left } else { right };
                     let want = if lit { RED } else { BLACK };
-                    assert_eq!(*px, want, "pixel {i}, count {count}, indexed {indexed_draw}");
+                    assert_eq!(
+                        *px, want,
+                        "pixel {i}, count {count}, indexed {indexed_draw}"
+                    );
                 }
                 dev.destroy_buffer(counts);
             }
@@ -1690,7 +1787,9 @@ mod graphics_tests {
         let Some(dev) = open() else { return };
         let (tex, target) = color_target(&dev, 4, 4);
         let p = pipeline(&dev, &FROM_BUFFER_VS, &TINT_FS, &[], None, None);
-        let corners: [f32; 12] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0];
+        let corners: [f32; 12] = [
+            -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0,
+        ];
         let xy = buffer(&dev, bytes(&corners), BufferUsage::STORAGE);
         let tint = buffer(&dev, bytes(&[0.0f32, 1.0, 0.0]), BufferUsage::STORAGE);
         let hits = buffer(
