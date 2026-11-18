@@ -189,6 +189,79 @@ mod tests {
         assert_eq!(got, want, "winner {got:x}, want {want:x}");
     }
 
+    /// Timestamps around a compute dispatch: both read back, the second later, and the gap is a
+    /// believable number of nanoseconds.
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn compute_ops_time_their_work_with_timestamps() {
+        use std::time::Duration;
+        use zengpu_hal::{
+            Bindings, BufferUsage, ComputeOp, ComputePipelineDesc, DispatchOp, GraphicsDevice,
+            MemoryUsage,
+        };
+        use zengpu_shader::{ZslShader, zsl};
+
+        const SPIN: ZslShader = zsl!(
+            @workgroup_size(64)
+            kernel spin(out: device mut buffer<f32>, id: global_id) {
+                let x = f32(id.x)
+                for i in 0..4096 {
+                    x = x * 0.999 + 0.001
+                }
+                out[id.x] = x
+            }
+        );
+        let Some(dev) = MetalInstance::new()
+            .request_metal_adapter()
+            .and_then(|adapter| adapter.open_metal(DeviceRequest::default()).ok())
+        else {
+            return;
+        };
+        let limits = dev.limits();
+        assert!(limits.timestamp_supported, "the m1 samples timestamps at encoder edges");
+        assert!(limits.timestamp_period_ns > 0.0);
+        const N: u32 = 1 << 14;
+        let shader = dev.create_shader(ShaderDesc::msl(SPIN.msl.unwrap())).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        let out = dev
+            .create_buffer(BufferDesc {
+                size: u64::from(N) * 4,
+                usage: BufferUsage::STORAGE,
+                memory: MemoryUsage::GpuOnly,
+            })
+            .unwrap();
+        let pool = dev.create_query_pool(2).unwrap();
+        assert_eq!(dev.read_timestamps(pool).unwrap(), None, "nothing written yet");
+        let buffers = [out.index()];
+        let ops = [
+            ComputeOp::Timestamp { pool, index: 0 },
+            ComputeOp::Dispatch(DispatchOp {
+                pipeline,
+                bindings: Bindings {
+                    buffers: &buffers,
+                    ..Default::default()
+                },
+                grid: [N / 64, 1, 1],
+            }),
+            ComputeOp::Timestamp { pool, index: 1 },
+        ];
+        dev.submit_compute_ops(1, &ops)
+            .unwrap()
+            .wait(Duration::from_secs(10))
+            .unwrap();
+        let times = dev.read_timestamps(pool).unwrap().expect("both written");
+        assert!(times[0] != 0 && times[1] > times[0], "{times:?}");
+        let ns = (times[1] - times[0]) as f64 * f64::from(limits.timestamp_period_ns);
+        println!("spin took {ns:.0} ns");
+        assert!(ns > 0.0 && ns < 5e9, "{ns} ns");
+    }
+
     /// A dispatch whose group counts an earlier dispatch wrote runs that many groups; arguments
     /// past the end, unaligned, or in a buffer without `INDIRECT` are refused.
     #[test]
@@ -1430,6 +1503,13 @@ mod graphics_tests {
         }
     }
 
+    const FULL_RED_VS: ZslShader = zsl!(
+        vertex vs(vi: vertex_index) -> f32x4 {
+            let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+            f32x4(corner.x * 4.0 - 1.0, corner.y * 4.0 - 1.0, 0.0, 1.0)
+        }
+    );
+
     const RED_FS: ZslShader = zsl!(
         fragment fs() -> f32x4 { f32x4(1.0, 0.0, 0.0, 1.0) }
     );
@@ -1437,6 +1517,42 @@ mod graphics_tests {
     /// ZSL clip space has +y down, as on Vulkan: y in -1..0 is the top half.
     /// Count driven draws on the GPU: a left and a right half, the count read from a buffer.
     /// 0 draws nothing, 1 the left, 2 and anything past `max_draws` both.
+    /// A timestamp before a pass and one inside it, which Apple GPUs take where the pass ends;
+    /// a reset makes the pool unread again.
+    #[test]
+    fn list_timestamps_land_at_pass_edges_and_reset() {
+        let Some(dev) = open() else { return };
+        let pool = dev.create_query_pool(2).expect("pool");
+        let (_tex, target) = color_target(&dev, 4, 4);
+        let p = pipeline(&dev, &FULL_RED_VS, &RED_FS, &[], None, None);
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.write_timestamp(pool, 0);
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 4));
+        cmd.draw(0..3, 0..1);
+        cmd.write_timestamp(pool, 1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        let times = dev.read_timestamps(pool).expect("read").expect("both written");
+        assert!(times[0] != 0 && times[1] >= times[0], "{times:?}");
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.reset_queries(pool, 0, 2);
+        assert_eq!(dev.read_timestamps(pool).expect("read"), None);
+        dev.submit_and_wait(cmd).expect("submit");
+    }
+
     #[test]
     fn indirect_count_draws_follow_the_gpu_count() {
         const POS_VS: ZslShader = zsl!(
