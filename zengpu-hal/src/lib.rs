@@ -42,7 +42,7 @@ pub use zen_window_handle as window_handle;
 pub use desc::{
     AddressMode, BlendComponent, BlendFactor, BlendMode, BlendOp, BlendState, BorderColor,
     BufferDesc, ColorTargetState, CompareFn, ComputePipelineDesc, ComputePipelineHints, CullMode,
-    DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, PipelineStats, PolygonMode,
+    DepthState, FilterMode, FrontFace, GraphicsPipelineDesc, MathMode, PipelineStats, PolygonMode,
     PrimitiveTopology, RasterState, Reduction, SamplerDesc, ShaderDesc, ShaderSource,
     StencilFaceState, StencilOp, StencilState, StepMode, SurfaceConfig, TexDim, TextureDesc,
     TextureRegion, TextureWrite, VertexAttribute, VertexFormat, VertexLayout,

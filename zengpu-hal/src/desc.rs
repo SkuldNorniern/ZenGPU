@@ -68,36 +68,60 @@ pub enum ShaderSource<'a> {
     CudaSrc(&'a [u8]),
 }
 
+/// How freely a backend may rewrite a shader's float math.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum MathMode {
+    /// The backend's usual: Metal compiles with fast math, which may reassociate and fuse, drop
+    /// the sign of zeros, assume no inf or NaN, and divide approximately. Vulkan, CUDA and HIP
+    /// compile as they do in `Precise`, apart from drivers that relax on their own (MoltenVK).
+    #[default]
+    Fast,
+    /// IEEE 754 as written, the reference the CPU backend gives: inf, NaN and signed zeros kept,
+    /// correctly rounded division. Slower where the backend has a fast mode.
+    Precise,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ShaderDesc<'a> {
     pub source: ShaderSource<'a>,
+    pub math: MathMode,
 }
 
 impl<'a> ShaderDesc<'a> {
     pub fn spirv(bytes: &'a [u8]) -> Self {
         Self {
             source: ShaderSource::Spirv(bytes),
+            math: MathMode::Fast,
         }
     }
     pub fn ptx(bytes: &'a [u8]) -> Self {
         Self {
             source: ShaderSource::Ptx(bytes),
+            math: MathMode::Fast,
         }
     }
     pub fn msl(source: &'a str) -> Self {
         Self {
             source: ShaderSource::Msl(source.as_bytes()),
+            math: MathMode::Fast,
         }
     }
     pub fn hip(source: &'a str) -> Self {
         Self {
             source: ShaderSource::Hip(source.as_bytes()),
+            math: MathMode::Fast,
         }
     }
     pub fn cuda_src(source: &'a str) -> Self {
         Self {
             source: ShaderSource::CudaSrc(source.as_bytes()),
+            math: MathMode::Fast,
         }
+    }
+
+    /// This shader with `math`.
+    pub fn with_math(self, math: MathMode) -> Self {
+        Self { math, ..self }
     }
 }
 
