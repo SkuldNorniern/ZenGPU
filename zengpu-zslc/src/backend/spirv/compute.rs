@@ -2073,6 +2073,16 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let s0 = ctx.spv.op_fadd(t_f32, acc, p0);
             let p1 = ctx.spv.op_fmul(t_f32, ahi, bhi);
             let id = ctx.spv.op_fadd(t_f32, s0, p1);
+            // each step rounds on its own, as the other backends do: no fused multiply-add
+            for step in [p0, s0, p1, id] {
+                ctx.spv.decorate(step, NO_CONTRACTION, &[]);
+            }
+            let acc_neg = neg_zero(ctx, acc);
+            let n0 = neg_zero_product(ctx, alo, blo);
+            let n1 = neg_zero_product(ctx, ahi, bhi);
+            let both = ctx.spv.op_logical_and(ctx.t_bool, n0, n1);
+            let neg = ctx.spv.op_logical_and(ctx.t_bool, acc_neg, both);
+            let id = with_zero_sign(ctx, id, neg);
             Ok(Val { id, ty: ctx.f32_id })
         }
 
@@ -2800,7 +2810,13 @@ fn fma_f16_lane(ctx: &mut LowerCtx<'_>, a: Id, b: Id, c: Id) -> Id {
     let inexact = ctx.spv.op_ford_ne(t_bool, err, zero);
     let lsb = ctx.spv.op_bitwise_and(t_u32, bits, c1);
     let even = ctx.spv.op_iequal(t_bool, lsb, c0);
-    let adjust = ctx.spv.op_logical_and(t_bool, inexact, even);
+    // An inf or NaN sum takes no step. Its error terms are NaN, and a driver compiling with fast
+    // math (MoltenVK does) may find NaN != 0, which would step -inf into a NaN.
+    let exp_mask = ctx.spv.constant_u32(t_u32, 0x7f80_0000);
+    let exp = ctx.spv.op_bitwise_and(t_u32, bits, exp_mask);
+    let finite = ctx.spv.op_inot_equal(t_bool, exp, exp_mask);
+    let odd_fix = ctx.spv.op_logical_and(t_bool, inexact, even);
+    let adjust = ctx.spv.op_logical_and(t_bool, odd_fix, finite);
     let err_pos = ctx.spv.op_ford_gt(t_bool, err, zero);
     let sign = ctx.spv.op_shift_right_logical(t_u32, bits, c31);
     let s_neg = ctx.spv.op_iequal(t_bool, sign, c1);
@@ -2811,7 +2827,54 @@ fn fma_f16_lane(ctx: &mut LowerCtx<'_>, a: Id, b: Id, c: Id) -> Id {
     let delta = ctx.spv.op_iadd(t_u32, twice, all);
     let stepped = ctx.spv.op_iadd(t_u32, bits, delta);
     let fixed = ctx.spv.op_select(t_u32, adjust, stepped, bits);
-    ctx.spv.op_bitcast(t_f32, fixed)
+    let fixed = ctx.spv.op_bitcast(t_f32, fixed);
+    let product = neg_zero_product(ctx, a, b);
+    let addend = neg_zero(ctx, c);
+    let neg = ctx.spv.op_logical_and(t_bool, product, addend);
+    with_zero_sign(ctx, fixed, neg)
+}
+
+// Exact zero sums carry their sign by IEEE: -0 only when every term is -0. Drivers that ignore
+// signed zeros (MoltenVK) give +0 for -0 + -0, so the bit-exact builtins set it from integer
+// tests on the terms instead.
+
+fn neg_zero(ctx: &mut LowerCtx<'_>, v: Id) -> Id {
+    let bits = ctx.spv.op_bitcast(ctx.t_u32, v);
+    let minus = ctx.spv.constant_u32(ctx.t_u32, 0x8000_0000);
+    ctx.spv.op_iequal(ctx.t_bool, bits, minus)
+}
+
+/// Whether `a * b` is -0, for f16 lanes: their products never underflow f32, so the product is
+/// zero just when a factor is.
+fn neg_zero_product(ctx: &mut LowerCtx<'_>, a: Id, b: Id) -> Id {
+    let (t_u32, t_bool) = (ctx.t_u32, ctx.t_bool);
+    let mag = ctx.spv.constant_u32(t_u32, 0x7fff_ffff);
+    let sign = ctx.spv.constant_u32(t_u32, 0x8000_0000);
+    let c0 = ctx.spv.constant_u32(t_u32, 0);
+    let [a, b] = [a, b].map(|v| ctx.spv.op_bitcast(t_u32, v));
+    let a_mag = ctx.spv.op_bitwise_and(t_u32, a, mag);
+    let b_mag = ctx.spv.op_bitwise_and(t_u32, b, mag);
+    let a_zero = ctx.spv.op_iequal(t_bool, a_mag, c0);
+    let b_zero = ctx.spv.op_iequal(t_bool, b_mag, c0);
+    let zero = ctx.spv.op_logical_or(t_bool, a_zero, b_zero);
+    let xor = ctx.spv.op_bitwise_xor(t_u32, a, b);
+    let neg_bits = ctx.spv.op_bitwise_and(t_u32, xor, sign);
+    let negative = ctx.spv.op_inot_equal(t_bool, neg_bits, c0);
+    ctx.spv.op_logical_and(t_bool, zero, negative)
+}
+
+/// `v`, or the zero `neg` picks when `v` is a zero.
+fn with_zero_sign(ctx: &mut LowerCtx<'_>, v: Id, neg: Id) -> Id {
+    let (t_u32, t_bool, t_f32) = (ctx.t_u32, ctx.t_bool, ctx.t_f32);
+    let mag = ctx.spv.constant_u32(t_u32, 0x7fff_ffff);
+    let minus = ctx.spv.constant_u32(t_u32, 0x8000_0000);
+    let c0 = ctx.spv.constant_u32(t_u32, 0);
+    let bits = ctx.spv.op_bitcast(t_u32, v);
+    let v_mag = ctx.spv.op_bitwise_and(t_u32, bits, mag);
+    let is_zero = ctx.spv.op_iequal(t_bool, v_mag, c0);
+    let zero = ctx.spv.op_select(t_u32, neg, minus, c0);
+    let out = ctx.spv.op_select(t_u32, is_zero, zero, bits);
+    ctx.spv.op_bitcast(t_f32, out)
 }
 
 fn pk_add_u16(ctx: &mut LowerCtx<'_>, a: Id, b: Id) -> Id {
