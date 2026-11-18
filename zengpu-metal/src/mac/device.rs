@@ -7,7 +7,7 @@ use std::mem::take;
 use std::ptr::copy_nonoverlapping;
 use std::str::from_utf8;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use block::ConcreteBlock;
@@ -135,6 +135,8 @@ pub(crate) struct Inner {
     pub(crate) completions: Arc<Completions>,
     /// Async submissions and their buffer slots. The host must not touch those buffers until done.
     pub(crate) in_flight: Mutex<Vec<(CommandBuffer, Vec<u32>)>>,
+    /// The kernel count driven draws clamp their arguments with, built on first use.
+    pub(crate) count_clamp: OnceLock<Option<ComputePipelineState>>,
 }
 
 /// Completed-buffer count. Waiters block on the condvar instead of polling.
@@ -367,6 +369,7 @@ impl MetalDevice {
                 lost: AtomicBool::new(false),
                 completions: Arc::default(),
                 in_flight: Mutex::new(Vec::new()),
+                count_clamp: OnceLock::new(),
             }),
         })
     }
@@ -1034,7 +1037,8 @@ pub(crate) fn capabilities() -> HalCapabilities {
         features: Features::COMPUTE
             | Features::GRAPHICS
             | Features::DESCRIPTOR_INDEXING
-            | Features::UNIFIED_MEMORY,
+            | Features::UNIFIED_MEMORY
+            | Features::DRAW_INDIRECT_COUNT,
         transfers: TransferCaps {
             texture_region_write: true,
             buffer_texture_copy: true,
@@ -1056,7 +1060,10 @@ impl GpuDevice for MetalDevice {
     fn capabilities(&self) -> HalCapabilities {
         let mut caps = capabilities();
         if !shared_memory(&self.inner.device) {
-            caps.features = Features::COMPUTE | Features::GRAPHICS | Features::DESCRIPTOR_INDEXING;
+            caps.features = Features::COMPUTE
+                | Features::GRAPHICS
+                | Features::DESCRIPTOR_INDEXING
+                | Features::DRAW_INDIRECT_COUNT;
         }
         // atomic_ulong min and max need Apple8 (A15, M2) or later
         if self.inner.device.supports_family(MTLGPUFamily::Apple8) {

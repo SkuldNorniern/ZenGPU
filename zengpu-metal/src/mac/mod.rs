@@ -2,6 +2,7 @@
 
 mod command;
 mod convert;
+mod count;
 mod device;
 mod instance;
 mod offscreen;

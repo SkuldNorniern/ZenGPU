@@ -19,6 +19,7 @@ use zengpu_hal::{
 };
 
 use super::convert;
+use super::count::{self, Clamp, DRAW_WORDS, INDEXED_WORDS};
 use super::device::{Inner, MetalPipeline, RenderPipeline};
 use super::table::{
     DEPTH_TEXTURE_BUFFER_INDEX, GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX,
@@ -45,6 +46,8 @@ pub struct MetalCommandList {
     binding_valid: bool,
     /// The current pass's attachment size, which scissors must stay inside.
     extent: (u32, u32),
+    /// Work the GPU must do before this list: count driven draws clamping their arguments.
+    pre: Option<CommandBuffer>,
 }
 
 // SAFETY: used only through `&mut self`, so one thread encodes at a time.
@@ -61,11 +64,16 @@ impl MetalCommandList {
             index: None,
             binding_valid: true,
             extent: (0, 0),
+            pre: None,
         }
     }
 
     pub(crate) fn finish(mut self) -> CommandBuffer {
         self.end_encoder();
+        // committed first, so the queue runs it before the list
+        if let Some(pre) = self.pre.take() {
+            self.inner.commit(&pre);
+        }
         match self.cmd.take() {
             Some(cmd) => cmd,
             None => self.inner.command_buffer(),
@@ -116,6 +124,44 @@ impl MetalCommandList {
             enc.set_fragment_buffer(at, Some(&buffer.buf), 0);
         }
         true
+    }
+
+    /// Arguments of a count driven draw, clamped to the count in a pass before this list. `None`
+    /// when the draw cannot run: no pipeline or pass, a stale buffer, or arguments out of range.
+    fn clamp(
+        &mut self,
+        what: &str,
+        args: BufferHandle,
+        count: BufferHandle,
+        clamp: Clamp,
+    ) -> Option<Buffer> {
+        if !self.binding_valid || clamp.max_draws == 0 {
+            return None;
+        }
+        if self.pipeline.is_none() || self.encoder.is_none() {
+            log::error!("[zengpu-metal] {what} without a pipeline in a pass; skipped");
+            return None;
+        }
+        let (args, count) = {
+            let buffers = self.inner.buffers.lock().ok()?;
+            match (buffers.get(args), buffers.get(count)) {
+                (Some(a), Some(c)) => {
+                    if let Err(why) = clamp.check(a.size, c.size) {
+                        log::error!("[zengpu-metal] {what}: {why}; skipped");
+                        return None;
+                    }
+                    (a.buf.clone(), c.buf.clone())
+                }
+                _ => {
+                    log::error!("[zengpu-metal] {what}: stale buffer; skipped");
+                    return None;
+                }
+            }
+        };
+        let pipeline = count::pipeline(&self.inner.count_clamp, &self.inner.device)?;
+        let inner = Arc::clone(&self.inner);
+        let pre = self.pre.get_or_insert_with(|| inner.command_buffer());
+        Some(clamp.encode(&inner.device, &pipeline, pre, &args, &count))
     }
 
     fn full_scissor(&self) -> MTLScissorRect {
@@ -555,26 +601,74 @@ impl RenderCommands for MetalCommandList {
 
     fn draw_indirect_count(
         &mut self,
-        _buffer: BufferHandle,
-        _offset: u64,
-        _count_buffer: BufferHandle,
-        _count_offset: u64,
-        _max_draws: u32,
-        _stride: u32,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
     ) {
-        log::error!("[zengpu-metal] draw_indirect_count is not supported yet; skipped");
+        let stride = if stride == 0 { DRAW_INDIRECT_STRIDE } else { u64::from(stride) };
+        let clamp = Clamp {
+            offset,
+            stride,
+            words: DRAW_WORDS,
+            count_offset,
+            max_draws,
+        };
+        let Some(scratch) = self.clamp("draw_indirect_count", buffer, count_buffer, clamp) else {
+            return;
+        };
+        let (Some(p), Some(enc)) = (self.pipeline.clone(), self.encoder.as_ref()) else {
+            return;
+        };
+        for i in 0..u64::from(max_draws) {
+            enc.draw_primitives_indirect(p.primitive, &scratch, i * DRAW_INDIRECT_STRIDE);
+        }
     }
 
     fn draw_indexed_indirect_count(
         &mut self,
-        _buffer: BufferHandle,
-        _offset: u64,
-        _count_buffer: BufferHandle,
-        _count_offset: u64,
-        _max_draws: u32,
-        _stride: u32,
+        buffer: BufferHandle,
+        offset: u64,
+        count_buffer: BufferHandle,
+        count_offset: u64,
+        max_draws: u32,
+        stride: u32,
     ) {
-        log::error!("[zengpu-metal] draw_indexed_indirect_count is not supported yet; skipped");
+        let stride = if stride == 0 {
+            DRAW_INDEXED_INDIRECT_STRIDE
+        } else {
+            u64::from(stride)
+        };
+        let clamp = Clamp {
+            offset,
+            stride,
+            words: INDEXED_WORDS,
+            count_offset,
+            max_draws,
+        };
+        let Some((index, start, format)) = self.index.clone() else {
+            log::error!("[zengpu-metal] draw_indexed_indirect_count without an index buffer; skipped");
+            return;
+        };
+        let Some(scratch) = self.clamp("draw_indexed_indirect_count", buffer, count_buffer, clamp)
+        else {
+            return;
+        };
+        let (Some(p), Some(enc)) = (self.pipeline.clone(), self.encoder.as_ref()) else {
+            return;
+        };
+        for i in 0..u64::from(max_draws) {
+            enc.draw_indexed_primitives_indirect(
+                p.primitive,
+                index_type(format),
+                &index,
+                start,
+                &scratch,
+                i * DRAW_INDEXED_INDIRECT_STRIDE,
+            );
+        }
     }
 
     fn end_render_pass(&mut self) {
