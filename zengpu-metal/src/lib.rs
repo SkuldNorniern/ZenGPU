@@ -1435,6 +1435,78 @@ mod graphics_tests {
     );
 
     /// ZSL clip space has +y down, as on Vulkan: y in -1..0 is the top half.
+    /// Count driven draws on the GPU: a left and a right half, the count read from a buffer.
+    /// 0 draws nothing, 1 the left, 2 and anything past `max_draws` both.
+    #[test]
+    fn indirect_count_draws_follow_the_gpu_count() {
+        const POS_VS: ZslShader = zsl!(
+            vertex vs(@location(0) pos: f32x2) -> f32x4 { f32x4(pos, 0.0, 1.0) }
+        );
+        let Some(dev) = open() else { return };
+        assert!(
+            dev.capabilities()
+                .features
+                .contains(zengpu_hal::Features::DRAW_INDIRECT_COUNT)
+        );
+        let attrs = [VertexAttribute {
+            location: 0,
+            offset: 0,
+            format: VertexFormat::Float32x2,
+        }];
+        let layouts = [VertexLayout {
+            stride: 8,
+            attributes: &attrs,
+            step_mode: StepMode::Vertex,
+        }];
+        let p = pipeline(&dev, &POS_VS, &RED_FS, &layouts, None, None);
+        let half = |x0: f32, x1: f32| [x0, -1.0, x1, -1.0, x1, 1.0, x0, -1.0, x1, 1.0, x0, 1.0];
+        let quads: Vec<f32> = half(-1.0, 0.0).into_iter().chain(half(0.0, 1.0)).collect();
+        let vertices = buffer(&dev, bytes(&quads), BufferUsage::VERTEX);
+        let indices = buffer(&dev, bytes(&(0u32..12).collect::<Vec<_>>()), BufferUsage::INDEX);
+        let draws = buffer(&dev, bytes(&[6u32, 1, 0, 0, 6, 1, 6, 0]), BufferUsage::INDIRECT);
+        let indexed = buffer(
+            &dev,
+            bytes(&[6u32, 1, 0, 0, 0, 6, 1, 6, 0, 0]),
+            BufferUsage::INDIRECT,
+        );
+        let (tex, target) = color_target(&dev, 4, 4);
+        for indexed_draw in [false, true] {
+            for (count, left, right) in [(0u32, false, false), (1, true, false), (2, true, true), (9, true, true)] {
+                let counts = buffer(&dev, bytes(&[count]), BufferUsage::INDIRECT);
+                let mut cmd = dev.create_command_list().expect("list");
+                let mut color = [ColorAttachment {
+                    target,
+                    load: LoadOp::DontCare,
+                    store: true,
+                    sample_after: false,
+                }];
+                cmd.begin_render_pass(&pass(
+                    target,
+                    LoadOp::clear_rgb(0.0, 0.0, 0.0),
+                    None,
+                    &mut color,
+                ));
+                cmd.set_pipeline(p);
+                cmd.set_viewport_scissor(viewport(4, 4));
+                cmd.set_vertex_buffer(0, vertices, 0);
+                if indexed_draw {
+                    cmd.set_index_buffer(indices, 0, IndexFormat::U32);
+                    cmd.draw_indexed_indirect_count(indexed, 0, counts, 0, 2, 0);
+                } else {
+                    cmd.draw_indirect_count(draws, 0, counts, 0, 2, 0);
+                }
+                cmd.end_render_pass();
+                dev.submit_and_wait(cmd).expect("submit");
+                for (i, px) in pixels(&dev, tex, 4, 4).iter().enumerate() {
+                    let lit = if i % 4 < 2 { left } else { right };
+                    let want = if lit { RED } else { BLACK };
+                    assert_eq!(*px, want, "pixel {i}, count {count}, indexed {indexed_draw}");
+                }
+                dev.destroy_buffer(counts);
+            }
+        }
+    }
+
     #[test]
     fn each_fragment_counts_once_through_an_atomic() {
         const FULL_VS: ZslShader = zsl!(
