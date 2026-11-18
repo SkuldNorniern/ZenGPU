@@ -14,10 +14,10 @@ use zengpu_hal::{
     PresentMode, QueryPoolHandle, Result, Surface, SurfaceConfig, TargetHandle, WindowHandles,
 };
 
-use super::timestamps;
 use super::command::MetalCommandList;
 use super::convert;
 use super::device::{Inner, MetalDevice, MetalTarget, lock};
+use super::timestamps;
 
 const LAYER_FILLS_PARENT: u64 = 2 | 16;
 

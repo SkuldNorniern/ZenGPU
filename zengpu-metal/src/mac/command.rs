@@ -8,8 +8,7 @@ use std::sync::Arc;
 use metal::{
     Buffer, CommandBuffer, MTLClearColor, MTLIndexType, MTLLoadAction, MTLResourceUsage,
     MTLScissorRect, MTLStoreAction, MTLViewport, RenderCommandEncoder, RenderCommandEncoderRef,
-    RenderPassDescriptor,
-    ResourceRef, Texture,
+    RenderPassDescriptor, ResourceRef, Texture,
 };
 use objc::rc::autoreleasepool;
 use objc::{msg_send, sel, sel_impl};
@@ -19,13 +18,13 @@ use zengpu_hal::{
 };
 
 use super::convert;
-use super::timestamps;
 use super::count::{self, Clamp, DRAW_WORDS, INDEXED_WORDS};
 use super::device::{Inner, MetalPipeline, RenderPipeline};
 use super::table::{
-    DEPTH_TEXTURE_BUFFER_INDEX, GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX, TEXTURE_BUFFER_INDEX,
-    TEXTURE_IDS_BUFFER_INDEX,
+    DEPTH_TEXTURE_BUFFER_INDEX, GRAPHICS_BUFFER_INDEX, MAX_GRAPHICS_BUFFERS, PUSH_BUFFER_INDEX,
+    TEXTURE_BUFFER_INDEX, TEXTURE_IDS_BUFFER_INDEX,
 };
+use super::timestamps;
 
 /// The push block's size limit, as on Vulkan: 64 four-byte words.
 const PUSH_BYTES: usize = 256;
@@ -652,7 +651,11 @@ impl RenderCommands for MetalCommandList {
         max_draws: u32,
         stride: u32,
     ) {
-        let stride = if stride == 0 { DRAW_INDIRECT_STRIDE } else { u64::from(stride) };
+        let stride = if stride == 0 {
+            DRAW_INDIRECT_STRIDE
+        } else {
+            u64::from(stride)
+        };
         let clamp = Clamp {
             offset,
             stride,
@@ -693,7 +696,9 @@ impl RenderCommands for MetalCommandList {
             max_draws,
         };
         let Some((index, start, format)) = self.index.clone() else {
-            log::error!("[zengpu-metal] draw_indexed_indirect_count without an index buffer; skipped");
+            log::error!(
+                "[zengpu-metal] draw_indexed_indirect_count without an index buffer; skipped"
+            );
             return;
         };
         let Some(scratch) = self.clamp("draw_indexed_indirect_count", buffer, count_buffer, clamp)
