@@ -32,7 +32,7 @@ use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::slice;
 
 use zengpu_hal::{
-    BackendPreference, GpuDevice, GpuError, Result as HalResult, ShaderDesc, ShaderHandle,
+    BackendPreference, GpuDevice, GpuError, MathMode, Result as HalResult, ShaderDesc, ShaderHandle,
 };
 
 #[cfg(test)]
@@ -124,6 +124,17 @@ impl ZslShader {
     pub fn create(&self, device: &dyn GpuDevice) -> HalResult<(ShaderHandle, &'static str)> {
         let (desc, entry) = self.for_backend(device.backend())?;
         Ok((device.create_shader(desc)?, entry))
+    }
+
+    /// [`Self::create`] with `math`: [`MathMode::Precise`] for results to check against the CPU
+    /// backend, or math that relies on inf, NaN or signed zeros.
+    pub fn create_with_math(
+        &self,
+        device: &dyn GpuDevice,
+        math: MathMode,
+    ) -> HalResult<(ShaderHandle, &'static str)> {
+        let (desc, entry) = self.for_backend(device.backend())?;
+        Ok((device.create_shader(desc.with_math(math))?, entry))
     }
 
     /// Convenience: SPIR-V [`ShaderDesc`] for Vulkan-only callers.
