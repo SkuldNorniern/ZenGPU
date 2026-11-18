@@ -2382,4 +2382,177 @@ mod graphics_tests {
         let tex = dev.create_texture(ok).unwrap();
         dev.destroy_texture(tex);
     }
+
+    /// Metal records no compute between passes. The list's compute calls are no-ops there, and
+    /// a render pass after them still draws.
+    #[test]
+    fn compute_in_list_is_refused_and_list_still_draws() {
+        const NOOP: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel noop(id: global_id) {
+            }
+        );
+        let Some(dev) = open() else { return };
+        assert!(
+            !dev.compute_in_command_lists(),
+            "metal should not record compute in command lists"
+        );
+        let shader = dev
+            .create_shader(ShaderDesc::msl(NOOP.msl.unwrap()))
+            .expect("compute shader");
+        let cp = dev
+            .create_compute_pipeline(zengpu_hal::ComputePipelineDesc {
+                shader,
+                entry: "zsl_main",
+                block: [1, 1, 1],
+            })
+            .expect("compute pipeline");
+        dev.destroy_shader(shader);
+        let indirect = dev
+            .create_buffer(BufferDesc {
+                size: 12,
+                usage: BufferUsage::INDIRECT | BufferUsage::TRANSFER_DST,
+                memory: MemoryUsage::Upload,
+            })
+            .expect("indirect buffer");
+        let none = Bindings {
+            buffers: &[],
+            textures: &[],
+            images: &[],
+            scalars: &[],
+        };
+        let p = pipeline(&dev, &FULL_RED_VS, &RED_FS, &[], None, None);
+        let (tex, target) = color_target(&dev, 4, 4);
+        let mut cmd = dev.create_command_list().expect("list");
+        cmd.dispatch(cp, none, [1, 1, 1]);
+        cmd.dispatch_indirect(cp, none, indirect, 0);
+        let mut color = [ColorAttachment {
+            target,
+            load: LoadOp::DontCare,
+            store: true,
+            sample_after: false,
+        }];
+        cmd.begin_render_pass(&pass(
+            target,
+            LoadOp::clear_rgb(0.0, 0.0, 0.0),
+            None,
+            &mut color,
+        ));
+        cmd.set_pipeline(p);
+        cmd.set_viewport_scissor(viewport(4, 4));
+        cmd.draw(0..6, 0..1);
+        cmd.end_render_pass();
+        dev.submit_and_wait(cmd).expect("submit");
+        for (i, px) in pixels(&dev, tex, 4, 4).iter().enumerate() {
+            assert_eq!(*px, RED, "pixel {i}");
+        }
+        dev.destroy_buffer(indirect);
+        dev.destroy_pipeline(cp);
+    }
+
+    /// One level view per mip above 0 of a `STORAGE` texture. Destroying the textures gives the
+    /// slots back.
+    #[test]
+    fn level_views_for_64_full_chains_release_on_destroy() {
+        const N: usize = 64;
+        const SIDE: u32 = 1024;
+        let Some(dev) = open() else { return };
+        let levels = SIDE.ilog2() + 1;
+        let desc = TextureDesc {
+            width: SIDE,
+            height: SIDE,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::STORAGE,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: levels,
+            array_layers: 1,
+        };
+        let grab = |textures: &[TextureHandle]| -> Vec<u32> {
+            let mut slots = Vec::new();
+            for &tex in textures {
+                for level in 1..levels {
+                    slots.push(dev.storage_level(tex, level).expect("level slot"));
+                }
+            }
+            slots
+        };
+        let mut textures: Vec<TextureHandle> = (0..N)
+            .map(|_| dev.create_texture(desc).expect("texture"))
+            .collect();
+        let slots = grab(&textures);
+        assert_eq!(slots.len(), N * (levels - 1) as usize);
+        let mut unique = slots.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), slots.len(), "level slots must not repeat");
+        println!(
+            "{N} textures {SIDE}x{SIDE}: {levels} mips each, {} mips total, {} level views",
+            N * levels as usize,
+            slots.len()
+        );
+        for tex in textures.drain(..) {
+            dev.destroy_texture(tex);
+        }
+        let textures: Vec<TextureHandle> = (0..N)
+            .map(|_| dev.create_texture(desc).expect("texture"))
+            .collect();
+        assert_eq!(grab(&textures).len(), slots.len());
+        for tex in textures {
+            dev.destroy_texture(tex);
+        }
+    }
+
+    /// Past the level-view cap, `storage_level` returns an error, not a panic. Freeing the
+    /// textures makes the slots usable again.
+    #[test]
+    fn level_views_past_the_cap_error_cleanly() {
+        const SIDE: u32 = 1024;
+        let Some(dev) = open() else { return };
+        let levels = SIDE.ilog2() + 1;
+        let desc = TextureDesc {
+            width: SIDE,
+            height: SIDE,
+            depth: 1,
+            format: Format::Rgba8Unorm,
+            usage: TextureUsage::STORAGE,
+            samples: 1,
+            dimension: TexDim::D2,
+            mip_levels: levels,
+            array_layers: 1,
+        };
+        let mut textures = Vec::new();
+        let mut granted = 0usize;
+        let mut refusal = None;
+        'fill: for _ in 0..200 {
+            let tex = dev.create_texture(desc).expect("texture");
+            textures.push(tex);
+            for level in 1..levels {
+                match dev.storage_level(tex, level) {
+                    Ok(_) => granted += 1,
+                    Err(e) => {
+                        refusal = Some(e);
+                        break 'fill;
+                    }
+                }
+            }
+        }
+        let err = refusal.expect("the level-view cap was never reached");
+        assert!(
+            matches!(err, zengpu_hal::GpuError::Unsupported(_)),
+            "{err:?}"
+        );
+        println!("level-view cap {granted} slots; refusal: {err:?}");
+        assert_eq!(
+            granted, 1024,
+            "measured cap differs from LEVEL_VIEW_CAPACITY"
+        );
+        for tex in textures {
+            dev.destroy_texture(tex);
+        }
+        let tex = dev.create_texture(desc).expect("texture");
+        assert!(dev.storage_level(tex, 1).is_ok());
+        dev.destroy_texture(tex);
+    }
 }
