@@ -3793,7 +3793,10 @@ mod tests {
             return;
         };
         let dev = vulkan(&device);
-        assert!(dev.capabilities().features.contains(Features::ATOMIC_U64));
+        if !dev.capabilities().features.contains(Features::ATOMIC_U64) {
+            // MoltenVK on M1 and older mobile GPUs have no 64-bit atomics
+            return;
+        }
         // Full quad at depth 5 with id 4, top-left 2x2 at depth 9 with id 2, full quad at depth 5
         // with id 1. The 2x2 wins where it covers, since depth sits above id in the packed value.
         let got = visibility_winners(dev, &VIS_FS, &[(4.0, 5, 4), (2.0, 9, 2), (4.0, 5, 1)]);
@@ -3821,7 +3824,10 @@ mod tests {
         let Some(dev) = try_device() else {
             return;
         };
-        assert!(dev.capabilities().features.contains(Features::ATOMIC_U64));
+        if !dev.capabilities().features.contains(Features::ATOMIC_U64) {
+            // MoltenVK on M1 and older mobile GPUs have no 64-bit atomics
+            return;
+        }
         let n: u32 = 256;
         let depth: Vec<u32> = (0..n).map(|i| (i * 73 + 11) % 251).collect();
         let depth_bytes: Vec<u8> = depth.iter().flat_map(|d| d.to_ne_bytes()).collect();
