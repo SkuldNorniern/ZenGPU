@@ -3,7 +3,7 @@
 
 use crate::ir::types::TypeId;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IrExpr {
     /// Typed as `u32`.
     LitU32(u32),
@@ -94,7 +94,7 @@ pub enum IrExpr {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum IrStmt {
     /// `name` is pre-declared in `Entry::locals`.
     Let {

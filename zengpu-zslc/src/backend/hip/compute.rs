@@ -1,3 +1,4 @@
+use crate::ir::escape;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -16,6 +17,7 @@ use crate::ir::{EntryKind, Module, Mutability, ParamKind};
 mod frag;
 
 pub fn lower_compute(module: &Module) -> Result<HipShader, Diagnostic> {
+    let module = &*escape::compute(module);
     check_uniformity(module)?;
     let e = &module.entry;
     let EntryKind::Compute {

@@ -4,6 +4,7 @@
 pub mod arena;
 pub mod binding;
 pub mod capability;
+pub mod escape;
 pub mod layout;
 pub mod node;
 pub mod reflection;
@@ -22,13 +23,13 @@ pub enum Mutability {
     ReadWrite,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Param {
     pub name: String,
     pub kind: ParamKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ParamKind {
     /// `elem` is interned in `Module::types`. SPIR-V only handles `f32` elements. Writability is
     /// checked in `ir::build`.
@@ -44,7 +45,7 @@ pub enum ParamKind {
     Image,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EntryKind {
     Compute {
         local_size: [u32; 3],
@@ -71,7 +72,7 @@ pub struct Occupancy {
     pub min_blocks: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Entry {
     pub kind: EntryKind,
     pub params: Vec<Param>,
@@ -81,7 +82,7 @@ pub struct Entry {
     pub body: Vec<IrStmt>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SharedDecl {
     pub name: String,
     /// Storage element type: f32, f16, bf16, i8, u8, i32 or u32. Loads and stores go
@@ -122,7 +123,7 @@ impl Backend {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Module {
     pub entry: Entry,
     pub types: TypeArena,
@@ -130,7 +131,7 @@ pub struct Module {
     pub backends: Vec<Backend>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GfxInput {
     pub name: String,
     pub slot: GfxSlot,
@@ -168,13 +169,13 @@ impl GfxBuiltin {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GfxScalar {
     pub name: String,
     pub ty: TypeId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphicsEntry {
     pub is_fragment: bool,
     /// `@location` inputs. The backend sorts them by location.
@@ -206,7 +207,7 @@ pub struct GfxOutput {
     pub blend_src: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphicsModule {
     pub entry: GraphicsEntry,
     pub types: TypeArena,

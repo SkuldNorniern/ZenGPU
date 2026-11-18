@@ -8,6 +8,7 @@
 //! - the texture table binds at [`TEXTURE_BUFFER_INDEX`] as an argument buffer of `{ tex, smp }`
 //!   texture and sampler pairs, one per bindless slot.
 
+use crate::ir::escape;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -33,6 +34,7 @@ pub const GRAPHICS_BUFFER_INDEX: u32 = 20;
 pub const MAX_GRAPHICS_BUFFERS: u32 = 31 - GRAPHICS_BUFFER_INDEX;
 
 pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> {
+    let module = &*escape::graphics(module);
     let e = &module.entry;
     let mut locals: HashMap<&str, &'static str> = HashMap::new();
     let mut arrays: HashMap<&str, (&'static str, u32)> = HashMap::new();
@@ -57,7 +59,10 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
         .collect();
     let mut buffers = HashMap::new();
     for (name, elem) in e.buf_params.iter().zip(&e.buf_elems) {
-        buffers.insert(name.as_str(), super::compute::msl_buffer_elem(module.types.get(*elem))?);
+        buffers.insert(
+            name.as_str(),
+            super::compute::msl_buffer_elem(module.types.get(*elem))?,
+        );
     }
     let ctx = Ctx {
         locals,
@@ -402,7 +407,16 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let val = emit_expr(ctx, value)?;
             let cmp = compare.as_ref().map(|c| emit_expr(ctx, c)).transpose()?;
             indent(s, depth);
-            super::compute::atomic_stmt(s, *op, buf, cty, &idx, &val, cmp.as_deref(), old.as_deref())?;
+            super::compute::atomic_stmt(
+                s,
+                *op,
+                buf,
+                cty,
+                &idx,
+                &val,
+                cmp.as_deref(),
+                old.as_deref(),
+            )?;
         }
         IrStmt::ImageStore { .. } => {
             return Err(Diagnostic::new(
@@ -690,10 +704,9 @@ mod tests {
         "#,
         );
         assert!(m.source.contains("device atomic_uint* hits [[buffer(20)]]"));
-        assert!(
-            m.source
-                .contains("atomic_fetch_add_explicit(&hits[uint(0u)], uint(1u), memory_order_relaxed);")
-        );
+        assert!(m.source.contains(
+            "atomic_fetch_add_explicit(&hits[uint(0u)], uint(1u), memory_order_relaxed);"
+        ));
         let _ = metal_compiles(&m.source);
     }
 
@@ -738,6 +751,26 @@ mod tests {
         assert!(m.source.contains("out.vary0 = in.col;"));
         assert!(m.source.contains("out.position.y = -out.position.y;"));
         let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn names_metal_has_taken_are_respelled() {
+        let m = graphics(
+            r#"
+            push P { half: u32, scale: f32 }
+            fragment fs(pos: frag_coord, p: P) -> f32x4 {
+                let float = pos.x * p.scale
+                for pc in 0..p.half {
+                    float = float + f32(pc)
+                }
+                f32x4(float, 0.0, 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("pc.half_"), "{}", m.source);
+        assert!(m.source.contains("float_ ="), "{}", m.source);
+        assert!(m.source.contains("pc_"), "{}", m.source);
+        assert_ne!(metal_compiles(&m.source), Some(false), "{}", m.source);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::ir::escape;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -15,6 +16,7 @@ use crate::ir::{EntryKind, Module, ParamKind};
 use std::cell::RefCell;
 
 pub fn lower_compute(module: &Module) -> Result<MslShader, Diagnostic> {
+    let module = &*escape::compute(module);
     check_uniformity(module)?;
     let e = &module.entry;
     let EntryKind::Compute {
@@ -596,7 +598,16 @@ fn emit_stmt(s: &mut String, ctx: &Ctx<'_>, stmt: &IrStmt, depth: usize) -> Resu
             let idx = emit_expr(ctx, index)?;
             let val = emit_expr(ctx, value)?;
             let cmp = compare.as_ref().map(|c| emit_expr(ctx, c)).transpose()?;
-            atomic_stmt(s, *aop, buf, cty, &idx, &val, cmp.as_deref(), old.as_deref())?;
+            atomic_stmt(
+                s,
+                *aop,
+                buf,
+                cty,
+                &idx,
+                &val,
+                cmp.as_deref(),
+                old.as_deref(),
+            )?;
         }
 
         IrStmt::AssignShared { name, index, value } => {
