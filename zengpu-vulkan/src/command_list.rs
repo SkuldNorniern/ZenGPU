@@ -785,16 +785,16 @@ impl RenderCommands for VulkanCommandList {
                 len += 4;
             }
         };
-        // the same order the shaders lay the block out in
-        for &idx in bindings.buffers {
-            push(idx.to_ne_bytes());
-        }
+        // the same order the shaders lay the block out in: scalars, then buffer slots
         for scalar in bindings.scalars {
             push(match scalar {
                 Scalar::U32(v) => v.to_ne_bytes(),
                 Scalar::I32(v) => v.to_ne_bytes(),
                 Scalar::F32(v) => v.to_bits().to_ne_bytes(),
             });
+        }
+        for &idx in bindings.buffers {
+            push(idx.to_ne_bytes());
         }
         for &idx in bindings.textures {
             push(idx.to_ne_bytes());

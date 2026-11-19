@@ -694,6 +694,37 @@ mod tests {
     }
 
     #[test]
+    fn stages_with_different_buffers_share_the_push_scalars() {
+        let vs = graphics(
+            r#"
+            push P { scale: f32, tint: f32 }
+            vertex vs(vi: vertex_index, a: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(a[vi] * p.scale, p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        let fs = graphics(
+            r#"
+            push P { scale: f32, tint: f32 }
+            fragment fs(@location(0) c: f32x4, b: device buffer<u32>, k: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(c.x * p.scale + f32(b[0]) + k[0], p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        for m in [&vs, &fs] {
+            assert!(
+                m.source
+                    .contains("struct Push {\n    float scale;\n    float tint;\n};")
+            );
+            assert!(m.source.contains("constant Push& pc [[buffer(16)]]"));
+            let _ = metal_compiles(&m.source);
+        }
+        assert!(vs.source.contains("device float* a [[buffer(20)]]"));
+        assert!(fs.source.contains("device uint* b [[buffer(20)]]"));
+        assert!(fs.source.contains("device float* k [[buffer(21)]]"));
+    }
+
+    #[test]
     fn fragments_count_into_an_atomic_buffer() {
         let m = graphics(
             r#"

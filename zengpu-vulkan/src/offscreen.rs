@@ -353,7 +353,7 @@ mod zsl_parity_tests {
     }
 
     #[test]
-    fn buffer_indices_come_before_scalars_in_the_push_block() {
+    fn scalars_come_before_buffer_indices_in_the_push_block() {
         let _guard = crate::test_gpu_lock();
         const FROM_BUFFER_VS: ZslShader = zsl!(
             push P { other: u32 }
@@ -395,6 +395,61 @@ mod zsl_parity_tests {
         let green = (wrong.index() as f32).min(1.0);
         let want = [255, (green * 255.0) as u8, 255, 255];
         assert!(px.iter().all(|p| *p == want), "{px:?} {want:?}");
+    }
+
+    #[test]
+    fn stages_read_their_own_buffers_and_shared_scalars() {
+        let _guard = crate::test_gpu_lock();
+        // buffer slot 0 is `a` in the vertex stage and `b` in the fragment stage, slot 1 is `k`
+        const BUFFERS_VS: ZslShader = zsl!(
+            push P { scale: f32, tint: f32 }
+            vertex vs(vi: vertex_index, a: device buffer<f32>, p: P) -> (f32x4, f32x3) {
+                let corner = f32x2(f32((26 >> vi) & 1), f32((52 >> vi) & 1))
+                (f32x4(corner * 2.0 - 1.0, 0.0, 1.0), f32x3(a[0] * p.scale, 0.0, 0.0))
+            }
+        );
+        const BUFFERS_FS: ZslShader = zsl!(
+            push P { scale: f32, tint: f32 }
+            fragment fs(@location(0) v: f32x3, b: device buffer<u32>, k: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(v.x, f32(b[1]) * 0.1, k[0] * p.tint, 1.0)
+            }
+        );
+        let Some(dev) = open() else { return };
+        let upload = |bytes: Vec<u8>| {
+            let buffer = dev
+                .create_buffer(BufferDesc {
+                    size: bytes.len() as u64,
+                    usage: BufferUsage::STORAGE,
+                    memory: MemoryUsage::Upload,
+                })
+                .expect("buffer");
+            dev.write_buffer(buffer, 0, &bytes).expect("write");
+            buffer
+        };
+        // a[0] = 1.0 as f32, b[1] = 5 as u32, k[0] = 0.5
+        let x = upload([1.0f32.to_le_bytes(), 5u32.to_le_bytes()].concat());
+        let y = upload(0.5f32.to_le_bytes().to_vec());
+        let target = OffscreenTarget::new(&dev, Format::Rgba8Unorm, 4, 4).expect("target");
+        let p = pipeline(&dev, &BUFFERS_VS, &BUFFERS_FS);
+        // scale 0.5 gives red 0.5, tint 0.75 gives blue 0.5 * 0.75
+        let px = draw(
+            &dev,
+            &target,
+            p,
+            Bindings {
+                buffers: &[x.index(), y.index()],
+                scalars: &[Scalar::F32(0.5), Scalar::F32(0.75)],
+                ..Default::default()
+            },
+        );
+        let want: [u8; 4] = [128, 128, 96, 255];
+        for px in &px {
+            let close = px
+                .iter()
+                .zip(want)
+                .all(|(a, b)| (i32::from(*a) - i32::from(b)).abs() <= 2);
+            assert!(close, "{px:?} {want:?}");
+        }
     }
 
     #[test]

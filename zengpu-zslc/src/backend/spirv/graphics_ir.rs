@@ -410,26 +410,29 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         }
     });
 
+    let n_scalars = e.scalar_params.len() as u32;
     let pc_var = if !e.buf_params.is_empty() || !e.scalar_params.is_empty() {
-        let mut pc_members: Vec<Id> = (0..n_buf_params).map(|_| t_u32).collect();
-        pc_members.extend(e.scalar_params.iter().map(|s| spv_value_ty(s.ty)));
+        // scalars first, then buffer slots: see `layout::graphics_layout`
+        let mut pc_members: Vec<Id> = e.scalar_params.iter().map(|s| spv_value_ty(s.ty)).collect();
+        pc_members.extend((0..n_buf_params).map(|_| t_u32));
         let t_pc_struct = spv.type_struct(&pc_members);
         spv.decorate(t_pc_struct, deco::BLOCK, &[]);
         let mut offset: u32 = 0;
-        for i in 0..n_buf_params {
-            spv.member_decorate(t_pc_struct, i, deco::OFFSET, &[offset]);
-            offset += 4;
-        }
         for (i, s) in e.scalar_params.iter().enumerate() {
-            let member = n_buf_params + i as u32;
             let (align, size) = graphics_member(s.ty, &mut types);
             offset = offset.next_multiple_of(align);
+            let member = i as u32;
             spv.member_decorate(t_pc_struct, member, deco::OFFSET, &[offset]);
             if s.ty == mat4_id {
                 spv.member_decorate(t_pc_struct, member, deco::COL_MAJOR, &[]);
                 spv.member_decorate(t_pc_struct, member, deco::MATRIX_STRIDE, &[16]);
             }
             offset += size;
+        }
+        offset = offset.next_multiple_of(4);
+        for i in 0..n_buf_params {
+            spv.member_decorate(t_pc_struct, n_scalars + i, deco::OFFSET, &[offset]);
+            offset += 4;
         }
         let t_ptr_pc = spv.type_pointer(sc::PUSH_CONSTANT, t_pc_struct);
         Some(spv.global_variable(t_ptr_pc, sc::PUSH_CONSTANT))
@@ -456,7 +459,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
             (
                 s.name.clone(),
                 ScalarInfo {
-                    pc_index: n_buf_params + i as u32,
+                    pc_index: i as u32,
                     ty: spv_value_ty(s.ty),
                     gty: s.ty,
                 },
@@ -469,7 +472,7 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         .iter()
         .zip(&e.buf_elems)
         .enumerate()
-        .map(|(i, (name, &elem))| (name.clone(), (i as u32, elem)))
+        .map(|(i, (name, &elem))| (name.clone(), (n_scalars + i as u32, elem)))
         .collect();
 
     spv.begin_function(t_void, fn_id, t_fn);
@@ -2140,6 +2143,70 @@ pub(crate) mod tests {
                 "fragment fs(@location(0) uv: f32x2, tex: textures) -> f32x4 { let a = tex[0].sample_compare(uv, 0.5).r\n f32x4(a) }"
             )
             .is_err()
+        );
+    }
+
+    /// Per member of the push-constant struct: whether it is a float, and its byte offset.
+    fn push_members(words: &[u32]) -> Vec<(bool, u32)> {
+        use std::collections::HashMap;
+        let (mut floats, mut pointee, mut structs) = (Vec::new(), HashMap::new(), HashMap::new());
+        let (mut push, mut offsets) = (None, Vec::new());
+        let mut at = 5;
+        while at < words.len() {
+            let count = ((words[at] >> 16) as usize).max(1);
+            let w = &words[at..at + count];
+            match w[0] & 0xffff {
+                22 => floats.push(w[1]),
+                30 => {
+                    structs.insert(w[1], w[2..].to_vec());
+                }
+                32 => {
+                    pointee.insert(w[1], w[3]);
+                }
+                // OpVariable in PushConstant storage
+                59 if w[3] == 9 => push = Some(w[1]),
+                // OpMemberDecorate Offset
+                72 if w[3] == super::deco::OFFSET => offsets.push((w[1], w[2], w[4])),
+                _ => {}
+            }
+            at += count;
+        }
+        let strct = pointee[&push.expect("push variable")];
+        let types = &structs[&strct];
+        let mut out = vec![(false, 0); types.len()];
+        for (target, member, offset) in offsets {
+            if target == strct {
+                let is_float = floats.contains(&types[member as usize]);
+                out[member as usize] = (is_float, offset);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn stages_with_different_buffers_keep_scalars_in_place() {
+        let vs = lower(
+            r#"
+            push P { scale: f32, tint: f32 }
+            vertex vs(vi: vertex_index, a: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(a[vi] * p.scale, p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        let fs = lower(
+            r#"
+            push P { scale: f32, tint: f32 }
+            fragment fs(@location(0) c: f32x4, b: device buffer<u32>, k: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(c.x * p.scale + f32(b[0]) + k[0], p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        validate(&vs);
+        validate(&fs);
+        assert_eq!(push_members(&vs), [(true, 0), (true, 4), (false, 8)]);
+        assert_eq!(
+            push_members(&fs),
+            [(true, 0), (true, 4), (false, 8), (false, 12)]
         );
     }
 

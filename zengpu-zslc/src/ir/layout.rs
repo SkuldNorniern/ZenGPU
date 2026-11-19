@@ -1,7 +1,8 @@
 //! Host-visible push-constant layout for a compiled entry point.
 //!
-//! Buffer slots first (u32 each), then scalars, tightly packed. `zengpu-vulkan`'s dispatch packs
-//! `Bindings` in this order. The layout is spelled out here so callers can check it.
+//! Compute: buffer slots, texture slots, image slots, then scalars, each u32 and tightly packed.
+//! Graphics: scalars first, then buffer slots, so shared scalars sit at the same offset in every
+//! stage whatever buffers each stage takes. `zengpu-vulkan` packs `Bindings` in these orders.
 
 use crate::ir::arena::TypeArena;
 use crate::ir::types::TypeId;
@@ -94,26 +95,14 @@ fn entry_layout(entry: &Entry) -> Vec<(String, LayoutInfo)> {
     out
 }
 
-/// Graphics layout: buffer slots, then scalars. `mat4x4<f32>` is 16-byte aligned, 64
-/// bytes, column-major.
-///
+/// Graphics layout: scalars, then buffer slots. `mat4x4<f32>` is 16-byte aligned, 64 bytes,
+/// column-major. Buffer slot `i` is the `i`th buffer param of every stage.
 pub fn graphics_layout(module: &GraphicsModule) -> Vec<(String, LayoutInfo)> {
     let e: &GraphicsEntry = &module.entry;
     let mut types = module.types.clone();
 
     let mut out = Vec::new();
     let mut offset = 0u32;
-    for (name, &elem) in e.buf_params.iter().zip(&e.buf_elems) {
-        out.push((
-            name.clone(),
-            LayoutInfo {
-                offset,
-                size: 4,
-                kind: LayoutKind::BufferIndex { elem },
-            },
-        ));
-        offset += 4;
-    }
     for s in &e.scalar_params {
         let (align, size) = graphics_member(s.ty, &mut types);
         offset = offset.next_multiple_of(align);
@@ -126,6 +115,18 @@ pub fn graphics_layout(module: &GraphicsModule) -> Vec<(String, LayoutInfo)> {
             },
         ));
         offset += size;
+    }
+    offset = offset.next_multiple_of(4);
+    for (name, &elem) in e.buf_params.iter().zip(&e.buf_elems) {
+        out.push((
+            name.clone(),
+            LayoutInfo {
+                offset,
+                size: 4,
+                kind: LayoutKind::BufferIndex { elem },
+            },
+        ));
+        offset += 4;
     }
     out
 }
@@ -236,5 +237,39 @@ mod tests {
             offsets,
             vec![("flag".to_string(), 0, 4), ("mvp".to_string(), 16, 64),]
         );
+    }
+
+    #[test]
+    fn graphics_scalars_keep_their_offsets_when_stages_take_different_buffers() {
+        let vs = compile_graphics(
+            r#"
+            push P { scale: f32, tint: f32 }
+            vertex vs(vi: vertex_index, a: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(a[vi] * p.scale, p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        let fs = compile_graphics(
+            r#"
+            push P { scale: f32, tint: f32 }
+            fragment fs(@location(0) c: f32x4, b: device buffer<u32>, k: device buffer<f32>, p: P) -> f32x4 {
+                f32x4(c.x * p.scale + f32(b[0]) + k[0], p.tint, 0.0, 1.0)
+            }
+        "#,
+        );
+        let at = |m: &GraphicsModule, name: &str| {
+            graphics_layout(m)
+                .into_iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, l)| l.offset)
+                .expect("param")
+        };
+        for m in [&vs, &fs] {
+            assert_eq!(at(m, "scale"), 0);
+            assert_eq!(at(m, "tint"), 4);
+        }
+        assert_eq!(at(&vs, "a"), 8);
+        assert_eq!(at(&fs, "b"), 8);
+        assert_eq!(at(&fs, "k"), 12);
     }
 }

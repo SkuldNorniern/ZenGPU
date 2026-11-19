@@ -15,6 +15,8 @@ pub enum Scalar {
 /// generation, so a destroyed resource can't be detected here.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Bindings<'a> {
+    /// Bindless buffer indices, in `buffer` param declaration order. A graphics draw reads them
+    /// positionally: entry `i` is the `i`th buffer param of each stage.
     pub buffers: &'a [u32],
     /// Sampled-texture table indices, in `texture` param declaration order.
     pub textures: &'a [u32],

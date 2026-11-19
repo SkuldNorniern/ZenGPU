@@ -98,8 +98,8 @@ pub struct ZslShader {
     pub msl: Result<&'static str, &'static str>,
     /// CUDA C++ source for NVIDIA CUDA (compiled at runtime via NVRTC).
     pub cuda: Result<&'static str, &'static str>,
-    /// Push-constant layout and binding metadata. Buffer params come first, then scalars, as every
-    /// backend builds it.
+    /// Push-constant layout and binding metadata. Compute: buffer params, then scalars. Graphics:
+    /// scalars, then buffer params.
     pub reflection: &'static [ParamLayout],
 }
 
