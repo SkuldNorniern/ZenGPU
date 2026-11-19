@@ -1120,24 +1120,24 @@ int main() {{
         let msl_source = msl::lower_compute(&module).expect("lower to MSL").source;
         for name in [
             "atomicMin(&words[",
-            "atomicMax(&signed[",
+            "atomicMax(&signed_[",
             "atomicAnd(&words[",
             "atomicOr(&words[",
             "atomicExch(&words[",
             "atomicCAS(&words[",
-            "atomicCAS(&signed[",
+            "atomicCAS(&signed_[",
         ] {
             assert!(hip_source.contains(name), "HIP missing {name}");
             assert!(cuda_source.contains(name), "CUDA missing {name}");
         }
         for name in [
             "atomic_fetch_min_explicit(&words[",
-            "atomic_fetch_max_explicit(&signed[",
+            "atomic_fetch_max_explicit(&signed_[",
             "atomic_fetch_and_explicit(&words[",
             "atomic_fetch_or_explicit(&words[",
             "atomic_exchange_explicit(&words[",
             "atomic_compare_exchange_weak_explicit(&words[",
-            "atomic_compare_exchange_weak_explicit(&signed[",
+            "atomic_compare_exchange_weak_explicit(&signed_[",
         ] {
             assert!(msl_source.contains(name), "MSL missing {name}");
         }
@@ -1216,8 +1216,8 @@ int main() {{
             msl_source.contains("device atomic_ulong* vis"),
             "{msl_source}"
         );
-        assert!(msl_source.contains("atomic_fetch_max_explicit(&vis["));
-        assert!(msl_source.contains("atomic_fetch_min_explicit(&vis["));
+        assert!(msl_source.contains("atomic_max_explicit(&vis["));
+        assert!(msl_source.contains("atomic_min_explicit(&vis["));
     }
 
     /// Metal has no 64-bit and, or, add, exchange or compare-exchange, so MSL refuses them.
@@ -2278,10 +2278,10 @@ int main() {{
         let msl_source = msl::lower_compute(&module)
             .expect("lower scatter_add to MSL")
             .source;
-        assert!(hip_source.contains("atomicAdd(&out["));
-        assert!(cuda_source.contains("atomicAdd(&out["));
+        assert!(hip_source.contains("atomicAdd(&out_["));
+        assert!(cuda_source.contains("atomicAdd(&out_["));
         assert!(msl_source.contains("device atomic_float* out"));
-        assert!(msl_source.contains("atomic_fetch_add_explicit(&out["));
+        assert!(msl_source.contains("atomic_fetch_add_explicit(&out_["));
         assert!(msl_source.contains("memory_order_relaxed"));
 
         let words = spirv::lower_compute(&module).expect("lower scatter_add to SPIR-V");
@@ -2328,7 +2328,7 @@ int main() {{
     fn scatter_add_hip_exact_match_when_gpu_present() {
         let module = parse_compute(SCATTER_ADD).expect("parse scatter_add");
         let shader = hip::lower_compute(&module).expect("lower scatter_add to HIP");
-        assert!(shader.source.contains("atomicAdd(&out["));
+        assert!(shader.source.contains("atomicAdd(&out_["));
 
         let rocm = var("ROCM_PATH").unwrap_or_else(|_| "/opt/rocm".into());
         let hipcc = Path::new(&rocm).join("bin/hipcc");
