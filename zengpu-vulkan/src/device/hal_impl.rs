@@ -1034,12 +1034,17 @@ impl GpuDevice for VulkanDevice {
                 )
                 .map_err(|e| GpuError::ShaderCompile(format!("vkCreateShaderModule: {e}")))?
         };
-        Ok(self.shaders.lock().unwrap().insert((module, coop)))
+        let push_bytes = super::graphics::push_block_bytes(words);
+        Ok(self
+            .shaders
+            .lock()
+            .unwrap()
+            .insert((module, coop, push_bytes)))
     }
 
     fn destroy_shader(&self, shader: ShaderHandle) {
         let mut shaders = self.shaders.lock().unwrap();
-        if let Some((m, _)) = shaders.remove(shader) {
+        if let Some((m, _, _)) = shaders.remove(shader) {
             unsafe {
                 self.inner.device.destroy_shader_module(m, None);
             }
@@ -1055,7 +1060,7 @@ impl GpuDevice for VulkanDevice {
         desc: ComputePipelineDesc<'_>,
         hints: zengpu_hal::ComputePipelineHints,
     ) -> Result<PipelineHandle> {
-        let (shader_module, coop) = {
+        let (shader_module, coop, _) = {
             let shaders = self.shaders.lock().unwrap();
             *shaders
                 .get(desc.shader)

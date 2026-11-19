@@ -542,6 +542,8 @@ pub(crate) enum VulkanPipeline {
     Graphics {
         layout: vk::PipelineLayout,
         pipeline: vk::Pipeline,
+        /// Size of the layout's push-constant range; binds never push past it.
+        push_bytes: u32,
     },
 }
 
@@ -549,7 +551,9 @@ impl VulkanPipeline {
     pub(crate) fn handles(&self) -> (vk::Pipeline, vk::PipelineLayout) {
         match *self {
             VulkanPipeline::Compute { layout, pipeline }
-            | VulkanPipeline::Graphics { layout, pipeline } => (pipeline, layout),
+            | VulkanPipeline::Graphics {
+                layout, pipeline, ..
+            } => (pipeline, layout),
         }
     }
 }
@@ -911,7 +915,7 @@ pub struct VulkanDevice {
     pub(crate) buffers: Arc<Mutex<SlotMap<marker::Buffer, VulkanBuffer>>>,
     pub(crate) textures: Arc<Mutex<SlotMap<marker::Texture, VulkanTexture>>>,
     samplers: Arc<Mutex<SlotMap<marker::Sampler, vk::Sampler>>>,
-    shaders: Mutex<SlotMap<marker::Shader, (vk::ShaderModule, bool)>>,
+    shaders: Mutex<SlotMap<marker::Shader, (vk::ShaderModule, bool, u32)>>,
     pub(crate) pipelines: Arc<Mutex<SlotMap<marker::Pipeline, VulkanPipeline>>>,
     /// Render targets (swapchain images, offscreen textures) that commands attach to.
     pub(crate) render_targets: Arc<Mutex<SlotMap<marker::RenderTarget, VulkanRenderTarget>>>,
@@ -1939,11 +1943,10 @@ fn stale(handle: BufferHandle, buffers: &SlotMap<marker::Buffer, VulkanBuffer>) 
 
 impl Drop for VulkanDevice {
     fn drop(&mut self) {
+        let idle_through = self.inner.serials.submitted();
         unsafe {
             if self.inner.device.device_wait_idle().is_ok() {
-                self.inner
-                    .serials
-                    .complete_all(self.inner.serials.submitted());
+                self.inner.serials.complete_all(idle_through);
             }
         }
         self.drain_in_flight();
@@ -2045,7 +2048,7 @@ impl Drop for VulkanDevice {
             unsafe { self.inner.device.destroy_sampler(s, None) };
         }
         let mut shaders = self.shaders.lock().unwrap();
-        for (m, _) in shaders.drain() {
+        for (m, _, _) in shaders.drain() {
             unsafe {
                 self.inner.device.destroy_shader_module(m, None);
             }
@@ -2123,6 +2126,119 @@ mod tests {
         state.mark_used(&[7], 6);
         state.mark_used(&[7], 5);
         assert!(state.buffer_busy(7, 5), "serial 6 still pending at 5");
+    }
+
+    /// Work numbered while `wait_idle` waits may still be running, so `wait_idle` must not
+    /// complete it.
+    #[test]
+    fn wait_idle_leaves_work_numbered_during_it_open() {
+        let Some((dev, _guard)) = try_async_device(false) else {
+            return;
+        };
+        if !dev.inner.async_lane.as_ref().is_some_and(|l| l.dedicated) {
+            return;
+        }
+        let make = |usage| {
+            dev.create_buffer(BufferDesc {
+                size: 16,
+                usage,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap()
+        };
+        let (src, dst) = (
+            make(BufferUsage::TRANSFER_SRC),
+            make(BufferUsage::TRANSFER_DST),
+        );
+        let mut late = None;
+        dev.wait_idle_then(|| {
+            let copy = ComputeOp::CopyBuffer(zengpu_hal::BufferCopyOp {
+                src,
+                src_offset: 0,
+                dst,
+                dst_offset: 0,
+                len: 16,
+            });
+            late = Some(dev.submit_compute_async(9, &[copy], &[]).unwrap());
+        })
+        .unwrap();
+        let (_submission, _) = late.unwrap();
+        let numbered = dev.inner.serials.submitted();
+        assert!(
+            dev.inner.serials.completed() < numbered,
+            "work numbered during wait_idle was completed by it"
+        );
+    }
+
+    /// Shift counts mask to the width, and a literal shifted into a u64 store is a u64 shift.
+    #[test]
+    fn shifts_mask_the_count_and_widen_literals() {
+        use zengpu_shader::{ZslShader, zsl};
+        const SHIFTS: ZslShader = zsl!(
+            @workgroup_size(1)
+            kernel shifts(src: device buffer<u32>, out: device mut buffer<u32>, wide: device mut buffer<u64>, id: global_id) {
+                let x = src[0]
+                out[0] = x << 33
+                out[1] = x >> 33
+                wide[0] = 1u64 << 40
+                wide[1] = 1 << 40
+            }
+        );
+        let Some(dev) = try_device() else {
+            return;
+        };
+        let shader = dev.create_shader(SHIFTS.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [1, 1, 1],
+            })
+            .unwrap();
+        let buffer = |size: u64| {
+            dev.create_buffer(BufferDesc {
+                size,
+                usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+                memory: MemoryUsage::Upload,
+            })
+            .unwrap()
+        };
+        let (src, out, wide) = (buffer(4), buffer(8), buffer(16));
+        dev.write_buffer(src, 0, &8u32.to_le_bytes()).unwrap();
+        let ops = [ComputeOp::Dispatch(DispatchOp {
+            pipeline,
+            bindings: Bindings {
+                buffers: &[src.index(), out.index(), wide.index()],
+                ..Default::default()
+            },
+            grid: [1, 1, 1],
+        })];
+        dev.submit_compute_ops(1, &ops)
+            .unwrap()
+            .wait(Duration::from_secs(10))
+            .unwrap();
+        let words = |bytes: Vec<u8>| -> Vec<u64> {
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| u64::from_le_bytes(*c))
+                .collect()
+        };
+        // 8 << 33 masks to 8 << 1; 8 >> 33 masks to 8 >> 1
+        let got_out: Vec<u32> = dev
+            .read_buffer(out, 0, 8)
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(got_out, [16, 4]);
+        assert_eq!(
+            words(dev.read_buffer(wide, 0, 16).unwrap()),
+            [1 << 40, 1 << 40]
+        );
     }
 
     struct TestDevice {

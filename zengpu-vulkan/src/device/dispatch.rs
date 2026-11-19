@@ -16,6 +16,15 @@ impl VulkanDevice {
     }
 
     pub fn wait_idle(&self) -> Result<()> {
+        self.wait_idle_then(|| {})
+    }
+
+    /// `wait_idle` with `between` run after the serials it may complete are read, before the
+    /// wait. Async submissions on a dedicated queue don't take `queue_lock`, so one can be
+    /// numbered during the wait. Only serials read first were submitted before the wait.
+    pub(crate) fn wait_idle_then(&self, between: impl FnOnce()) -> Result<()> {
+        let idle_through = self.inner.serials.submitted();
+        between();
         {
             let _queue = self.inner.queue_lock.lock().unwrap();
             unsafe {
@@ -24,9 +33,7 @@ impl VulkanDevice {
                     .device_wait_idle()
                     .map_err(|e| GpuError::Backend(format!("device_wait_idle: {e}")))?;
             }
-            self.inner
-                .serials
-                .complete_all(self.inner.serials.submitted());
+            self.inner.serials.complete_all(idle_through);
         }
         self.drain_in_flight();
         self.recover_raw_waits()?;

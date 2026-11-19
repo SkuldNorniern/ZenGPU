@@ -193,6 +193,8 @@ pub struct VulkanCommandList {
     current_pipeline: Option<PipelineHandle>,
     /// Layout of the bound graphics pipeline. Scopes push constants for `bind`.
     current_layout: Option<vk::PipelineLayout>,
+    /// Push range of `current_layout`, in bytes.
+    current_push_bytes: u32,
     current_vertex_buffers: [Option<(BufferHandle, u64)>; MAX_VERTEX_BUFFERS],
     current_index_buffer: Option<(BufferHandle, u64, IndexFormat)>,
     /// Targets from this pass with `sample_after` set: moved to
@@ -327,6 +329,7 @@ impl VulkanCommandList {
             bindless_set,
             current_pipeline: None,
             current_layout: None,
+            current_push_bytes: 0,
             current_vertex_buffers: [None; MAX_VERTEX_BUFFERS],
             current_index_buffer: None,
             pending_shader_read: [None; MAX_COLOR_ATTACHMENTS],
@@ -710,11 +713,12 @@ impl RenderCommands for VulkanCommandList {
         let Some(VulkanPipeline::Graphics {
             layout,
             pipeline: vk_pipeline,
+            push_bytes,
         }) = pipelines.get(pipeline)
         else {
             return;
         };
-        let (layout, vk_pipeline) = (*layout, *vk_pipeline);
+        let (layout, vk_pipeline, push_bytes) = (*layout, *vk_pipeline, *push_bytes);
         drop(pipelines);
         unsafe {
             self.inner.device.cmd_bind_pipeline(
@@ -733,6 +737,7 @@ impl RenderCommands for VulkanCommandList {
         }
         self.current_pipeline = Some(pipeline);
         self.current_layout = Some(layout);
+        self.current_push_bytes = push_bytes;
     }
 
     fn set_viewport_scissor(&mut self, vs: ViewportScissor) {
@@ -799,6 +804,8 @@ impl RenderCommands for VulkanCommandList {
         for &idx in bindings.textures {
             push(idx.to_ne_bytes());
         }
+        // Trailing texture indices past the range are unused by the shader: drop them.
+        let len = len.min(self.current_push_bytes as usize);
         if len == 0 {
             return;
         }

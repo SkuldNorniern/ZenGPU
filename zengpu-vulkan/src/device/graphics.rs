@@ -12,17 +12,17 @@ impl VulkanDevice {
             ));
         }
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: resolve shaders");
-        let (vert_module, frag_module) = {
+        let ((vert_module, vert_push), (frag_module, frag_push)) = {
             let shaders = self.shaders.lock().unwrap();
             let vert = shaders
                 .get(desc.vertex_shader)
-                .map(|s| s.0)
+                .map(|s| (s.0, s.2))
                 .ok_or_else(|| {
                     GpuError::PipelineCreation("stale vertex shader handle".to_string())
                 })?;
             let frag = shaders
                 .get(desc.fragment_shader)
-                .map(|s| s.0)
+                .map(|s| (s.0, s.2))
                 .ok_or_else(|| {
                     GpuError::PipelineCreation("stale fragment shader handle".to_string())
                 })?;
@@ -190,10 +190,14 @@ impl VulkanDevice {
         };
 
         log::debug!("[zengpu-vulkan] create_graphics_pipeline: create_pipeline_layout");
+        let push_bytes = graphics_push_range(
+            vert_push.max(frag_push),
+            self.inner.limits.max_push_constant_size,
+        )?;
         let pc_range = vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             offset: 0,
-            size: 256,
+            size: push_bytes,
         };
         let layout = unsafe {
             self.inner
@@ -242,6 +246,7 @@ impl VulkanDevice {
                 .insert(VulkanPipeline::Graphics {
                     layout,
                     pipeline: pipelines[0],
+                    push_bytes,
                 })),
             Err((_, e)) => {
                 unsafe {
@@ -411,5 +416,120 @@ impl GraphicsDevice for VulkanDevice {
 
     fn compute_in_command_lists(&self) -> bool {
         true
+    }
+}
+
+/// Push bytes a graphics pipeline's range covers: the 256-byte ABI, held to the device.
+const GRAPHICS_PUSH_BYTES: u32 = 256;
+
+/// Range size for a push block of `needed` bytes on a device allowing `limit`.
+fn graphics_push_range(needed: u32, limit: u32) -> Result<u32> {
+    let size = GRAPHICS_PUSH_BYTES.min(limit);
+    if needed > size {
+        return Err(GpuError::PipelineCreation(format!(
+            "push block needs {needed} bytes; this device allows {limit}"
+        )));
+    }
+    Ok(size)
+}
+
+/// Bytes the push-constant block of a SPIR-V module spans, up to the end of its last member.
+pub(crate) fn push_block_bytes(words: &[u32]) -> u32 {
+    use std::collections::HashMap;
+    enum Ty {
+        Scalar(u32),
+        Vector(u32, u32),
+        Matrix(u32, u32),
+        Struct(Vec<u32>),
+        Pointer(u32),
+    }
+    let (mut types, mut offsets) = (HashMap::new(), HashMap::new());
+    let mut push_ptr = None;
+    let mut at = 5;
+    while at < words.len() {
+        let count = ((words[at] >> 16) as usize).max(1);
+        let Some(w) = words.get(at..at + count) else {
+            break;
+        };
+        match w[0] & 0xffff {
+            // OpTypeInt, OpTypeFloat: width in bits
+            21 | 22 => {
+                types.insert(w[1], Ty::Scalar(w[2] / 8));
+            }
+            23 => {
+                types.insert(w[1], Ty::Vector(w[2], w[3]));
+            }
+            24 => {
+                types.insert(w[1], Ty::Matrix(w[2], w[3]));
+            }
+            30 => {
+                types.insert(w[1], Ty::Struct(w[2..].to_vec()));
+            }
+            32 => {
+                types.insert(w[1], Ty::Pointer(w[3]));
+            }
+            // OpVariable in PushConstant storage
+            59 if w[3] == 9 => push_ptr = Some(w[1]),
+            // OpMemberDecorate Offset
+            72 if w[3] == 35 => {
+                offsets.insert((w[1], w[2]), w[4]);
+            }
+            _ => {}
+        }
+        at += count;
+    }
+    fn size(types: &HashMap<u32, Ty>, id: u32) -> u32 {
+        match types.get(&id) {
+            Some(Ty::Scalar(bytes)) => *bytes,
+            Some(Ty::Vector(comp, n)) => size(types, *comp) * n,
+            Some(Ty::Matrix(col, n)) => size(types, *col) * n,
+            _ => 0,
+        }
+    }
+    let Some(Ty::Pointer(strct)) = push_ptr.and_then(|p| types.get(&p)) else {
+        return 0;
+    };
+    let Some(Ty::Struct(members)) = types.get(strct) else {
+        return 0;
+    };
+    members
+        .iter()
+        .enumerate()
+        .map(|(i, &m)| offsets.get(&(*strct, i as u32)).copied().unwrap_or(0) + size(&types, m))
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zengpu_shader::{ZslShader, zsl};
+
+    #[test]
+    fn push_range_is_held_to_the_device_limit() {
+        assert_eq!(graphics_push_range(64, 256).unwrap(), 256);
+        assert_eq!(graphics_push_range(64, 128).unwrap(), 128);
+        assert_eq!(graphics_push_range(128, 128).unwrap(), 128);
+        let err = graphics_push_range(200, 128).unwrap_err();
+        assert!(err.to_string().contains("needs 200 bytes"), "{err}");
+        assert!(err.to_string().contains("allows 128"), "{err}");
+    }
+
+    #[test]
+    fn push_block_spans_its_last_member() {
+        const SCALE_AND_TINT: ZslShader = zsl!(
+            push P { scale: f32, tint: f32x4 }
+            vertex vs(p: P) -> f32x4 {
+                f32x4(p.scale, p.tint.x, p.tint.y, p.tint.z)
+            }
+        );
+        let words = SCALE_AND_TINT.spirv_words().unwrap();
+        assert_eq!(push_block_bytes(words), 32);
+        const NO_PUSH: ZslShader = zsl!(
+            vertex vs(@location(0) c: f32x4) -> f32x4 {
+                c
+            }
+        );
+        assert_eq!(push_block_bytes(NO_PUSH.spirv_words().unwrap()), 0);
     }
 }
