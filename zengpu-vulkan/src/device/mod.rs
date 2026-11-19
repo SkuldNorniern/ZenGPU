@@ -307,9 +307,11 @@ impl VulkanLifetimeState {
             .is_some_and(|serial| *serial > completed)
     }
 
+    /// Keeps the latest serial: lanes number submissions and record them in either order.
     fn mark_used(&mut self, indices: &[u32], serial: u64) {
         for &index in indices {
-            self.buffer_use.insert(index, serial);
+            let last = self.buffer_use.entry(index).or_insert(serial);
+            *last = (*last).max(serial);
         }
     }
 
@@ -2113,6 +2115,15 @@ mod tests {
         SamplerDesc, Scalar, TargetHandle, TexDim, TextureHandle, TextureRegion, Viewport,
         ViewportScissor,
     };
+
+    /// Submissions race on the lifetime lock, so a smaller serial can land after a larger one.
+    #[test]
+    fn last_use_keeps_the_latest_serial() {
+        let mut state = VulkanLifetimeState::default();
+        state.mark_used(&[7], 6);
+        state.mark_used(&[7], 5);
+        assert!(state.buffer_busy(7, 5), "serial 6 still pending at 5");
+    }
 
     struct TestDevice {
         dev: Box<dyn GpuDevice>,
