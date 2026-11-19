@@ -8,10 +8,16 @@ pub(super) fn bin(op: IrBinOp, lhs: IrExpr, rhs: IrExpr) -> IrExpr {
     }
 }
 
-/// An untyped integer literal becomes `u64`. Other expressions are unchanged.
+/// An untyped integer literal becomes `u64`, and so does the untyped left side of a shift, since
+/// a shift keeps its left operand's type. Other expressions are unchanged.
 pub(super) fn widen_u64_literal(expr: IrExpr) -> IrExpr {
     match expr {
         IrExpr::LitU32(v) => IrExpr::LitU64(u64::from(v)),
+        IrExpr::Binary {
+            op: op @ (IrBinOp::Shl | IrBinOp::Shr),
+            lhs,
+            rhs,
+        } => bin(op, widen_u64_literal(*lhs), *rhs),
         other => other,
     }
 }

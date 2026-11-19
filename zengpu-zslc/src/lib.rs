@@ -1237,6 +1237,44 @@ int main() {{
         );
     }
 
+    /// Counts are masked to the width on every backend. A literal shifted into a u64 store is a
+    /// u64 shift.
+    #[test]
+    fn shift_counts_mask_to_the_width_on_every_backend() {
+        let src = r#"
+            @workgroup_size(64)
+            kernel k(x: device mut buffer<u32>, wide: device mut buffer<u64>, id: global_id) {
+                let v = x[id.x]
+                x[id.x] = (v << 33) | (v >> 33)
+                wide[id.x] = 1 << 40
+            }
+        "#;
+        let module = parse_compute(src).expect("parse");
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        let hip_source = hip::lower_compute(&module).expect("HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("CUDA").source;
+        for (name, source) in [
+            ("MSL", &msl_source),
+            ("HIP", &hip_source),
+            ("CUDA", &cuda_source),
+        ] {
+            assert!(
+                source.contains("& 31)"),
+                "{name} misses the u32 mask:\n{source}"
+            );
+            assert!(
+                source.contains("& 63)"),
+                "{name} misses the u64 mask:\n{source}"
+            );
+        }
+        assert!(msl_source.contains("1ul << (40u & 63)"), "{msl_source}");
+        let words = spirv::lower_compute(&module).expect("SPIR-V");
+        validate(&words);
+        let ops = spirv_opcodes(&words);
+        assert!(ops.contains(&199), "SPIR-V masks with OpBitwiseAnd");
+        assert!(ops.contains(&196), "SPIR-V shift left");
+    }
+
     #[test]
     fn atomic_min_rejects_f32_buffers_at_parse() {
         let src = r#"

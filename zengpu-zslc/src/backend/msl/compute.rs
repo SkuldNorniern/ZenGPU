@@ -973,6 +973,11 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
                     l = format!("int({l})");
                 }
             }
+            if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
+                // The count is masked to the width, as on every backend.
+                let wide = expr_type(ctx, lhs) == ctx.types.borrow_mut().u64_id();
+                r = format!("({r} & {})", if wide { 63 } else { 31 });
+            }
             format!("({l} {} {r})", binop(*op)?)
         }
         IrExpr::FieldAccess { base, component: c } => {

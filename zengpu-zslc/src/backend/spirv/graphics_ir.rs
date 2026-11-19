@@ -1450,6 +1450,8 @@ fn lower_u64_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GV
             } else {
                 return Err("a shift count of u64 must be u32 or u64".into());
             };
+            let mask = ctx.spv.constant_u64(t, 63);
+            let amount = ctx.spv.op_bitwise_and(t, amount, mask);
             if matches!(op, IrBinOp::Shl) {
                 ctx.spv.op_shift_left_logical(t, lhs.id, amount)
             } else {
@@ -1556,8 +1558,15 @@ fn lower_arith(ctx: &mut Ctx<'_>, op: IrBinOp, lhs: GVal, rhs: GVal) -> R<GVal> 
             IrBinOp::BitAnd => ctx.spv.op_bitwise_and(ty, lhs.id, rhs.id),
             IrBinOp::BitOr => ctx.spv.op_bitwise_or(ty, lhs.id, rhs.id),
             IrBinOp::BitXor => ctx.spv.op_bitwise_xor(ty, lhs.id, rhs.id),
-            IrBinOp::Shl => ctx.spv.op_shift_left_logical(ty, lhs.id, rhs.id),
-            IrBinOp::Shr => ctx.spv.op_shift_right_logical(ty, lhs.id, rhs.id),
+            IrBinOp::Shl | IrBinOp::Shr => {
+                let mask = ctx.spv.constant_u32(ty, 31);
+                let amount = ctx.spv.op_bitwise_and(ty, rhs.id, mask);
+                if matches!(op, IrBinOp::Shl) {
+                    ctx.spv.op_shift_left_logical(ty, lhs.id, amount)
+                } else {
+                    ctx.spv.op_shift_right_logical(ty, lhs.id, amount)
+                }
+            }
             _ => return Err("unsupported op; use + - * / & | ^ << >>".into()),
         }
     };
@@ -1924,6 +1933,29 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    /// Counts mask to the width: a u32 shift by 33 and a u64 shift by 65 both validate and mask.
+    #[test]
+    fn shift_counts_mask_to_the_width() {
+        let words = lower(
+            r#"
+            vertex vs(vi: vertex_index, ids: device buffer<u64>, xs: device buffer<u32>) -> f32x4 {
+                let id = ids[vi] << 65u64
+                let x = xs[vi] << 33
+                f32x4(f32(u32(id)) + f32(x), 0.0, 0.0, 1.0)
+            }
+            "#,
+        );
+        validate(&words);
+        let mut ops = Vec::new();
+        let mut at = 5;
+        while at < words.len() {
+            let count = ((words[at] >> 16) as usize).max(1);
+            ops.push(words[at] & 0xffff);
+            at += count;
+        }
+        assert!(ops.contains(&199), "OpBitwiseAnd masks the count");
     }
 
     #[test]

@@ -527,12 +527,12 @@ fn emit_expr(ctx: &Ctx<'_>, expr: &IrExpr) -> Result<String, Diagnostic> {
         }
         IrExpr::Neg(e) => format!("(-{})", emit_expr(ctx, e)?),
         IrExpr::Binary { op, lhs, rhs } => {
-            format!(
-                "({} {} {})",
-                emit_expr(ctx, lhs)?,
-                binop(*op)?,
-                emit_expr(ctx, rhs)?
-            )
+            let mut r = emit_expr(ctx, rhs)?;
+            // The count is masked to the width. Graphics MSL takes no u64.
+            if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
+                r = format!("({r} & 31)");
+            }
+            format!("({} {} {r})", emit_expr(ctx, lhs)?, binop(*op)?)
         }
         IrExpr::GlobalId(_)
         | IrExpr::LocalId(_)
@@ -722,6 +722,20 @@ mod tests {
         assert!(vs.source.contains("device float* a [[buffer(20)]]"));
         assert!(fs.source.contains("device uint* b [[buffer(20)]]"));
         assert!(fs.source.contains("device float* k [[buffer(21)]]"));
+    }
+
+    #[test]
+    fn shift_counts_mask_to_the_width() {
+        let m = graphics(
+            r#"
+            vertex vs(vi: vertex_index, a: device buffer<u32>) -> f32x4 {
+                let v = a[vi] << 33
+                f32x4(f32(v >> 33), 0.0, 0.0, 1.0)
+            }
+        "#,
+        );
+        assert!(m.source.contains("(33u & 31)"), "{}", m.source);
+        assert!(m.source.contains("& 31)"), "{}", m.source);
     }
 
     #[test]

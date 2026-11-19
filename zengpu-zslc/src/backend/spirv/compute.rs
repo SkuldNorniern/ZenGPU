@@ -1576,10 +1576,18 @@ fn lower_binary(ctx: &mut LowerCtx<'_>, op: IrBinOp, lhs: Val, rhs: Val) -> Resu
                 return Err("ZSL: `&`/`|`/`^`/`<<`/`>>` require u32, i32 or u64 operands".into());
             }
             if matches!(op, IrBinOp::Shl | IrBinOp::Shr) {
-                // A shift keeps its left operand's type; `>>` sign-fills an i32.
+                // A shift keeps its left operand's type; `>>` sign-fills an i32. The count is
+                // masked to the width, as on every backend.
                 let ty_id = lhs.ty;
-                let amount = coerce(ctx, rhs, ty_id);
                 let ty = ctx.spv_ty(ty_id);
+                let amount = coerce(ctx, rhs, ty_id);
+                let amount = if ty_id == ctx.u64_id {
+                    let mask = ctx.spv.constant_u64(ty, 63);
+                    ctx.spv.op_bitwise_and(ty, amount, mask)
+                } else {
+                    let mask = ctx.spv.constant_u32(ty, 31);
+                    ctx.spv.op_bitwise_and(ty, amount, mask)
+                };
                 let id = match op {
                     IrBinOp::Shl => ctx.spv.op_shift_left_logical(ty, lhs.id, amount),
                     _ if ty_id == ctx.i32_id => {
