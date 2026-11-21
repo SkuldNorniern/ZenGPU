@@ -182,6 +182,7 @@ enum DeferredVulkanResource {
     Texture(u32, VulkanTexture),
     Sampler(u32, vk::Sampler),
     Pipeline(u32, VulkanPipeline),
+    QueryPool(vk::QueryPool),
 }
 
 /// Which queue work goes to. `Async` is the compute family when the GPU has one, else the main
@@ -901,6 +902,9 @@ fn destroy_deferred_vulkan(
                     inner.device.destroy_pipeline_layout(layout, None);
                 }
                 pipelines.lock().unwrap().release_retired(index);
+            }
+            DeferredVulkanResource::QueryPool(pool) => {
+                unsafe { inner.device.destroy_query_pool(pool, None) };
             }
         }
     }
@@ -4693,6 +4697,33 @@ mod tests {
         let timestamps = device.resolve_query_pool(pool).unwrap();
         assert_eq!(timestamps.len(), 1);
         assert_ne!(timestamps[0], 0);
+    }
+
+    #[test]
+    fn destroyed_query_pool_is_stale_and_a_second_destroy_is_a_no_op() {
+        let _guard = crate::test_gpu_lock();
+        let Ok(inst) = VulkanInstance::new() else {
+            return;
+        };
+        let Some(adapter) = inst.request_vulkan_adapter() else {
+            return;
+        };
+        let Ok(device) = adapter.open_headless(DeviceRequest::default()) else {
+            return;
+        };
+
+        let pool = device.create_query_pool(2).unwrap();
+        let mut commands = device.create_command_list().unwrap();
+        commands.write_timestamp(pool, 0);
+        device.submit_list(commands).unwrap();
+        device.destroy_query_pool(pool);
+        device.destroy_query_pool(pool);
+        assert!(device.read_timestamps(pool).is_err());
+        device.wait_idle().unwrap();
+        device.collect_garbage();
+        assert!(device.lifetime.lock().unwrap().deferred.is_empty());
+        let again = device.create_query_pool(1).unwrap();
+        assert_ne!(again, pool);
     }
 
     #[test]

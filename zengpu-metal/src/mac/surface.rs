@@ -280,6 +280,12 @@ impl GraphicsDevice for MetalDevice {
             .insert(pool))
     }
 
+    fn destroy_query_pool(&self, pool: QueryPoolHandle) {
+        if let Ok(mut pools) = self.inner.query_pools.lock() {
+            pools.remove(pool);
+        }
+    }
+
     fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
         let pools = self
             .inner

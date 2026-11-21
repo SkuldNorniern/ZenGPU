@@ -82,6 +82,9 @@ pub trait GraphicsDevice: crate::GpuDevice {
 
     fn create_query_pool(&self, count: u32) -> Result<QueryPoolHandle>;
 
+    /// Frees `pool` once the GPU is done with lists that wrote to it. Stale handles are ignored.
+    fn destroy_query_pool(&self, pool: QueryPoolHandle);
+
     /// Every timestamp in `pool` in ticks, or `None` while the GPU has not written them all.
     /// Never waits. Multiply by `timestamp_period_ns` for nanoseconds.
     fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>>;

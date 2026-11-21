@@ -385,6 +385,22 @@ impl GraphicsDevice for VulkanDevice {
             .insert(VulkanQueryPool { pool, count }))
     }
 
+    fn destroy_query_pool(&self, pool: QueryPoolHandle) {
+        self.collect_garbage();
+        let Some(query_pool) = self.query_pools.lock().unwrap().remove(pool) else {
+            return;
+        };
+        let mut lifetime = self.lifetime.lock().unwrap();
+        if self.inner.serials.idle() {
+            unsafe { self.inner.device.destroy_query_pool(query_pool.pool, None) };
+        } else {
+            lifetime.deferred.push((
+                self.inner.serials.submitted(),
+                DeferredVulkanResource::QueryPool(query_pool.pool),
+            ));
+        }
+    }
+
     fn read_timestamps(&self, pool: QueryPoolHandle) -> Result<Option<Vec<u64>>> {
         let query_pools = self.query_pools.lock().unwrap();
         let query_pool = query_pools
