@@ -1949,7 +1949,7 @@ impl Drop for VulkanDevice {
                 self.inner.serials.complete_all(idle_through);
             }
         }
-        self.drain_in_flight();
+        self.drain_in_flight(u64::MAX);
         self.reap_orphans();
         // destroyed while work ran: idle now, so free them before the device goes
         let deferred = self
@@ -2168,6 +2168,29 @@ mod tests {
             dev.inner.serials.completed() < numbered,
             "work numbered during wait_idle was completed by it"
         );
+    }
+
+    /// A list submitted from the main lane after `wait_idle` read its serials is not recycled by
+    /// it: another thread's submission may still run, its fence and command buffer stay in use.
+    #[test]
+    fn wait_idle_keeps_a_list_submitted_after_it_began() {
+        let Some((dev, _guard)) = try_async_device(false) else {
+            return;
+        };
+        dev.wait_idle().unwrap();
+        assert_eq!(dev.in_flight_count(), 0);
+        dev.wait_idle_then(|| {
+            let list = dev.create_command_list().unwrap();
+            dev.submit_list(list).unwrap();
+        })
+        .unwrap();
+        assert_eq!(
+            dev.in_flight_count(),
+            1,
+            "a later list was recycled by the wait"
+        );
+        dev.wait_idle().unwrap();
+        assert_eq!(dev.in_flight_count(), 0);
     }
 
     /// Shift counts mask to the width, and a literal shifted into a u64 store is a u64 shift.

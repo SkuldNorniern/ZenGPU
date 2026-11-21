@@ -35,7 +35,7 @@ impl VulkanDevice {
             }
             self.inner.serials.complete_all(idle_through);
         }
-        self.drain_in_flight();
+        self.drain_in_flight(idle_through);
         self.recover_raw_waits()?;
         self.reap_orphans();
         self.collect_garbage();
@@ -140,8 +140,16 @@ impl VulkanDevice {
     }
 
     /// After the device is idle every list from [`Self::submit_list`] is done.
-    pub(super) fn drain_in_flight(&self) {
-        let done: Vec<RawSubmit> = mem::take(&mut *self.in_flight.lock().unwrap());
+    pub(super) fn drain_in_flight(&self, through: u64) {
+        // a list another thread submitted after the wait may still run: it stays for the reap
+        let done: Vec<RawSubmit> = {
+            let mut pending = self.in_flight.lock().unwrap();
+            let (done, later) = mem::take(&mut *pending)
+                .into_iter()
+                .partition(|submit| submit.serial <= through);
+            *pending = later;
+            done
+        };
         for pending in done {
             self.recycle_raw(pending);
         }
