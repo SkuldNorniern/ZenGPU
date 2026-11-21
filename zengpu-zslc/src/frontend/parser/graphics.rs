@@ -216,17 +216,32 @@ impl<'a> Parser<'a> {
     /// Location of a fragment output attachment: its `@location`, else its tuple index.
     ///
     /// Dual-source blend uses sources 0 and 1 of location 0.
-    fn fragment_outputs(
-        &self,
-        slots: &[(TypeId, Option<u32>, u32)],
-    ) -> Result<Vec<GfxOutput>, ParseError> {
+    fn fragment_outputs(&mut self, slots: &[types::RetSlot]) -> Result<Vec<GfxOutput>, ParseError> {
+        let depths = slots.iter().filter(|slot| slot.3).count();
+        if depths > 1 {
+            return self.err("a fragment writes `@depth` once");
+        }
+        if let Some(&(ty, location, blend_src, _)) = slots.iter().find(|slot| slot.3)
+            && (ty != self.types.f32_id() || location.is_some() || blend_src != 0)
+        {
+            return self.err("`@depth` is one `f32` with no location or blend source");
+        }
+        let mut colors = 0;
         let outputs: Vec<GfxOutput> = slots
             .iter()
-            .enumerate()
-            .map(|(i, &(ty, location, blend_src))| GfxOutput {
-                ty,
-                location: location.unwrap_or(i as u32),
-                blend_src,
+            .map(|&(ty, location, blend_src, depth)| {
+                let index = if depth {
+                    0
+                } else {
+                    colors += 1;
+                    colors - 1
+                };
+                GfxOutput {
+                    ty,
+                    location: location.unwrap_or(index),
+                    blend_src,
+                    depth,
+                }
             })
             .collect();
         if outputs.iter().any(|o| o.blend_src != 0) {
@@ -241,9 +256,10 @@ impl<'a> Parser<'a> {
                 );
             }
         }
-        for (i, a) in outputs.iter().enumerate() {
+        for (i, a) in outputs.iter().enumerate().filter(|(_, a)| !a.depth) {
             let clash = outputs[..i]
                 .iter()
+                .filter(|b| !b.depth)
                 .any(|b| (b.location, b.blend_src) == (a.location, a.blend_src));
             if clash {
                 return self.err(format!("two outputs write location {}", a.location));

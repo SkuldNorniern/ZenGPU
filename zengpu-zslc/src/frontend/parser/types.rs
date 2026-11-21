@@ -1,5 +1,8 @@
 use super::*;
 
+/// A fragment output: its type, `@location`, `@blend_src` and whether it is `@depth`.
+pub(super) type RetSlot = (TypeId, Option<u32>, u32, bool);
+
 impl<'a> Parser<'a> {
     pub(super) fn parse_scalar_type(&mut self) -> Result<TypeId, ParseError> {
         let name = self.ident()?;
@@ -150,15 +153,17 @@ impl<'a> Parser<'a> {
     }
 
     /// Keeps `@location(n)` and `@blend_src(n)` for each value.
-    pub(super) fn parse_ret_slots(
-        &mut self,
-    ) -> Result<Vec<(TypeId, Option<u32>, u32)>, ParseError> {
+    pub(super) fn parse_ret_slots(&mut self) -> Result<Vec<RetSlot>, ParseError> {
         let tuple = self.eat(&Tok::LParen);
         let mut out = Vec::new();
         loop {
-            let (mut location, mut blend_src) = (None, 0);
+            let (mut location, mut blend_src, mut depth) = (None, 0, false);
             while self.eat(&Tok::At) {
                 let attr = self.ident()?;
+                if attr == "depth" {
+                    depth = true;
+                    continue;
+                }
                 self.expect(&Tok::LParen, "`(`")?;
                 let value = match self.peek() {
                     Some(Tok::Int(v)) => *v as u32,
@@ -172,7 +177,7 @@ impl<'a> Parser<'a> {
                     other => return self.err(format!("unknown output attribute `@{other}`")),
                 }
             }
-            out.push((self.parse_any_type()?, location, blend_src));
+            out.push((self.parse_any_type()?, location, blend_src, depth));
             if !tuple || !self.eat(&Tok::Comma) || self.peek() == Some(&Tok::RParen) {
                 break;
             }

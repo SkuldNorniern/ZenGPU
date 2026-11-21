@@ -346,6 +346,12 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
         for o in &e.outputs {
             let t_ptr = spv.type_pointer(sc::OUTPUT, spv_value_ty(o.ty));
             let var = spv.global_variable(t_ptr, sc::OUTPUT);
+            if o.depth {
+                spv.decorate(var, deco::BUILT_IN, &[builtin::FRAG_DEPTH]);
+                interface.push(var);
+                out_vars.push((var, o.ty));
+                continue;
+            }
             spv.decorate(var, deco::LOCATION, &[o.location]);
             if dual_source {
                 spv.decorate(var, deco::INDEX, &[o.blend_src]);
@@ -445,6 +451,9 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     if is_fragment {
         spv.entry_point_fragment(fn_id, "main", &interface);
         spv.execution_mode_origin_upper_left(fn_id);
+        if e.outputs.iter().any(|o| o.depth) {
+            spv.execution_mode_depth_replacing(fn_id);
+        }
     } else {
         spv.entry_point_vertex(fn_id, "main", &interface);
     }
@@ -1816,6 +1825,43 @@ pub(crate) mod tests {
             }
             "#,
         ));
+    }
+
+    #[test]
+    fn a_fragment_writes_its_depth() {
+        let words = lower(
+            r#"
+            fragment fs(at: frag_coord) -> (f32x4, @depth f32) {
+                (f32x4(1.0, 0.0, 0.0, 1.0), at.x * 0.001)
+            }
+            "#,
+        );
+        validate(&words);
+        // OpDecorate _ BuiltIn FragDepth, OpExecutionMode _ DepthReplacing
+        let has = |op: u32, tail: &[u32]| {
+            let mut at = 5;
+            while at < words.len() {
+                let (count, code) = ((words[at] >> 16) as usize, words[at] & 0xffff);
+                if code == op && words[at + 2..at + count].ends_with(tail) {
+                    return true;
+                }
+                at += count.max(1);
+            }
+            false
+        };
+        assert!(has(71, &[11, 22]), "no FragDepth decoration");
+        assert!(has(16, &[12]), "no DepthReplacing mode");
+    }
+
+    #[test]
+    fn depth_is_one_f32_without_a_location() {
+        for bad in [
+            "fragment fs() -> (f32x4, @depth f32, @depth f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5, 0.5) }",
+            "fragment fs() -> (f32x4, @depth f32x2) { (f32x4(1.0, 1.0, 1.0, 1.0), f32x2(0.5, 0.5)) }",
+            "fragment fs() -> (f32x4, @depth @location(1) f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5) }",
+        ] {
+            assert!(parse_zsl(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

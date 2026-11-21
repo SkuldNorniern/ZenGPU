@@ -205,6 +205,8 @@ pub struct GfxOutput {
     pub location: u32,
     /// Blend source from `@blend_src(n)`. Source 1 feeds dual-source blending.
     pub blend_src: u32,
+    /// `@depth`: the fragment's depth, not a color attachment.
+    pub depth: bool,
 }
 
 #[derive(Debug, Clone)]

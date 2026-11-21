@@ -172,12 +172,18 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
 
     if e.is_fragment {
         let single = match &e.outputs[..] {
-            [only] if only.location == 0 => Some(msl_ty_of(module.types.get(only.ty))?),
+            [only] if only.location == 0 && !only.depth => {
+                Some(msl_ty_of(module.types.get(only.ty))?)
+            }
             _ => None,
         };
         if single.is_none() {
             s.push_str("struct FsOut {\n");
             for (i, o) in e.outputs.iter().enumerate() {
+                if o.depth {
+                    let _ = writeln!(s, "    float out{i} [[depth(any)]];");
+                    continue;
+                }
                 let _ = writeln!(
                     s,
                     "    {} out{i} [[color({}), index({})]];",
@@ -796,6 +802,20 @@ mod tests {
         assert!(m.source.contains("out.vary0 = in.col;"));
         assert!(m.source.contains("out.position.y = -out.position.y;"));
         let _ = metal_compiles(&m.source);
+    }
+
+    #[test]
+    fn a_fragment_writes_its_depth() {
+        let m = graphics(
+            r#"
+            fragment fs(at: frag_coord) -> (f32x4, @depth f32) {
+                (f32x4(1.0, 0.0, 0.0, 1.0), at.x * 0.001)
+            }
+        "#,
+        );
+        assert!(m.source.contains("[[depth(any)]]"), "{}", m.source);
+        assert!(m.source.contains("[[color(0), index(0)]]"), "{}", m.source);
+        assert_ne!(metal_compiles(&m.source), Some(false), "{}", m.source);
     }
 
     #[test]

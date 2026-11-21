@@ -217,6 +217,7 @@ mod exec_model {
 pub mod builtin {
     pub const POSITION: u32 = 0;
     pub const FRAG_COORD: u32 = 15;
+    pub const FRAG_DEPTH: u32 = 22;
     pub const VERTEX_INDEX: u32 = 42;
     pub const INSTANCE_INDEX: u32 = 43;
     pub const GLOBAL_INVOCATION_ID: u32 = 28;
@@ -438,6 +439,11 @@ impl SpvBuilder {
     /// OriginUpperLeft (mode 7), required for fragment shaders.
     pub fn execution_mode_origin_upper_left(&mut self, fn_id: Id) {
         emit(&mut self.exec_modes, op::EXECUTION_MODE, &[fn_id.0, 7]);
+    }
+
+    /// DepthReplacing (mode 12), for a fragment that writes its depth.
+    pub fn execution_mode_depth_replacing(&mut self, fn_id: Id) {
+        emit(&mut self.exec_modes, op::EXECUTION_MODE, &[fn_id.0, 12]);
     }
 
     pub fn decorate(&mut self, target: Id, decoration: u32, extra: &[u32]) {
