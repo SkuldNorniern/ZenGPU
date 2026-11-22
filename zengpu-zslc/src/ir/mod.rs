@@ -207,6 +207,17 @@ pub struct GfxOutput {
     pub blend_src: u32,
     /// `@depth`: the fragment's depth, not a color attachment.
     pub depth: bool,
+    pub depth_bound: DepthBound,
+}
+
+/// What a fragment promises about the depth it writes against the rasterized one, so the
+/// early depth test can still reject: `@depth(less)` or `@depth(greater)`, `@depth` for any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DepthBound {
+    #[default]
+    Any,
+    Less,
+    Greater,
 }
 
 #[derive(Debug, Clone)]

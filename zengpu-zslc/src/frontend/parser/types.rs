@@ -1,7 +1,8 @@
 use super::*;
+use crate::ir::DepthBound;
 
 /// A fragment output: its type, `@location`, `@blend_src` and whether it is `@depth`.
-pub(super) type RetSlot = (TypeId, Option<u32>, u32, bool);
+pub(super) type RetSlot = (TypeId, Option<u32>, u32, Option<DepthBound>);
 
 impl<'a> Parser<'a> {
     pub(super) fn parse_scalar_type(&mut self) -> Result<TypeId, ParseError> {
@@ -157,11 +158,25 @@ impl<'a> Parser<'a> {
         let tuple = self.eat(&Tok::LParen);
         let mut out = Vec::new();
         loop {
-            let (mut location, mut blend_src, mut depth) = (None, 0, false);
+            let (mut location, mut blend_src, mut depth) = (None, 0, None);
             while self.eat(&Tok::At) {
                 let attr = self.ident()?;
                 if attr == "depth" {
-                    depth = true;
+                    let mut bound = DepthBound::Any;
+                    if self.eat(&Tok::LParen) {
+                        bound = match self.ident()?.as_str() {
+                            "any" => DepthBound::Any,
+                            "less" => DepthBound::Less,
+                            "greater" => DepthBound::Greater,
+                            other => {
+                                return self.err(format!(
+                                    "`@depth({other})` is not `any`, `less` or `greater`"
+                                ));
+                            }
+                        };
+                        self.expect(&Tok::RParen, "`)`")?;
+                    }
+                    depth = Some(bound);
                     continue;
                 }
                 self.expect(&Tok::LParen, "`(`")?;

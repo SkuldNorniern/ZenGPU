@@ -217,11 +217,11 @@ impl<'a> Parser<'a> {
     ///
     /// Dual-source blend uses sources 0 and 1 of location 0.
     fn fragment_outputs(&mut self, slots: &[types::RetSlot]) -> Result<Vec<GfxOutput>, ParseError> {
-        let depths = slots.iter().filter(|slot| slot.3).count();
+        let depths = slots.iter().filter(|slot| slot.3.is_some()).count();
         if depths > 1 {
             return self.err("a fragment writes `@depth` once");
         }
-        if let Some(&(ty, location, blend_src, _)) = slots.iter().find(|slot| slot.3)
+        if let Some(&(ty, location, blend_src, _)) = slots.iter().find(|slot| slot.3.is_some())
             && (ty != self.types.f32_id() || location.is_some() || blend_src != 0)
         {
             return self.err("`@depth` is one `f32` with no location or blend source");
@@ -229,7 +229,8 @@ impl<'a> Parser<'a> {
         let mut colors = 0;
         let outputs: Vec<GfxOutput> = slots
             .iter()
-            .map(|&(ty, location, blend_src, depth)| {
+            .map(|&(ty, location, blend_src, bound)| {
+                let depth = bound.is_some();
                 let index = if depth {
                     0
                 } else {
@@ -241,6 +242,7 @@ impl<'a> Parser<'a> {
                     location: location.unwrap_or(index),
                     blend_src,
                     depth,
+                    depth_bound: bound.unwrap_or_default(),
                 }
             })
             .collect();

@@ -451,8 +451,9 @@ fn lower_graphics_inner(module: &GraphicsModule) -> R<Vec<u32>> {
     if is_fragment {
         spv.entry_point_fragment(fn_id, "main", &interface);
         spv.execution_mode_origin_upper_left(fn_id);
-        if e.outputs.iter().any(|o| o.depth) {
+        if let Some(o) = e.outputs.iter().find(|o| o.depth) {
             spv.execution_mode_depth_replacing(fn_id);
+            spv.execution_mode_depth_bound(fn_id, o.depth_bound);
         }
     } else {
         spv.entry_point_vertex(fn_id, "main", &interface);
@@ -1851,6 +1852,28 @@ pub(crate) mod tests {
         };
         assert!(has(71, &[11, 22]), "no FragDepth decoration");
         assert!(has(16, &[12]), "no DepthReplacing mode");
+        assert!(
+            !has(16, &[14]) && !has(16, &[15]),
+            "a bound on plain `@depth`"
+        );
+        for (bound, mode) in [("less", 15), ("greater", 14)] {
+            let words = lower(&format!(
+                "fragment fs(at: frag_coord) -> (f32x4, @depth({bound}) f32) {{ (f32x4(1.0, 0.0, 0.0, 1.0), at.x * 0.001) }}"
+            ));
+            validate(&words);
+            let has = |op: u32, tail: &[u32]| {
+                let mut at = 5;
+                while at < words.len() {
+                    let (count, code) = ((words[at] >> 16) as usize, words[at] & 0xffff);
+                    if code == op && words[at + 2..at + count].ends_with(tail) {
+                        return true;
+                    }
+                    at += count.max(1);
+                }
+                false
+            };
+            assert!(has(16, &[12]) && has(16, &[mode]), "{bound}");
+        }
     }
 
     #[test]
@@ -1859,6 +1882,8 @@ pub(crate) mod tests {
             "fragment fs() -> (f32x4, @depth f32, @depth f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5, 0.5) }",
             "fragment fs() -> (f32x4, @depth f32x2) { (f32x4(1.0, 1.0, 1.0, 1.0), f32x2(0.5, 0.5)) }",
             "fragment fs() -> (f32x4, @depth @location(1) f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5) }",
+            "fragment fs() -> (f32x4, @depth(nearer) f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5) }",
+            "fragment fs() -> (f32x4, @depth(less f32) { (f32x4(1.0, 1.0, 1.0, 1.0), 0.5) }",
         ] {
             assert!(parse_zsl(bad).is_err(), "{bad}");
         }

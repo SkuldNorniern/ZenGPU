@@ -1,6 +1,7 @@
 //! SPIR-V binary builder for the ZSL subset: SSBOs, push constants, scalars, vectors,
 //! matrices, arithmetic/logic.
 
+use crate::ir::DepthBound;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -444,6 +445,16 @@ impl SpvBuilder {
     /// DepthReplacing (mode 12), for a fragment that writes its depth.
     pub fn execution_mode_depth_replacing(&mut self, fn_id: Id) {
         emit(&mut self.exec_modes, op::EXECUTION_MODE, &[fn_id.0, 12]);
+    }
+
+    /// DepthGreater (14) or DepthLess (15): the written depth only goes that way.
+    pub fn execution_mode_depth_bound(&mut self, fn_id: Id, bound: DepthBound) {
+        let mode = match bound {
+            DepthBound::Any => return,
+            DepthBound::Greater => 14,
+            DepthBound::Less => 15,
+        };
+        emit(&mut self.exec_modes, op::EXECUTION_MODE, &[fn_id.0, mode]);
     }
 
     pub fn decorate(&mut self, target: Id, decoration: u32, extra: &[u32]) {

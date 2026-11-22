@@ -8,6 +8,7 @@
 //! - the texture table binds at [`TEXTURE_BUFFER_INDEX`] as an argument buffer of `{ tex, smp }`
 //!   texture and sampler pairs, one per bindless slot.
 
+use crate::ir::DepthBound;
 use crate::ir::escape;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -181,7 +182,12 @@ pub fn lower_graphics(module: &GraphicsModule) -> Result<MslShader, Diagnostic> 
             s.push_str("struct FsOut {\n");
             for (i, o) in e.outputs.iter().enumerate() {
                 if o.depth {
-                    let _ = writeln!(s, "    float out{i} [[depth(any)]];");
+                    let bound = match o.depth_bound {
+                        DepthBound::Any => "any",
+                        DepthBound::Less => "less",
+                        DepthBound::Greater => "greater",
+                    };
+                    let _ = writeln!(s, "    float out{i} [[depth({bound})]];");
                     continue;
                 }
                 let _ = writeln!(
@@ -815,6 +821,11 @@ mod tests {
         );
         assert!(m.source.contains("[[depth(any)]]"), "{}", m.source);
         assert!(m.source.contains("[[color(0), index(0)]]"), "{}", m.source);
+        assert_ne!(metal_compiles(&m.source), Some(false), "{}", m.source);
+        let m = graphics(
+            "fragment fs(at: frag_coord) -> (f32x4, @depth(less) f32) { (f32x4(1.0, 0.0, 0.0, 1.0), at.x * 0.001) }",
+        );
+        assert!(m.source.contains("[[depth(less)]]"), "{}", m.source);
         assert_ne!(metal_compiles(&m.source), Some(false), "{}", m.source);
     }
 
