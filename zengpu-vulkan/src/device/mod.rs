@@ -1183,6 +1183,9 @@ impl VulkanDevice {
         }
         let on = |enabled: bool| if enabled { vk::TRUE } else { vk::FALSE };
         let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
+        // a blend per color target, as a scene's light and its motion vectors want
+        let independent_blend =
+            needs_graphics && supported_features.independent_blend == vk::TRUE;
         let fill_mode_non_solid =
             needs_graphics && supported_features.fill_mode_non_solid == vk::TRUE;
         let sampler_anisotropy =
@@ -1288,6 +1291,7 @@ impl VulkanDevice {
                 shader_storage_image_read_without_format: on(storage_images),
                 shader_storage_image_write_without_format: on(storage_images),
                 dual_src_blend: if dual_src_blend { vk::TRUE } else { vk::FALSE },
+                independent_blend: on(independent_blend),
                 fill_mode_non_solid: if fill_mode_non_solid {
                     vk::TRUE
                 } else {
