@@ -251,6 +251,11 @@ impl<K, V> SlotMap<K, V> {
         self.live
     }
 
+    /// Live values in slot order.
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.slots.iter().filter_map(|slot| slot.value.as_ref())
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
