@@ -14,6 +14,10 @@ mod glsl_op {
     pub const SIN: u32 = 13;
     pub const COS: u32 = 14;
     pub const TAN: u32 = 15;
+    pub const ASIN: u32 = 16;
+    pub const ACOS: u32 = 17;
+    pub const ATAN: u32 = 18;
+    pub const ATAN2: u32 = 25;
     pub const TANH: u32 = 21;
     pub const POW: u32 = 26;
     pub const EXP: u32 = 27;
@@ -1273,6 +1277,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
         | BuiltinFn::Sin
         | BuiltinFn::Cos
         | BuiltinFn::Tan
+        | BuiltinFn::Asin
+        | BuiltinFn::Acos
+        | BuiltinFn::Atan
         | BuiltinFn::Log
         | BuiltinFn::Sqrt
         | BuiltinFn::Rsqrt
@@ -1301,6 +1308,9 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
                 BuiltinFn::Sin => glsl_op::SIN,
                 BuiltinFn::Cos => glsl_op::COS,
                 BuiltinFn::Tan => glsl_op::TAN,
+                BuiltinFn::Asin => glsl_op::ASIN,
+                BuiltinFn::Acos => glsl_op::ACOS,
+                BuiltinFn::Atan => glsl_op::ATAN,
                 BuiltinFn::Log => glsl_op::LOG,
                 BuiltinFn::Sqrt => glsl_op::SQRT,
                 BuiltinFn::Rsqrt => glsl_op::INVERSE_SQRT,
@@ -1362,13 +1372,16 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
                 ty: ctx.vec4_id,
             })
         }
-        BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow => {
+        BuiltinFn::Min | BuiltinFn::Max | BuiltinFn::Pow | BuiltinFn::Atan2 => {
             if args.len() != 2 {
                 return Err(format!("{name}(a, b) takes 2 args"));
             }
             let a = lower_expr(ctx, &args[0])?;
             let b = lower_expr(ctx, &args[1])?;
-            if a.ty == ctx.u32_id && b.ty == ctx.u32_id && func != BuiltinFn::Pow {
+            if a.ty == ctx.u32_id
+                && b.ty == ctx.u32_id
+                && !matches!(func, BuiltinFn::Pow | BuiltinFn::Atan2)
+            {
                 let op = if func == BuiltinFn::Min {
                     glsl_op::U_MIN
                 } else {
@@ -1385,6 +1398,7 @@ fn lower_builtin(ctx: &mut Ctx<'_>, func: BuiltinFn, args: &[IrExpr]) -> R<GVal>
             let opcode = match func {
                 BuiltinFn::Min => glsl_op::F_MIN,
                 BuiltinFn::Max => glsl_op::F_MAX,
+                BuiltinFn::Atan2 => glsl_op::ATAN2,
                 _ => glsl_op::POW,
             };
             let ty = ctx.spv_elem_ty(a.ty);

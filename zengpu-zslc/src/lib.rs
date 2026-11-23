@@ -86,6 +86,14 @@ mod phase_z_tests {
         }
     "#;
 
+    const INVERSE_TRIG: &str = r#"
+        @workgroup_size(64)
+        kernel arcs(src: device buffer<f32>, out: device mut buffer<f32>, id: global_id) {
+            let x = src[id.x]
+            out[id.x] = asin(x) + acos(x) + atan(x) + atan2(x, 0.5)
+        }
+    "#;
+
     const TYPED_BUFFERS: &str = r#"
         @workgroup_size(64)
         kernel typed(src_u: device buffer<u32>, src_i: device buffer<i32>, out_u: device mut buffer<u32>, out_i: device mut buffer<i32>, id: global_id) {
@@ -176,6 +184,19 @@ mod phase_z_tests {
         assert!(msl_source.contains("cos(x)"));
         assert!(msl_source.contains("tan(x)"));
         spirv::lower_compute(&module).expect("lower trigonometry to SPIR-V");
+        let module = parse_compute(INVERSE_TRIG).expect("parse inverse trigonometry");
+        let hip_source = hip::lower_compute(&module).expect("HIP").source;
+        let cuda_source = cuda::lower_compute(&module).expect("CUDA").source;
+        let msl_source = msl::lower_compute(&module).expect("MSL").source;
+        for source in [&hip_source, &cuda_source] {
+            for call in ["asinf(x)", "acosf(x)", "atanf(x)", "atan2f(x, "] {
+                assert!(source.contains(call), "{call}");
+            }
+        }
+        for call in ["asin(x)", "acos(x)", "atan(x)", "atan2(x, "] {
+            assert!(msl_source.contains(call), "{call}");
+        }
+        spirv::lower_compute(&module).expect("lower inverse trigonometry to SPIR-V");
     }
 
     #[test]

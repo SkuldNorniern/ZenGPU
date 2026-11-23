@@ -21,6 +21,10 @@ mod glsl_op {
     pub const SIN: u32 = 13;
     pub const COS: u32 = 14;
     pub const TAN: u32 = 15;
+    pub const ASIN: u32 = 16;
+    pub const ACOS: u32 = 17;
+    pub const ATAN: u32 = 18;
+    pub const ATAN2: u32 = 25;
     pub const TANH: u32 = 21;
     pub const POW: u32 = 26;
     pub const EXP: u32 = 27;
@@ -1731,6 +1735,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
         | BuiltinFn::Sin
         | BuiltinFn::Cos
         | BuiltinFn::Tan
+        | BuiltinFn::Asin
+        | BuiltinFn::Acos
+        | BuiltinFn::Atan
         | BuiltinFn::Log
         | BuiltinFn::Sqrt
         | BuiltinFn::Rsqrt
@@ -1751,6 +1758,9 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
                 BuiltinFn::Sin => glsl_op::SIN,
                 BuiltinFn::Cos => glsl_op::COS,
                 BuiltinFn::Tan => glsl_op::TAN,
+                BuiltinFn::Asin => glsl_op::ASIN,
+                BuiltinFn::Acos => glsl_op::ACOS,
+                BuiltinFn::Atan => glsl_op::ATAN,
                 BuiltinFn::Log => glsl_op::LOG,
                 BuiltinFn::Sqrt => glsl_op::SQRT,
                 BuiltinFn::Rsqrt => glsl_op::INVERSE_SQRT,
@@ -1786,7 +1796,7 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             let id = ctx.spv.op_ext_inst(t, glsl, opcode, &[a.id, b.id]);
             Ok(Val { id, ty: a.ty })
         }
-        BuiltinFn::Pow => {
+        BuiltinFn::Pow | BuiltinFn::Atan2 => {
             if args.len() != 2 {
                 return Err(format!("ZSL: {name}(a, b) takes 2 args"));
             }
@@ -1798,11 +1808,16 @@ fn lower_builtin(ctx: &mut LowerCtx<'_>, func: BuiltinFn, args: &[IrExpr]) -> Re
             if b.ty != ctx.f32_id {
                 return Err(format!("ZSL: {name}() requires f32"));
             }
+            let op = if func == BuiltinFn::Pow {
+                glsl_op::POW
+            } else {
+                glsl_op::ATAN2
+            };
             let t_f32 = ctx.t_f32;
             let glsl = ctx.glsl_ext;
             let id = ctx
                 .spv
-                .op_ext_inst(t_f32, glsl, glsl_op::POW, &[a.id, b.id]);
+                .op_ext_inst(t_f32, glsl, op, &[a.id, b.id]);
             Ok(Val { id, ty: ctx.f32_id })
         }
         BuiltinFn::Clamp => {

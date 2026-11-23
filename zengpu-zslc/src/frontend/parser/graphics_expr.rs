@@ -335,6 +335,7 @@ impl<'a> Parser<'a> {
             BuiltinFn::Min
                 | BuiltinFn::Max
                 | BuiltinFn::Pow
+                | BuiltinFn::Atan2
                 | BuiltinFn::Clamp
                 | BuiltinFn::Mix
                 | BuiltinFn::Step

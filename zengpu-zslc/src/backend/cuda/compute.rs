@@ -473,6 +473,10 @@ fn builtin_requires_f32(func: BuiltinFn) -> bool {
             | BuiltinFn::Sin
             | BuiltinFn::Cos
             | BuiltinFn::Tan
+            | BuiltinFn::Asin
+            | BuiltinFn::Acos
+            | BuiltinFn::Atan
+            | BuiltinFn::Atan2
             | BuiltinFn::Log
             | BuiltinFn::Sqrt
             | BuiltinFn::Rsqrt
@@ -892,6 +896,10 @@ fn emit_expr(ctx: &Ctx<'_>, e: &IrExpr) -> Result<String, Diagnostic> {
                 BuiltinFn::Sin => format!("sinf({})", args_s[0]),
                 BuiltinFn::Cos => format!("cosf({})", args_s[0]),
                 BuiltinFn::Tan => format!("tanf({})", args_s[0]),
+                BuiltinFn::Asin => format!("asinf({})", args_s[0]),
+                BuiltinFn::Acos => format!("acosf({})", args_s[0]),
+                BuiltinFn::Atan => format!("atanf({})", args_s[0]),
+                BuiltinFn::Atan2 => format!("atan2f({}, {})", args_s[0], args_s[1]),
                 BuiltinFn::IsNan => format!("isnan({})", args_s[0]),
                 BuiltinFn::IsInf => format!("isinf({})", args_s[0]),
                 BuiltinFn::IsFinite => format!("isfinite({})", args_s[0]),
