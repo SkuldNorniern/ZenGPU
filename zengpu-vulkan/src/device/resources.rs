@@ -274,8 +274,7 @@ impl VulkanDevice {
         }
     }
 
-    /// Copies the offscreen image into a host-visible buffer. Call after `submit_and_wait`. The
-    /// image must be in `COLOR_ATTACHMENT_OPTIMAL`, and is returned there after the copy.
+    /// Copies the offscreen image into a host-visible buffer. Call after `submit_and_wait`.
     pub fn copy_offscreen_to_buffer(
         &self,
         offscreen: &OffscreenTarget,
@@ -289,24 +288,38 @@ impl VulkanDevice {
         texture: TextureHandle,
         buffer: BufferHandle,
     ) -> Result<()> {
-        let (image, extent) = {
+        let (image, extent, resting) = {
             let textures = self.textures.lock().unwrap();
-            let texture = textures.get(texture).ok_or_else(|| {
+            let tex = textures.get(texture).ok_or_else(|| {
                 GpuError::Backend("copy_texture_to_buffer: stale texture handle".to_string())
             })?;
-            (texture.image, texture.extent)
+            (tex.image, tex.extent, tex.resting)
         };
+        // a color target not sampled after its pass stays in attachment layout, the rest rest
+        let layout = self
+            .render_targets
+            .lock()
+            .unwrap()
+            .values()
+            .find(|rt| rt.texture == Some(texture))
+            .map_or(resting, |rt| rt.layout);
         let vk_buffer = {
             let buffers = self.buffers.lock().unwrap();
             buffers.get(buffer).map(|b| b.buffer).ok_or_else(|| {
                 GpuError::Backend("copy_texture_to_buffer: stale buffer handle".to_string())
             })?
         };
+        // a target never drawn has nothing to keep, it goes back to rest
+        let back = if layout == vk::ImageLayout::UNDEFINED {
+            resting
+        } else {
+            layout
+        };
         self.one_shot_submit(|dev, cmd| {
             let to_transfer = vk::ImageMemoryBarrier {
-                old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                old_layout: layout,
                 new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                src_access_mask: vk::AccessFlags::MEMORY_WRITE,
                 dst_access_mask: vk::AccessFlags::TRANSFER_READ,
                 image,
                 subresource_range: COLOR_SUBRESOURCE,
@@ -317,7 +330,7 @@ impl VulkanDevice {
             unsafe {
                 dev.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
                     &[],
@@ -348,11 +361,11 @@ impl VulkanDevice {
                     }],
                 );
             }
-            let to_color = vk::ImageMemoryBarrier {
+            let to_back = vk::ImageMemoryBarrier {
                 old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                new_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                new_layout: back,
                 src_access_mask: vk::AccessFlags::TRANSFER_READ,
-                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access_mask: vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
                 image,
                 subresource_range: COLOR_SUBRESOURCE,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -363,11 +376,11 @@ impl VulkanDevice {
                 dev.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::DependencyFlags::empty(),
                     &[],
                     &[],
-                    &[to_color],
+                    &[to_back],
                 );
             }
             Ok(())
