@@ -2056,6 +2056,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_let_shadows_in_its_block_with_its_own_type() {
+        validate(&lower(
+            r#"
+            fragment fs(pos: frag_coord) -> f32x4 {
+                let u = pos.x * 0.5
+                let total = 0.0
+                for i in 0..4 {
+                    let u = u32(pos.y) + i
+                    let pair = f32x2(f32(u), 1.0)
+                    total = total + pair.x
+                }
+                for i in 0..2 {
+                    let pair = 2.0
+                    total = total + pair
+                }
+                let u = u + 1.0
+                f32x4(u, total, 0.0, 1.0)
+            }
+            "#,
+        ));
+    }
+
+    #[test]
     fn graphics_u64_atomics_need_u64_values() {
         let err = parse_zsl(
             r#"

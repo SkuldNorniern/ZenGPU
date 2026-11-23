@@ -16,6 +16,8 @@ impl<'a> Parser<'a> {
             textures: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
+            renames: HashMap::new(),
+            shadows: 0,
             arrays: HashSet::new(),
             compares: Cell::new(false),
         };
@@ -359,6 +361,7 @@ impl<'a> Parser<'a> {
 
     pub(super) fn parse_gfx_stmts(&mut self, ctx: &mut GfxCtx) -> Result<Vec<IrStmt>, ParseError> {
         self.expect(&Tok::LBrace, "`{`")?;
+        let outer = ctx.renames.clone();
         let mut stmts = Vec::new();
         loop {
             if self.eat(&Tok::RBrace) {
@@ -395,6 +398,7 @@ impl<'a> Parser<'a> {
             stmts.push(self.gfx_assign(ctx, e, rhs)?);
             self.eat(&Tok::Semi);
         }
+        ctx.renames = outer;
         Ok(stmts)
     }
 
@@ -411,23 +415,46 @@ impl<'a> Parser<'a> {
             if annot.is_some_and(|ty| ty != elem) {
                 return self.err(format!("{kw} hands back the buffer's element type"));
             }
-            ctx.locals.insert(name.clone(), elem);
-            ctx.locals_order.push((name, elem));
-            return Ok(atomic);
+            let local = ctx.declare(name, elem);
+            return Ok(match atomic {
+                IrStmt::Atomic {
+                    op,
+                    buf,
+                    index,
+                    value,
+                    compare,
+                    ..
+                } => IrStmt::Atomic {
+                    op,
+                    buf,
+                    index,
+                    value,
+                    compare,
+                    old: Some(local),
+                },
+                other => other,
+            });
         }
         let init = self.parse_g_expr(ctx)?;
-        if matches!(init, IrExpr::ArrayLit(_)) {
-            if annot.is_some() {
-                return self.err("an array's type comes from its elements");
-            }
-            ctx.arrays.insert(name.clone());
+        let array = matches!(init, IrExpr::ArrayLit(_));
+        if array && annot.is_some() {
+            return self.err("an array's type comes from its elements");
         }
         let ty = match annot {
             Some(ty) => ty,
             None => type_of_graphics_expr(&init, &ctx.type_ctx(), &mut self.types),
         };
-        ctx.locals.insert(name.clone(), ty);
-        ctx.locals_order.push((name.clone(), ty));
+        // an input keeps its name: a local of the same name was never read over it
+        let name = if ctx.inputs.contains_key(&name) {
+            ctx.locals.insert(name.clone(), ty);
+            ctx.locals_order.push((name.clone(), ty));
+            name
+        } else {
+            ctx.declare(name, ty)
+        };
+        if array {
+            ctx.arrays.insert(name.clone());
+        }
         Ok(IrStmt::Let { name, init })
     }
 
@@ -520,9 +547,6 @@ impl<'a> Parser<'a> {
 
     pub(super) fn parse_gfx_for(&mut self, ctx: &mut GfxCtx) -> Result<IrStmt, ParseError> {
         let var = self.ident()?;
-        if ctx.locals.contains_key(&var) {
-            return self.err(format!("`{var}` is already a local"));
-        }
         if !self.eat_kw("in") {
             return self.err("expected `in` in for-loop");
         }
@@ -530,9 +554,10 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::DotDot, "`..` in for-loop range")?;
         let hi = self.parse_g_expr(ctx)?;
         let u32_id = self.types.u32_id();
-        ctx.locals.insert(var.clone(), u32_id);
-        ctx.locals_order.push((var.clone(), u32_id));
+        let outer = ctx.renames.clone();
+        let var = ctx.declare(var, u32_id);
         let body = self.parse_gfx_stmts(ctx)?;
+        ctx.renames = outer;
         Ok(IrStmt::For { var, lo, hi, body })
     }
 

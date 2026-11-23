@@ -189,7 +189,7 @@ impl<'a> Parser<'a> {
                 Ok(IrExpr::ArrayLit(elems))
             }
             Some(Tok::Ident(_)) => {
-                let name = self.ident()?;
+                let name = ctx.resolve(self.ident()?);
                 let is_value = ctx.inputs.contains_key(&name) || ctx.locals.contains_key(&name);
                 if !is_value && self.peek() == Some(&Tok::LParen) {
                     let call = self.parse_g_call(ctx, &name)?;

@@ -124,6 +124,8 @@ impl<'a> Parser<'a> {
             id_param: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
+            renames: HashMap::new(),
+            shadows: 0,
             shared: HashMap::new(),
             shared_order: Vec::new(),
             textures: HashMap::new(),
@@ -250,6 +252,8 @@ impl<'a> Parser<'a> {
             id_param: None,
             locals: HashMap::new(),
             locals_order: Vec::new(),
+            renames: HashMap::new(),
+            shadows: 0,
             shared: HashMap::new(),
             shared_order: Vec::new(),
             textures: HashMap::new(),
@@ -307,6 +311,7 @@ impl<'a> Parser<'a> {
 
     pub(super) fn parse_block(&mut self, ctx: &mut Ctx) -> Result<Vec<IrStmt>, ParseError> {
         self.expect(&Tok::LBrace, "`{`")?;
+        let outer = ctx.renames.clone();
         let mut stmts = Vec::new();
         while !self.eat(&Tok::RBrace) {
             if self.peek().is_none() {
@@ -320,6 +325,7 @@ impl<'a> Parser<'a> {
                 stmts.extend(self.parse_stmt(ctx)?);
             }
         }
+        ctx.renames = outer;
         Ok(stmts)
     }
 
@@ -607,7 +613,7 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::Comma, "`,` between function call arguments")?;
             }
             if param.is_out {
-                let arg_name = self.ident()?;
+                let arg_name = ctx.resolve(self.ident()?);
                 let Some(&arg_ty) = ctx.locals.get(&arg_name) else {
                     return self.err(format!(
                         "`{arg_name}` is not a declared local; `out` arguments must be a pre-declared local variable"
@@ -763,8 +769,7 @@ impl<'a> Parser<'a> {
             if annot.is_some_and(|ty| ty != elem) {
                 return self.err(format!("{kw} hands back the buffer's element type"));
             }
-            ctx.locals.insert(name.clone(), elem);
-            ctx.locals_order.push((name.clone(), elem));
+            let name = ctx.declare(name, elem);
             return Ok(IrStmt::Atomic {
                 op,
                 buf,
@@ -813,8 +818,7 @@ impl<'a> Parser<'a> {
             }
             None => type_of_compute_expr(&init, &ctx.type_ctx(), &mut self.types),
         };
-        ctx.locals.insert(name.clone(), ty);
-        ctx.locals_order.push((name.clone(), ty));
+        let name = ctx.declare(name, ty);
         Ok(IrStmt::Let { name, init })
     }
 
@@ -841,9 +845,10 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::DotDot, "`..` in for-loop range")?;
         let hi = self.parse_expr(ctx)?;
         let u32_id = self.types.u32_id();
-        ctx.locals.insert(var.clone(), u32_id);
-        ctx.locals_order.push((var.clone(), u32_id));
+        let outer = ctx.renames.clone();
+        let var = ctx.declare(var, u32_id);
         let body = self.parse_block(ctx)?;
+        ctx.renames = outer;
         Ok(IrStmt::For { var, lo, hi, body })
     }
 }

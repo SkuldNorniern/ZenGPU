@@ -225,7 +225,7 @@ impl<'a> Parser<'a> {
                 Ok(e)
             }
             Some(Tok::Ident(_)) => {
-                let name = self.ident()?;
+                let name = ctx.resolve(self.ident()?);
                 if self.peek() == Some(&Tok::LParen) {
                     if name == "local_id" || name == "group_id" {
                         self.expect(&Tok::LParen, "`(`")?;

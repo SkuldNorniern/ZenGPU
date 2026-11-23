@@ -31,12 +31,37 @@ pub(super) struct Ctx {
     pub(super) id_param: Option<String>,
     pub(super) locals: HashMap<String, TypeId>,
     pub(super) locals_order: Vec<(String, TypeId)>,
+    /// Names a `let` shadowed, to the fresh local each now means; a block puts them back.
+    pub(super) renames: HashMap<String, String>,
+    pub(super) shadows: u32,
     pub(super) shared: HashMap<String, PendingShared>,
     pub(super) shared_order: Vec<String>,
     pub(super) textures: HashMap<String, bool>,
 }
 
 impl Ctx {
+    /// The local `name` means here, past any `let` that shadowed it.
+    pub(super) fn resolve(&self, name: String) -> String {
+        self.renames.get(&name).cloned().unwrap_or(name)
+    }
+
+    /// Binds `name` to a local of `ty`: a fresh one when the name is taken, so a shadowing
+    /// `let` never shares another's storage or type.
+    pub(super) fn declare(&mut self, name: String, ty: TypeId) -> String {
+        let local = if self.locals.contains_key(&name) {
+            self.shadows += 1;
+            let fresh = format!("__shadow{}_{name}", self.shadows);
+            self.renames.insert(name, fresh.clone());
+            fresh
+        } else {
+            self.renames.remove(&name);
+            name
+        };
+        self.locals.insert(local.clone(), ty);
+        self.locals_order.push((local.clone(), ty));
+        local
+    }
+
     pub(super) fn type_ctx(&self) -> ComputeTypeCtx {
         ComputeTypeCtx {
             locals: self.locals.clone(),
@@ -103,6 +128,9 @@ pub(super) struct GfxCtx {
     pub(super) textures: Option<String>,
     pub(super) locals: HashMap<String, TypeId>,
     pub(super) locals_order: Vec<(String, TypeId)>,
+    /// Names a `let` shadowed, to the fresh local each now means; a block puts them back.
+    pub(super) renames: HashMap<String, String>,
+    pub(super) shadows: u32,
     /// Array-literal locals, readable only as `name[i]`.
     pub(super) arrays: HashSet<String>,
     /// Set when the body calls `.sample_compare`, so the table gets a depth image type.
@@ -110,6 +138,28 @@ pub(super) struct GfxCtx {
 }
 
 impl GfxCtx {
+    /// The local `name` means here, past any `let` that shadowed it.
+    pub(super) fn resolve(&self, name: String) -> String {
+        self.renames.get(&name).cloned().unwrap_or(name)
+    }
+
+    /// Binds `name` to a local of `ty`: a fresh one when the name is taken, so a shadowing
+    /// `let` never shares another's storage or type.
+    pub(super) fn declare(&mut self, name: String, ty: TypeId) -> String {
+        let local = if self.locals.contains_key(&name) {
+            self.shadows += 1;
+            let fresh = format!("__shadow{}_{name}", self.shadows);
+            self.renames.insert(name, fresh.clone());
+            fresh
+        } else {
+            self.renames.remove(&name);
+            name
+        };
+        self.locals.insert(local.clone(), ty);
+        self.locals_order.push((local.clone(), ty));
+        local
+    }
+
     pub(super) fn type_ctx(&self) -> GraphicsTypeCtx {
         GraphicsTypeCtx {
             inputs: self.inputs.clone(),
