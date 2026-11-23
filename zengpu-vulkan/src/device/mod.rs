@@ -7012,6 +7012,73 @@ mod tests {
     }
 
     #[test]
+    fn zsl_inverse_trigonometry_runs_through_vulkan() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const ARC_ZSL: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel arcs(src: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len {
+                    let x = src[i]
+                    out[i] = asin(x) + acos(x) + atan(x) + atan2(x, -0.5)
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 128u32;
+        let size = u64::from(n) * 4;
+        let desc = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let src = dev.create_buffer(desc).unwrap();
+        let out = dev.create_buffer(desc).unwrap();
+        let input: Vec<f32> = (0..n).map(|i| -0.5 + i as f32 / n as f32).collect();
+        dev.write_buffer(
+            src,
+            0,
+            u32s_to_bytes(unsafe { from_raw_parts(input.as_ptr() as *const u32, input.len()) }),
+        )
+        .unwrap();
+
+        let shader = dev.create_shader(ARC_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[src.index(), out.index()],
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+
+        let raw = dev.read_buffer(out, 0, size).unwrap();
+        for (i, value) in input.iter().copied().enumerate() {
+            let got = f32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            let expected = value.asin() + value.acos() + value.atan() + value.atan2(-0.5);
+            assert!((got - expected).abs() < 2e-5, "out[{i}] mismatch");
+        }
+
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(src);
+        dev.destroy_buffer(out);
+    }
+
+    #[test]
     fn zsl_dot4_runs_through_vulkan() {
         use zengpu_shader::{ZslShader, zsl};
 
