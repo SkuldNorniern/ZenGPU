@@ -1184,8 +1184,7 @@ impl VulkanDevice {
         let on = |enabled: bool| if enabled { vk::TRUE } else { vk::FALSE };
         let dual_src_blend = needs_graphics && supported_features.dual_src_blend == vk::TRUE;
         // a blend per color target, as a scene's light and its motion vectors want
-        let independent_blend =
-            needs_graphics && supported_features.independent_blend == vk::TRUE;
+        let independent_blend = needs_graphics && supported_features.independent_blend == vk::TRUE;
         let fill_mode_non_solid =
             needs_graphics && supported_features.fill_mode_non_solid == vk::TRUE;
         let sampler_anisotropy =
