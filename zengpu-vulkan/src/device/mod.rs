@@ -7012,6 +7012,82 @@ mod tests {
     }
 
     #[test]
+    fn zsl_shadowed_lets_keep_their_own_values_through_vulkan() {
+        use zengpu_shader::{ZslShader, zsl};
+
+        const SHADOW_ZSL: ZslShader = zsl!(
+            push P { len: u32 }
+            @workgroup_size(64)
+            kernel shadows(src: device buffer<f32>, out: device mut buffer<f32>, p: P, id: global_id) {
+                let i = id.x
+                if i < p.len {
+                    let x = src[i]
+                    let acc = 0.0
+                    for k in 0..3 {
+                        let x = k * 2u
+                        acc = acc + f32(x)
+                    }
+                    for k in 0..2 {
+                        acc = acc + 1.0
+                    }
+                    let acc = acc * 2.0
+                    out[i] = x + acc
+                }
+            }
+        );
+
+        let Some(dev) = try_device() else { return };
+        let n = 128u32;
+        let size = u64::from(n) * 4;
+        let desc = BufferDesc {
+            size,
+            usage: BufferUsage::STORAGE | BufferUsage::READBACK,
+            memory: MemoryUsage::Upload,
+        };
+        let src = dev.create_buffer(desc).unwrap();
+        let out = dev.create_buffer(desc).unwrap();
+        let input: Vec<f32> = (0..n).map(|i| i as f32 * 0.25 - 3.0).collect();
+        dev.write_buffer(
+            src,
+            0,
+            u32s_to_bytes(unsafe { from_raw_parts(input.as_ptr() as *const u32, input.len()) }),
+        )
+        .unwrap();
+
+        let shader = dev.create_shader(SHADOW_ZSL.spirv_desc().unwrap()).unwrap();
+        let pipeline = dev
+            .create_compute_pipeline(ComputePipelineDesc {
+                shader,
+                entry: "main",
+                block: [64, 1, 1],
+            })
+            .unwrap();
+        dev.dispatch(
+            pipeline,
+            Bindings {
+                buffers: &[src.index(), out.index()],
+                scalars: &[Scalar::U32(n)],
+                textures: &[],
+                images: &[],
+            },
+            [n.div_ceil(64), 1, 1],
+        )
+        .unwrap();
+
+        let raw = dev.read_buffer(out, 0, size).unwrap();
+        for (i, value) in input.iter().copied().enumerate() {
+            let got = f32::from_ne_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+            // the inner x is 0, 2, 4 and never the outer one; then twice the sum, 2 * (6 + 2)
+            assert_eq!(got, value + 16.0, "out[{i}]");
+        }
+
+        dev.destroy_pipeline(pipeline);
+        dev.destroy_shader(shader);
+        dev.destroy_buffer(src);
+        dev.destroy_buffer(out);
+    }
+
+    #[test]
     fn zsl_inverse_trigonometry_runs_through_vulkan() {
         use zengpu_shader::{ZslShader, zsl};
 
