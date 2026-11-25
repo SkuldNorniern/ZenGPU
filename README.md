@@ -23,7 +23,7 @@ helpers. Raw slot-based dispatches can opt into full-handle checks with
 
 ```toml
 [dependencies]
-zengpu = "0.1.0"
+zengpu = "0.2.0"
 ```
 
 ```rust,ignore
